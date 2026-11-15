@@ -8,53 +8,65 @@ struct ZagWelcomeView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 28) {
+                VStack(alignment: .leading, spacing: 20) {
                     Image(systemName: "iphone.radiowaves.left.and.right")
-                        .font(.system(size: 64, weight: .medium))
+                        .font(.largeTitle)
                         .foregroundStyle(.tint)
                         .accessibilityHidden(true)
-                        .padding(.top, 28)
 
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("Welcome to Zag Store")
                             .font(.largeTitle.bold())
                             .accessibilityAddTraits(.isHeader)
-                        Text("Your apps. Your iPhone. Ready when you are.")
-                            .font(.title3)
+                        Text("Pair your iPhone to unlock direct app installation.")
+                            .font(.body)
                             .foregroundStyle(.secondary)
                     }
 
-                    VStack(alignment: .leading, spacing: 22) {
-                        feature("Make this iPhone yours", icon: "link", detail: "RPPairing securely connects Zag Store to this iPhone so you can install and manage signed apps directly on your device.")
-                        feature("Set up once", icon: "checkmark.shield", detail: "Your pairing credentials stay on this device and can be reused. The setup page guides you through pairing and the local VPN connection needed for installation.")
-                        feature("Explore at your pace", icon: "safari", detail: "Browse sources and discover apps now. You can always set up pairing later in Settings → Installation.")
+                    VStack(alignment: .leading, spacing: 16) {
+                        feature("Quick setup", icon: "link", detail: "Connect securely using RPPairing.")
+                        feature("Private & secure", icon: "checkmark.shield", detail: "Your pairing credentials stay on your device.")
                     }
-                    .padding(22)
+                    .padding(20)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28))
 
-                    VStack(spacing: 12) {
-                        Text(pairingStatus)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        if launch.policy.status == .checking {
-                            ProgressView("Checking pairing…")
-                        } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            if launch.policy.status == .checking {
+                                ProgressView().accessibilityHidden(true)
+                            }
+                            Text(pairingStatus)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        if launch.policy.status != .checking {
                             Button("Retry Pairing Check") { launch.retry() }
                                 .frame(minHeight: 44)
                         }
-                        primaryAction
-                            .disabled(launch.policy.status == .checking)
-                        Button("Continue Without Pairing") { launch.skip() }
-                            .buttonStyle(.plain)
-                            .frame(maxWidth: .infinity, minHeight: 48)
-                            .foregroundStyle(.secondary)
-                            .accessibilityHint("Open Zag Store. Pairing remains available in Settings.")
                     }
                 }
-                .frame(maxWidth: 560)
-                .padding(24)
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 16)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 8) {
+                    primaryAction
+                        .disabled(launch.policy.status == .checking)
+                    Button { launch.skip() } label: {
+                        Text("Continue Without Pairing")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHint("Open Zag Store. Pairing remains available in Settings.")
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+                .background(.regularMaterial)
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationDestination(isPresented: $showPairing) {
@@ -72,14 +84,14 @@ struct ZagWelcomeView: View {
 
     private var pairingStatus: String {
         switch launch.policy.status {
-        case .checking: return "Checking whether pairing is ready on this iPhone. You can continue while setup is unavailable."
-        case .missing: return "No pairing record is saved. Set up pairing to install apps directly on this iPhone."
-        case .invalid: return "The saved pairing credentials could not be accepted. Open setup to pair this iPhone again."
-        case .failed: return "Pairing could not be verified. Check the local VPN connection and device permissions, then retry."
-        case .timedOut: return "The pairing check timed out. Your pairing status is unknown. Check the connection and retry, or continue for now."
-        case .unknown: return "Pairing status is unknown. Retry the check, open setup, or continue for now."
-        case .verified: return "Pairing verified."
-        case .skipped: return "You can set up pairing later in Settings → Installation."
+        case .checking: return "Checking pairing…"
+        case .missing: return "No pairing detected"
+        case .invalid: return "Pairing needs attention"
+        case .failed: return "Pairing verification failed"
+        case .timedOut: return "Pairing check timed out"
+        case .unknown: return "Pairing status unknown"
+        case .verified: return "Pairing verified"
+        case .skipped: return "Pairing skipped for this session"
         }
     }
 
@@ -98,15 +110,16 @@ struct ZagWelcomeView: View {
     }
 
     private func feature(_ title: LocalizedStringKey, icon: String, detail: LocalizedStringKey) -> some View {
-        HStack(alignment: .top, spacing: 16) {
+        HStack(alignment: .top, spacing: 12) {
             Image(systemName: icon)
-                .font(.title2)
+                .font(.title3)
                 .foregroundStyle(.tint)
                 .frame(width: 30)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.headline)
                 Text(detail).font(.body).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .accessibilityElement(children: .combine)
