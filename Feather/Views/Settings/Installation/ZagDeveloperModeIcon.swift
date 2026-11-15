@@ -12,7 +12,7 @@ struct ZagDeveloperModeIcon: View {
 private struct ZagDeveloperModeHammer: Shape {
     func path(in rect: CGRect) -> Path {
         func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-            CGPoint(x: rect.minX + rect.width * x / 30, y: rect.minY + rect.height * y / 30)
+            CGPoint(x: rect.minX + rect.width * x / 30, y: rect.minY + rect.height * (y + 0.5) / 30)
         }
         var path = Path()
         // A single balanced head and a tapered handle, with no crossing outlines.

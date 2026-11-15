@@ -5,6 +5,7 @@ struct ZagDeveloperModeGuidanceView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     @State private var expanded = false
+    @State private var indicatorRow: CGRect?
     @State private var columns = DeveloperModeColumns()
     @ScaledMetric(relativeTo: .footnote) private var numberSpacing = 4.0
 
@@ -61,21 +62,41 @@ struct ZagDeveloperModeGuidanceView: View {
             .tint(Color(hex: themeColorHex))
             .anchorPreference(key: DeveloperModeRowBounds.self, value: .bounds) { $0 }
         }
-        // Keep native disclosure layout, hit testing and animation. Only its glyph
-        // is transparent; a decorative chevron uses the Status indicator column.
-        .tint(.clear)
+        // Native iOS can render the disclosure glyph in secondary rather than tint.
+        // Mask only its indicator column; native layout, hit testing and expansion stay intact.
+        .mask {
+            GeometryReader { geometry in
+                Path { path in
+                    path.addRect(CGRect(origin: .zero, size: geometry.size))
+                    if let indicatorRow {
+                        path.addRect(CGRect(x: indicatorRow.maxX, y: indicatorRow.minY,
+                                            width: max(0, geometry.size.width - indicatorRow.maxX),
+                                            height: indicatorRow.height))
+                    }
+                }
+                .fill(style: FillStyle(eoFill: true))
+            }
+        }
         .overlayPreferenceValue(DeveloperModeRowBounds.self) { anchor in
             GeometryReader { geometry in
                 if let anchor {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 22, alignment: .center)
-                        .position(x: geometry.size.width - 11, y: geometry[anchor].midY)
+                    Color.clear.preference(key: DeveloperModeRowRect.self, value: geometry[anchor])
+                    if indicatorRow != nil {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 22, alignment: .center)
+                            .position(x: geometry.size.width - 11, y: geometry[anchor].midY)
+                    }
                 }
             }
             .allowsHitTesting(false)
             .accessibilityHidden(true)
+        }
+        .onPreferenceChange(DeveloperModeRowRect.self) { value in
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { indicatorRow = value }
         }
         .onPreferenceChange(DeveloperModeColumnsKey.self) { value in
             var transaction = Transaction()
@@ -110,6 +131,13 @@ private struct DeveloperModeColumnsKey: PreferenceKey {
 private struct DeveloperModeRowBounds: PreferenceKey {
     static let defaultValue: Anchor<CGRect>? = nil
     static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
+private struct DeveloperModeRowRect: PreferenceKey {
+    static let defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
         value = nextValue() ?? value
     }
 }

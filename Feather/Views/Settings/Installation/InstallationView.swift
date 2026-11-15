@@ -38,6 +38,7 @@ struct InstallationView: View {
 private struct RPPairingView: View {
 	@State private var isLocalDevVpnAvailable = true
 	@StateObject private var pairingCore = ZagRPPairingCore.shared
+    @ObservedObject private var pairingMonitor = ZagLocalVPNMonitor.shared
 	@State private var showGate4Importer = false
 	@State private var showUnpairConfirmation = false
     @State private var cleanupFeedback: CleanupFeedback?
@@ -195,7 +196,7 @@ private struct RPPairingView: View {
 		} header: {
 			Text("Control")
 		} footer: {
-            Text("Settings App → Privacy & Security → Developer Mode → Pair with Zag Store")
+            Text(pairingFooter)
                 .fixedSize(horizontal: false, vertical: true)
 		}
 
@@ -353,6 +354,18 @@ private struct RPPairingView: View {
 		pairingCore.pairingFileExists && tunnelVerified ? "checkmark.circle.fill" : "circle"
 	}
 
+    private var pairingFooter: String {
+        let verified: Bool
+        if case .verified = pairingMonitor.model.pairing {
+            verified = !pairingCore.localPairingCleanupPending && pairingCore.pairingFileExists
+        } else {
+            verified = false
+        }
+        return verified
+            ? "Settings App → Privacy & Security → Developer Mode → Zag Store"
+            : "Settings App → Privacy & Security → Developer Mode → Pair with Zag Store"
+    }
+
 	private var directInstallStatusColor: Color {
 		pairingCore.pairingFileExists && tunnelVerified ? .green : .secondary
 	}
@@ -373,7 +386,9 @@ private struct RPPairingView: View {
                 if usesPairingIcon {
                     ZagPairingIcon().frame(width: 25, height: 25).foregroundStyle(.tint)
                 } else {
-                    Image(systemName: titleSystemImage).foregroundStyle(.tint)
+                    Image(systemName: titleSystemImage)
+                        .frame(width: 25, height: 25, alignment: .center)
+                        .foregroundStyle(.tint)
                 }
             }
                 .labelStyle(.titleAndIcon)

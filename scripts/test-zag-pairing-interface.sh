@@ -50,12 +50,57 @@ pairing_site = view.split('.sheet(isPresented: $showUnpairConfirmation', 1)[1].s
 apps_site = library.split('.sheet(item: $_pendingRemoveApp)', 1)[1].split('.sheet(item: $_selectedInfoAppPresenting)', 1)[0]
 for site in [pairing_site, apps_site]:
     assert '.modifier(ZagRemovalSheetPresentation())' in site
-# The two presentation sites are the only edits to either host view.
-for name in ['Feather/Views/Settings/Installation/InstallationView.swift', 'Feather/Views/Library/LibraryView.swift']:
-    current = (root / name).read_text()
-    previous = subprocess.check_output(['git', 'show', '32647357:' + name], cwd=root, text=True)
-    assert current.replace('                .modifier(ZagRemovalSheetPresentation())\n', '') == previous
-
+# Protected host logic remains unchanged; only presentation binds the verified footer.
+current_page = (root / 'Feather/Views/Settings/Installation/InstallationView.swift').read_text()
+prior_page = subprocess.check_output(['git', 'show', '4d1b426a:Feather/Views/Settings/Installation/InstallationView.swift'], cwd=root, text=True)
+assert current_page.split('struct RPPairingDiagnosticsView:', 1)[1] == prior_page.split('struct RPPairingDiagnosticsView:', 1)[1]
+assert current_page.split('private func confirmLocalCleanup()', 1)[1].split('private var tunnelVerified', 1)[0] == prior_page.split('private func confirmLocalCleanup()', 1)[1].split('private var tunnelVerified', 1)[0]
+footer = view.split('private var pairingFooter:', 1)[1].split('private var directInstallStatusColor:', 1)[0]
+assert 'if case .verified = pairingMonitor.model.pairing' in footer
+assert '!pairingCore.localPairingCleanupPending && pairingCore.pairingFileExists' in footer
+assert 'Settings App → Privacy & Security → Developer Mode → Zag Store' in footer
+assert 'Settings App → Privacy & Security → Developer Mode → Pair with Zag Store' in footer
+# Compile the actual computed footer against the real verification model.
+import tempfile
+footer_source = 'private var pairingFooter:' + footer
+fixture = '''import Foundation
+struct Monitor { var model = ZagDeviceLinkModel() }
+struct Core { var localPairingCleanupPending = false; var pairingFileExists = true }
+struct Fixture {
+    var pairingMonitor = Monitor()
+    var pairingCore = Core()
+''' + footer_source + '''
+    var text: String { pairingFooter }
+}
+var fixture = Fixture()
+let missing = "Settings App → Privacy & Security → Developer Mode → Pair with Zag Store"
+let paired = "Settings App → Privacy & Security → Developer Mode → Zag Store"
+let now = Date()
+precondition(fixture.text == missing) // a record without verification
+fixture.pairingMonitor.model.pairingEvent(.verified(now))
+precondition(fixture.text == paired)
+fixture.pairingCore.localPairingCleanupPending = true
+precondition(fixture.text == missing)
+fixture.pairingCore.localPairingCleanupPending = false
+fixture.pairingCore.pairingFileExists = false
+precondition(fixture.text == missing)
+fixture.pairingCore.pairingFileExists = true
+fixture.pairingMonitor.model.pairingEvent(.failed(.pairingRejected, now.addingTimeInterval(1)))
+precondition(fixture.text == missing)
+fixture.pairingMonitor.model.pairingEvent(.verified(now.addingTimeInterval(2)))
+precondition(fixture.text == paired) // re-pair / new successful verification
+fixture.pairingMonitor.model.expire(now: now.addingTimeInterval(1000))
+precondition(fixture.text == missing)
+print("PASS: actual footer responds to verified, missing, cleanup, rejected, re-verified and expired pairing")
+'''
+with tempfile.TemporaryDirectory(prefix='zag-footer-') as work:
+    source = Path(work) / 'main.swift'
+    source.write_text(fixture)
+    binary = str(Path(work) / 'tests')
+    subprocess.run(['xcrun', 'swiftc', str(root / 'Feather/Utilities/ZagDeviceLink.swift'), str(source), '-module-cache-path', '/tmp/zag-checkpoint-module-cache', '-o', binary], check=True)
+    subprocess.run([binary], check=True)
+assert 'Text(pairingFooter)' in view
+assert '.frame(width: 25, height: 25, alignment: .center)' in view
 assert '.presentationCornerRadius' not in popup  # same native rounded sheet geometry as Apps
 assert '.ignoresSafeArea' not in popup and '.frame(maxHeight: .infinity)' not in popup
 assert 'ZagInstallationRowLabelStyle(' not in view and 'ZagInstallationRowLabelStyle(' not in guide
@@ -68,7 +113,20 @@ assert '.accessibilityLabel("\\(index + 1). \\(step)")' in guide
 assert '.frame(width: 22, alignment: .center)' in guide
 assert '.position(x: geometry.size.width - 11, y: geometry[anchor].midY)' in guide
 assert '.allowsHitTesting(false)' in guide and '.accessibilityHidden(true)' in guide
-assert '.tint(.clear)' in guide and '.tint(Color(hex: themeColorHex))' in guide
+assert '.tint(.clear)' not in guide and '.tint(Color(hex: themeColorHex))' in guide
+assert '.mask {' in guide and '.fill(style: FillStyle(eoFill: true))' in guide
+assert 'CGRect(x: indicatorRow.maxX' in guide and 'geometry.size.width - indicatorRow.maxX' in guide
+assert 'if indicatorRow != nil' in guide
+assert guide.count('Image(systemName: expanded ? "chevron.down" : "chevron.right")') == 1
+mobile = (root / 'Feather/Views/Settings/Installation/ZagMobileDataFixView.swift').read_text()
+assert 'ZagMobileDataFixStatusLabel(status: status, compact: true)' in mobile
+assert 'if case .verificationRequired = status { return "Not Verified" }' in mobile
+compact = mobile.split('if compact {', 1)[1].split('} else {', 1)[0]
+assert compact.index('Text(compactTitle)') < compact.index('Image(systemName: style.icon)')
+assert 'HStack(spacing: 8)' in compact and '.frame(width: 22, alignment: .center)' in compact
+assert '.lineLimit(dynamicTypeSize > .large ? nil : 1)' in compact
+assert '.fixedSize(horizontal: dynamicTypeSize <= .large, vertical: true)' in compact
+assert 'case .verificationRequired: return ("questionmark.circle.fill", .orange)' in mobile
 for competing in ['disclosureGroupStyle', 'withAnimation', '.animation(', '.transition(', 'if expanded {']:
     assert competing not in guide
 # Only the local pairing labels change; Apps shared content/presentation are identical.

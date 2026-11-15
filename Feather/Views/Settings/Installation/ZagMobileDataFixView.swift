@@ -28,7 +28,7 @@ struct ZagMobileDataFixRow: View {
 				if case .notSetUp = status {
 					EmptyView()
 				} else {
-					ZagMobileDataFixStatusLabel(status: status)
+					ZagMobileDataFixStatusLabel(status: status, compact: true)
 						.font(.subheadline)
 				}
 			}
@@ -38,13 +38,32 @@ struct ZagMobileDataFixRow: View {
 
 struct ZagMobileDataFixStatusLabel: View {
 	let status: ZagMobileDataToggle.Status
+    var compact = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
 	var body: some View {
 		let style = Self.style(for: status)
-		Label(status.title, systemImage: style.icon)
-			.foregroundStyle(style.color)
-			.labelStyle(.titleAndIcon)
+        if compact {
+            HStack(spacing: 8) {
+                Text(compactTitle)
+                    .lineLimit(dynamicTypeSize > .large ? nil : 1)
+                    .fixedSize(horizontal: dynamicTypeSize <= .large, vertical: true)
+                Image(systemName: style.icon)
+                    .frame(width: 22, alignment: .center)
+                    .accessibilityHidden(true)
+            }
+            .foregroundStyle(style.color)
+        } else {
+            Label(status.title, systemImage: style.icon)
+                .foregroundStyle(style.color)
+                .labelStyle(.titleAndIcon)
+        }
 	}
+
+    private var compactTitle: String {
+        if case .verificationRequired = status { return "Not Verified" }
+        return status.title
+    }
 
 	static func style(for status: ZagMobileDataToggle.Status) -> (icon: String, color: Color) {
 		switch status {
