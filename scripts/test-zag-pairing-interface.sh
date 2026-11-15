@@ -4,6 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 python3 - "$ROOT" <<'PY'
 from pathlib import Path
 import sys
+import subprocess
 root = Path(sys.argv[1])
 view = (root / 'Feather/Views/Settings/Installation/InstallationView.swift').read_text().split('private struct RPPairingView:', 1)[1].split('struct RPPairingDiagnosticsView:', 1)[0]
 assert view.count('Button(role: (pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending)') == 1
@@ -36,16 +37,38 @@ assert 'VStack(spacing: 10)' in popup
 assert popup.count('Color(uiColor: .tertiarySystemFill)') == 2
 assert popup.count('RoundedRectangle(cornerRadius: 26, style: .continuous)') == 2
 assert popup.count('.frame(minHeight: 52)') == 2
-assert '.foregroundStyle(.red)' in popup and '.height(302)' in popup
+assert '.foregroundStyle(.red)' in popup and '.height(contentHeight)' in popup
 assert '.padding(.horizontal, 20)' in popup and '.padding(.top, 24)' in popup and '.padding(.bottom, 8)' in popup
 assert '.presentationDragIndicator(.visible)' in popup
-assert 'dynamicTypeSize > .large' in popup and 'ScrollView { content }' in popup
+assert 'dynamicTypeSize > .large' not in popup and '[.large]' not in popup
+assert '.fixedSize(horizontal: false, vertical: true)' in popup
+assert 'geometry.size.height' in popup and 'contentHeight = height' in popup
+assert '.scrollBounceBehavior(.basedOnSize)' in popup
+assert '.presentationBackground(.ultraThinMaterial)' in popup
+# Inspect actual presentation closures, not just the shared content implementation.
+pairing_site = view.split('.sheet(isPresented: $showUnpairConfirmation', 1)[1].split('\n\t\t\tHStack', 1)[0]
+apps_site = library.split('.sheet(item: $_pendingRemoveApp)', 1)[1].split('.sheet(item: $_selectedInfoAppPresenting)', 1)[0]
+for site in [pairing_site, apps_site]:
+    assert '.modifier(ZagRemovalSheetPresentation())' in site
+# The two presentation sites are the only edits to either host view.
+for name in ['Feather/Views/Settings/Installation/InstallationView.swift', 'Feather/Views/Library/LibraryView.swift']:
+    current = (root / name).read_text()
+    previous = subprocess.check_output(['git', 'show', '32647357:' + name], cwd=root, text=True)
+    assert current.replace('                .modifier(ZagRemovalSheetPresentation())\n', '') == previous
+
+assert '.presentationCornerRadius' not in popup  # same native rounded sheet geometry as Apps
+assert '.ignoresSafeArea' not in popup and '.frame(maxHeight: .infinity)' not in popup
 assert 'ZagInstallationRowLabelStyle(' not in view and 'ZagInstallationRowLabelStyle(' not in guide
 assert '.labelStyle(.titleAndIcon)' in view and guide.count('.labelStyle(.titleAndIcon)') == 2
 assert 'Color.clear.frame(width: 25, height: 25)' in guide
-assert '.disclosureGroupStyle(ZagInstallationDisclosureStyle())' in guide
+assert 'DisclosureGroup {' in guide and '} label: {' in guide
+assert guide.index('ZagDeveloperModeGuidance.steps') < guide.index('} label: {')
+for competing in ['disclosureGroupStyle', 'withAnimation', '.animation(', '.transition(', 'GeometryReader', 'overlay', 'configuration.isExpanded']:
+    assert competing not in guide
+# Label/icon/status tree remains byte-for-byte unchanged from the corrected baseline.
+prior_guide = subprocess.check_output(['git', 'show', '32647357:Feather/Views/Settings/Installation/ZagDeveloperModeGuidanceView.swift'], cwd=root, text=True)
+assert guide.split('} label: {', 1)[1].split('        }', 1)[0] == prior_guide.split('} label: {', 1)[1].split('        }', 1)[0]
 # Restore every native Control label modifier against the actual pre-regression source.
-import subprocess
 baseline = subprocess.check_output(['git', 'show', '57664bf4:Feather/Views/Settings/Installation/InstallationView.swift'], cwd=root, text=True)
 start = 'Button(role: (pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending)'
 # Control label and native frame/contentShape before the presentation modifier.

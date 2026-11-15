@@ -1078,6 +1078,7 @@ struct LibraryView: View {
 
 			.sheet(item: $_pendingRemoveApp) { app in
 				_removeAppSheetContent(app)
+                .modifier(ZagRemovalSheetPresentation())
 			}
 
 			.sheet(item: $_selectedInfoAppPresenting) { app in

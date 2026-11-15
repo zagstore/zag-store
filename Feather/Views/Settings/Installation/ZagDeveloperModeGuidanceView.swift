@@ -39,32 +39,5 @@ struct ZagDeveloperModeGuidanceView: View {
                     .accessibilityLabel(ZagDeveloperModeGuidance.accessibilityStatus)
             }
         }
-        .disclosureGroupStyle(ZagInstallationDisclosureStyle())
-    }
-}
-
-/// Avoid the native disclosure content indent: both labels use Control’s native icon column.
-private struct ZagInstallationDisclosureStyle: DisclosureGroupStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button {
-                withAnimation { configuration.isExpanded.toggle() }
-            } label: {
-                HStack {
-                    configuration.label
-                    Image(systemName: "chevron.right")
-                        .font(.footnote.weight(.semibold))
-                        .rotationEffect(.degrees(configuration.isExpanded ? 90 : 0))
-                        .foregroundStyle(.secondary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(configuration.isExpanded ? "Expanded" : "Collapsed")
-            if configuration.isExpanded {
-                Divider()
-                configuration.content
-            }
-        }
     }
 }

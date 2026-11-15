@@ -130,6 +130,7 @@ private struct RPPairingView: View {
                     confirm: confirmLocalCleanup,
                     cancel: { showUnpairConfirmation = false }
                 )
+                .modifier(ZagRemovalSheetPresentation())
             }
 
 			HStack {

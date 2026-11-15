@@ -7,22 +7,11 @@ struct ZagRemovalConfirmationSheet: View {
     let destructiveTitle: String
     let confirm: () -> Void
     let cancel: () -> Void
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .title2) private var titleSize = 22.0
     @ScaledMetric(relativeTo: .body) private var messageSize = 17.0
     @ScaledMetric(relativeTo: .title3) private var buttonSize = 20.0
 
-    var body: some View {
-        Group {
-            if dynamicTypeSize > .large {
-                ScrollView { content }
-            } else {
-                content
-            }
-        }
-        .presentationDetents(dynamicTypeSize > .large ? [.large] : [.height(302)])
-        .presentationDragIndicator(.visible)
-    }
+    var body: some View { content }
 
     private var content: some View {
 		VStack(spacing: 10) {
@@ -82,5 +71,38 @@ struct ZagLocalPairingConfirmationPopup: View {
             confirm: confirm,
             cancel: cancel
         )
+    }
+}
+
+/// Applied at both sheet presentation sites, including sheets nested in Settings.
+/// Measure the ideal content rather than switching larger text sizes to a full-height detent.
+struct ZagRemovalSheetPresentation: ViewModifier {
+    // The original Apps detent is used only until the first content measurement.
+    @State private var contentHeight: CGFloat = 302
+
+    func body(content: Content) -> some View {
+        ScrollView {
+            content
+                .fixedSize(horizontal: false, vertical: true)
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear.preference(key: ZagRemovalSheetHeight.self, value: geometry.size.height)
+                    }
+                }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .onPreferenceChange(ZagRemovalSheetHeight.self) { height in
+            if height.isFinite && height > 0 { contentHeight = height }
+        }
+        .presentationDetents([.height(contentHeight)])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(.ultraThinMaterial)
+    }
+}
+
+private struct ZagRemovalSheetHeight: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
