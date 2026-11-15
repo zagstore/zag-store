@@ -16,6 +16,10 @@ import NimbleJSON
 
 @main
 struct FeatherApp: App {
+    // Must precede manager initialization and their persistence side effects.
+    @State private var showWelcome = ZagOnboardingPolicy.beginInstallation()
+    @State private var pendingURLs: [URL] = []
+    @State private var splashFinished = false
 	@UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 	
 	let heartbeat = HeartbeatManager.shared
@@ -28,9 +32,16 @@ struct FeatherApp: App {
 			ZStack {
 				ZagWallpaperBackground()
 
-				VariedTabbarView()
+                if showWelcome {
+                    ZagWelcomeView {
+                        ZagOnboardingPolicy.complete()
+                        showWelcome = false
+                    }
+                    .allowsHitTesting(splashFinished)
+                    .accessibilityHidden(!splashFinished)
+                } else {
+                VariedTabbarView()
 					.environment(\.managedObjectContext, storage.context)
-					.onOpenURL(perform: _handleURL)
 					.modifier(ZagMobileDataInstallOverlay())
 					.overlay(alignment: .top) {
 						// Manual transfers float above the app rather than
@@ -39,8 +50,26 @@ struct FeatherApp: App {
 							.padding(.top, 4)
 							.transition(.move(edge: .top).combined(with: .opacity))
 						}
+                }
 				ZagAnimatedLaunchOverlay()
 			}
+            .onOpenURL { url in
+                if ZagMobileDataToggleController.shared.handle(url) { return }
+                if showWelcome || !splashFinished {
+                    if pendingURLs.count < 16 { pendingURLs.append(url) }
+                } else { _handleURL(url) }
+            }
+            .task {
+                await ZagLaunchGate.shared.waitUntilSplashFinishes()
+                splashFinished = true
+                drainPendingURLs()
+            }
+            .onChange(of: showWelcome) { _ in
+                Task { @MainActor in
+                    await Task.yield()
+                    drainPendingURLs()
+                }
+            }
 			.animation(.smooth, value: downloadManager.manualDownloads.description)
 			.onAppear { ZagInventorySnapshotRecorder.shared.start() }
             .onAppear {
@@ -76,6 +105,13 @@ struct FeatherApp: App {
 		}
 	}
 	
+    private func drainPendingURLs() {
+        guard !showWelcome, splashFinished else { return }
+        let urls = pendingURLs
+        pendingURLs.removeAll()
+        for url in urls { _handleURL(url) }
+    }
+
 	private func _handleURL(_ url: URL) {
 		// Consumes only zagstore://shortcut-callback/…; all other links route as before.
 		if ZagMobileDataToggleController.shared.handle(url) {
