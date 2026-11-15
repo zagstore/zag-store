@@ -53,6 +53,23 @@ import Foundation
 		NBRepositoryFetchDiagnostics.clear()
 		expect(NBRepositoryFetchDiagnostics.metrics.isEmpty, "clearing diagnostics removes them")
 
+		// A failed cache write must not discard the only copy of older metrics.
+		let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+			.appendingPathComponent("ZagStore-RepositoryFetchMetrics.json")
+		do {
+			try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+			UserDefaults.standard.set(legacy, forKey: legacyKey)
+			NBRepositoryFetchDiagnostics.record(metric("https://failed.example/repo.json", "network/200"))
+			expect(UserDefaults.standard.data(forKey: legacyKey) == legacy,
+				"failed file migration preserves the legacy metrics")
+			expect(NBRepositoryFetchDiagnostics.metrics.map(\.url) == ["https://old.example/repo.json"],
+				"legacy metrics remain readable after a failed migration")
+			try FileManager.default.removeItem(at: cache)
+		} catch {
+			expect(false, "could not prepare failed-migration fixture: \(error)")
+		}
+		NBRepositoryFetchDiagnostics.clear()
+
 		if failures > 0 { print("\(failures) fetch defaults test(s) failed"); exit(1) }
 		print("All fetch defaults tests passed")
 	}

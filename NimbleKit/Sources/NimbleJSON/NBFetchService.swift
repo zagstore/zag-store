@@ -56,7 +56,13 @@ public enum NBRepositoryFetchDiagnostics {
 		var current = load().filter { $0.url != metric.url }
 		current.append(metric)
 		guard let fileURL, let data = try? JSONEncoder().encode(current) else { return }
-		try? data.write(to: fileURL, options: .atomic)
+		do {
+			try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+			try data.write(to: fileURL, options: .atomic)
+		} catch {
+			// Retain legacy metrics if the cache is unavailable or unwritable.
+			return
+		}
 		// One-time migration: the file now holds the older metrics as well.
 		if UserDefaults.standard.object(forKey: legacyKey) != nil {
 			UserDefaults.standard.removeObject(forKey: legacyKey)
