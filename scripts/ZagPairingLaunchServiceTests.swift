@@ -9,6 +9,7 @@ import Combine
     @Published var state: State = .idle
     @Published var gate2State: Gate2State = .idle
     var pairingFileExists = true
+    var localPairingCleanupPending = false
     var isTransportBusy = false
     var isGate2Running = false
     var isRunning = false
@@ -37,6 +38,13 @@ import Combine
         let setupSubscription = service.setupSuccesses.sink { successes += 1 }
         defer { checkSubscription.cancel(); setupSubscription.cancel() }
         check(results.isEmpty && successes == 0, "cached health-check/setup successes never grant entry")
+        core.localPairingCleanupPending = true
+        check(!service.hasPairingRecord, "pending local cleanup blocks cold-launch entry even if a file remains")
+        core.gate2State = .complete
+        core.state = .paired
+        check(results.isEmpty && successes == 0, "pending cleanup rejects late native success events")
+        core.localPairingCleanupPending = false
+        check(service.hasPairingRecord, "cleanup recovery restores eligibility for a fresh check only")
         service.verify()
         check(core.checks == 1 && core.gate2Endpoint == .localDevVPN, "launch uses existing production-endpoint Gate 2 verifier")
         core.gate2State = .pairRecord("accepted")
@@ -59,6 +67,6 @@ import Combine
         check(successes == 0, "opening/starting pairing is not success")
         core.state = .paired
         check(successes == 1, "only fresh native setup completion exits welcome")
-        print("SUCCESS: 11 production pairing event-bridge checks passed")
+        print("SUCCESS: 14 production pairing event-bridge checks passed")
     }
 }

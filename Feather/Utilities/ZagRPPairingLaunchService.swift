@@ -2,13 +2,13 @@ import Combine
 
 @MainActor final class ZagRPPairingLaunchService: ZagLaunchPairingService {
     private let core = ZagRPPairingCore.shared
-    var hasPairingRecord: Bool { core.pairingFileExists }
+    var hasPairingRecord: Bool { core.pairingFileExists && !core.localPairingCleanupPending }
     var isBusy: Bool { core.isTransportBusy || core.isGate2Running || core.isRunning }
 
     var verificationEvents: AnyPublisher<ZagOnboardingPolicy.Verification, Never> {
         // Drop the publisher's initial cached value. Only this new live check counts.
         core.$gate2State.dropFirst().compactMap { [weak self] state -> ZagOnboardingPolicy.Verification? in
-            guard self?.core.gate2Endpoint == .localDevVPN else { return nil }
+            guard self?.core.gate2Endpoint == .localDevVPN, self?.core.localPairingCleanupPending == false else { return nil }
             switch state {
             case .complete: return .verified
             case .failed(let message):
@@ -23,7 +23,8 @@ import Combine
     }
 
     var setupSuccesses: AnyPublisher<Void, Never> {
-        core.$state.dropFirst().compactMap { state -> Void? in
+        core.$state.dropFirst().compactMap { [weak self] state -> Void? in
+            guard self?.core.localPairingCleanupPending == false else { return nil }
             if case .paired = state { return () }
             return nil
         }.eraseToAnyPublisher()

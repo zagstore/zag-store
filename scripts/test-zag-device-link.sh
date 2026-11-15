@@ -57,10 +57,9 @@ check "Gate4 classifies failures before deciding on a retry" grep -q 'ZagRPPairi
 check "Gate4 never retries once installation has begun" grep -q 'gate4InstallationCodes: Set<Int32> = \[205, 206, 208, 209, 210\]' "$CORE"
 check "Gate4 retries are opt-in" grep -q 'retryTransientFailures: Bool = false' "$CORE"
 check "self-update does not opt in to retries" absent 'retryTransientFailures' "$(cat "$SELFUPDATE")"
-forget=$(sed -n '/func forgetPairing() throws {/,/^	}/p' "$CORE")
-gate4=$(sed -n '/fileprivate func receiveGate4(/,/^	}/p' "$CORE")
-check "the pairing file is deleted in exactly one place" test "$(grep -c 'removeItem(at: Self.pairingFileURL' "$CORE")" = 1
-check "that place is the explicit Forget Pairing action" grep -q 'removeItem(at: Self.pairingFileURL' <<< "$forget"
+gate4=$(sed -n '/fileprivate func receiveGate4(/,/^\t}/p' "$CORE")
+check "local cleanup uses only the explicit credential and host identity paths" bash -c "grep -q 'ZagLocalPairingRemoval(pairingRecord: Self.pairingFileURL, hostIdentity: Self.hostIdentityURL' '$CORE' && grep -q 'remove: ZagLocalPairingRemoval.removeFile' '$CORE'"
+check "local cleanup is blocked while any native transport is busy" grep -q '!isGate4Running && !isTransportBusy' "$CORE"
 check "Gate4 failures never forget or rewrite pairing" bash -c "! grep -qE 'forgetPairing|pairingFileURL' <<< \"\$1\"" _ "$gate4"
 TRACE="$ROOT/Feather/Utilities/ZagTransportTrace.swift"
 check "trace sends no data on any connection" absent '.send(' "$(cat "$TRACE")"
@@ -124,10 +123,20 @@ def excluding_pin_presentation(source):
     start = source.index('\n', source.index('state = .pin(message)'))
     end = source.index('\n\t\t\tUNUserNotificationCenter.current().add(', start)
     return source[:start] + source[end:]
-assert excluding_pin_presentation(current) == excluding_pin_presentation(baseline)
+def excluding_local_cleanup(source):
+    source = source.replace('    @Published private(set) var localPairingCleanupPending = UserDefaults.standard.bool(forKey: ZagLocalPairingRemoval.pendingKey)\n', '')
+    source = source.replace('        guard !localPairingCleanupPending else { return false }\n', '')
+    source = source.replace('        guard !localPairingCleanupPending else {\n            state = .failed("Retry Local Cleanup before starting pairing again.")\n            return\n        }\n', '')
+    source = source.replace('        guard !localPairingCleanupPending else {\n            gate2State = .failed("Retry Local Cleanup before checking pairing again.")\n            return\n        }\n', '')
+    source = source.replace('    /// Forgets only this app\'s local material; system trust must be removed in Settings.\n', '')
+    source = source.replace('Stop the current RPPairing operation before removing local pairing credentials.', 'Stop the current RPPairing operation before forgetting this iPhone.')
+    start = source.index('\tfunc forgetPairing() throws {')
+    end = source.index('\n\tfileprivate func receive(code:', start)
+    return source[:start] + '<local cleanup>\n' + source[end:]
+assert excluding_local_cleanup(excluding_pin_presentation(current)) == excluding_local_cleanup(excluding_pin_presentation(baseline))
 PYCODE
 }
-check "install: installer core is unchanged outside PIN presentation" installer_core_unchanged
+check "install: installer core is unchanged outside PIN presentation and explicit local-cleanup guards" installer_core_unchanged
 check "install: self-update never uses Mobile Data Fix" bash -c "! grep -q 'ZagMobileDataInstall' '$ROOT/Feather/Utilities/ZagSelfUpdateCoordinator.swift' && grep -q 'if isSelfInstall {' '$ROOT/Feather/Views/Library/Install/InstallPreviewView.swift'"
 check "uninstall: Library removal goes through the shared coordinator" grep -q 'coordinator.perform(.uninstall' "$ROOT/Feather/Views/Library/LibraryView.swift"
 check "uninstall: only one RPPairing uninstall entry point exists" bash -c "[ \$(grep -rn 'uninstallGate4App(' '$ROOT/Feather' | grep -vc 'func uninstallGate4App') -eq 1 ]"

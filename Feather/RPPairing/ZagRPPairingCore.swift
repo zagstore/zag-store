@@ -77,6 +77,7 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 
 	@Published private(set) var state: State = .idle
+    @Published private(set) var localPairingCleanupPending = UserDefaults.standard.bool(forKey: ZagLocalPairingRemoval.pendingKey)
 
 	enum InstalledAppsState: Equatable {
 		case idle
@@ -126,6 +127,7 @@ final class ZagRPPairingCore: ObservableObject {
 	/// check starts; every check without an explicit endpoint uses LocalDevVPN.
 	@Published private(set) var gate2Endpoint: ZagRPPairingEndpoint = .localDevVPN
 	private func acquireTransport(_ operation: String) -> Bool {
+        guard !localPairingCleanupPending else { return false }
 		guard transportOwner == nil else {
 			ZagLogger.shared.warning("RPPairing", "Transport busy | requested=\(operation) owner=\(transportOwner ?? "unknown")")
 			return false
@@ -714,6 +716,10 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 
 	func startGate2Probe(endpoint: ZagRPPairingEndpoint = .localDevVPN) {
+        guard !localPairingCleanupPending else {
+            gate2State = .failed("Retry Local Cleanup before checking pairing again.")
+            return
+        }
 		guard !isGate2Running else { return }
 		let deviceIP = endpoint.address
 		guard acquireTransport("Gate2 health probe") else {
@@ -869,6 +875,10 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 
 	func start() {
+        guard !localPairingCleanupPending else {
+            state = .failed("Retry Local Cleanup before starting pairing again.")
+            return
+        }
 		guard !isRunning else { return }
 		ZagLogger.shared.info("RPPairing", "Pairing session starting")
 		// The PIN is generated after iOS connects while the user is normally in
@@ -910,24 +920,36 @@ final class ZagRPPairingCore: ObservableObject {
 		state = .idle
 	}
 
+    /// Forgets only this app's local material; system trust must be removed in Settings.
 	func forgetPairing() throws {
-		guard !isRunning && !isGate2Running && !isGate4Running else {
-			throw PairingResetError.busy
-		}
-		advertiser.stop()
-		endPairingBackgroundTime()
-		if FileManager.default.fileExists(atPath: Self.pairingFileURL.path) {
-			try FileManager.default.removeItem(at: Self.pairingFileURL)
-		}
-		if FileManager.default.fileExists(atPath: Self.hostIdentityURL.path) {
-			try FileManager.default.removeItem(at: Self.hostIdentityURL)
-		}
-		gate2DeviceInfo = nil
-		gate2LastAppResult = nil
-		gate2State = .idle
-		gate4State = .idle
-		state = .idle
-	}
+        guard !isRunning && !isGate2Running && !isGate4Running && !isTransportBusy else {
+            throw PairingResetError.busy
+        }
+        advertiser.stop()
+        endPairingBackgroundTime()
+        let removal = ZagLocalPairingRemoval(pairingRecord: Self.pairingFileURL, hostIdentity: Self.hostIdentityURL, env: .init(
+            exists: ZagLocalPairingRemoval.fileExists,
+            remove: ZagLocalPairingRemoval.removeFile,
+            setPending: { pending in
+                UserDefaults.standard.set(pending, forKey: ZagLocalPairingRemoval.pendingKey)
+                self.localPairingCleanupPending = pending
+            }
+        ))
+        do { try removal.run() } catch {
+            invalidateLocalPairingStatus()
+            throw error
+        }
+        invalidateLocalPairingStatus()
+    }
+
+    private func invalidateLocalPairingStatus() {
+        gate2DeviceInfo = nil
+        gate2LastAppResult = nil
+        gate2State = .idle
+        gate4State = .idle
+        state = .idle
+        publishReadiness(.failed(.pairingFile, Date()))
+    }
 
 	fileprivate func receive(code: Int32, message: String) {
 		switch code {
@@ -1130,7 +1152,7 @@ private enum PairingResetError: LocalizedError {
 	case busy
 
 	var errorDescription: String? {
-		"Stop the current RPPairing operation before forgetting this iPhone."
+		"Stop the current RPPairing operation before removing local pairing credentials."
 	}
 }
 
