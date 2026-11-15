@@ -65,9 +65,9 @@ struct ZagLocalPairingConfirmationPopup: View {
 
     var body: some View {
         ZagRemovalConfirmationSheet(
-            title: "Forget Local Pairing?",
+            title: "Forget Local Pairing",
             message: "Removes local pairing credentials. To fully unpair, also remove Zag Store in iOS Settings.",
-            destructiveTitle: "Forget Local Pairing",
+            destructiveTitle: "Forget",
             confirm: confirm,
             cancel: cancel
         )

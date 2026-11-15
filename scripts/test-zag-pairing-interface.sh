@@ -59,15 +59,22 @@ for name in ['Feather/Views/Settings/Installation/InstallationView.swift', 'Feat
 assert '.presentationCornerRadius' not in popup  # same native rounded sheet geometry as Apps
 assert '.ignoresSafeArea' not in popup and '.frame(maxHeight: .infinity)' not in popup
 assert 'ZagInstallationRowLabelStyle(' not in view and 'ZagInstallationRowLabelStyle(' not in guide
-assert '.labelStyle(.titleAndIcon)' in view and guide.count('.labelStyle(.titleAndIcon)') == 2
-assert 'Color.clear.frame(width: 25, height: 25)' in guide
-assert 'DisclosureGroup {' in guide and '} label: {' in guide
-assert guide.index('ZagDeveloperModeGuidance.steps') < guide.index('} label: {')
-for competing in ['disclosureGroupStyle', 'withAnimation', '.animation(', '.transition(', 'GeometryReader', 'overlay', 'configuration.isExpanded']:
+assert '.labelStyle(.titleAndIcon)' in view and '.labelStyle(.titleAndIcon)' in guide
+assert 'DisclosureGroup(isExpanded: $expanded)' in guide and '} label: {' in guide
+assert 'Text(step)' in guide and '.alignmentGuide(.leading) { $0[.trailing] + numberSpacing }' in guide
+assert '.padding(.leading, columns.offset)' in guide
+assert 'return label - content' in guide
+assert '.accessibilityLabel("\\(index + 1). \\(step)")' in guide
+assert '.frame(width: 22, alignment: .center)' in guide
+assert '.position(x: geometry.size.width - 11, y: geometry[anchor].midY)' in guide
+assert '.allowsHitTesting(false)' in guide and '.accessibilityHidden(true)' in guide
+assert '.tint(.clear)' in guide and '.tint(Color(hex: themeColorHex))' in guide
+for competing in ['disclosureGroupStyle', 'withAnimation', '.animation(', '.transition(', 'if expanded {']:
     assert competing not in guide
-# Label/icon/status tree remains byte-for-byte unchanged from the corrected baseline.
-prior_guide = subprocess.check_output(['git', 'show', '32647357:Feather/Views/Settings/Installation/ZagDeveloperModeGuidanceView.swift'], cwd=root, text=True)
-assert guide.split('} label: {', 1)[1].split('        }', 1)[0] == prior_guide.split('} label: {', 1)[1].split('        }', 1)[0]
+# Only the local pairing labels change; Apps shared content/presentation are identical.
+prior_popup = subprocess.check_output(['git', 'show', 'fe05fb61:Feather/Views/Settings/Installation/ZagLocalPairingConfirmationPopup.swift'], cwd=root, text=True)
+assert popup == prior_popup.replace('title: "Forget Local Pairing?"', 'title: "Forget Local Pairing"').replace('destructiveTitle: "Forget Local Pairing"', 'destructiveTitle: "Forget"')
+assert library == subprocess.check_output(['git', 'show', 'fe05fb61:Feather/Views/Library/LibraryView.swift'], cwd=root, text=True)
 # Restore every native Control label modifier against the actual pre-regression source.
 baseline = subprocess.check_output(['git', 'show', '57664bf4:Feather/Views/Settings/Installation/InstallationView.swift'], cwd=root, text=True)
 start = 'Button(role: (pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending)'
