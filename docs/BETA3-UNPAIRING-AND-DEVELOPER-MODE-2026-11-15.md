@@ -35,6 +35,18 @@ If any step fails, the flag remains, the UI reports incomplete local cleanup and
 
 All active native workers block explicit cleanup. While cleanup is pending, new pairing/device-service work cannot reuse incomplete material. Gate 2 handles this as an immediate failure rather than queuing forever. Cached native readiness is invalidated after cleanup/failure. The launch adapter excludes pending cleanup from usable records and ignores success events while that flag is set. A cold launch after local removal therefore shows welcome; re-pairing still requires the existing authenticated native success/live verification. Ordinary background returns do not reopen onboarding. No installation, LocalDevVPN, protocol, key derivation or native Rust behavior is rewritten.
 
+## Developer Mode detection and UI
+
+The existing Gate 2 bridge carries product/device information, service stages and pairing-readiness results; none is an authoritative Developer Mode boolean. Pair-Verify, file presence, a working VPN, a successful install, app debug status and the current process's entitlements are not used as substitutes.
+
+The dependency contains device-tooling queries: `AmfiClient.get_developer_mode_status()` reads a `success`/`status` boolean, and `ImageMounter.query_developer_mode_status()` reads `DeveloperModeStatus`. Classic Lockdown tools also query the AMFI domain. These require authenticated device-service access; they are not a documented public local iOS app API, and the current Zag Store diagnostics do not request or export them. Their existence is not evidence that this device/OS/transport allows a reliable, supported app-side read. No new AMFI/private-service query, reboot/enable command, entitlement or speculative inference was added.
+
+Accordingly the Installation Status section now has one compact, initially collapsed native **Developer Mode — Check in Settings** disclosure, with the existing icon column, theme tint and secondary typography. This is deliberately unknown status; it never displays fabricated Enabled/Disabled badges. Its help gives the five manual steps: open Settings; Privacy & Security → Developer Mode; turn it on; restart when prompted; confirm Turn On and enter the passcode after restarting. It notes that the option may appear only after development pairing begins and explicitly distinguishes Developer Mode from the separate Pair with Zag Store approval. No new Settings URL or automation is used. Apple's confirmation-button label can vary by OS.
+
+Sources: [Apple: enabling Developer Mode](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device), [Apple: first-pairing visibility](https://developer.apple.com/documentation/xcode/managing-your-simulated-and-physical-devices-in-device-hub). Public navigation remains limited as documented by [UIApplication.openSettingsURLString](https://developer.apple.com/documentation/uikit/uiapplication/opensettingsurlstring), which opens the app's own Settings page, not Developer Mode.
+
+Guidance files: `Feather/Utilities/ZagDeveloperModeGuidance.swift`, `Feather/Views/Settings/Installation/ZagDeveloperModeGuidanceView.swift`, its single insertion in `InstallationView.swift`, `scripts/ZagDeveloperModeGuidanceTests.swift`, `scripts/test-zag-developer-mode-guidance.sh`, and this report. This is a separate commit from unpairing correction `b8bd1816`.
+
 ## Unpairing validation
 
 Passed:
@@ -47,8 +59,12 @@ Passed:
 
 **Not applicable / not claimed:** automatic device-side unpair success/failure tests, or automatic system revocation verification. There is no supported revocation branch to test. No mock device-side success is presented as evidence of a working iOS revoke operation. Manual revocation success/failure and genuine re-pairing need the iPhone.
 
+## Developer Mode validation
+
+Passed: eight guidance checks plus native disclosure integration guards (unknown status, five steps, restart/confirmation/passcode, delayed option visibility and separation from pairing). Targeted arm64/iOS 16.4 SDK compilation includes the real Installation/RPPairing view prefix, vector icon, local cleanup helper and Developer Mode view/model, with unrelated external scaffolding stubbed. No enabled/disabled detection path or real device-service query is claimed or simulated.
+
 ## Remaining device acceptance
 
-Remove only Zag Store through the system paired-device details; confirm the entry disappears. Test local forgetting before/after manual removal and confirm the app never claims system trust was revoked. Check Retry after local cleanup errors, cold launch with no usable credentials, and a fresh pairing followed by an operational cold-launch check. Verify the existing row alignment/icons, confirmation bubble, small-screen text, tint and light/dark appearance. No full app build or simulator/runtime pass is claimed; previous CoreSimulator/Xcode blockers were not repaired or bypassed.
+Remove only Zag Store through the system paired-device details; confirm the entry disappears. Test local forgetting before/after manual removal and confirm the app never claims system trust was revoked. Check Retry after local cleanup errors, cold launch with no usable credentials, and a fresh pairing followed by an operational cold-launch check. Verify the existing row alignment/icons, confirmation bubble, collapsed/expanded Developer Mode guide, small-screen text, Dynamic Type/VoiceOver, tint and light/dark appearance. Confirm the five Developer Mode steps on the target iOS version independently of pairing. No full app build or simulator/runtime pass is claimed; previous CoreSimulator/Xcode blockers were not repaired or bypassed.
 
-Logs: `/tmp/zag-local-pairing-removal.log`, `/tmp/zag-unpair-*.log`, `/tmp/zag-local-removal-core-typecheck.log`.
+Logs: `/tmp/zag-developer-mode-guidance.log`, `/tmp/zag-developer-mode-typecheck.log`, `/tmp/zag-local-pairing-removal.log`, `/tmp/zag-unpair-*.log`, `/tmp/zag-local-removal-core-typecheck.log`.

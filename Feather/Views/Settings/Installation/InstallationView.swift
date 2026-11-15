@@ -96,6 +96,8 @@ private struct RPPairingView: View {
 				systemImage: directInstallStatusIcon,
 				color: directInstallStatusColor
 			)
+
+            ZagDeveloperModeGuidanceView()
 		} header: {
 			Text("Status")
 		} footer: {
