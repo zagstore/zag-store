@@ -111,7 +111,23 @@ COORD="$ROOT/Feather/Utilities/ZagMobileDataInstallCoordinator.swift"
 for f in Feather/Views/Sources/Apps/DownloadButtonView.swift Feather/Views/Library/LibraryCellView.swift Feather/Views/Library/LibraryView.swift Feather/Views/Library/Install/InstallPreviewView.swift; do
 	check "install: $(basename $f) installs through Mobile Data Fix" grep -qE '(ZagMobileDataInstallCoordinator.shared|coordinator)\.install\(jobID:' "$ROOT/$f"
 done
-check "install: installGate4IPA and the installer core are unchanged" bash -c "cd '$ROOT' && git diff --quiet cdc94c31a8293d7f504d268dee19185f36bf258f -- Feather/RPPairing/ZagRPPairingCore.swift"
+installer_core_unchanged() {
+    python3 - "$ROOT" "$CORE" <<'PYCODE'
+from pathlib import Path
+import subprocess, sys
+root, core = sys.argv[1:]
+baseline = subprocess.check_output(['git', 'show', 'cdc94c31a8293d7f504d268dee19185f36bf258f:Feather/RPPairing/ZagRPPairingCore.swift'], cwd=root, text=True)
+current = Path(core).read_text()
+def excluding_pin_presentation(source):
+    # Keep the state callback and notification submission/lifecycle protected.
+    # Only code-content construction and the removed automatic copy may differ.
+    start = source.index('\n', source.index('state = .pin(message)'))
+    end = source.index('\n\t\t\tUNUserNotificationCenter.current().add(', start)
+    return source[:start] + source[end:]
+assert excluding_pin_presentation(current) == excluding_pin_presentation(baseline)
+PYCODE
+}
+check "install: installer core is unchanged outside PIN presentation" installer_core_unchanged
 check "install: self-update never uses Mobile Data Fix" bash -c "! grep -q 'ZagMobileDataInstall' '$ROOT/Feather/Utilities/ZagSelfUpdateCoordinator.swift' && grep -q 'if isSelfInstall {' '$ROOT/Feather/Views/Library/Install/InstallPreviewView.swift'"
 check "uninstall: Library removal goes through the shared coordinator" grep -q 'coordinator.perform(.uninstall' "$ROOT/Feather/Views/Library/LibraryView.swift"
 check "uninstall: only one RPPairing uninstall entry point exists" bash -c "[ \$(grep -rn 'uninstallGate4App(' '$ROOT/Feather' | grep -vc 'func uninstallGate4App') -eq 1 ]"
