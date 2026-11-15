@@ -16,7 +16,7 @@
 [![Rust pairing core](https://img.shields.io/badge/pairing%20core-Rust-bc44e5?style=flat-square&logo=rust&logoColor=white)](RPPairingCore)
 [![GPL-3.0](https://img.shields.io/badge/licence-GPL--3.0-35cba5?style=flat-square)](LICENSE)
 
-[**zagstore.app**](https://zagstore.app) &nbsp;·&nbsp; [Install](docs/INSTALL.md) &nbsp;·&nbsp; [Beta 2 release](https://github.com/zagstore/zag-store/releases/tag/v1.0.0-beta.2) &nbsp;·&nbsp; [Features](docs/FEATURES.md) &nbsp;·&nbsp; [From Feather](docs/FROM-FEATHER.md) &nbsp;·&nbsp; [Build](docs/BUILDING.md) &nbsp;·&nbsp; [Security](SECURITY.md)
+[**zagstore.app**](https://zagstore.app) &nbsp;·&nbsp; [Discord](https://discord.zagstore.app) &nbsp;·&nbsp; [Install](docs/INSTALL.md) &nbsp;·&nbsp; [Beta 2 release](https://github.com/zagstore/zag-store/releases/tag/v1.0.0-beta.2) &nbsp;·&nbsp; [Features](docs/FEATURES.md) &nbsp;·&nbsp; [From Feather](docs/FROM-FEATHER.md) &nbsp;·&nbsp; [Build](docs/BUILDING.md) &nbsp;·&nbsp; [Security](SECURITY.md)
 
 </div>
 
@@ -374,7 +374,7 @@ Zag Store is free and open source. If you enjoy the project, you can help suppor
 
 ## Contributing
 
-Bug reports, design feedback and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md) first. Report security problems privately, as described in [SECURITY.md](SECURITY.md), never in a public issue.
+Bug reports, design feedback and pull requests are welcome. Join the [Zag Store Discord community](https://discord.zagstore.app) for discussion. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md) first. Report security problems privately, as described in [SECURITY.md](SECURITY.md), never in a public issue.
 
 <br>
 
