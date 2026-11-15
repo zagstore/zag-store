@@ -16,10 +16,7 @@ import NimbleJSON
 
 @main
 struct FeatherApp: App {
-    // Must precede manager initialization and their persistence side effects.
-    @State private var showWelcome = ZagOnboardingPolicy.beginInstallation()
-    @State private var pendingURLs: [URL] = []
-    @State private var splashFinished = false
+    @StateObject private var launch = ZagPairingLaunchCoordinator()
 	@UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 	
 	let heartbeat = HeartbeatManager.shared
@@ -32,13 +29,10 @@ struct FeatherApp: App {
 			ZStack {
 				ZagWallpaperBackground()
 
-                if showWelcome {
-                    ZagWelcomeView {
-                        ZagOnboardingPolicy.complete()
-                        showWelcome = false
-                    }
-                    .allowsHitTesting(splashFinished)
-                    .accessibilityHidden(!splashFinished)
+                if !launch.policy.canEnterMain {
+                    ZagWelcomeView(launch: launch)
+                        .allowsHitTesting(launch.policy.splashFinished)
+                        .accessibilityHidden(!launch.policy.splashFinished)
                 } else {
                 VariedTabbarView()
 					.environment(\.managedObjectContext, storage.context)
@@ -56,16 +50,16 @@ struct FeatherApp: App {
             .onOpenURL { url in
                 guard url.absoluteString.utf8.count <= 4 * 1024 * 1024 else { return }
                 if ZagMobileDataToggleController.shared.handle(url) { return }
-                if showWelcome || !splashFinished {
-                    if pendingURLs.count < 16 { pendingURLs.append(url) }
-                } else { _handleURL(url) }
-            }
-            .task {
-                await ZagLaunchGate.shared.waitUntilSplashFinishes()
-                splashFinished = true
+                launch.enqueue(url)
                 drainPendingURLs()
             }
-            .onChange(of: showWelcome) { _ in
+            .task {
+                launch.startIfNeeded()
+                await ZagLaunchGate.shared.waitUntilSplashFinishes()
+                launch.finishSplash()
+                drainPendingURLs()
+            }
+            .onChange(of: launch.policy.canEnterMain) { _ in
                 Task { @MainActor in
                     await Task.yield()
                     drainPendingURLs()
@@ -107,10 +101,7 @@ struct FeatherApp: App {
 	}
 	
     private func drainPendingURLs() {
-        guard !showWelcome, splashFinished else { return }
-        let urls = pendingURLs
-        pendingURLs.removeAll()
-        for url in urls { _handleURL(url) }
+        for url in launch.takeURLs() { _handleURL(url) }
     }
 
     private func _handleURL(_ url: URL) {

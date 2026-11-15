@@ -1,31 +1,53 @@
 import Foundation
 
-/// Installation-local state, independent of app version and privacy preferences.
-enum ZagOnboardingPolicy {
-    static let stateKey = "ZagStore.onboardingState"
+/// Process-local launch gate. No installation history or persisted dismissal is evidence.
+struct ZagOnboardingPolicy {
+    enum Verification: Equatable { case verified, missing, invalid, failed, unknown, timedOut }
+    enum Status: Equatable { case checking, verified, missing, invalid, failed, unknown, timedOut, skipped }
+    private(set) var status: Status = .checking
+    private(set) var generation = 0
+    private(set) var started = false
+    private(set) var splashFinished = false
+    private var pendingURLs: [URL] = []
 
-    static func begin(defaults: UserDefaults, hasExistingData: Bool, domain: [String: Any]) -> Bool {
-        if let state = defaults.string(forKey: stateKey) { return state == "pending" }
-        // Older builds have no onboarding marker. Preserve their existing experience.
-        let existing = hasExistingData || !domain.isEmpty
-        defaults.set(existing ? "existing" : "pending", forKey: stateKey)
-        return !existing
+    var canEnterMain: Bool { status == .verified || status == .skipped }
+
+    mutating func beginIfNeeded(hasRecord: Bool) -> Int? {
+        guard !started else { return nil }
+        started = true
+        return retry(hasRecord: hasRecord)
     }
 
-    static func complete(defaults: UserDefaults = .standard) {
-        defaults.set("completed", forKey: stateKey)
+    mutating func retry(hasRecord: Bool) -> Int? {
+        guard !canEnterMain else { return nil }
+        generation += 1
+        status = hasRecord ? .checking : .missing
+        return hasRecord ? generation : nil
     }
 
-    /// Capture before the app's managers create stores or write defaults.
-    static func beginInstallation() -> Bool {
-        let defaults = UserDefaults.standard
-        let domain = Bundle.main.bundleIdentifier.flatMap { defaults.persistentDomain(forName: $0) } ?? [:]
-        let manager = FileManager.default
-        let hasData = [FileManager.SearchPathDirectory.applicationSupportDirectory, .documentDirectory].contains { kind in
-            guard let directory = manager.urls(for: kind, in: .userDomainMask).first,
-                  let contents = try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return false }
-            return contents.contains { $0.lastPathComponent != "Inbox" && $0.lastPathComponent != ".DS_Store" }
+    mutating func receive(_ result: Verification, generation token: Int) {
+        guard token == generation, status == .checking else { return }
+        switch result {
+        case .verified: status = .verified
+        case .missing: status = .missing
+        case .invalid: status = .invalid
+        case .failed: status = .failed
+        case .unknown: status = .unknown
+        case .timedOut: status = .timedOut
         }
-        return begin(defaults: defaults, hasExistingData: hasData, domain: domain)
+    }
+
+    mutating func skip() { generation += 1; status = .skipped }
+    mutating func setupSucceeded() { generation += 1; status = .verified }
+    mutating func finishSplash() { splashFinished = true }
+    mutating func enqueue(_ url: URL) {
+        guard pendingURLs.count < 16, url.absoluteString.utf8.count <= 4 * 1024 * 1024 else { return }
+        pendingURLs.append(url)
+    }
+    mutating func takeURLs() -> [URL] {
+        guard canEnterMain, splashFinished else { return [] }
+        let urls = pendingURLs
+        pendingURLs.removeAll()
+        return urls
     }
 }

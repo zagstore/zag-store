@@ -1,8 +1,7 @@
 import SwiftUI
 
 struct ZagWelcomeView: View {
-    let finish: () -> Void
-    @ObservedObject private var pairing = ZagRPPairingCore.shared
+    @ObservedObject var launch: ZagPairingLaunchCoordinator
     @AppStorage("Feather.userTintColor") private var tintHex = "#0090FF"
     @State private var showPairing = false
 
@@ -34,8 +33,19 @@ struct ZagWelcomeView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28))
 
                     VStack(spacing: 12) {
+                        Text(pairingStatus)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if launch.policy.status == .checking {
+                            ProgressView("Checking pairing…")
+                        } else {
+                            Button("Retry Pairing Check") { launch.retry() }
+                                .frame(minHeight: 44)
+                        }
                         primaryAction
-                        Button("Continue Without Pairing", action: finish)
+                            .disabled(launch.policy.status == .checking)
+                        Button("Continue Without Pairing") { launch.skip() }
                             .buttonStyle(.plain)
                             .frame(maxWidth: .infinity, minHeight: 48)
                             .foregroundStyle(.secondary)
@@ -51,20 +61,26 @@ struct ZagWelcomeView: View {
                 InstallationView()
                     .toolbar {
                         ToolbarItem(placement: .topBarTrailing) {
-                            Button("Continue", action: finish)
+                            Button("Continue Without Pairing") { launch.skip() }
                                 .accessibilityHint("Open Zag Store. You can return to pairing in Settings.")
                         }
                     }
             }
         }
         .tint(ZagWideGamutTint.color(hex: tintHex))
-        .onAppear {
-            // The existing manager treats its saved record as persisted pairing.
-            // Native setup writes it only after success, before emitting .paired.
-            // This also covers termination between saving and dismissing welcome.
-            if pairing.pairingFileExists { finish() }
+    }
+
+    private var pairingStatus: String {
+        switch launch.policy.status {
+        case .checking: return "Checking whether pairing is ready on this iPhone. You can continue while setup is unavailable."
+        case .missing: return "No pairing record is saved. Set up pairing to install apps directly on this iPhone."
+        case .invalid: return "The saved pairing credentials could not be accepted. Open setup to pair this iPhone again."
+        case .failed: return "Pairing could not be verified. Check the local VPN connection and device permissions, then retry."
+        case .timedOut: return "The pairing check timed out. Your pairing status is unknown. Check the connection and retry, or continue for now."
+        case .unknown: return "Pairing status is unknown. Retry the check, open setup, or continue for now."
+        case .verified: return "Pairing verified."
+        case .skipped: return "You can set up pairing later in Settings → Installation."
         }
-        .onReceive(pairing.$state) { state in finishIfPaired(state) }
     }
 
     @ViewBuilder private var primaryAction: some View {
@@ -96,8 +112,4 @@ struct ZagWelcomeView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func finishIfPaired(_ state: ZagRPPairingCore.State) {
-        // Opening setup, a saved file, a PIN or a failed attempt is not success.
-        if case .paired = state, pairing.pairingFileExists { finish() }
-    }
 }
