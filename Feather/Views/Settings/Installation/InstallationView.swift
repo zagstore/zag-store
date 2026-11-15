@@ -119,7 +119,6 @@ private struct RPPairingView: View {
 						ZagPairingIcon().frame(width: 25, height: 25)
 					}
 				}
-                .labelStyle(ZagInstallationRowLabelStyle())
 				.frame(maxWidth: .infinity, alignment: .leading)
 				.contentShape(Rectangle())
 			}
@@ -135,7 +134,6 @@ private struct RPPairingView: View {
 
 			HStack {
 				Label("Pairing File", systemImage: "doc.badge.gearshape")
-                    .labelStyle(ZagInstallationRowLabelStyle())
 				Spacer()
 				Text(pairingCore.pairingFileExists ? "Saved" : "Not Saved")
 					.foregroundStyle(pairingCore.pairingFileExists ? .green : .secondary)
@@ -148,7 +146,6 @@ private struct RPPairingView: View {
 				if let pairingExportURL {
 					ShareLink(item: pairingExportURL) {
 						Label("Export Pairing File", systemImage: "square.and.arrow.up")
-                            .labelStyle(ZagInstallationRowLabelStyle())
 					}
 				} else {
 					Button {
@@ -159,7 +156,6 @@ private struct RPPairingView: View {
 						}
 					} label: {
 						Label("Export Pairing File", systemImage: "square.and.arrow.up")
-                            .labelStyle(ZagInstallationRowLabelStyle())
 					}
 				}
 			}
@@ -371,15 +367,15 @@ private struct RPPairingView: View {
 	) -> some View {
 		HStack {
 			Label {
-                Text(title)
+                Text(title).foregroundStyle(.primary)
             } icon: {
                 if usesPairingIcon {
-                    ZagPairingIcon().frame(width: 25, height: 25)
+                    ZagPairingIcon().frame(width: 25, height: 25).foregroundStyle(.tint)
                 } else {
-                    Image(systemName: titleSystemImage)
+                    Image(systemName: titleSystemImage).foregroundStyle(.tint)
                 }
             }
-                .labelStyle(ZagInstallationRowLabelStyle(tinted: true))
+                .labelStyle(.titleAndIcon)
 			Spacer()
 			Text(value)
 				.foregroundStyle(color)

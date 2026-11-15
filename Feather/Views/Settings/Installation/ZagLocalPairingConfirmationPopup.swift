@@ -1,76 +1,86 @@
 import SwiftUI
-import NimbleViews
 
-/// Uses the existing certificate/account sheet header and shared glass buttons.
-struct ZagLocalPairingConfirmationPopup: View {
+/// The Apps Remove App sheet, shared without changing its default geometry.
+struct ZagRemovalConfirmationSheet: View {
+    let title: String
+    let message: String
+    let destructiveTitle: String
     let confirm: () -> Void
     let cancel: () -> Void
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .title2) private var titleSize = 22.0
+    @ScaledMetric(relativeTo: .body) private var messageSize = 17.0
+    @ScaledMetric(relativeTo: .title3) private var buttonSize = 20.0
 
     var body: some View {
-        NBNavigationView("Forget Local Pairing?", displayMode: .inline) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Removes local pairing credentials. To fully unpair, also remove Zag Store in iOS Settings.")
-                        .font(.body)
-                        .fixedSize(horizontal: false, vertical: true)
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("System pairing")
-                            .font(.caption.weight(.semibold))
-                        Text(ZagLocalPairingRemoval.systemRemovalInstructions)
-                            .font(.footnote)
-                    }
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 17, style: .continuous))
-                }
-                .padding(20)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                VStack(spacing: 8) {
-                    if dynamicTypeSize.isAccessibilitySize {
-                        // The shared sheet label has a fixed 50-point height.
-                        // Native growing pills keep large accessibility text intact.
-                        Button(role: .destructive, action: confirm) {
-                            Text("Forget Local Pairing").frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .buttonBorderShape(.capsule)
-                        .tint(.red)
-                        Button(action: cancel) {
-                            Text("Cancel").frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .buttonBorderShape(.capsule)
-                        .tint(.primary)
-                    } else {
-                        Button(role: .destructive, action: confirm) {
-                            NBSheetButton(title: "Forget Local Pairing", style: .prominent)
-                                .accentColor(.red)
-                        }
-                        .buttonStyle(.plain)
-                        Button(action: cancel) {
-                            NBSheetButton(title: "Cancel")
-                                .accentColor(.primary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button(action: cancel) { Image(systemName: "xmark") }
-                        .accessibilityLabel("Close")
-                }
+        Group {
+            if dynamicTypeSize > .large {
+                ScrollView { content }
+            } else {
+                content
             }
         }
-        .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.large] : [.medium, .large])
-        .presentationCornerRadius(28)
-        .presentationBackground(.ultraThinMaterial)
+        .presentationDetents(dynamicTypeSize > .large ? [.large] : [.height(302)])
+        .presentationDragIndicator(.visible)
+    }
+
+    private var content: some View {
+		VStack(spacing: 10) {
+			Text(title)
+			.font(.system(size: titleSize, weight: .semibold))
+			.multilineTextAlignment(.center)
+
+			Text(message)
+				.font(.system(size: messageSize))
+				.foregroundStyle(.secondary)
+				.multilineTextAlignment(.center)
+				.fixedSize(horizontal: false, vertical: true)
+
+			Spacer().frame(height: 10)
+
+			Button(action: confirm) {
+				Text(destructiveTitle)
+					.font(.system(size: buttonSize, weight: .semibold))
+					.foregroundStyle(.red)
+					.frame(maxWidth: .infinity)
+					.frame(minHeight: 52)
+					.background(
+						Color(uiColor: .tertiarySystemFill),
+						in: RoundedRectangle(cornerRadius: 26, style: .continuous)
+					)
+			}
+			.buttonStyle(.plain)
+
+			Button(action: cancel) {
+				Text("Cancel")
+					.font(.system(size: buttonSize, weight: .semibold))
+					.foregroundStyle(.primary)
+					.frame(maxWidth: .infinity)
+					.frame(minHeight: 52)
+					.background(
+						Color(uiColor: .tertiarySystemFill),
+						in: RoundedRectangle(cornerRadius: 26, style: .continuous)
+					)
+			}
+			.buttonStyle(.plain)
+		}
+		.padding(.horizontal, 20)
+		.padding(.top, 24)
+		.padding(.bottom, 8)
+    }
+}
+
+struct ZagLocalPairingConfirmationPopup: View {
+    let confirm: () -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        ZagRemovalConfirmationSheet(
+            title: "Forget Local Pairing?",
+            message: "Removes local pairing credentials. To fully unpair, also remove Zag Store in iOS Settings.",
+            destructiveTitle: "Forget Local Pairing",
+            confirm: confirm,
+            cancel: cancel
+        )
     }
 }
