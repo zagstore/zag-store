@@ -34,16 +34,19 @@ struct ZagFirstLaunchPrivacyView: View {
 			}
 
 			Section {
-				Toggle(isOn: Binding(
-					get: { !_optedOut },
-					set: { ZagFirstLaunchReporter.setSharing($0); _status = ZagFirstLaunchReporter.status() }
-				)) {
-					Text("Share First-Launch Report")
+				if _status == .notApplicable {
+					LabeledContent("Share First-Launch Report", value: "Unavailable")
+				} else {
+					Toggle(isOn: Binding(
+						get: { !_optedOut },
+						set: { ZagFirstLaunchReporter.setSharing($0); _status = ZagFirstLaunchReporter.status() }
+					)) {
+						Text("Share First-Launch Report")
+					}
+					.toggleStyle(ZagThemeTintToggleStyle())
 				}
-				.toggleStyle(ZagThemeTintToggleStyle())
-				.disabled(_status == .notApplicable)
 			} footer: {
-				Text(ZagFirstLaunchDisclosure.summary)
+				Text(_status == .notApplicable ? ZagFirstLaunchDisclosure.unavailable : ZagFirstLaunchDisclosure.summary)
 			}
 
 			Section {
@@ -53,14 +56,18 @@ struct ZagFirstLaunchPrivacyView: View {
 			}
 
 			Section {
-				Toggle(isOn: Binding(
-					get: { _sharesJailbreak },
-					set: { ZagFirstLaunchReporter.setJailbreakSharing($0) }
-				)) {
-					Text("Share Jailbreak Status")
+				if _status == .notApplicable {
+					LabeledContent("Share Jailbreak Status", value: "Unavailable")
+				} else {
+					Toggle(isOn: Binding(
+						get: { _sharesJailbreak },
+						set: { ZagFirstLaunchReporter.setJailbreakSharing($0) }
+					)) {
+						Text("Share Jailbreak Status")
+					}
+					.toggleStyle(ZagThemeTintToggleStyle())
+					.disabled(_optedOut)
 				}
-				.toggleStyle(ZagThemeTintToggleStyle())
-				.disabled(_status == .notApplicable || _optedOut)
 			} footer: {
 				Text(ZagFirstLaunchDisclosure.jailbreak)
 			}
@@ -94,7 +101,7 @@ struct ZagFirstLaunchPrivacyView: View {
 
 	private var _statusText: String {
 		switch _status {
-		case .notApplicable: return "Nothing to Report"
+		case .notApplicable: return "Unavailable"
 		case .off: return "Off"
 		case .pending: return "Waiting to Send"
 		case .sent: return "Sent"
@@ -105,7 +112,7 @@ struct ZagFirstLaunchPrivacyView: View {
 	private var _statusFooter: String {
 		switch _status {
 		case .notApplicable:
-			return "This copy of Zag Store was not signed on the Zag Store website, so it has no report to send."
+			return ZagFirstLaunchDisclosure.unavailable
 		case .off:
 			return "Nothing is sent while this is off."
 		case .pending:
@@ -132,6 +139,7 @@ enum ZagActivityDisclosure {
 
 /// What the first-launch report contains, in plain words.
 enum ZagFirstLaunchDisclosure {
+	static let unavailable = "This copy has no website installation attribution, so no first-launch report or jailbreak status is sent. Usage statistics are controlled separately."
 	static let summary = "Zag Store tells the website you downloaded it from, once, that the copy you installed from it has opened. It helps count how many website installations actually start. Turn this off and nothing is sent."
 	static let sent = [
 		"The installation code from your download (it identifies that download, not you or your device)",

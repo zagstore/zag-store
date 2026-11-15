@@ -122,6 +122,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         case signedIdentityMismatch
         case pairingUnavailable
         case installationAlreadyRunning
+        case downloadAlreadyRunning
         case unsupportedIOSVersion
         case incompatibleSigningTeam
         case channelNotPublished
@@ -142,6 +143,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             case .noUpdateAvailable: return "This Zag Store version is already up to date."
             case .signedIdentityMismatch: return "The signed update does not match the current Zag Store identity and version."
             case .pairingUnavailable: return "RPPairing must be configured before installing this update."
+            case .downloadAlreadyRunning: return "An update download is already running. Wait for it to finish, then try again."
             case .installationAlreadyRunning: return "Another RPPairing installation is already running."
             case .unsupportedIOSVersion: return "This release requires a newer version of iOS."
             case .incompatibleSigningTeam: return "The update is signed by a different team. In-place replacement may not preserve app data."
@@ -168,6 +170,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
               wifiAvailable, !downloadInProgress, pendingInstallation == nil else { return }
         let identity = releaseIdentity(release)
         guard downloadedReleaseIdentity != identity else { return }
+        let generation = checkGeneration
         downloadInProgress = true
         automaticDownloadStatus = "Downloading on Wi-Fi…"
         defer { downloadInProgress = false }
@@ -186,6 +189,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             downloadedReleaseIdentity = identity
             automaticDownloadStatus = "Downloaded and SHA-256 verified — ready to sign"
         } catch {
+            guard generation == checkGeneration else { return }
             automaticDownloadStatus = "Wi-Fi download failed: " + error.localizedDescription
         }
     }
@@ -242,8 +246,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     func preferencesChanged() {
         checkGeneration += 1
         availableRelease = nil
-        preparedIPA = nil
-        downloadedReleaseIdentity = nil
+        discardPreparedIPA()
         automaticDownloadStatus = "Not downloaded"
         lastAutomaticCheck = nil
         lastCheckedChannel = nil
@@ -400,6 +403,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     }
 
     func prepare(_ release: Release) async throws -> URL {
+        guard !downloadInProgress else { throw UpdateError.downloadAlreadyRunning }
         guard isSupportedReleaseIdentity(release.bundleIdentifier) else {
             throw UpdateError.incompatibleBundleIdentifier
         }
@@ -415,8 +419,11 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         // Whatever was prepared before is stale now. Discard it first, so a
         // failed attempt can never leave an earlier file available to import.
         discardPreparedIPA()
+        downloadInProgress = true
+        defer { downloadInProgress = false }
         let destination = try await downloadVerifiedIPA(release, session: .shared)
         preparedIPA = destination
+        downloadedReleaseIdentity = releaseIdentity(release)
         return destination
     }
 
@@ -429,6 +436,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     /// to verified-release.ipa only when it matches the signed SHA-256. A
     /// rejected, interrupted or cancelled download removes its partial file.
     private func downloadVerifiedIPA(_ release: Release, session: URLSession) async throws -> URL {
+        let generation = checkGeneration
         let folder = Self.selfUpdateFolder
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let partial = folder.appendingPathComponent("incoming-\(UUID().uuidString).partial")
@@ -446,6 +454,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         } catch ZagPackageIntegrity.Failure.unexpectedResponse {
             throw UpdateError.invalidRelease
         }
+        try Task.checkCancellation()
+        // A channel/preference change invalidates this attempt even if its
+        // network request completed successfully while the actor was suspended.
+        guard generation == checkGeneration else { throw CancellationError() }
         let destination = folder.appendingPathComponent("verified-release.ipa")
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
