@@ -3,7 +3,8 @@ import Foundation
 /// No documented app-level status API or verified response is available here.
 /// Pairing, reachability, a saved record and installed apps are not status evidence.
 enum ZagDeveloperModeGuidance {
-    static let status = "Check in Settings"
+    static let status = "Check"
+    static let accessibilityStatus = "Not verified. Check Developer Mode in Settings."
     static let steps = [
         "Open Settings.",
         "Go to Privacy & Security → Developer Mode.",

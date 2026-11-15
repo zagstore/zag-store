@@ -35,25 +35,13 @@ struct InstallationView: View {
 }
 
 
-private struct ZagInstallationTintedIconLabelStyle: LabelStyle {
-    @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
-
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: 8) {
-            configuration.icon
-                .frame(width: 25)
-                .foregroundStyle(Color(hex: themeColorHex))
-            configuration.title
-                .foregroundStyle(.primary)
-        }
-    }
-}
-
 private struct RPPairingView: View {
 	@State private var isLocalDevVpnAvailable = true
 	@StateObject private var pairingCore = ZagRPPairingCore.shared
 	@State private var showGate4Importer = false
 	@State private var showUnpairConfirmation = false
+    @State private var cleanupFeedback: CleanupFeedback?
+    private enum CleanupFeedback { case removed, failed(String) }
 	@State private var unpairError: String?
     @State private var localRemovalMessage: String?
 	@State private var pairingExportURL: URL?
@@ -131,30 +119,23 @@ private struct RPPairingView: View {
 						ZagPairingIcon().frame(width: 25, height: 25)
 					}
 				}
+                .labelStyle(ZagInstallationRowLabelStyle())
 				.frame(maxWidth: .infinity, alignment: .leading)
 				.contentShape(Rectangle())
 			}
 			.buttonStyle(.plain)
 			.foregroundStyle((pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending) ? Color.red : Color.accentColor)
 			.disabled(pairingCore.isRunning)
-			.popover(isPresented: $showUnpairConfirmation, attachmentAnchor: .rect(.bounds), arrowEdge: .bottom) {
-				ZagUnpairConfirmationBubble(
-					confirm: {
-						showUnpairConfirmation = false
-						do {
-                            try pairingCore.forgetPairing()
-                            localRemovalMessage = ZagLocalPairingRemoval.localOnlyMessage
-                        }
-						catch { unpairError = error.localizedDescription }
-					},
-					cancel: { showUnpairConfirmation = false }
-				)
-				.frame(width: 340)
-				.presentationCompactAdaptation(.popover)
-			}
+            .sheet(isPresented: $showUnpairConfirmation, onDismiss: presentCleanupFeedback) {
+                ZagLocalPairingConfirmationPopup(
+                    confirm: confirmLocalCleanup,
+                    cancel: { showUnpairConfirmation = false }
+                )
+            }
 
 			HStack {
 				Label("Pairing File", systemImage: "doc.badge.gearshape")
+                    .labelStyle(ZagInstallationRowLabelStyle())
 				Spacer()
 				Text(pairingCore.pairingFileExists ? "Saved" : "Not Saved")
 					.foregroundStyle(pairingCore.pairingFileExists ? .green : .secondary)
@@ -167,6 +148,7 @@ private struct RPPairingView: View {
 				if let pairingExportURL {
 					ShareLink(item: pairingExportURL) {
 						Label("Export Pairing File", systemImage: "square.and.arrow.up")
+                            .labelStyle(ZagInstallationRowLabelStyle())
 					}
 				} else {
 					Button {
@@ -177,6 +159,7 @@ private struct RPPairingView: View {
 						}
 					} label: {
 						Label("Export Pairing File", systemImage: "square.and.arrow.up")
+                            .labelStyle(ZagInstallationRowLabelStyle())
 					}
 				}
 			}
@@ -215,11 +198,8 @@ private struct RPPairingView: View {
 		} header: {
 			Text("Control")
 		} footer: {
-			VStack(alignment: .leading, spacing: 8) {
-                Text("Settings App → Privacy & Security → Developer Mode → Pair with Zag Store")
-                Text(ZagLocalPairingRemoval.systemRemovalInstructions)
-            }
-            .fixedSize(horizontal: false, vertical: true)
+            Text("Settings App → Privacy & Security → Developer Mode → Pair with Zag Store")
+                .fixedSize(horizontal: false, vertical: true)
 		}
 
 		Section {
@@ -326,6 +306,25 @@ private struct RPPairingView: View {
 		}
 	}
 
+    private func confirmLocalCleanup() {
+        showUnpairConfirmation = false
+        do {
+            try pairingCore.forgetPairing()
+            cleanupFeedback = .removed
+        } catch { cleanupFeedback = .failed(error.localizedDescription) }
+    }
+
+    private func presentCleanupFeedback() {
+        guard let feedback = cleanupFeedback else { return }
+        cleanupFeedback = nil
+        // Keep the operation in the confirmed action, as before. Only its alert
+        // waits for the custom sheet to finish dismissing.
+        switch feedback {
+        case .removed: localRemovalMessage = ZagLocalPairingRemoval.localOnlyMessage
+        case .failed(let message): unpairError = message
+        }
+    }
+
 	private var tunnelVerified: Bool {
 		switch pairingCore.gate2State {
 		case .lockdown, .pairing, .pairRecord, .coreDevice, .rsd, .deviceInfo, .installationProxy, .installedApps, .afc, .stagingWrite, .stagingVerify, .complete:
@@ -380,7 +379,7 @@ private struct RPPairingView: View {
                     Image(systemName: titleSystemImage)
                 }
             }
-                .labelStyle(ZagInstallationTintedIconLabelStyle())
+                .labelStyle(ZagInstallationRowLabelStyle(tinted: true))
 			Spacer()
 			Text(value)
 				.foregroundStyle(color)
@@ -435,64 +434,6 @@ private struct RPPairingView: View {
 }
 
 
-private struct ZagUnpairConfirmationBubble: View {
-	let confirm: () -> Void
-	let cancel: () -> Void
-
-	var body: some View {
-		VStack(spacing: 0) {
-			VStack(alignment: .leading, spacing: 10) {
-				Text("Forget Local Pairing?")
-					.font(.title3.weight(.semibold))
-				Text("This removes only Zag Store's local credentials. It does not revoke iOS trust or remove the paired-device entry. Remove Zag Store in Settings first, then forget the local files.\n\n" + ZagLocalPairingRemoval.systemRemovalInstructions)
-					.font(.body)
-					.foregroundStyle(.secondary)
-					.fixedSize(horizontal: false, vertical: true)
-			}
-			.frame(maxWidth: .infinity, alignment: .leading)
-			.padding(.horizontal, 20)
-			.padding(.top, 18)
-			.padding(.bottom, 14)
-
-			Divider()
-
-			Button(role: .destructive, action: confirm) {
-				Text("Forget Local Pairing")
-					.font(.body.weight(.semibold))
-					.frame(maxWidth: .infinity)
-					.frame(minHeight: 50)
-			}
-			.buttonStyle(.plain)
-			.foregroundStyle(.red)
-
-			Divider()
-
-			Button(action: cancel) {
-				Text("Cancel")
-					.font(.body.weight(.semibold))
-					.frame(maxWidth: .infinity)
-					.frame(minHeight: 50)
-			}
-			.buttonStyle(.plain)
-			.foregroundStyle(Color.accentColor)
-		}
-		.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
-		.overlay {
-			RoundedRectangle(cornerRadius: 28, style: .continuous)
-				.strokeBorder(.white.opacity(0.12), lineWidth: 0.5)
-		}
-		.overlay(alignment: .bottom) {
-			Image(systemName: "triangle.fill")
-				.font(.system(size: 24))
-				.foregroundStyle(.regularMaterial)
-				.rotationEffect(.degrees(180))
-				.offset(y: 15)
-		}
-		.shadow(color: .black.opacity(0.28), radius: 24, y: 10)
-		.frame(maxWidth: .infinity)
-		.padding(.horizontal, 2)
-	}
-}
 
 struct RPPairingDiagnosticsView: View {
 	@StateObject private var pairingCore = ZagRPPairingCore.shared

@@ -6,7 +6,7 @@ import Foundation
             guard value else { fatalError("FAIL: \(label)") }
             print("PASS: \(label)")
         }
-        check(ZagDeveloperModeGuidance.status == "Check in Settings", "unverified Developer Mode is presented as unknown, not enabled or disabled")
+        check(ZagDeveloperModeGuidance.status == "Check" && ZagDeveloperModeGuidance.accessibilityStatus.contains("Not verified"), "unverified Developer Mode is presented as unknown, not enabled or disabled")
         check(ZagDeveloperModeGuidance.steps.count == 5, "five manual steps provided")
         check(ZagDeveloperModeGuidance.steps[1].contains("Privacy & Security → Developer Mode"), "correct manual Settings path")
         check(ZagDeveloperModeGuidance.steps[2] == "Turn on Developer Mode.", "user controls enabling Developer Mode")
