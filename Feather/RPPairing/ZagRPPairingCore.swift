@@ -939,21 +939,7 @@ final class ZagRPPairingCore: ObservableObject {
 			state = .connected
 		case 4:
 			state = .pin(message)
-			UIPasteboard.general.string = message
-			let content = UNMutableNotificationContent()
-			content.title = "Zag Store Pairing Code"
-			let digits = message.filter(\.isNumber)
-			if digits.count == 6 {
-				let split = digits.index(digits.startIndex, offsetBy: 3)
-				content.body = "\(digits[..<split]) \(digits[split...])  •  Tap to return to Zag Store"
-			} else {
-				content.body = "\(message)  •  Tap to return to Zag Store"
-			}
-			content.sound = .default
-			content.categoryIdentifier = "zag-rppairing-pin-category"
-			if #available(iOS 15.0, *) {
-				content.interruptionLevel = .timeSensitive
-			}
+            guard let content = ZagPairingCodeNotification.content(for: message) else { return }
 			UNUserNotificationCenter.current().add(
 				UNNotificationRequest(
 					identifier: "zag-rppairing-pin",
