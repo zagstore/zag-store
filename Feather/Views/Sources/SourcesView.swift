@@ -400,7 +400,7 @@ struct SourcesView: View {
 				style: .default
 			) { _ in
 				UIApplication.open(
-					"https://github.com/khcrysalis/Feather"
+					"https://github.com/zagstore/zag-store"
 				)
 			}
 			let cancel = UIAlertAction(

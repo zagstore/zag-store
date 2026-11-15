@@ -9,6 +9,7 @@ import Foundation
 import Combine
 import UIKit.UIImpactFeedbackGenerator
 import BackgroundTasks
+import NimbleJSON
 
 class Download: Identifiable, @unchecked Sendable {
 	@Published var progress: Double = 0.0
@@ -272,6 +273,16 @@ class DownloadManager: NSObject, ObservableObject {
 }
 
 extension DownloadManager: URLSessionDownloadDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        guard NBFetchRedirectPolicy.allows(original: task.originalRequest?.url ?? response.url, destination: request.url) else {
+            task.cancel()
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
 	
 	func handlePachageFile(url: URL, dl: Download) throws {
 		var importedUUID: String?

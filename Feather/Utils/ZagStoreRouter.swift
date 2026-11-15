@@ -6,6 +6,7 @@ extension Notification.Name {
 
 enum ZagStoreRoute: String, CaseIterable {
 	case home
+    case activity, games, devices, certificates
 	case sources
 	case yourSources
 	case apps
@@ -17,15 +18,29 @@ enum ZagStoreRoute: String, CaseIterable {
 
 	var tab: String {
 		switch self {
-		case .home: return "home"
+		case .home: return "discover"
+        case .activity: return "activity"
+        case .games: return "games"
+        case .devices: return "devices"
+        case .certificates: return "certificates"
 		case .sources, .yourSources: return "sources"
 		case .apps: return "library"
 		default: return "settings"
 		}
 	}
 
+    var isTabRoot: Bool {
+        switch self {
+        case .yourSources, .installation, .installationDiagnostics, .rppairingDiagnostics, .updateDiagnostics: return false
+        default: return true
+        }
+    }
+
 	var url: URL {
 		switch self {
+        case .activity, .games, .devices, .certificates:
+            return URL(string: "zagstore://\(rawValue)")!
+
 		case .home:
 			return URL(string: "zagstore://home")!
 		case .sources:
@@ -48,16 +63,23 @@ enum ZagStoreRoute: String, CaseIterable {
 	}
 
 	static func parse(_ url: URL) -> ZagStoreRoute? {
-		guard url.scheme?.lowercased() == "zagstore" else { return nil }
+		guard url.scheme?.lowercased() == "zagstore",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.user == nil, components.password == nil, components.port == nil,
+              components.query == nil, components.fragment == nil else { return nil }
 
 		let parts = ([url.host].compactMap { $0 } + url.pathComponents.filter { $0 != "/" })
 			.map { $0.lowercased() }
 
 		switch parts {
-		case ["home"]: return .home
+		case ["home"], ["discover"]: return .home
+        case ["activity"]: return .activity
+        case ["games"]: return .games
+        case ["devices"]: return .devices
+        case ["certificates"]: return .certificates
 		case ["sources"]: return .sources
 		case ["sources", "your-sources"]: return .yourSources
-		case ["apps"]: return .apps
+		case ["apps"], ["library"]: return .apps
 		case ["settings"]: return .settings
 		case ["settings", "installation"]: return .installation
 		case ["settings", "diagnostics", "installation"]: return .installationDiagnostics
@@ -85,7 +107,6 @@ enum ZagStoreRouter {
 
 	static func open(_ url: URL) -> Bool {
 		guard let route = ZagStoreRoute.parse(url) else {
-			pendingRoute = nil
 			return false
 		}
 

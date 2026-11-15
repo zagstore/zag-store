@@ -100,7 +100,9 @@ enum ZagMobileDataToggle {
 
 	static func parse(_ url: URL) -> Callback? {
 		guard isCallback(url),
-			  let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+			  let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.user == nil, components.password == nil, components.port == nil,
+              components.fragment == nil, url.absoluteString.utf8.count <= 16384
 		else { return nil }
 		let parts = url.pathComponents.filter { $0 != "/" }.map { $0.lowercased() }
 		guard parts.count == 2,
@@ -108,6 +110,7 @@ enum ZagMobileDataToggle {
 			  let outcome = Outcome(rawValue: parts[1])
 		else { return nil }
 		let items = components.queryItems ?? []
+        guard Set(items.map(\.name)).count == items.count else { return nil }
 		func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
 		guard let id = value("id"), !id.isEmpty else { return nil }
 		return Callback(

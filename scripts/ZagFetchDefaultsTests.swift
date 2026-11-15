@@ -22,6 +22,16 @@ import Foundation
 	}
 
 	static func main() {
+        func allowed(_ original: String, _ destination: String) -> Bool {
+            NBFetchRedirectPolicy.allows(original: URL(string: original), destination: URL(string: destination))
+        }
+        expect(allowed("https://repo.example/a", "https://cdn.example/b"), "HTTPS CDN redirects supported")
+        expect(!allowed("https://repo.example/a", "http://repo.example/b"), "HTTPS downgrade rejected")
+        expect(!allowed("https://repo.example/a", "file:///private/data"), "local-file redirect rejected")
+        expect(!allowed("https://repo.example/a", "feather://install/https://example.com/a"), "custom-scheme redirect rejected")
+        expect(!allowed("https://repo.example/a", "https://user:pass@repo.example/b"), "credential-bearing redirect rejected")
+        expect(allowed("http://repo.example/a", "http://cdn.example/b"), "existing HTTP repository compatibility retained")
+
 		let legacyKey = "ZagStore.RepositoryFetchMetrics"
 		NBRepositoryFetchDiagnostics.clear()
 

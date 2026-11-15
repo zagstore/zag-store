@@ -71,6 +71,7 @@ struct VariedTabbarView: View {
 	private let updateManager = UpdateManager.shared
 	@StateObject private var pairingCore = ZagRPPairingCore.shared
 	@State private var didStartInitialUpdateRefresh = false
+    @State private var linkedTab: TabEnum?
 
 	@FetchRequest(
 		entity: AltSource.entity(),
@@ -94,6 +95,29 @@ struct VariedTabbarView: View {
 				TabbarView()
 			}
 		}
+        .sheet(isPresented: Binding(get: { linkedTab != nil }, set: { if !$0 { linkedTab = nil } })) {
+            if let tab = linkedTab {
+                TabEnum.view(for: tab)
+                    .onAppear {
+                        if let route = ZagStoreRouter.pendingRoute, route.isTabRoot { ZagStoreRouter.consume(route) }
+                    }
+                    .safeAreaInset(edge: .top) {
+                        HStack {
+                            Spacer()
+                            Button("Done") { linkedTab = nil }
+                                .padding()
+                        }
+                    }
+                    .presentationDetents([.large])
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .zagStoreRouteRequested)) { note in
+            guard let route = note.object as? ZagStoreRoute else { return }
+            openHiddenDestination(route)
+        }
+        .onAppear {
+            if let route = ZagStoreRouter.pendingRoute { openHiddenDestination(route) }
+        }
 		.onAppear {
             // Migrate only the previous built-in blues; leave custom themes intact.
             let previous = themeColorHex.uppercased()
@@ -146,6 +170,15 @@ struct VariedTabbarView: View {
 			updateManager.refresh(repositories: Array(activeSources.values))
 		}
 	}
+
+    private func openHiddenDestination(_ route: ZagStoreRoute) {
+        guard let tab = TabEnum(rawValue: route.tab) else { return }
+        if ZagDockConfiguration.tabs.contains(tab) {
+            linkedTab = nil
+        } else {
+            linkedTab = tab
+        }
+    }
 
 	private func updateDockTint() {
 		let color = UIColor(ZagWideGamutTint.color(hex: themeColorHex))
