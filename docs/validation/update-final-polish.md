@@ -1,5 +1,8 @@
 # Update control final polish — 16 November 2026
 
+This records the `ab4ee2e8` baseline. For the subsequent morph/transfer isolation
+and exact completion wording, see [Symmetric update morph](update-symmetric-transfer.md).
+
 Baseline: `232bc2d2` + `d2237fdc`. This is a presentation correction; the
 coordinator, native installer, persisted update proof, splash implementation,
 security policies, manifests, version/build and signing configuration are unchanged.

@@ -13,7 +13,9 @@ struct ZagSelfUpdateActionControl: View {
     @ScaledMetric(relativeTo: .headline) private var actionFontSize = 19.0
 
     private var theme: Color { ZagWideGamutTint.color(hex: themeColorHex) }
-    private var morphAnimation: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.42) }
+    private var morphAnimation: Animation? { reduceMotion ? nil : .timingCurve(ZagUpdateMorphSpecification.x1, ZagUpdateMorphSpecification.y1,
+                                                    ZagUpdateMorphSpecification.x2, ZagUpdateMorphSpecification.y2,
+                                                    duration: ZagUpdateMorphSpecification.duration) }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -37,13 +39,12 @@ struct ZagSelfUpdateActionControl: View {
                     .padding(.vertical, 12)
                     .frame(maxWidth: .infinity, minHeight: 54)
                     .opacity(state.showsProgress ? 0 : 1)
-                    .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: state.showsProgress)
+                    .animation(morphAnimation, value: state.showsProgress)
                     .background {
                         ZagUpdateSpectrumSurface(morph: state.showsProgress ? 1 : 0,
                                                  progress: state.fraction ?? 1,
                                                  theme: theme, moving: state.showsProgress)
                             .animation(morphAnimation, value: state.showsProgress)
-                            .animation(reduceMotion ? nil : .linear(duration: 0.1), value: state.fraction)
                     }
                     .contentShape(Capsule())
             }
@@ -52,7 +53,7 @@ struct ZagSelfUpdateActionControl: View {
             .accessibilityRemoveTraits(state.showsProgress ? .isButton : [])
             .accessibilityAddTraits(state.showsProgress ? .updatesFrequently : .isButton)
             .accessibilityLabel(state.title)
-            .accessibilityValue(state.fraction.map { "\(Int($0 * 100)) percent" } ?? "")
+            .accessibilityValue(state.fraction.map { "\(ZagUpdateProgressFormatting.percent($0)) percent" } ?? "")
             .accessibilityHint(state.offersGuidance ? "Shows short manual steps below. Cannot close or restart the app." : "")
 
             if let status = state.status {

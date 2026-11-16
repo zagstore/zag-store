@@ -17,11 +17,19 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
     private static let halo = Gradient(colors: [.cyan.opacity(0.12), .purple.opacity(0.10), .pink.opacity(0.12)])
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
+    @State private var visualProgress: ZagUpdateVisualProgress
     @State private var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
 
-    var animatableData: AnimatablePair<Double, Double> {
-        get { .init(morph, progress) }
-        set { morph = newValue.first; progress = newValue.second }
+    init(morph: Double, progress: Double, theme: Color, moving: Bool) {
+        self.morph = morph; self.progress = progress; self.theme = theme; self.moving = moving
+        _visualProgress = State(initialValue: ZagUpdateVisualProgress(progress, at: Date.timeIntervalSinceReferenceDate))
+    }
+
+    // Geometry has precisely one animation channel. Measured progress is not
+    // animatableData and can never retarget the in-flight capsule morph.
+    var animatableData: Double {
+        get { morph }
+        set { morph = newValue }
     }
 
     private var animates: Bool {
@@ -37,8 +45,13 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
             // it needs no additional asynchronous presentation queue.
             Canvas(opaque: false, rendersAsynchronously: false) { context, size in
                 draw(in: &context, size: size,
-                     phase: timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 5) / 5)
+                     phase: timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 5) / 5,
+                     displayedProgress: (reduceMotion || lowPower) ? progress : visualProgress.value(at: timeline.date.timeIntervalSinceReferenceDate))
             }
+        }
+        .onChange(of: progress) { value in
+            visualProgress.update(value, at: Date.timeIntervalSinceReferenceDate,
+                                  immediate: reduceMotion || lowPower)
         }
         .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)) { _ in
             lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
@@ -48,12 +61,12 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
 
     /// `morph` is interpolated, not used to exchange two shapes. The same path
     /// compresses from the button's full height to 14 pt about its vertical centre.
-    func draw(in context: inout GraphicsContext, size: CGSize, phase: Double) {
+    func draw(in context: inout GraphicsContext, size: CGSize, phase: Double, displayedProgress: Double? = nil) {
         let amount = min(1, max(0, morph))
         let height = ZagUpdateControlGeometry.height(slotHeight: size.height, morph: amount)
         let rect = CGRect(x: 0, y: (size.height - height) / 2, width: size.width, height: height)
         let path = Path(roundedRect: rect, cornerRadius: height / 2)
-        let fillFraction = ZagUpdateControlGeometry.filledFraction(progress: progress, morph: amount)
+        let fillFraction = ZagUpdateControlGeometry.filledFraction(progress: displayedProgress ?? progress, morph: amount)
         let fillRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width * fillFraction, height: rect.height)
         let fill = Path(roundedRect: fillRect, cornerRadius: height / 2)
 

@@ -33,9 +33,18 @@ view=read('Feather/Views/Settings/ZagSelfUpdateStatusView.swift')
 coord=read('Feather/Utilities/ZagSelfUpdateCoordinator.swift')
 assert control.count('            Button {') == 1
 assert control.count('ZagUpdateSpectrumSurface(') == 1
+assert control.count('.animation(morphAnimation, value: state.showsProgress)') == 2
+assert 'ZagUpdateMorphSpecification.duration' in control and '.timingCurve(' in control
+assert 'value: state.fraction' not in control
+assert '.id(' not in surface and 'AnimatablePair' not in surface
+assert '.onChange(of: progress)' in surface and 'visualProgress.update' in surface
+assert '@ObservedObject private var gate4' not in view
+assert '@StateObject private var installerPresentation' in view
+assert 'ZagUpdateTransferActionControl(' in view
+assert 'if case .upgradeSubmitted = gate4.gate4State { return .awaitingHandoff }' in view
 assert 'ProgressView(' not in control and '.transition(' not in control
 assert '.frame(maxWidth: .infinity, minHeight: 54)' in control
-assert '\n        .opacity(' not in surface and 'var animatableData: AnimatablePair<Double, Double>' in surface
+assert '\n        .opacity(' not in surface and 'var animatableData: Double' in surface
 assert 'Path(roundedRect: rect, cornerRadius: height / 2)' in surface
 assert 'rect.width * fillFraction' in surface
 assert 'ZagUpdateControlGeometry.height(slotHeight: size.height' in surface
@@ -64,6 +73,8 @@ assert 'rect.width * (phase - 1)' in surface and 'rect.width * (phase + 1)' in s
 assert 'if amount < 1 { context.fill(fill, with: .color(theme)) }' in surface
 pending=view.split('private var updateActionState:',1)[1].split('private func beginUpdate',1)[0]
 assert pending.index('handoffState == .reportedComplete') < pending.index('gate4.isGate4Running')
+assert pending.count('return .handedOff') == 1
+assert 'pendingInstallation != nil && coordinator.handoffState != .reportedComplete && !gate4.isGate4Running && !installBusy' in view
 assert 'if case .staged = gate4.gate4State { return .awaitingHandoff }' in pending
 assert 'handoffState == .uncertain' in pending
 handoff=coord.split('private func performPreparedHandoff(',1)[1].split('/// Explicitly confirmed upgrade-only',1)[0]

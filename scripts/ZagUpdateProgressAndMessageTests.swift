@@ -29,7 +29,7 @@ import Foundation
         check(publications <= 11, "1000 callbacks produce at most eleven first/10Hz publications")
 
         check(ZagSelfUpdateActionState.idle.title == "Update Now", "idle control remains Update Now")
-        check(ZagSelfUpdateActionState.confirmed.title == "Restart to Complete...", "only confirmed state offers restart guidance")
+        check(ZagSelfUpdateActionState.confirmed.title == "Restart to Complete...", "verified installed state retains exact restart title")
         check(ZagSelfUpdateActionState.awaitingVerification.title != ZagSelfUpdateActionState.confirmed.title, "installer handoff is distinct from confirmed replacement")
         check(ZagSelfUpdateActionState.progress(message: "Downloaded", fraction: 1).title != ZagSelfUpdateActionState.confirmed.title, "100 percent download never claims installation success")
         for state in [ZagUpdatePreparationState.verifying, .importing, .signing, .readyForHandoff] {
@@ -44,15 +44,15 @@ import Foundation
         check(ZagUpdateControlGeometry.height(slotHeight: 86, morph: 1) == 14, "Dynamic Type progress track remains inside the same slot")
         check(ZagUpdateControlGeometry.filledFraction(progress: 0.25, morph: 1) == 0.25, "real byte fraction determines the filled track")
         check(ZagUpdateControlGeometry.filledFraction(progress: 0.25, morph: 0) == 1, "idle and terminal pills have a continuous full body")
-        for terminal in [ZagSelfUpdateActionState.awaitingHandoff, .handedOff, .awaitingVerification, .confirmed] {
+        for terminal in [ZagSelfUpdateActionState.handedOff, .confirmed] {
             check(!terminal.showsProgress && terminal.offersGuidance, "every non-busy outcome expands to an actionable capsule")
             check(terminal.guidance.contains("install") || terminal.guidance.contains("installed"), "outcome guidance describes actual installation proof")
         }
-        check(ZagSelfUpdateActionState.handedOff.status?.contains("handed off") == true, "successful native return is described as handoff")
+        check(ZagSelfUpdateActionState.handedOff.status == "Update successful. Reopen Zag Store to complete.", "successful native return uses exact requested final wording")
         check(ZagSelfUpdateActionState.awaitingVerification.status?.contains("not verified") == true, "ambiguous failure never claims handoff success")
         check(ZagSelfUpdateActionState.awaitingHandoff.status?.contains("Signed IPA transferred") == true, "staged data describes transfer without claiming installation")
-        check(ZagSelfUpdateActionState.awaitingHandoff.title == "Reopen After Installation...", "normal staged state has a concise user-facing action")
-        check(ZagSelfUpdateActionState.confirmed.status == "Update completed. Please restart Zag Store.", "confirmed installation retains exact completion text")
+        check(ZagSelfUpdateActionState.awaitingHandoff.showsProgress, "staging alone cannot trigger the terminal capsule")
+        check(ZagSelfUpdateActionState.confirmed.status == "Update successful. Reopen Zag Store to complete.", "confirmed installation retains exact completion text")
         check(ZagSelfUpdateActionState.confirmed.reopenInstruction.contains("App Switcher"), "restart action supplies safe manual steps")
         check(ZagSelfUpdateActionState.idle.showsProgress == false, "failed pre-handoff operation can restore the original capsule")
         check(!ZagPostUpdateMessage.isReleaseAdvance(version: "2.4.6", build: "21", fromVersion: "2.4.6", fromBuild: "21"), "same version/build re-signing is not a new release")
@@ -64,6 +64,46 @@ import Foundation
         check(!ZagUpdateDecorationPolicy.animates(progress: false, active: true, reduceMotion: false, lowPower: false), "idle and terminal capsules stop the gradient clock")
         check(ZagSelfUpdateActionState.progress(message: "Downloading update...", fraction: 0.42).status == "Downloading update... 42%", "visible percentage uses the authoritative measured fraction")
         check(ZagSelfUpdateActionState.progress(message: "Verifying IPA...", fraction: nil).status == "Verifying IPA...", "unknown verification duration displays no percentage")
+        check(ZagSelfUpdateActionState.handedOff.title == "Restart to Complete...", "successful installer return uses the exact final button label")
+        for uncertain in [ZagSelfUpdateActionState.awaitingHandoff, .awaitingVerification, .idle,
+                          .progress(message: "Failed", fraction: nil), .progress(message: "Transferred", fraction: 1)] {
+            check(uncertain.status != ZagSelfUpdateActionState.handedOff.status, "unsuccessful or unconfirmed states never show success wording")
+        }
+        let activeSequence: [ZagSelfUpdateActionState] = [
+            .progress(message: "Preparing", fraction: nil), .awaitingVerification,
+            .progress(message: "Connecting", fraction: nil), .awaitingHandoff,
+            .progress(message: "Installing", fraction: 0.3)]
+        check(activeSequence.allSatisfy { $0.showsProgress } && !ZagSelfUpdateActionState.handedOff.showsProgress,
+              "persisting/staging pending records cannot reverse the morph before successful installer return")
+        check(ZagUpdateMorphSpecification.duration == 0.42, "both directions retain the accepted final-morph duration")
+        check(abs(ZagUpdateMorphSpecification.x1 + ZagUpdateMorphSpecification.x2 - 1) < 1e-12 &&
+              abs(ZagUpdateMorphSpecification.y1 + ZagUpdateMorphSpecification.y2 - 1) < 1e-12,
+              "one shared easing curve is mathematically symmetric under time reversal")
+        func bezier(_ t: Double) -> Double {
+            3 * (1-t) * (1-t) * t * ZagUpdateMorphSpecification.y1 +
+            3 * (1-t) * t * t * ZagUpdateMorphSpecification.y2 + t*t*t
+        }
+        for time in [0.0, 0.2, 0.5, 0.8, 1.0] {
+            let entering = ZagUpdateControlGeometry.height(slotHeight: 54, morph: bezier(time))
+            let exitingReversed = ZagUpdateControlGeometry.height(slotHeight: 54, morph: 1 - bezier(1-time))
+            check(abs(entering - exitingReversed) < 1e-10, "reverse-time morph has identical geometry at sample \(time)")
+        }
+        var visual = ZagUpdateVisualProgress(0.1, at: 0)
+        visual.update(0.5, at: 1, immediate: false)
+        check(visual.value(at: 1) == 0.1 && abs(visual.value(at: 1.05) - 0.3) < 1e-9, "displayed progress interpolates from its previous measurement")
+        let beforeRetarget = visual.value(at: 1.06)
+        visual.update(0.8, at: 1.06, immediate: false)
+        check(abs(visual.value(at: 1.06) - beforeRetarget) < 1e-9, "new percentages do not snap the current displayed value")
+        check(visual.value(at: 1.11) >= beforeRetarget && visual.value(at: 3) == 0.8,
+              "visual interpolation remains monotonic and never extrapolates past the actual target")
+        visual.update(0.02, at: 4, immediate: false)
+        check(visual.value(at: 4) == 0.02, "a new measured phase never inherits the previous phase's percentage")
+        visual.update(0.7, at: 5, immediate: true)
+        check(visual.value(at: 5) == 0.7, "Reduce Motion and Low Power Mode can use immediate authoritative values")
+        check((0...100).allSatisfy { ZagUpdateProgressFormatting.percent(Double($0)/100) == $0 },
+              "all integer installer percentages survive floating-point formatting exactly")
+        check(ZagUpdateProgressFormatting.percent(Double(1).nextDown) == 99,
+              "formatting never rounds an incomplete byte transfer up to 100 percent")
         let newHash = String(repeating: "a", count: 64)
         let oldHash = String(repeating: "b", count: 64)
         let running = ZagPostUpdateMessage.RunningIdentity(bundleIdentifier: "app.test.zag", version: "2.4.6", build: "21", executableSHA256: newHash)

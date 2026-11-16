@@ -10,7 +10,8 @@ import UniformTypeIdentifiers
 struct ZagSelfUpdateStatusView: View {
     @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared
-    @ObservedObject private var gate4 = ZagRPPairingCore.shared
+    private let gate4 = ZagRPPairingCore.shared
+    @StateObject private var installerPresentation = ZagUpdateInstallerPresentation()
 
     // Automatic discovery is independent from installation.
     @AppStorage("ZagStore.updatePreferences.automaticChecks.v1")
@@ -482,95 +483,99 @@ struct ZagSelfUpdateStatusView: View {
     }
 
     private var zagDeveloperDiagnostics: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            LabeledContent("Native installer event", value: gate4.gate4LastEvent)
-            LabeledContent("Previous event", value: gate4.gate4PreviousEvent)
-            LabeledContent("Signed candidate", value: candidateSummary)
-            LabeledContent("Installation status", value: installStatus)
-            Text("Native installer events are diagnostic information, not proof of successful replacement.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Button("Check Installation Prerequisites") {
-                handoffReadiness = coordinator.inspectInstallationHandoffReadiness()
-            }
-            ForEach(handoffReadiness, id: \.self) { finding in
-                Text(finding)
+        ZagUpdateLiveInstallerDetails {
+            VStack(alignment: .leading, spacing: 10) {
+                LabeledContent("Native installer event", value: gate4.gate4LastEvent)
+                LabeledContent("Previous event", value: gate4.gate4PreviousEvent)
+                LabeledContent("Signed candidate", value: candidateSummary)
+                LabeledContent("Installation status", value: installStatus)
+                Text("Native installer events are diagnostic information, not proof of successful replacement.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-            }
-            if updateActionState.offersGuidance {
-                Text(updateActionState.guidance)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            if let pending = coordinator.pendingInstallation {
-                LabeledContent("Pending version", value: pending.version)
-                LabeledContent("Pending build", value: pending.build)
-            }
-            if let completed = coordinator.lastVerifiedInstallation {
-                LabeledContent("Verified build", value: completed.build)
+                Button("Check Installation Prerequisites") {
+                    handoffReadiness = coordinator.inspectInstallationHandoffReadiness()
+                }
+                ForEach(handoffReadiness, id: \.self) { finding in
+                    Text(finding)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                if coordinator.pendingInstallation != nil {
+                    Text(updateActionState.guidance)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                if let pending = coordinator.pendingInstallation {
+                    LabeledContent("Pending version", value: pending.version)
+                    LabeledContent("Pending build", value: pending.build)
+                }
+                if let completed = coordinator.lastVerifiedInstallation {
+                    LabeledContent("Verified build", value: completed.build)
+                }
             }
         }
     }
 
     @ViewBuilder
     private var gate4ProgressDisplay: some View {
-        if gate4ShouldShowProgress {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 10) {
-                    Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.cyan)
-                        .accessibilityHidden(true)
-                    Text(gate4PhaseLabel)
-                        .font(.headline)
-                    Spacer(minLength: 8)
-                    if let measured = gate4MeasuredPercentage {
-                        Text("\(measured)%")
-                            .font(.system(.headline, design: .rounded, weight: .semibold))
-                            .monospacedDigit()
-                    } else {
-                        Text("In progress")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                ZagSelfUpdateRainbowProgress(
-                    progress: Double(gate4MeasuredPercentage ?? 0) / 100,
-                    isIndeterminate: gate4MeasuredPercentage == nil
-                )
-                .frame(height: 16)
-                .accessibilityLabel(gate4MeasuredPercentage == nil
-                    ? "Update is in progress"
-                    : "Installation stage progress")
-
-                Text(gate4StageDescription)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
-                if coordinator.pendingInstallation != nil {
-                    switch gate4.gate4State {
-                    case .staged, .upgradeSubmitted, .complete:
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label("Finish on Home Screen", systemImage: "house.fill")
-                                .font(.subheadline.weight(.semibold))
-                            Text("After a few seconds, swipe up to the Home Screen normally. Wait for Zag Store to finish updating, then reopen it.")
-                                .font(.footnote)
-                            Text("Do not force-quit Zag Store or start the installation again.")
-                                .font(.footnote)
+        ZagUpdateLiveInstallerDetails {
+            if gate4ShouldShowProgress {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.cyan)
+                            .accessibilityHidden(true)
+                        Text(gate4PhaseLabel)
+                            .font(.headline)
+                        Spacer(minLength: 8)
+                        if let measured = gate4MeasuredPercentage {
+                            Text("\(measured)%")
+                                .font(.system(.headline, design: .rounded, weight: .semibold))
+                                .monospacedDigit()
+                        } else {
+                            Text("In progress")
+                                .font(.subheadline.weight(.medium))
                                 .foregroundStyle(.secondary)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-                    default:
-                        EmptyView()
+                    }
+
+                    ZagSelfUpdateRainbowProgress(
+                        progress: Double(gate4MeasuredPercentage ?? 0) / 100,
+                        isIndeterminate: gate4MeasuredPercentage == nil
+                    )
+                    .frame(height: 16)
+                    .accessibilityLabel(gate4MeasuredPercentage == nil
+                        ? "Update is in progress"
+                        : "Installation stage progress")
+
+                    Text(gate4StageDescription)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    if coordinator.pendingInstallation != nil {
+                        switch gate4.gate4State {
+                        case .staged, .upgradeSubmitted, .complete:
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label("Finish on Home Screen", systemImage: "house.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                Text("After a few seconds, swipe up to the Home Screen normally. Wait for Zag Store to finish updating, then reopen it.")
+                                    .font(.footnote)
+                                Text("Do not force-quit Zag Store or start the installation again.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                        default:
+                            EmptyView()
+                        }
                     }
                 }
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -629,12 +634,13 @@ struct ZagSelfUpdateStatusView: View {
     }
 
     private var updateActionState: ZagSelfUpdateActionState {
+        let _ = installerPresentation.stage
         // Only a pending self-update may interpret the shared installer's events.
         if coordinator.pendingInstallation != nil {
             if coordinator.handoffState == .reportedComplete { return .handedOff }
             if coordinator.handoffState == .uncertain { return .awaitingVerification }
             if case .staged = gate4.gate4State { return .awaitingHandoff }
-            if case .upgradeSubmitted = gate4.gate4State { return .handedOff }
+            if case .upgradeSubmitted = gate4.gate4State { return .awaitingHandoff }
             if gate4.isGate4Running {
                 return .progress(message: gate4ProgressTitle,
                                  fraction: gate4MeasuredPercentage.map { Double($0) / 100 })
@@ -693,6 +699,7 @@ struct ZagSelfUpdateStatusView: View {
     }
 
     var body: some View {
+        let _ = installerPresentation.stage
         Form {
             Section {
                 NavigationLink {
@@ -718,7 +725,7 @@ struct ZagSelfUpdateStatusView: View {
                 }
             }
 
-            if coordinator.pendingInstallation != nil && !gate4.isGate4Running && !installBusy {
+            if coordinator.pendingInstallation != nil && coordinator.handoffState != .reportedComplete && !gate4.isGate4Running && !installBusy {
                 Section {
                     Label("Previous update not confirmed", systemImage: "exclamationmark.triangle")
                         .font(.headline)
@@ -811,8 +818,10 @@ struct ZagSelfUpdateStatusView: View {
                         ZagUpdateReleaseNotesView(markdown: release.releaseNotes ?? "Release notes are not available for this update.", version: release.version, build: release.build)
                             .id([release.version, release.build, release.ipaURL.absoluteString, release.releaseNotes ?? ""])
                         Divider()
-                        ZagSelfUpdateActionControl(state: updateActionState,
-                                                   disabled: coordinator.pendingInstallation != nil) {
+                        ZagUpdateTransferActionControl(state: updateActionState,
+                                                   usesInstallerProgress: coordinator.pendingInstallation != nil,
+                                                   disabled: coordinator.pendingInstallation != nil,
+                                                   progress: installerPresentation.progress) {
                             beginUpdate(release)
                         }
 
@@ -1069,14 +1078,12 @@ struct ZagSelfUpdateStatusView: View {
 
 // Diagnostics reuse the same spectrum renderer as the primary morphing control.
 private struct ZagSelfUpdateRainbowProgress: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let progress: Double
     var isIndeterminate = false
 
     var body: some View {
         ZagUpdateSpectrumSurface(morph: 1, progress: isIndeterminate ? 1 : progress,
                                  theme: .accentColor, moving: true)
-            .animation(reduceMotion ? nil : .linear(duration: 0.1), value: progress)
     }
 }
 

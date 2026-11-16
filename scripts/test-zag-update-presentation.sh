@@ -26,7 +26,7 @@ assert 'coordinator.beginUserUpdateOperation()' in normal and 'coordinator.finis
 assert 'guard channel == ZagSelfUpdateCoordinator.UpdateChannel.selected' in normal
 assert view.count('Link("Learn More"') == 1 and 'Learn more about this update' not in view
 card = view.split('if let release = coordinator.availableRelease {', 1)[1].split('.task(id: release.ipaURL)', 1)[0]
-assert card.index('ZagUpdateReleaseNotesView(') < card.index('Divider()') < card.index('ZagSelfUpdateActionControl(') < card.index('Link("Learn More"')
+assert card.index('ZagUpdateReleaseNotesView(') < card.index('Divider()') < card.index('ZagUpdateTransferActionControl(') < card.index('Link("Learn More"')
 assert 'https://github.com/zagorskey/zag-store-releases/releases' in card
 assert '.frame(maxWidth: .infinity, minHeight: 44)' in card
 assert 'content.listSectionSpacing(.custom(16))' in view
@@ -74,10 +74,11 @@ assert control.count('ZagUpdateSpectrumSurface(') == 1
 assert '.frame(maxWidth: .infinity, minHeight: 54)' in control
 assert 'ProgressView(' not in control
 assert 'morph: state.showsProgress ? 1 : 0' in control
-assert 'reduceMotion ? nil' in control and '.linear(duration: 0.1)' in control
+assert 'reduceMotion ? nil' in control and 'ZagUpdateMorphSpecification.duration' in control
+assert 'value: state.fraction' not in control
 assert 'Shows short manual steps below' in control and 'Cannot close or restart the app' in control
 celebration = view.split('private var verifiedUpdateCelebration:', 1)[1].split('private var gate4ProgressTitle:', 1)[0]
-assert 'Update completed. Please restart Zag Store.' in (root / 'Feather/Utilities/ZagUpdateProgressPresentation.swift').read_text()
+assert 'Update successful. Reopen Zag Store to complete.' in (root / 'Feather/Utilities/ZagUpdateProgressPresentation.swift').read_text()
 assert 'ZagSelfUpdateActionControl(state: .confirmed)' in celebration
 assert 'presentUpdateGuidance' not in view
 assert 'coordinator.installedIdentityVerified' in view.split('private var verifiedReplacementKey:', 1)[1].split('private var shouldCelebrateVerifiedReplacement:', 1)[0]

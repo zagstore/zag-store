@@ -19,7 +19,7 @@ assert 'expectedContentLength' in package and 'ZagUpdateProgressSampler' in pack
 view=read('Feather/Views/Settings/ZagSelfUpdateStatusView.swift')
 assert 'IPA verified - waiting for iOS handoff' in view
 assert 'IPA verified — waiting for iOS handoff' not in view
-assert read('Feather/Utilities/ZagUpdateProgressPresentation.swift').count('Update completed. Please restart Zag Store.') == 1
+assert read('Feather/Utilities/ZagUpdateProgressPresentation.swift').count('Update successful. Reopen Zag Store to complete.') == 1
 assert 'coordinator.installedIdentityVerified' in view
 assert 'presentUpdateGuidance' not in view and 'showRestartGuidance' not in view
 assert 'Text(state.reopenInstruction)' in read('Feather/Views/Settings/ZagSelfUpdateActionControl.swift')

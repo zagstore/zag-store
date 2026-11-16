@@ -69,6 +69,10 @@ import SwiftUI
         let bluePixel = (27 * 360 + 144) * 4
         let components = (0..<3).map { Int(earlier[bluePixel + $0]) }
         check(components.max()! - components.min()! > 200, "subtle gloss preserves strong spectrum saturation")
+        var isolatedSurface = ZagUpdateSpectrumSurface(morph: 0.35, progress: 0.1, theme: .blue, moving: true)
+        let geometryBeforeProgress = isolatedSurface.animatableData
+        isolatedSurface.progress = 0.85
+        check(isolatedSurface.animatableData == geometryBeforeProgress, "incoming percentages cannot retarget the Canvas geometry animation channel")
         let suite = "ZagStore.morph-rendering.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }

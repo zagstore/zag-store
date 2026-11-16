@@ -58,8 +58,8 @@ enum ZagUpdatePreparationState: Equatable {
     }
 }
 
-/// Installer callbacks can report progress, but only installed-identity
-/// reconciliation is allowed to produce the completed action.
+/// A successful installer return enables completion UI; installed-identity
+/// reconciliation remains a separate, stronger proof for the one-shot splash.
 enum ZagSelfUpdateActionState: Equatable {
     case idle
     case progress(message: String, fraction: Double?)
@@ -72,26 +72,24 @@ enum ZagSelfUpdateActionState: Equatable {
         switch self {
         case .idle: return "Update Now"
         case .progress(let message, _): return message
-        case .awaitingHandoff: return "Reopen After Installation..."
-        case .handedOff: return "Reopen After Installation..."
-        case .awaitingVerification: return "Reopen to Check Update"
-        case .confirmed: return "Restart to Complete..."
+        case .awaitingHandoff: return "IPA verified - waiting for iOS handoff"
+        case .awaitingVerification: return "Installation not verified. Reopen Zag Store to check."
+        case .handedOff, .confirmed: return "Restart to Complete..."
         }
     }
     var status: String? {
         switch self {
         case .idle: return nil
         case .progress(let message, let measured):
-            if let measured { return "\(message) \(Int(min(1, max(0, measured)) * 100))%" }
+            if let measured { return "\(message) \(ZagUpdateProgressFormatting.percent(measured))%" }
             return message
         case .awaitingHandoff: return "Signed IPA transferred. Reopen Zag Store after iOS finishes installing."
-        case .handedOff: return "Update handed off to iOS. Reopen Zag Store after installation."
         case .awaitingVerification: return "Installation not verified. Reopen Zag Store to check."
-        case .confirmed: return "Update completed. Please restart Zag Store."
+        case .handedOff, .confirmed: return "Update successful. Reopen Zag Store to complete."
         }
     }
     var offersGuidance: Bool {
-        switch self { case .awaitingHandoff, .handedOff, .awaitingVerification, .confirmed: return true; default: return false }
+        switch self { case .handedOff, .confirmed: return true; default: return false }
     }
     /// Short manual steps shown inline after an explicit tap, never a modal.
     var reopenInstruction: String {
@@ -115,7 +113,7 @@ enum ZagSelfUpdateActionState: Equatable {
         }
     }
     var showsProgress: Bool {
-        switch self { case .progress: return true; default: return false }
+        switch self { case .progress, .awaitingHandoff, .awaitingVerification: return true; default: return false }
     }
     var fraction: Double? {
         if case .progress(_, let fraction) = self { return fraction.map { min(1, max(0, $0)) } }
@@ -149,5 +147,48 @@ enum ZagUpdateControlGeometry {
 enum ZagUpdateDecorationPolicy {
     static func animates(progress: Bool, active: Bool, reduceMotion: Bool, lowPower: Bool) -> Bool {
         progress && active && !reduceMotion && !lowPower
+    }
+}
+
+/// Symmetric cubic timing shared by both directions. Percentages never select
+/// or restart this specification.
+enum ZagUpdateMorphSpecification {
+    static let duration = 0.42
+    static let x1 = 0.42
+    static let y1 = 0.0
+    static let x2 = 0.58
+    static let y2 = 1.0
+}
+
+/// Retargeted measured progress, independent from capsule geometry and the
+/// decorative five-second clock. Never extrapolates beyond an observed target.
+struct ZagUpdateVisualProgress {
+    private var start: Double
+    private var target: Double
+    private var startedAt: TimeInterval
+    private let duration: TimeInterval = 0.1
+
+    init(_ value: Double, at time: TimeInterval) {
+        start = value; target = value; startedAt = time
+    }
+    func value(at time: TimeInterval) -> Double {
+        let elapsed = min(1, max(0, (time - startedAt) / duration))
+        return start + (target - start) * elapsed
+    }
+    mutating func update(_ value: Double, at time: TimeInterval, immediate: Bool) {
+        start = (immediate || value < target) ? value : self.value(at: time)
+        target = value
+        startedAt = time
+    }
+}
+
+/// Preserve integer installer percentages through Double round trips without
+/// rounding an incomplete byte transfer up to 100 percent.
+enum ZagUpdateProgressFormatting {
+    static func percent(_ fraction: Double) -> Int {
+        guard fraction.isFinite else { return 0 }
+        let bounded = min(1, max(0, fraction))
+        if bounded == 1 { return 100 }
+        return min(99, Int((bounded * 100).nextUp.rounded(.down)))
     }
 }
