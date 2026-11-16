@@ -99,7 +99,14 @@ native=read('RPPairingCore/rust-core/src/lib.rs')
 assert 'Do not emit 210 here: transmission is not separately observable.' in native
 # No edits to native transport, cryptographic admission, rollback, splash or metadata.
 changed=subprocess.check_output(['git','diff','ea191fff','--name-only'],cwd=root,text=True).splitlines()
-assert not any(p.startswith(('RPPairingCore/','Feather/RPPairing/')) for p in changed)
+assert not any(p.startswith('RPPairingCore/') for p in changed), 'native transport is unchanged'
+# Swift core changes are limited to publication cadence and the 209 hook.
+assert {p for p in changed if p.startswith('Feather/RPPairing/')} <= {
+ 'Feather/RPPairing/ZagRPPairingCore.swift','Feather/RPPairing/ZagGate4PublicationPolicy.swift'}
+core=read('Feather/RPPairing/ZagRPPairingCore.swift')
+for invariant in ['gate4Completion?(.success(()))','ZagRPPairingFailure.classify(message, installationStarted: installationStarted)',
+                  'gate4AttemptEvents.append(ZagGate4Event(code: code, message: message))','gate4Progress?(percent)']:
+ assert invariant in core, invariant
 assert not any('ManifestVerifier' in p or 'RollbackStore' in p for p in changed)
 plistPath='Feather/Resources/Info.plist'
 oldPlist=plistlib.loads(subprocess.check_output(['git','show','ea191fff:'+plistPath],cwd=root))

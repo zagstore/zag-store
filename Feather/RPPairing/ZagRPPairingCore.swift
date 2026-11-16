@@ -182,7 +182,29 @@ final class ZagRPPairingCore: ObservableObject {
 		case failed(String)
 	}
 
-	@Published private(set) var gate4State: Gate4State = .idle
+	/// The exact native state. Views observing the whole core are invalidated
+	/// for every stage change but for a percentage only every ten points: one
+	/// publication per transfer callback re-evaluated the tab hierarchy up to
+	/// a hundred times while the update control was animating. Every exact
+	/// value still reaches gate4StatePublisher.
+	private(set) var gate4State: Gate4State = .idle {
+		willSet {
+			if Self.gate4StateInvalidatesViews(from: gate4State, to: newValue) { objectWillChange.send() }
+		}
+		didSet { gate4StateSubject.send(gate4State) }
+	}
+	private let gate4StateSubject = CurrentValueSubject<Gate4State, Never>(.idle)
+	/// Every native state, including each percentage, after it is stored.
+	var gate4StatePublisher: AnyPublisher<Gate4State, Never> { gate4StateSubject.eraseToAnyPublisher() }
+
+	nonisolated static func gate4StateInvalidatesViews(from old: Gate4State, to new: Gate4State) -> Bool {
+		switch (old, new) {
+		case let (.uploading(previous), .uploading(next)), let (.progress(previous), .progress(next)):
+			return ZagGate4PublicationPolicy.invalidatesViews(fromPercent: previous, toPercent: next)
+		default:
+			return old != new
+		}
+	}
 	@Published private(set) var gate4SelfUpdateCommandSent = false
 	/// Callbacks received for the current or most recent Gate4 attempt, in
 	/// order. Used to tell whether a failure happened before the Upgrade request.
@@ -353,12 +375,20 @@ final class ZagRPPairingCore: ObservableObject {
 
 	fileprivate func receiveGate4(code: Int32, message: String) {
 		gate4AttemptEvents.append(ZagGate4Event(code: code, message: message))
-		recordGate4Event("Gate4 callback \(code): \(message)")
-		// Record native installation stages for diagnostics.
-		if code == 206 {
-			ZagLogger.shared.info("RPPairing", "Gate4 install progress: \(message)%")
-		} else {
-			ZagLogger.shared.info("RPPairing", "Gate4 callback stage=\(code) detail=\(message)")
+		// Percentages arrive up to a hundred times per phase on the main
+		// thread. Keep the diagnostic record and log at the same ten-point
+		// cadence as view invalidation; the retry policy still sees every event.
+		var percentage: Gate4State?
+		if code == 208 { percentage = Int(message).map { .uploading($0) } }
+		if code == 206 { percentage = Int(message).map { .progress($0) } }
+		if percentage == nil || Self.gate4StateInvalidatesViews(from: gate4State, to: percentage!) {
+			recordGate4Event("Gate4 callback \(code): \(message)")
+			// Record native installation stages for diagnostics.
+			if code == 206 {
+				ZagLogger.shared.info("RPPairing", "Gate4 install progress: \(message)%")
+			} else {
+				ZagLogger.shared.info("RPPairing", "Gate4 callback stage=\(code) detail=\(message)")
+			}
 		}
 		switch code {
 		case 201: gate4State = .starting

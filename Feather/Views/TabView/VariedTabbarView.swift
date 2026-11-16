@@ -61,6 +61,21 @@ enum ZagWideGamutTint {
 	}
 }
 
+/// The root needs only inventory changes. Observing the whole pairing core
+/// re-evaluated the tab hierarchy for every Gate4 publication; this empty
+/// view takes those invalidations instead.
+private struct ZagInstalledAppsStateObserver: View {
+	@ObservedObject private var pairingCore = ZagRPPairingCore.shared
+	let onChange: (ZagRPPairingCore.InstalledAppsState) -> Void
+
+	var body: some View {
+		Color.clear
+			.frame(width: 0, height: 0)
+			.accessibilityHidden(true)
+			.onChange(of: pairingCore.installedAppsState, perform: onChange)
+	}
+}
+
 struct VariedTabbarView: View {
 	@AppStorage("Feather.userTintColor") private var themeColorHex: String = "#0090FF"
 	@AppStorage(ZagWallpaperStore.enabledKey) private var wallpaperEnabled = false
@@ -69,7 +84,6 @@ struct VariedTabbarView: View {
 	// every repository that finished during a refresh.
 	private let sourcesViewModel = SourcesViewModel.shared
 	private let updateManager = UpdateManager.shared
-	@StateObject private var pairingCore = ZagRPPairingCore.shared
 	@State private var didStartInitialUpdateRefresh = false
     @State private var linkedTab: TabEnum?
 
@@ -149,7 +163,7 @@ struct VariedTabbarView: View {
 				await updateManager.requestBadgePermission()
 			}
 		}
-		.onChange(of: pairingCore.installedAppsState) { state in
+		.background(ZagInstalledAppsStateObserver { state in
 			// An inventory query can complete after the startup refresh has
 			// timed out and published Signed fallback. Promote it to the
 			// authoritative update snapshot without opening the Apps tab.
@@ -168,7 +182,7 @@ struct VariedTabbarView: View {
 			)
 			guard configuredURLs == loadedURLs else { return }
 			updateManager.refresh(repositories: Array(activeSources.values))
-		}
+		})
 	}
 
     private func openHiddenDestination(_ route: ZagStoreRoute) {

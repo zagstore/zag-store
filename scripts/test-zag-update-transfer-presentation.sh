@@ -18,6 +18,7 @@ swiftc -module-cache-path "${CLANG_MODULE_CACHE_PATH:-$WORK/module-cache}" -pars
  "$ROOT/Feather/Views/Settings/ZagUpdateInstallerPresentation.swift" \
  "$ROOT/Feather/Views/Settings/ZagSelfUpdateActionControl.swift" \
  "$ROOT/Feather/Views/Settings/ZagUpdateSpectrumSurface.swift" \
+ "$ROOT/Feather/RPPairing/ZagGate4PublicationPolicy.swift" \
  "$ROOT/scripts/ZagUpdateTransferCoreStub.swift" "$WORK/Adapters.swift" \
  "$ROOT/scripts/ZagUpdateTransferPresentationTests.swift" -o "$WORK/tests"
 "$WORK/tests"
@@ -29,6 +30,8 @@ root=Path(sys.argv[1])
 view=(root/'Feather/Views/Settings/ZagSelfUpdateStatusView.swift').read_text()
 bridge=(root/'Feather/Views/Settings/ZagUpdateInstallerPresentation.swift').read_text()
 surface=(root/'Feather/Views/Settings/ZagUpdateSpectrumSurface.swift').read_text()
+core=(root/'Feather/RPPairing/ZagRPPairingCore.swift').read_text()
+tabbar=(root/'Feather/Views/TabView/VariedTabbarView.swift').read_text()
 assert '@ObservedObject private var gate4' not in view
 assert '@StateObject private var installerPresentation' in view
 assert '@Published private(set) var stage:' in bridge
@@ -42,6 +45,16 @@ assert 'var animatableData: Double' in surface
 assert 'set { morph = newValue }' in surface
 assert 'displayedProgress:' in surface and 'visualProgress.value(at:' in surface
 assert 'truncatingRemainder(dividingBy: 5)' in surface
+assert 'core.gate4StatePublisher.sink' in bridge and '$gate4State' not in bridge
+# The production core publishes exact values separately and coarsens whole-object invalidation.
+assert '@Published private(set) var gate4State' not in core
+assert 'didSet { gate4StateSubject.send(gate4State) }' in core
+assert 'ZagGate4PublicationPolicy.invalidatesViews(fromPercent: previous, toPercent: next)' in core
+assert 'if Self.gate4StateInvalidatesViews(from: gate4State, to: newValue) { objectWillChange.send() }' in core
+# The root tab hierarchy no longer observes the whole pairing core.
+root=tabbar.split('struct VariedTabbarView: View {',1)[1]
+assert 'ZagRPPairingCore' not in root.split('var body')[0]
+assert 'ZagInstalledAppsStateObserver {' in root
 assert 'if case .upgradeSubmitted = gate4.gate4State { return .awaitingHandoff }' in view
-print('PASS: stage-only screen observation, stable child/gradient identity, independent progress and no premature submission success')
+print('PASS: stage-only screen observation, exact-value publisher, coarse core invalidation, scoped root observation and stable gradient identity')
 PYTEST

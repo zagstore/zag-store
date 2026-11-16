@@ -14,7 +14,7 @@ import Combine
 
     init(core: ZagRPPairingCore? = nil) {
         let core = core ?? .shared
-        subscription = core.$gate4State.sink { [weak self] state in
+        subscription = core.gate4StatePublisher.sink { [weak self] state in
             guard let self else { return }
             let next: Stage
             switch state {
