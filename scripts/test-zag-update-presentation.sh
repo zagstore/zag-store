@@ -24,11 +24,13 @@ assert normal.index('chooseForSigning()') < normal.index('prepareSignedUpdate(')
 assert 'userConfirmedSelfReplacement: true' in normal
 assert 'coordinator.beginUserUpdateOperation()' in normal and 'coordinator.finishUserUpdateOperation()' in normal
 assert 'guard channel == ZagSelfUpdateCoordinator.UpdateChannel.selected' in normal
-assert view.count('Link("Learn More"') == 1 and 'Learn more about this update' not in view
+learn = (root / 'Feather/Views/Settings/ZagSelfUpdateLearnMoreLink.swift').read_text()
+import re
+assert learn.count('Link("Learn More"') == 1 and not re.search(r'(?<!\w)Link\(', view) and 'Learn more about this update' not in view
 card = view.split('if let release = coordinator.availableRelease {', 1)[1].split('.task(id: release.ipaURL)', 1)[0]
-assert card.index('ZagUpdateReleaseNotesView(') < card.index('Divider()') < card.index('ZagUpdateTransferActionControl(') < card.index('Link("Learn More"')
-assert 'https://github.com/zagorskey/zag-store-releases/releases' in card
-assert '.frame(maxWidth: .infinity, minHeight: 44)' in card
+assert card.index('ZagUpdateReleaseNotesView(') < card.index('Divider()') < card.index('ZagUpdateTransferActionControl(') < card.index('ZagSelfUpdateLearnMoreLink(')
+assert 'https://github.com/zagorskey/zag-store-releases/releases' in learn
+assert '.frame(maxWidth: .infinity, minHeight: 44)' in learn
 assert 'content.listSectionSpacing(.custom(16))' in view
 reference = (root / 'docs/validation/software-update-spacing.md').read_text()
 assert '| Background gap | 48 px | 24 px |' in reference
@@ -48,8 +50,9 @@ assert '.frame(maxWidth: .infinity, alignment: .trailing)' in notes
 assert '.frame(minWidth: 44, minHeight: 44, alignment: .trailing)' in notes
 assert '.foregroundStyle(ZagWideGamutTint.color(hex: themeColorHex))' in notes
 assert '@AppStorage("Feather.userTintColor")' in notes and '@AppStorage("Feather.userTintColor")' in view
-assert '.foregroundStyle(ZagWideGamutTint.color(hex: themeColorHex))' in card
-assert '.tint(ZagWideGamutTint.color(hex: themeColorHex))' in card
+assert 'ZagSelfUpdateLearnMoreLink(tint: ZagWideGamutTint.color(hex: themeColorHex))' in card
+assert '.foregroundStyle(tint)' in learn and '.tint(tint)' in learn
+assert '.buttonStyle(.borderless)' in learn  # row taps must not reach the link
 assert 'withAnimation' not in notes and '.transition(' not in notes
 assert 'Text(document.preview)' not in notes
 assert 'if let first = blocks.first {' in notes and 'ForEach(Array(blocks.dropFirst()))' in notes

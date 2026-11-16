@@ -132,3 +132,17 @@ to do.
 6. Interrupted morph (a stage change within ~0.1 s of tapping): a two-line
    title can briefly overhang the shrinking capsule while the labels crossfade.
    This was already the case at `983e8dc4` and only occurs on this path.
+
+## Card tap boundaries (follow-up)
+
+Device report: tapping the green `Restart to Complete...` capsule opened Learn
+More. Root cause, reproduced with real coordinate taps
+(`test-zag-update-card-taps.sh`): the capsule and the Learn More `Link` share one
+Form section row. In a Form/List row, a default-styled button or link makes the
+whole row its tap target. The final capsule (and the busy bar) are deliberately
+not hit-testable, so taps there — and on empty card space — fell through to the
+row and activated the link. The frames never overlapped. Fix: the link, now
+`ZagSelfUpdateLearnMoreLink`, uses `.buttonStyle(.borderless)` so it responds
+only within its own frame. A simulator screenshot of the card is pixel-identical
+before and after.
+

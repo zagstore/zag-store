@@ -817,11 +817,7 @@ struct ZagSelfUpdateStatusView: View {
                             beginUpdate(release)
                         }
 
-                        Link("Learn More", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
-                            .font(.body)
-                            .foregroundStyle(ZagWideGamutTint.color(hex: themeColorHex))
-                            .tint(ZagWideGamutTint.color(hex: themeColorHex))
-                            .frame(maxWidth: .infinity, minHeight: 44)
+                        ZagSelfUpdateLearnMoreLink(tint: ZagWideGamutTint.color(hex: themeColorHex))
 
                         if let issue = userVisibleUpdateIssue {
                             Text(issue)
