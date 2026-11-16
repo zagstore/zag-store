@@ -410,14 +410,16 @@ struct ZagSelfUpdateStatusView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            ZagSelfUpdateActionControl(state: .confirmed) { presentUpdateGuidance(.confirmed) }
-            Text("Shows instructions to close and reopen the app.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            ZagSelfUpdateActionControl(state: .confirmed) {}
 
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 16)
+        .onDisappear {
+            // Acknowledge the existing UI notice when leaving it, so tapping
+            // inline restart help does not remove the instructions immediately.
+            if let key = verifiedReplacementKey { acknowledgedReplacement = key }
+        }
     }
 
     private var gate4ProgressTitle: String {
@@ -493,6 +495,11 @@ struct ZagSelfUpdateStatusView: View {
             }
             ForEach(handoffReadiness, id: \.self) { finding in
                 Text(finding)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            if updateActionState.offersGuidance {
+                Text(updateActionState.guidance)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -582,8 +589,6 @@ struct ZagSelfUpdateStatusView: View {
     @State private var preparedOfficialRelease: ZagSelfUpdateCoordinator.Release?
     @State private var showInstallConfirmation = false
     @State private var installBusy = false
-    @State private var showRestartGuidance = false
-    @State private var updateGuidance = ""
     @State private var selectingUpdateCertificate = false
     @State private var installStatus = "No installation attempted"
 
@@ -646,11 +651,6 @@ struct ZagSelfUpdateStatusView: View {
             return .progress(message: coordinator.preparationState.message, fraction: coordinator.preparationState.fraction)
         default: return .idle
         }
-    }
-
-    private func presentUpdateGuidance(_ state: ZagSelfUpdateActionState) {
-        updateGuidance = state.guidance
-        showRestartGuidance = true
     }
 
     private func beginUpdate(_ release: ZagSelfUpdateCoordinator.Release) {
@@ -726,9 +726,7 @@ struct ZagSelfUpdateStatusView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                     if coordinator.availableRelease == nil {
-                        ZagSelfUpdateActionControl(state: updateActionState) {
-                            presentUpdateGuidance(updateActionState)
-                        }
+                        ZagSelfUpdateActionControl(state: updateActionState) {}
                     }
                     Button("Clear and Try Again", role: .destructive) {
                         showClearPendingConfirmation = true
@@ -815,11 +813,7 @@ struct ZagSelfUpdateStatusView: View {
                         Divider()
                         ZagSelfUpdateActionControl(state: updateActionState,
                                                    disabled: coordinator.pendingInstallation != nil) {
-                            if updateActionState.offersGuidance {
-                                presentUpdateGuidance(updateActionState)
-                            } else {
-                                beginUpdate(release)
-                            }
+                            beginUpdate(release)
                         }
 
                         Link("Learn More", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
@@ -1066,13 +1060,6 @@ struct ZagSelfUpdateStatusView: View {
             }
         } message: {
             Text("Zag Store will attempt an in-place upgrade using the selected signed update. iOS may close the app during replacement. No automatic uninstall or fresh-install fallback will be attempted. Continue only if you have a recovery copy.")
-        }
-        .alert("Installation and Reopening", isPresented: $showRestartGuidance) {
-            Button("Got It") {
-                if let key = verifiedReplacementKey { acknowledgedReplacement = key }
-            }
-        } message: {
-            Text(updateGuidance)
         }
         .navigationTitle("Zag Store Update")
         .navigationBarTitleDisplayMode(.inline)

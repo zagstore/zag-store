@@ -31,7 +31,7 @@ surface=read('Feather/Views/Settings/ZagUpdateSpectrumSurface.swift')
 policy=read('Feather/Utilities/ZagUpdateProgressPresentation.swift')
 view=read('Feather/Views/Settings/ZagSelfUpdateStatusView.swift')
 coord=read('Feather/Utilities/ZagSelfUpdateCoordinator.swift')
-assert control.count('Button(action: action)') == 1
+assert control.count('            Button {') == 1
 assert control.count('ZagUpdateSpectrumSurface(') == 1
 assert 'ProgressView(' not in control and '.transition(' not in control
 assert '.frame(maxWidth: .infinity, minHeight: 54)' in control
@@ -40,7 +40,7 @@ assert 'Path(roundedRect: rect, cornerRadius: height / 2)' in surface
 assert 'rect.width * fillFraction' in surface
 assert 'ZagUpdateControlGeometry.height(slotHeight: size.height' in surface
 assert 'TimelineView(.animation(paused: !animates))' in surface
-assert 'rendersAsynchronously: true' in surface
+assert 'rendersAsynchronously: false' in surface
 assert 'dividingBy: 5' in surface and 'lineWidth: 1.5' in surface
 assert 'conicGradient(Self.spectrum' in surface
 assert 'private static let flowingSpectrum' in surface
@@ -50,9 +50,19 @@ assert 'ObservableObject' not in surface and '@ObservedObject' not in surface
 assert 'ZagUpdateDecorationPolicy.animates' in surface
 assert 'minimumInterval: 1' not in surface
 assert 'state.offersGuidance' in control and 'state.fraction ?? 1' in control
-assert 'if updateActionState.offersGuidance' in view
-assert 'presentUpdateGuidance(updateActionState)' in view
-pending=view.split('private var updateActionState:',1)[1].split('private func presentUpdateGuidance',1)[0]
+assert 'View Installation Steps' not in view and 'presentUpdateGuidance' not in view
+assert 'Installation and Reopening' not in view and 'showRestartGuidance' not in view
+assert 'if showsReopenInstructions && state.offersGuidance' in control
+assert 'Text(state.reopenInstruction)' in control
+diagnostics=view.split('private var zagDeveloperDiagnostics:',1)[1].split('private var gate4ProgressDisplay:',1)[0]
+assert 'Text(updateActionState.guidance)' in diagnostics
+assert 'Text(updateActionState.guidance)' not in view.split('    var body: some View {',1)[1]
+assert '.alert(' not in control
+assert '.hidden()' not in control and 'if let status = state.status' in control
+assert '.disabled(' not in control and 'guard !state.showsProgress' in control
+assert 'rect.width * (phase - 1)' in surface and 'rect.width * (phase + 1)' in surface
+assert 'if amount < 1 { context.fill(fill, with: .color(theme)) }' in surface
+pending=view.split('private var updateActionState:',1)[1].split('private func beginUpdate',1)[0]
 assert pending.index('handoffState == .reportedComplete') < pending.index('gate4.isGate4Running')
 assert 'if case .staged = gate4.gate4State { return .awaitingHandoff }' in pending
 assert 'handoffState == .uncertain' in pending

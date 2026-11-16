@@ -69,17 +69,17 @@ assert 'Text("Build \\(release.build)")\n                                       
 approved = subprocess.check_output(['git', 'show', '30741eaf:' + path], cwd=root, text=True)
 assert view.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1] == approved.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1]
 control = (root / 'Feather/Views/Settings/ZagSelfUpdateActionControl.swift').read_text()
-assert control.count('Button(action: action)') == 1
+assert control.count('            Button {') == 1
 assert control.count('ZagUpdateSpectrumSurface(') == 1
 assert '.frame(maxWidth: .infinity, minHeight: 54)' in control
 assert 'ProgressView(' not in control
 assert 'morph: state.showsProgress ? 1 : 0' in control
 assert 'reduceMotion ? nil' in control and '.linear(duration: 0.1)' in control
-assert 'Shows manual installation and reopening instructions' in control and 'Does not restart automatically' in control
+assert 'Shows short manual steps below' in control and 'Cannot close or restart the app' in control
 celebration = view.split('private var verifiedUpdateCelebration:', 1)[1].split('private var gate4ProgressTitle:', 1)[0]
 assert 'Update completed. Please restart Zag Store.' in (root / 'Feather/Utilities/ZagUpdateProgressPresentation.swift').read_text()
 assert 'ZagSelfUpdateActionControl(state: .confirmed)' in celebration
-assert 'presentUpdateGuidance(.confirmed)' in celebration
+assert 'presentUpdateGuidance' not in view
 assert 'coordinator.installedIdentityVerified' in view.split('private var verifiedReplacementKey:', 1)[1].split('private var shouldCelebrateVerifiedReplacement:', 1)[0]
 assert 'IPA verified - waiting for iOS handoff' in view
 assert 'IPA verified — waiting for iOS handoff' not in view

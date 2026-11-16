@@ -21,7 +21,8 @@ assert 'IPA verified - waiting for iOS handoff' in view
 assert 'IPA verified — waiting for iOS handoff' not in view
 assert read('Feather/Utilities/ZagUpdateProgressPresentation.swift').count('Update completed. Please restart Zag Store.') == 1
 assert 'coordinator.installedIdentityVerified' in view
-assert 'presentUpdateGuidance' in view and 'Text(updateGuidance)' in view
+assert 'presentUpdateGuidance' not in view and 'showRestartGuidance' not in view
+assert 'Text(state.reopenInstruction)' in read('Feather/Views/Settings/ZagSelfUpdateActionControl.swift')
 for p in ['Feather/Views/TabView/Bars/ZagCinematicSplashView.swift','Feather/Views/TabView/Bars/ZagSplashAnimationStage.swift']:
     s=read(p)
     assert 'signatureMessage?.tokens ?? ["Sideloading", "and", "beyond."]' in s

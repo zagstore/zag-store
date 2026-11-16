@@ -9,11 +9,11 @@ import SwiftUI
         func check(_ value: Bool, _ label: String) {
             precondition(value, label); checks += 1; print("PASS: \(label)")
         }
-        func render(morph: Double, progress: Double = 0.55, phase: Double = 0.15) -> [UInt8] {
+        func render(morph: Double, progress: Double = 0.55, phase: Double = 0.15, transparent: Bool = false) -> [UInt8] {
             let surface = ZagUpdateSpectrumSurface(morph: morph, progress: progress, theme: .blue, moving: false)
             let view = Canvas { context, size in
                 surface.draw(in: &context, size: size, phase: phase)
-            }.frame(width: 360, height: 54).background(Color.black).environment(\.colorScheme, .dark)
+            }.frame(width: 360, height: 54).background(transparent ? Color.clear : Color.black).environment(\.colorScheme, .dark)
             let renderer = ImageRenderer(content: view)
             renderer.scale = 1
             let image = renderer.cgImage!
@@ -52,6 +52,23 @@ import SwiftUI
         check(Int(track[i]) + Int(track[i+2]) > Int(track[i+1]) * 2, "original violet/pink spectrum remains vivid")
         check(render(morph: 0, progress: 0.1) == render(morph: 0, progress: 1),
               "idle/retry capsule is full-width blue independently of old progress")
+        for amount in [0.0, 0.5, 1.0] {
+            let rgba = render(morph: amount, progress: 1, transparent: true)
+            check(rgba[(27 * 360 + 120) * 4 + 3] == 255,
+                  "filled region stays fully opaque at morph \(amount) on a transparent canvas")
+        }
+        let earlier = render(morph: 1, progress: 1, phase: 0.15)
+        let later = render(morph: 1, progress: 1, phase: 0.25)
+        func colourDistance(_ a: [UInt8], x: Int, _ b: [UInt8], otherX: Int) -> Int {
+            (0..<3).reduce(0) { $0 + abs(Int(a[(27 * 360 + x) * 4 + $1]) - Int(b[(27 * 360 + otherX) * 4 + $1])) }
+        }
+        check(colourDistance(earlier, x: 100, later, otherX: 136) < 12,
+              "the same gradient feature travels right as phase increases")
+        check(colourDistance(earlier, x: 100, later, otherX: 64) > 20,
+              "gradient motion is not a leftward visual reversal")
+        let bluePixel = (27 * 360 + 144) * 4
+        let components = (0..<3).map { Int(earlier[bluePixel + $0]) }
+        check(components.max()! - components.min()! > 200, "subtle gloss preserves strong spectrum saturation")
         let suite = "ZagStore.morph-rendering.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -66,7 +83,14 @@ import SwiftUI
             controlHeights.append(image.height)
             check(image.width == 350, "full control retains reference width in \(state.title)")
         }
-        check(Set(controlHeights).count == 1, "actual idle, busy and terminal control layouts reserve exactly the same card height")
+        check(controlHeights[0] == 54, "idle capsule has no hidden status reservation before Learn More")
+        check(controlHeights.allSatisfy { (54...125).contains($0) }, "busy and terminal controls fit their visible status without oversized reserved space")
+        let compactCard = VStack(spacing: 18) {
+            ZagSelfUpdateActionControl(state: .idle) {}.defaultAppStorage(defaults)
+            Text("Learn More").frame(maxWidth: .infinity, minHeight: 44)
+        }.frame(width: 350)
+        check(ImageRenderer(content: compactCard).cgImage!.height == 116,
+              "capsule-to-Learn-More layout retains the original 18-point stack gap")
         let accessible = ZagSelfUpdateActionControl(state: .handedOff) {}
             .frame(width: 260).defaultAppStorage(defaults).dynamicTypeSize(.accessibility3)
         let accessibleImage = ImageRenderer(content: accessible).cgImage!

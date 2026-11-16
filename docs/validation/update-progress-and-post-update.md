@@ -1,5 +1,8 @@
 # Update progress, continuous morph and verified post-update messaging
 
+This records the `d2237fdc` baseline. For the subsequent spacing, opacity, flow
+and inline-reopen corrections, see [Update control final polish](update-final-polish.md).
+
 The header, measured 16 pt section gap, note expansion, Learn More URL and
 preferences remain unchanged. Normal Update Now directly invokes the existing
 certificate, verified download/import/signing and upgrade-only installation path.

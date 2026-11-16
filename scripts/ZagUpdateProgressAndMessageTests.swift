@@ -49,8 +49,11 @@ import Foundation
             check(terminal.guidance.contains("install") || terminal.guidance.contains("installed"), "outcome guidance describes actual installation proof")
         }
         check(ZagSelfUpdateActionState.handedOff.status?.contains("handed off") == true, "successful native return is described as handoff")
-        check(ZagSelfUpdateActionState.awaitingVerification.status?.contains("unverified") == true, "ambiguous failure never claims handoff success")
-        check(ZagSelfUpdateActionState.awaitingHandoff.status == "IPA verified - waiting for iOS handoff", "staged data alone remains unconfirmed with ASCII hyphen")
+        check(ZagSelfUpdateActionState.awaitingVerification.status?.contains("not verified") == true, "ambiguous failure never claims handoff success")
+        check(ZagSelfUpdateActionState.awaitingHandoff.status?.contains("Signed IPA transferred") == true, "staged data describes transfer without claiming installation")
+        check(ZagSelfUpdateActionState.awaitingHandoff.title == "Reopen After Installation...", "normal staged state has a concise user-facing action")
+        check(ZagSelfUpdateActionState.confirmed.status == "Update completed. Please restart Zag Store.", "confirmed installation retains exact completion text")
+        check(ZagSelfUpdateActionState.confirmed.reopenInstruction.contains("App Switcher"), "restart action supplies safe manual steps")
         check(ZagSelfUpdateActionState.idle.showsProgress == false, "failed pre-handoff operation can restore the original capsule")
         check(!ZagPostUpdateMessage.isReleaseAdvance(version: "2.4.6", build: "21", fromVersion: "2.4.6", fromBuild: "21"), "same version/build re-signing is not a new release")
         check(ZagPostUpdateMessage.isReleaseAdvance(version: "2.5.0", build: "1", fromVersion: "2.4.6", fromBuild: "21"), "newer semantic version supports reset build numbers")
@@ -99,6 +102,11 @@ import Foundation
             version: "2.4.5", build: "20", executableSHA256: oldHash)
         check(store.record(candidate(), running: stillOriginal) == nil, "failed or cancelled update with the original app still running cannot persist success")
         check(store.pending(running: stillOriginal) == nil, "incomplete update cannot display a post-update splash")
+        let interrupted = ZagPostUpdateMessage.RunningIdentity(bundleIdentifier: running.bundleIdentifier,
+            version: running.version, build: running.build, executableSHA256: oldHash)
+        check(store.record(candidate(), running: interrupted) == nil, "interrupted replacement with updated labels but the original executable never announces success")
+        defaults.set(Data("handoff without installed proof".utf8), forKey: "zagStore.selfUpdate.pending")
+        check(store.pending(running: stillOriginal) == nil, "a persisted pending handoff alone cannot create a splash notice")
         let message = store.record(candidate(), running: running)!
         store = ZagPostUpdateMessageStore(defaults: UserDefaults(suiteName: suite)!)
         check(store.pending(running: running) == message, "pending verified notice survives store recreation")
@@ -107,6 +115,8 @@ import Foundation
         check(store.pending(running: otherRunning) == nil, "pending message must match the currently running identity")
         store.acknowledgeDisplayed(message)
         check(store.pending(running: running) == nil, "successful display restores normal tagline on later launches")
+        check(ZagPostUpdateMessageStore(defaults: UserDefaults(suiteName: suite)!).pending(running: running) == nil,
+              "a second ordinary launch after successful reveal has no post-update message")
         check(store.record(candidate(), running: running) == nil, "reconciliation replay cannot show the same notice twice")
         let later = ZagPostUpdateMessage.RunningIdentity(bundleIdentifier: running.bundleIdentifier, version: "2.4.7", build: "22", executableSHA256: newHash)
         let next = store.record(candidate(version: "2.4.7", build: "22"), running: later)!

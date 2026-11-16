@@ -72,9 +72,9 @@ enum ZagSelfUpdateActionState: Equatable {
         switch self {
         case .idle: return "Update Now"
         case .progress(let message, _): return message
-        case .awaitingHandoff: return "View Installation Steps"
+        case .awaitingHandoff: return "Reopen After Installation..."
         case .handedOff: return "Reopen After Installation..."
-        case .awaitingVerification: return "Check Installation..."
+        case .awaitingVerification: return "Reopen to Check Update"
         case .confirmed: return "Restart to Complete..."
         }
     }
@@ -84,15 +84,24 @@ enum ZagSelfUpdateActionState: Equatable {
         case .progress(let message, let measured):
             if let measured { return "\(message) \(Int(min(1, max(0, measured)) * 100))%" }
             return message
-        case .awaitingHandoff: return "IPA verified - waiting for iOS handoff"
+        case .awaitingHandoff: return "Signed IPA transferred. Reopen Zag Store after iOS finishes installing."
         case .handedOff: return "Update handed off to iOS. Reopen Zag Store after installation."
-        case .awaitingVerification: return "Installation is unverified. Check iOS before trying again."
+        case .awaitingVerification: return "Installation not verified. Reopen Zag Store to check."
         case .confirmed: return "Update completed. Please restart Zag Store."
         }
     }
     var offersGuidance: Bool {
         switch self { case .awaitingHandoff, .handedOff, .awaitingVerification, .confirmed: return true; default: return false }
     }
+    /// Short manual steps shown inline after an explicit tap, never a modal.
+    var reopenInstruction: String {
+        if self == .confirmed {
+            return "Close Zag Store in the App Switcher, then open it again."
+        }
+        return "After iOS finishes installing, close Zag Store in the App Switcher and reopen it."
+    }
+
+    /// Detailed explanations are for the existing developer diagnostics only.
     var guidance: String {
         switch self {
         case .confirmed:

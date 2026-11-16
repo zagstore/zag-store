@@ -8,6 +8,8 @@ struct ZagSelfUpdateActionControl: View {
     let action: () -> Void
     @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showsReopenInstructions = false
+    @AccessibilityFocusState private var instructionsFocused: Bool
     @ScaledMetric(relativeTo: .headline) private var actionFontSize = 19.0
 
     private var theme: Color { ZagWideGamutTint.color(hex: themeColorHex) }
@@ -15,7 +17,16 @@ struct ZagSelfUpdateActionControl: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            Button(action: action) {
+            Button {
+                // Guard repeated/busy activation without applying a disabled
+                // appearance filter to the luminous Canvas.
+                guard !state.showsProgress, !disabled || state.offersGuidance else { return }
+                if state.offersGuidance {
+                    showsReopenInstructions = true
+                } else {
+                    action()
+                }
+            } label: {
                 // A single stationary label. Busy-phase messages belong below
                 // the bar; they never resize or slide the button's text baseline.
                 Text(state.showsProgress ? "Update Now" : state.title)
@@ -37,27 +48,34 @@ struct ZagSelfUpdateActionControl: View {
                     .contentShape(Capsule())
             }
             .buttonStyle(.plain)
-            .disabled(state.showsProgress || (disabled && !state.offersGuidance))
+            .allowsHitTesting(!state.showsProgress && (!disabled || state.offersGuidance))
+            .accessibilityRemoveTraits(state.showsProgress ? .isButton : [])
+            .accessibilityAddTraits(state.showsProgress ? .updatesFrequently : .isButton)
             .accessibilityLabel(state.title)
             .accessibilityValue(state.fraction.map { "\(Int($0 * 100)) percent" } ?? "")
-            .accessibilityHint(state.offersGuidance ? "Shows manual installation and reopening instructions. Does not restart automatically." : "")
+            .accessibilityHint(state.offersGuidance ? "Shows short manual steps below. Cannot close or restart the app." : "")
 
-            // Reserve the same status area in idle, busy and terminal states.
-            // Dynamic Type can grow it, without changing the capsule's centre.
-            ZStack(alignment: .top) {
-                Text("Update handed off to iOS. Reopen Zag Store after installation.")
-                    .hidden().accessibilityHidden(true)
-                Text(state.status ?? " ")
-                    .frame(maxWidth: .infinity, alignment: .top)
+            if let status = state.status {
+                Text(status)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .fixedSize(horizontal: false, vertical: true)
                     .transaction { $0.animation = nil }
             }
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.center)
-            .fixedSize(horizontal: false, vertical: true)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(state.status ?? "")
-            .accessibilityHidden(state.status == nil)
+            if showsReopenInstructions && state.offersGuidance {
+                Text(state.reopenInstruction)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityFocused($instructionsFocused)
+                    .onAppear { instructionsFocused = true }
+            }
+        }
+        .onChange(of: state.offersGuidance) { offersGuidance in
+            if !offersGuidance { showsReopenInstructions = false }
         }
     }
 }

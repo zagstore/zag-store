@@ -13,7 +13,7 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
     private static let spectrum = Gradient(colors: ZagSelfUpdateSpectrum.colors)
     private static let flowingSpectrum = Gradient(colors:
         Array(ZagSelfUpdateSpectrum.colors.dropLast()) + ZagSelfUpdateSpectrum.colors)
-    private static let gloss = Gradient(colors: [.white.opacity(0.48), .white.opacity(0.06), .clear])
+    private static let gloss = Gradient(colors: [.white.opacity(0.12), .white.opacity(0.02), .clear])
     private static let halo = Gradient(colors: [.cyan.opacity(0.12), .purple.opacity(0.10), .pink.opacity(0.12)])
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
@@ -33,7 +33,9 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
         // No fixed 60 Hz cap: the system chooses display cadence, including
         // ProMotion. Power-saving, inactive and Reduce Motion states pause it.
         TimelineView(.animation(paused: !animates)) { timeline in
-            Canvas(opaque: false, rendersAsynchronously: true) { context, size in
+            // This tiny vector track presents with the current display frame;
+            // it needs no additional asynchronous presentation queue.
+            Canvas(opaque: false, rendersAsynchronously: false) { context, size in
                 draw(in: &context, size: size,
                      phase: timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 5) / 5)
             }
@@ -57,8 +59,13 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
 
         // The blue body remains visible throughout compression. Only its fill
         // transforms; there is no view opacity swap or second progress control.
-        context.fill(path, with: .color(theme.opacity(1 - amount)))
+        if amount < 1 { context.fill(path, with: .color(theme.opacity(1 - amount))) }
         context.fill(path, with: .color(.primary.opacity(0.10 * amount)))
+        // The filled region always has an opaque backing, including intermediate
+        // morph frames. Only its colour blends, never its overall alpha.
+        if amount < 1 { context.fill(fill, with: .color(theme)) }
+        // At full progress morphology the spectrum itself is opaque, so avoid
+        // repainting an invisible blue backing on every decorative frame.
         guard amount > 0 else { return }
 
         // Cheap, bounded halo strokes replace per-frame blur/shadow filters.
@@ -68,8 +75,10 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
                      endPoint: CGPoint(x: size.width, y: 0)), lineWidth: 5)
 
         // Repeat the same spectrum twice so the five-second flow has no seam.
-        let start = CGPoint(x: -rect.width * phase, y: rect.midY)
-        let end = CGPoint(x: rect.width * (2 - phase), y: rect.midY)
+        // Increasing phase moves the spectrum's coordinate system to the right.
+        // A two-cycle strip covers the track at both ends of the seamless wrap.
+        let start = CGPoint(x: rect.width * (phase - 1), y: rect.midY)
+        let end = CGPoint(x: rect.width * (phase + 1), y: rect.midY)
         light.fill(fill, with: .linearGradient(Self.flowingSpectrum, startPoint: start, endPoint: end))
         light.fill(fill, with: .linearGradient(Self.gloss,
                    startPoint: CGPoint(x: 0, y: rect.minY), endPoint: CGPoint(x: 0, y: rect.maxY)))
