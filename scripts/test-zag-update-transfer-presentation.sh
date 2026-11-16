@@ -52,8 +52,8 @@ assert '@Published private(set) var gate4State' not in core
 assert 'didSet { gate4StateSubject.send(gate4State) }' in core
 assert 'ZagGate4PublicationPolicy.invalidatesViews(fromPercent: previous, toPercent: next)' in core
 assert 'if Self.gate4StateInvalidatesViews(from: gate4State, to: newValue) { objectWillChange.send() }' in core
-# The staged hook runs in the same main-thread turn as the 209 stage change.
-assert core.index('gate4State = .staged') < core.index('gate4Staged?()')
+# The acknowledgment hook runs in the same main-thread turn as the 211 stage change.
+assert core.index('gate4State = .upgradeAccepted') < core.index('gate4Acknowledged?()')
 # The root tab hierarchy no longer observes the whole pairing core.
 root=tabbar.split('struct VariedTabbarView: View {',1)[1]
 assert 'ZagRPPairingCore' not in root.split('var body')[0]

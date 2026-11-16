@@ -1685,6 +1685,7 @@ private struct ZagLoggingSettingsView: View {
 		case .uploading(let percent): return "Uploading \(percent)%"
 		case .staged: return "IPA Staged"
 		case .upgradeSubmitted: return "Upgrade Submitted"
+		case .upgradeAccepted: return "Upgrade Accepted"
 		case .progress(let percent): return "Installing \(percent)%"
 		case .complete: return "Complete"
 		case .failed(let message): return "Failed: \(message)"

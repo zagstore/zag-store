@@ -171,7 +171,8 @@ final class ZagRPPairingCore {
 
 	func installGate4IPA(
 		at url: URL, deviceIP: String,
-		staged: (() -> Void)? = nil,
+		submitted: (() -> Void)? = nil,
+		acknowledged: (() -> Void)? = nil,
 		completion: @escaping (Result<Void, Error>) -> Void
 	) throws {
 		throw NotAvailable()

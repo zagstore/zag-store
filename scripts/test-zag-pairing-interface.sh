@@ -53,6 +53,11 @@ for site in [pairing_site, apps_site]:
 # Protected host logic remains unchanged; only presentation binds the verified footer.
 current_page = (root / 'Feather/Views/Settings/Installation/InstallationView.swift').read_text()
 prior_page = subprocess.check_output(['git', 'show', '4d1b426a:Feather/Views/Settings/Installation/InstallationView.swift'], cwd=root, text=True)
+# Beta 4's only diagnostics edit: the Gate4 labels for 210 (sent) and 211 (accepted), reversed exactly.
+acknowledgment = ('\t\tcase .upgradeSubmitted: return "Upgrade request sent to iOS"\n\t\tcase .upgradeAccepted: return "Upgrade accepted by iOS"\n',
+                  '\t\tcase .upgradeSubmitted: return "Upgrade submitted to iOS"\n')
+assert current_page.count(acknowledgment[0]) == 1
+current_page = current_page.replace(*acknowledgment)
 assert current_page.split('struct RPPairingDiagnosticsView:', 1)[1] == prior_page.split('struct RPPairingDiagnosticsView:', 1)[1]
 assert current_page.split('private func confirmLocalCleanup()', 1)[1].split('private var tunnelVerified', 1)[0] == prior_page.split('private func confirmLocalCleanup()', 1)[1].split('private var tunnelVerified', 1)[0]
 footer = view.split('private var pairingFooter:', 1)[1].split('private var directInstallStatusColor:', 1)[0]

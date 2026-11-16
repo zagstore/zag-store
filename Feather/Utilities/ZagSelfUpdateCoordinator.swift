@@ -169,6 +169,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     private var wifiMonitor: NWPathMonitor?
     private var wifiAvailable = false
     @Published private(set) var handoffState: ZagUpdateHandoffState = .none
+    /// Identifies the installer attempt that late callbacks and timeouts belong to.
+    private var handoffAttempt = 0
     @Published private(set) var preparationState: ZagUpdatePreparationState = .idle
     @Published private(set) var userUpdateInProgress = false
     private var userUpdateGeneration: Int?
@@ -1162,7 +1164,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     private func submitStagedUpdateToGate4(
         _ packageURL: URL,
         onStarted: () -> Void,
-        onStaged: @escaping () -> Void,
+        onSubmitted: @escaping () -> Void,
+        onAcknowledged: @escaping () -> Void,
         onFinished: @escaping ([ZagGate4Event]) -> Void
     ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1170,7 +1173,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
                 try ZagRPPairingCore.shared.installGate4IPA(
                     at: packageURL,
                     deviceIP: "10.7.0.1",
-                    staged: onStaged,
+                    submitted: onSubmitted,
+                    acknowledged: onAcknowledged,
                     completion: { result in
                         // Snapshot this attempt's callbacks at the moment it
                         // ended, before any later attempt can reset them.
@@ -1182,6 +1186,19 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             } catch {
                 continuation.resume(throwing: error)
             }
+        }
+    }
+
+    /// Stops presenting a written but unanswered Upgrade request as in
+    /// progress once `ZagUpgradeAcknowledgement.timeout` passes. Never success.
+    private func awaitUpgradeAcknowledgement(_ attempt: Int) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(ZagUpgradeAcknowledgement.timeout * 1_000_000_000))
+            guard let self, self.handoffAttempt == attempt else { return }
+            let next = ZagUpgradeAcknowledgement.afterTimeout(self.handoffState)
+            guard next != self.handoffState else { return }
+            ZagLogger.shared.warning("SelfUpdate", "iOS has not answered the Upgrade request; pending record kept for launch verification")
+            self.handoffState = next
         }
     }
 
@@ -1219,6 +1236,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             if ZagSelfUpdateRetryPolicy.mayReleasePendingRecord(after: .notStarted) { clearFailedHandoff() }
             throw CancellationError()
         }
+        handoffAttempt += 1
+        let attempt = handoffAttempt
         handoffState = .waiting
         var installerStarted = false
         var finishedEvents: [ZagGate4Event]?
@@ -1226,9 +1245,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             try await submitStagedUpdateToGate4(
                 packageURL,
                 onStarted: { installerStarted = true },
-                onStaged: { [weak self] in
-                    guard let self, self.handoffState == .waiting else { return }
-                    self.handoffState = .stagedOnDevice
+                onSubmitted: { [weak self] in self?.awaitUpgradeAcknowledgement(attempt) },
+                onAcknowledged: { [weak self] in
+                    guard let self, self.handoffAttempt == attempt else { return }
+                    self.handoffState = ZagUpgradeAcknowledgement.afterAcknowledgement(self.handoffState)
                 },
                 onFinished: { finishedEvents = $0 }
             )

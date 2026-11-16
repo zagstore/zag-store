@@ -112,15 +112,50 @@ distribution channels. It is a normal exit, not a crash: no `abort`,
   <channel>` appears; a failed install, same-build reinstall or unchanged
   executable does not show it.
 
-Known native limitation: callback 209 is emitted before the native layer opens
-installation_proxy and sends the Upgrade request, and no callback reports that
-the request was sent (210 is documented but deliberately not emitted). The tap
-is accepted only after the 0.35 s morph, the 65 ms pause and the status fade,
-which leaves that window for the request. It is not a guarantee. If the process
-ends first, iOS installs nothing; the next launch finds the original executable,
-shows no update message and offers the existing "Previous update not confirmed"
-recovery. Closing the window fully would need a native 210 emitted after the
-Upgrade request is written, which requires a Rust rebuild (out of scope).
+Superseded for Beta 4 (see "Upgrade acknowledgment" below): success, and with
+it `Restart to Complete...`, now waits for installation_proxy's own answer to
+the Upgrade request, not for staging (209).
+
+## Upgrade acknowledgment (Beta 4)
+
+Previously callback 209 (staged) ended the operation, before the native layer
+had even opened installation_proxy, and nothing reported the Upgrade request.
+Writing the request is not proof either: until installd reads it, the bytes can
+die with the process, and installd can still reject it.
+
+The self-update path in `RPPairingCore/rust-core/src/lib.rs` now runs the
+Upgrade exchange itself (`run_self_upgrade`) instead of the crate's
+`upgrade_with_callback`, which discards replies that carry no percentage. Same
+command, framing and connection as the crate (`upgrade_command_frame` produces
+the identical `{Command, ClientOptions{CFBundleIdentifier}, PackagePath}` XML
+plist, length-prefixed):
+
+- 210: the request was written and flushed. Never success.
+- 211: installd's first reply without `Error`/`ErrorDescription`. This is the
+  acknowledgment: iOS has the request and is processing it.
+- 206: each `PercentComplete`; 207 after `Status` `Complete`, as before.
+- Any `Error` or `ErrorDescription` (before or after 211), an invalid frame or
+  a closed stream ends the attempt with -4.
+
+No timers in the native exchange. Other bundle IDs keep the crate's helper.
+
+Swift: 209 is only a stage. 210 records `gate4SelfUpdateCommandSent` and starts
+a bounded wait (`ZagUpgradeAcknowledgement.timeout`, 20 s); 211 moves the
+handoff to `.acceptedByInstaller`, the only new success state. A request still
+unanswered at the timeout becomes `.unacknowledged`, shown as "Installation not
+verified" and never green; a late 211 still counts. Errors keep the existing
+recovery (`.uncertain`, or `.none` when the retry policy proves nothing was
+sent). Late callbacks and timeouts are tied to their attempt.
+
+Tests: 8 native `self_upgrade_tests` (frame equals the crate's command; 210
+then 211 on the first error-free reply; status without a percentage; immediate
+string, integer and description-only rejections never acknowledge; a later
+rejection fails; silence or EOF is not an acknowledgment; a failed write emits
+nothing; oversized and non-dictionary replies). Swift: the acknowledgment and
+timeout transitions, 209 and 210 alone stay a progress bar, an unanswered
+request is never success, and termination only after `.acceptedByInstaller` or
+completion. Device check: on the iPhone, confirm 211 arrives in the foreground
+(the Gate4 history shows `Gate4 callback 211`) before iOS replaces the app.
 
 ## Validation
 

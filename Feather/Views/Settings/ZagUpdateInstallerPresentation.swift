@@ -26,7 +26,7 @@ import Combine
             case .installing: next = .preparing
             case .uploading: next = .transfer
             case .staged: next = .staged
-            case .upgradeSubmitted: next = .submitted
+            case .upgradeSubmitted, .upgradeAccepted: next = .submitted
             case .progress: next = .installing
             case .complete: next = .complete
             case .failed(let reason): next = .failed(reason)

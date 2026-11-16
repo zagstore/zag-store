@@ -123,7 +123,7 @@ assert 'if amount < 1 { context.fill(fill, with: .color(theme)) }' in surface
 pending=view.split('private var updateActionState:',1)[1].split('private func beginUpdate',1)[0]
 assert '.pendingAttempt(handoff: coordinator.handoffState,' in pending
 derive=policy.split('static func pendingAttempt(',1)[1].split('\n    }\n',1)[0]
-assert derive.index('if handoff.isSuccessfulHandoff') < derive.index('handoff == .uncertain') < derive.index('if installerRunning')
+assert derive.index('if handoff.isSuccessfulHandoff') < derive.index('handoff == .uncertain || handoff == .unacknowledged') < derive.index('if installerRunning')
 assert derive.count('return .handedOff') == 1
 assert 'pendingInstallation != nil && !coordinator.handoffState.isSuccessfulHandoff && !gate4.isGate4Running && !installBusy' in view
 # Busy until the coordinator records the outcome; no view-level reading of 209/210.
@@ -131,8 +131,18 @@ assert 'gate4.gate4State { return' not in pending
 assert 'return .progress(message: preparingMessage, fraction: nil)' in derive
 handoff=coord.split('private func performPreparedHandoff(',1)[1].split('/// Explicitly confirmed upgrade-only',1)[0]
 assert handoff.index('try await submitStagedUpdateToGate4(') < handoff.index('handoffState = .reportedComplete') < handoff.index('} catch {')
-# Verified staging (209) is recorded only for the attempt in flight.
-assert handoff.index('handoffState = .waiting') < handoff.index('guard let self, self.handoffState == .waiting else { return }') < handoff.index('self.handoffState = .stagedOnDevice')
+# Success is recorded only from iOS's answer (211), only for the attempt in flight;
+# a written request (210) only starts the bounded wait for it.
+assert handoff.index('handoffState = .waiting') < handoff.index('onSubmitted: { [weak self] in self?.awaitUpgradeAcknowledgement(attempt) }') < handoff.index('guard let self, self.handoffAttempt == attempt else { return }') < handoff.index('ZagUpgradeAcknowledgement.afterAcknowledgement(self.handoffState)')
+assert 'stagedOnDevice' not in coord
+wait=coord.split('private func awaitUpgradeAcknowledgement(',1)[1].split('\n    }\n',1)[0]
+assert 'self.handoffAttempt == attempt' in wait and 'ZagUpgradeAcknowledgement.afterTimeout(' in wait
+core_src=open('Feather/RPPairing/ZagRPPairingCore.swift').read()
+c209=core_src.split('\t\tcase 209:',1)[1].split('\t\tcase 210:',1)[0]
+c210=core_src.split('\t\tcase 210:',1)[1].split('\t\tcase 211:',1)[0]
+c211=core_src.split('\t\tcase 211:',1)[1].split('\t\tcase 206:',1)[0]
+assert 'gate4Acknowledged?()' not in c209 + c210 and 'gate4Acknowledged?()' in c211
+assert 'gate4Submitted?()' in c210
 assert 'handoffState = pendingInstallation == nil ? .none : .uncertain' in handoff
 assert 'mayReleasePendingRecord(after: progress)' in handoff
 assert 'if pendingInstallation != nil { handoffState = .uncertain }' in coord
@@ -150,11 +160,15 @@ assert 'Review Beta v2 In-Place Update' in view.split('showInstallConfirmation =
 assert 'No automatic uninstall or fresh-install fallback will be attempted' in view
 assert 'userConfirmedSelfReplacement: true' in view
 native=read('RPPairingCore/rust-core/src/lib.rs')
-assert 'Do not emit 210 here: transmission is not separately observable.' in native
-# No edits to native transport, cryptographic admission, rollback, splash or metadata.
+# Success waits for installd's answer (211); writing the request is only 210.
+upgrade=native.split('async fn run_self_upgrade<',1)[1].split('\n}\n',1)[0]
+assert upgrade.index('connection.send_frame(frame).await?') < upgrade.index('event(210,') < upgrade.index('connection.read_bytes(4)') < upgrade.index('event(211,')
+assert 'tokio::time' not in upgrade and 'sleep' not in upgrade
+# No edits to cryptographic admission, rollback, splash or metadata; the only
+# native change is the self-update Upgrade exchange in lib.rs.
 changed=subprocess.check_output(['git','diff','ea191fff','--name-only'],cwd=root,text=True).splitlines()
-assert not any(p.startswith('RPPairingCore/') for p in changed), 'native transport is unchanged'
-# Swift core changes are limited to publication cadence and the 209 hook.
+assert {p for p in changed if p.startswith('RPPairingCore/')} <= {'RPPairingCore/rust-core/src/lib.rs'}
+# Swift core changes are limited to publication cadence and the Upgrade hooks.
 assert {p for p in changed if p.startswith('Feather/RPPairing/')} <= {
  'Feather/RPPairing/ZagRPPairingCore.swift','Feather/RPPairing/ZagGate4PublicationPolicy.swift'}
 core=read('Feather/RPPairing/ZagRPPairingCore.swift')
