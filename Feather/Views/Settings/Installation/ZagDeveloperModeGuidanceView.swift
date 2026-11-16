@@ -83,10 +83,9 @@ struct ZagDeveloperModeGuidanceView: View {
                 if let anchor {
                     Color.clear.preference(key: DeveloperModeRowRect.self, value: geometry[anchor])
                     if indicatorRow != nil {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.tertiary)
-                            .frame(width: 22, alignment: .center)
+                        ZagNativeListDisclosureAccessory()
+                            .frame(width: 22, height: geometry[anchor].height)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
                             .position(x: geometry.size.width - 11, y: geometry[anchor].midY)
                     }
                 }
@@ -141,4 +140,21 @@ private struct DeveloperModeRowRect: PreferenceKey {
     static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
         value = nextValue() ?? value
     }
+}
+
+/// Render the system list accessory itself, rather than approximating its glyph.
+/// This view is decorative; DisclosureGroup retains all interaction and animation.
+private struct ZagNativeListDisclosureAccessory: UIViewRepresentable {
+    func makeUIView(context: Context) -> UICollectionViewListCell {
+        let cell = UICollectionViewListCell(frame: .zero)
+        cell.backgroundConfiguration = .clear()
+        cell.directionalLayoutMargins = .zero
+        cell.preservesSuperviewLayoutMargins = false
+        cell.isUserInteractionEnabled = false
+        cell.isAccessibilityElement = false
+        cell.accessories = [.disclosureIndicator(options: .init(reservedLayoutWidth: .actual))]
+        return cell
+    }
+
+    func updateUIView(_ cell: UICollectionViewListCell, context: Context) {}
 }

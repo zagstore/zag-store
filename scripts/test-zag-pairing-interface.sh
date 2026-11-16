@@ -116,14 +116,21 @@ assert 'Text(step)' in guide and '.alignmentGuide(.leading) { $0[.trailing] + nu
 assert '.padding(.leading, columns.offset)' in guide
 assert 'return label - content' in guide
 assert '.accessibilityLabel("\\(index + 1). \\(step)")' in guide
-assert '.frame(width: 22, alignment: .center)' in guide
+assert '.frame(width: 22, height: geometry[anchor].height)' in guide
 assert '.position(x: geometry.size.width - 11, y: geometry[anchor].midY)' in guide
 assert '.allowsHitTesting(false)' in guide and '.accessibilityHidden(true)' in guide
 assert '.tint(.clear)' not in guide and '.tint(Color(hex: themeColorHex))' in guide
 assert '.mask {' in guide and '.fill(style: FillStyle(eoFill: true))' in guide
 assert 'CGRect(x: indicatorRow.maxX' in guide and 'geometry.size.width - indicatorRow.maxX' in guide
 assert 'if indicatorRow != nil' in guide
-assert guide.count('Image(systemName: expanded ? "chevron.down" : "chevron.right")') == 1
+assert 'Image(systemName: expanded ? "chevron.down" : "chevron.right")' not in guide
+assert guide.count('ZagNativeListDisclosureAccessory()') == 1
+assert 'cell.accessories = [.disclosureIndicator(options: .init(reservedLayoutWidth: .actual))]' in guide
+assert '.rotationEffect(.degrees(expanded ? 90 : 0))' in guide
+native_accessory = guide.split('private struct ZagNativeListDisclosureAccessory:', 1)[1]
+assert 'Image(systemName:' not in native_accessory and '.font(' not in native_accessory
+assert 'tintColor' not in native_accessory and 'alpha' not in native_accessory
+assert 'cell.isUserInteractionEnabled = false' in native_accessory
 mobile = (root / 'Feather/Views/Settings/Installation/ZagMobileDataFixView.swift').read_text()
 assert mobile.count('ZagMobileDataFixStatusLabel(status: status, compact: true)') == 2
 assert 'ZagMobileDataFixStatusLabel(status: status)\n' not in mobile
@@ -146,10 +153,10 @@ normalized_destination = normalized_destination.replace('Text(verified)\n       
 assert normalized_destination == old_destination
 assert new_destination.count('Text(verified)\n                                .font(ZagInstallationStatusStyle.font)') == 2
 # Exactly the two requested visual corrections relative to this checkpoint.
-prior_guide = subprocess.check_output(['git', 'show', '7df4c00b:Feather/Views/Settings/Installation/ZagDeveloperModeGuidanceView.swift'], cwd=root, text=True)
-assert guide == prior_guide.replace('.font(.footnote.weight(.semibold))\n                            .foregroundStyle(.secondary)', '.font(.caption.weight(.semibold))\n                            .foregroundStyle(.tertiary)', 1)
-settings = (root / 'Feather/Views/Settings/SettingsView.swift').read_text()
-assert '.font(.caption.weight(.semibold))\n\t\t\t\t\t\t\t.foregroundStyle(.tertiary)' in settings
+prior_guide = subprocess.check_output(['git', 'show', '862110dd:Feather/Views/Settings/Installation/ZagDeveloperModeGuidanceView.swift'], cwd=root, text=True)
+# No changes to label, native disclosure content, alignment or mask/hit testing.
+assert guide.split('        .overlayPreferenceValue', 1)[0] == prior_guide.split('        .overlayPreferenceValue', 1)[0]
+assert guide.split('        .onPreferenceChange(DeveloperModeRowRect', 1)[1].split('/// Render the system list accessory', 1)[0].strip() == prior_guide.split('        .onPreferenceChange(DeveloperModeRowRect', 1)[1].strip()
 assert 'case .verificationRequired: return ("questionmark.circle.fill", .orange)' in mobile
 for competing in ['disclosureGroupStyle', 'withAnimation', '.animation(', '.transition(', 'if expanded {']:
     assert competing not in guide
