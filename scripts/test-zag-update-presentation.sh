@@ -79,7 +79,8 @@ assert 'value: state.fraction' not in control
 assert 'Shows short manual steps below' in control and 'Cannot close or restart the app' in control
 celebration = view.split('private var verifiedUpdateCelebration:', 1)[1].split('private var gate4ProgressTitle:', 1)[0]
 assert 'Update successful. Reopen Zag Store to complete.' in (root / 'Feather/Utilities/ZagUpdateProgressPresentation.swift').read_text()
-assert 'ZagSelfUpdateActionControl(state: .confirmed)' in celebration
+# After a verified relaunch the update is complete: no "Restart to Complete..." pill.
+assert 'ZagSelfUpdateActionControl(' not in celebration and 'Installation verified successfully' in celebration
 assert 'presentUpdateGuidance' not in view
 assert 'coordinator.installedIdentityVerified' in view.split('private var verifiedReplacementKey:', 1)[1].split('private var shouldCelebrateVerifiedReplacement:', 1)[0]
 assert 'IPA verified - waiting for iOS handoff' in view

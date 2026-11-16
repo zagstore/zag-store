@@ -1162,6 +1162,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     private func submitStagedUpdateToGate4(
         _ packageURL: URL,
         onStarted: () -> Void,
+        onStaged: @escaping () -> Void,
         onFinished: @escaping ([ZagGate4Event]) -> Void
     ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1169,6 +1170,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
                 try ZagRPPairingCore.shared.installGate4IPA(
                     at: packageURL,
                     deviceIP: "10.7.0.1",
+                    staged: onStaged,
                     completion: { result in
                         // Snapshot this attempt's callbacks at the moment it
                         // ended, before any later attempt can reset them.
@@ -1224,6 +1226,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             try await submitStagedUpdateToGate4(
                 packageURL,
                 onStarted: { installerStarted = true },
+                onStaged: { [weak self] in
+                    guard let self, self.handoffState == .waiting else { return }
+                    self.handoffState = .stagedOnDevice
+                },
                 onFinished: { finishedEvents = $0 }
             )
             // Only the native terminal success callback resumes this call.

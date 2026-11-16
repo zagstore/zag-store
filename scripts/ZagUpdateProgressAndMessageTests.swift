@@ -29,9 +29,8 @@ import Foundation
         check(publications <= 11, "1000 callbacks produce at most eleven first/10Hz publications")
 
         check(ZagSelfUpdateActionState.idle.title == "Update Now", "idle control remains Update Now")
-        check(ZagSelfUpdateActionState.confirmed.title == "Restart to Complete...", "verified installed state retains exact restart title")
-        check(ZagSelfUpdateActionState.awaitingVerification.title != ZagSelfUpdateActionState.confirmed.title, "installer handoff is distinct from confirmed replacement")
-        check(ZagSelfUpdateActionState.progress(message: "Downloaded", fraction: 1).title != ZagSelfUpdateActionState.confirmed.title, "100 percent download never claims installation success")
+        check(ZagSelfUpdateActionState.awaitingVerification.title != ZagSelfUpdateActionState.handedOff.title, "an unverified attempt is distinct from the successful handoff")
+        check(ZagSelfUpdateActionState.progress(message: "Downloaded", fraction: 1).title != ZagSelfUpdateActionState.handedOff.title, "100 percent download never claims installation success")
         for state in [ZagUpdatePreparationState.verifying, .importing, .signing, .readyForHandoff] {
             check(state.fraction == nil, "preparation phase has no fabricated percentage")
         }
@@ -44,16 +43,19 @@ import Foundation
         check(ZagUpdateControlGeometry.height(slotHeight: 86, morph: 1) == 14, "Dynamic Type progress track remains inside the same slot")
         check(ZagUpdateControlGeometry.filledFraction(progress: 0.25, morph: 1) == 0.25, "real byte fraction determines the filled track")
         check(ZagUpdateControlGeometry.filledFraction(progress: 0.25, morph: 0) == 1, "idle and terminal pills have a continuous full body")
-        for terminal in [ZagSelfUpdateActionState.handedOff, .confirmed] {
-            check(!terminal.showsProgress && terminal.offersGuidance, "every non-busy outcome expands to an actionable capsule")
-            check(terminal.guidance.contains("install") || terminal.guidance.contains("installed"), "outcome guidance describes actual installation proof")
+        check(!ZagSelfUpdateActionState.handedOff.showsProgress && ZagSelfUpdateActionState.handedOff.offersGuidance, "the successful handoff expands to an actionable capsule")
+        check(ZagSelfUpdateActionState.handedOff.guidance.contains("install"), "outcome guidance describes actual installation proof")
+        check(ZagSelfUpdateActionState.handedOff.status == "Update successful. Reopen Zag Store to complete.", "successful handoff uses exact requested final wording")
+        check(!ZagSelfUpdateActionState.awaitingVerification.showsProgress, "a failed or ambiguous attempt ends the progress bar")
+        check(!ZagSelfUpdateActionState.awaitingVerification.offersGuidance, "an unverified attempt offers no success guidance")
+        check(ZagSelfUpdateActionState.awaitingVerification.title.contains("not verified"), "ambiguous failure never claims handoff success")
+        check(ZagSelfUpdateActionState.awaitingVerification.status == nil, "the unverified capsule does not repeat its title below")
+        check(ZagSelfUpdateActionState.handedOff.reopenInstruction.contains("App Switcher"), "restart action supplies safe manual steps")
+        check(ZagUpdateHandoffState.stagedOnDevice.isSuccessfulHandoff && ZagUpdateHandoffState.reportedComplete.isSuccessfulHandoff,
+              "verified on-device staging (209) and native completion (207) end the in-app operation")
+        for state in [ZagUpdateHandoffState.none, .waiting, .uncertain] {
+            check(!state.isSuccessfulHandoff, "no handoff, an attempt in flight and an ambiguous failure never select success")
         }
-        check(ZagSelfUpdateActionState.handedOff.status == "Update successful. Reopen Zag Store to complete.", "successful native return uses exact requested final wording")
-        check(ZagSelfUpdateActionState.awaitingVerification.status?.contains("not verified") == true, "ambiguous failure never claims handoff success")
-        check(ZagSelfUpdateActionState.awaitingHandoff.status?.contains("Signed IPA transferred") == true, "staged data describes transfer without claiming installation")
-        check(ZagSelfUpdateActionState.awaitingHandoff.showsProgress, "staging alone cannot trigger the terminal capsule")
-        check(ZagSelfUpdateActionState.confirmed.status == "Update successful. Reopen Zag Store to complete.", "confirmed installation retains exact completion text")
-        check(ZagSelfUpdateActionState.confirmed.reopenInstruction.contains("App Switcher"), "restart action supplies safe manual steps")
         check(ZagSelfUpdateActionState.idle.showsProgress == false, "failed pre-handoff operation can restore the original capsule")
         check(!ZagPostUpdateMessage.isReleaseAdvance(version: "2.4.6", build: "21", fromVersion: "2.4.6", fromBuild: "21"), "same version/build re-signing is not a new release")
         check(ZagPostUpdateMessage.isReleaseAdvance(version: "2.5.0", build: "1", fromVersion: "2.4.6", fromBuild: "21"), "newer semantic version supports reset build numbers")
@@ -65,16 +67,41 @@ import Foundation
         check(ZagSelfUpdateActionState.progress(message: "Downloading update...", fraction: 0.42).status == "Downloading update... 42%", "visible percentage uses the authoritative measured fraction")
         check(ZagSelfUpdateActionState.progress(message: "Verifying IPA...", fraction: nil).status == "Verifying IPA...", "unknown verification duration displays no percentage")
         check(ZagSelfUpdateActionState.handedOff.title == "Restart to Complete...", "successful installer return uses the exact final button label")
-        for uncertain in [ZagSelfUpdateActionState.awaitingHandoff, .awaitingVerification, .idle,
+        for uncertain in [ZagSelfUpdateActionState.awaitingVerification, .idle,
                           .progress(message: "Failed", fraction: nil), .progress(message: "Transferred", fraction: 1)] {
             check(uncertain.status != ZagSelfUpdateActionState.handedOff.status, "unsuccessful or unconfirmed states never show success wording")
         }
         let activeSequence: [ZagSelfUpdateActionState] = [
-            .progress(message: "Preparing", fraction: nil), .awaitingVerification,
-            .progress(message: "Connecting", fraction: nil), .awaitingHandoff,
+            .progress(message: "Preparing", fraction: nil), .progress(message: "Preparing update...", fraction: nil),
+            .progress(message: "Connecting", fraction: nil), .progress(message: "Transferring signed IPA...", fraction: 1),
             .progress(message: "Installing", fraction: 0.3)]
         check(activeSequence.allSatisfy { $0.showsProgress } && !ZagSelfUpdateActionState.handedOff.showsProgress,
-              "persisting/staging pending records cannot reverse the morph before successful installer return")
+              "persisting a pending record or a complete transfer cannot reverse the morph before verified staging")
+        // Replays the 1:09 PM device recording: transfer to 100%, then 209, then
+        // no further installer callback while Zag Store stays open.
+        func pending(_ handoff: ZagUpdateHandoffState, running: Bool, title: String = "Transferring signed IPA...",
+                     fraction: Double? = nil) -> ZagSelfUpdateActionState {
+            .pendingAttempt(handoff: handoff, installerRunning: running, installerTitle: title,
+                            installerFraction: fraction, preparingMessage: "Preparing update...")
+        }
+        check(pending(.none, running: false) == .progress(message: "Preparing update...", fraction: nil),
+              "a pending record before the installer starts stays busy, never 'not verified'")
+        check(pending(.waiting, running: true, fraction: 0.88).showsProgress, "transfer at 88% is a progress bar")
+        check(pending(.waiting, running: true, fraction: 1).showsProgress, "a complete transfer alone does not end the operation")
+        let staged = pending(.stagedOnDevice, running: true, title: "IPA verified - waiting for iOS handoff")
+        check(staged == .handedOff && !staged.showsProgress, "verified staging (209) morphs back to the final capsule while iOS stays silent")
+        check(staged.title == "Restart to Complete..." && staged.status == "Update successful. Reopen Zag Store to complete.",
+              "the device sequence ends with the two exact requested strings")
+        check(pending(.stagedOnDevice, running: true, title: "Installing update...", fraction: 0.4) == .handedOff,
+              "a late installer percentage cannot pull the capsule back into a bar")
+        check(pending(.reportedComplete, running: false) == .handedOff, "a native completion (207) also ends on the final capsule")
+        let failedAfterStaging = pending(.uncertain, running: false)
+        check(failedAfterStaging == .awaitingVerification && !failedAfterStaging.showsProgress,
+              "an installer error after staging ends the bar without success wording")
+        check(failedAfterStaging.status != staged.status && failedAfterStaging.title != staged.title,
+              "failed and ambiguous attempts never reuse either completion string")
+        check(pending(.none, running: false) != .handedOff && pending(.waiting, running: false) != .handedOff,
+              "released or in-flight attempts never select success")
         check(ZagUpdateMorphSpecification.duration == 0.42, "both directions retain the accepted final-morph duration")
         check(abs(ZagUpdateMorphSpecification.x1 + ZagUpdateMorphSpecification.x2 - 1) < 1e-12 &&
               abs(ZagUpdateMorphSpecification.y1 + ZagUpdateMorphSpecification.y2 - 1) < 1e-12,

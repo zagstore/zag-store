@@ -410,15 +410,11 @@ struct ZagSelfUpdateStatusView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-
-            ZagSelfUpdateActionControl(state: .confirmed) {}
-
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 16)
         .onDisappear {
-            // Acknowledge the existing UI notice when leaving it, so tapping
-            // inline restart help does not remove the instructions immediately.
+            // Acknowledge the notice when leaving it, so it stays readable while open.
             if let key = verifiedReplacementKey { acknowledgedReplacement = key }
         }
     }
@@ -637,15 +633,11 @@ struct ZagSelfUpdateStatusView: View {
         let _ = installerPresentation.stage
         // Only a pending self-update may interpret the shared installer's events.
         if coordinator.pendingInstallation != nil {
-            if coordinator.handoffState == .reportedComplete { return .handedOff }
-            if coordinator.handoffState == .uncertain { return .awaitingVerification }
-            if case .staged = gate4.gate4State { return .awaitingHandoff }
-            if case .upgradeSubmitted = gate4.gate4State { return .awaitingHandoff }
-            if gate4.isGate4Running {
-                return .progress(message: gate4ProgressTitle,
-                                 fraction: gate4MeasuredPercentage.map { Double($0) / 100 })
-            }
-            return .awaitingVerification
+            return .pendingAttempt(handoff: coordinator.handoffState,
+                                   installerRunning: gate4.isGate4Running,
+                                   installerTitle: gate4ProgressTitle,
+                                   installerFraction: gate4MeasuredPercentage.map { Double($0) / 100 },
+                                   preparingMessage: coordinator.preparationState.message)
         }
         if selectingUpdateCertificate { return .progress(message: "Selecting signing certificate...", fraction: nil) }
         if releaseDownloadBusy || installBusy || coordinator.userUpdateInProgress {
@@ -725,7 +717,7 @@ struct ZagSelfUpdateStatusView: View {
                 }
             }
 
-            if coordinator.pendingInstallation != nil && coordinator.handoffState != .reportedComplete && !gate4.isGate4Running && !installBusy {
+            if coordinator.pendingInstallation != nil && !coordinator.handoffState.isSuccessfulHandoff && !gate4.isGate4Running && !installBusy {
                 Section {
                     Label("Previous update not confirmed", systemImage: "exclamationmark.triangle")
                         .font(.headline)

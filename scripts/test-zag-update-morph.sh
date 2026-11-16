@@ -41,7 +41,7 @@ assert '.onChange(of: progress)' in surface and 'visualProgress.update' in surfa
 assert '@ObservedObject private var gate4' not in view
 assert '@StateObject private var installerPresentation' in view
 assert 'ZagUpdateTransferActionControl(' in view
-assert 'if case .upgradeSubmitted = gate4.gate4State { return .awaitingHandoff }' in view
+assert '.awaitingHandoff' not in view and '.confirmed' not in view
 assert 'ProgressView(' not in control and '.transition(' not in control
 assert '.frame(maxWidth: .infinity, minHeight: 54)' in control
 assert '\n        .opacity(' not in surface and 'var animatableData: Double' in surface
@@ -72,13 +72,18 @@ assert '.disabled(' not in control and 'guard !state.showsProgress' in control
 assert 'rect.width * (phase - 1)' in surface and 'rect.width * (phase + 1)' in surface
 assert 'if amount < 1 { context.fill(fill, with: .color(theme)) }' in surface
 pending=view.split('private var updateActionState:',1)[1].split('private func beginUpdate',1)[0]
-assert pending.index('handoffState == .reportedComplete') < pending.index('gate4.isGate4Running')
-assert pending.count('return .handedOff') == 1
-assert 'pendingInstallation != nil && coordinator.handoffState != .reportedComplete && !gate4.isGate4Running && !installBusy' in view
-assert 'if case .staged = gate4.gate4State { return .awaitingHandoff }' in pending
-assert 'handoffState == .uncertain' in pending
+assert '.pendingAttempt(handoff: coordinator.handoffState,' in pending
+derive=policy.split('static func pendingAttempt(',1)[1].split('\n    }\n',1)[0]
+assert derive.index('if handoff.isSuccessfulHandoff') < derive.index('handoff == .uncertain') < derive.index('if installerRunning')
+assert derive.count('return .handedOff') == 1
+assert 'pendingInstallation != nil && !coordinator.handoffState.isSuccessfulHandoff && !gate4.isGate4Running && !installBusy' in view
+# Busy until the coordinator records the outcome; no view-level reading of 209/210.
+assert 'gate4.gate4State { return' not in pending
+assert 'return .progress(message: preparingMessage, fraction: nil)' in derive
 handoff=coord.split('private func performPreparedHandoff(',1)[1].split('/// Explicitly confirmed upgrade-only',1)[0]
 assert handoff.index('try await submitStagedUpdateToGate4(') < handoff.index('handoffState = .reportedComplete') < handoff.index('} catch {')
+# Verified staging (209) is recorded only for the attempt in flight.
+assert handoff.index('handoffState = .waiting') < handoff.index('guard let self, self.handoffState == .waiting else { return }') < handoff.index('self.handoffState = .stagedOnDevice')
 assert 'handoffState = pendingInstallation == nil ? .none : .uncertain' in handoff
 assert 'mayReleasePendingRecord(after: progress)' in handoff
 assert 'if pendingInstallation != nil { handoffState = .uncertain }' in coord

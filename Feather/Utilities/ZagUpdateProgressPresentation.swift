@@ -58,62 +58,52 @@ enum ZagUpdatePreparationState: Equatable {
     }
 }
 
-/// A successful installer return enables completion UI; installed-identity
-/// reconciliation remains a separate, stronger proof for the one-shot splash.
+/// The in-app operation's successful end (verified staging or a native
+/// completion) selects the final capsule; installed-identity reconciliation
+/// remains a separate, stronger proof for the one-shot splash.
 enum ZagSelfUpdateActionState: Equatable {
     case idle
     case progress(message: String, fraction: Double?)
-    case awaitingHandoff
     case handedOff
+    /// A failed or ambiguous attempt whose pending record is kept for launch
+    /// verification. Terminal: the capsule returns, never as success.
     case awaitingVerification
-    case confirmed
 
     var title: String {
         switch self {
         case .idle: return "Update Now"
         case .progress(let message, _): return message
-        case .awaitingHandoff: return "IPA verified - waiting for iOS handoff"
         case .awaitingVerification: return "Installation not verified. Reopen Zag Store to check."
-        case .handedOff, .confirmed: return "Restart to Complete..."
+        case .handedOff: return "Restart to Complete..."
         }
     }
     var status: String? {
         switch self {
-        case .idle: return nil
+        case .idle, .awaitingVerification: return nil
         case .progress(let message, let measured):
             if let measured { return "\(message) \(ZagUpdateProgressFormatting.percent(measured))%" }
             return message
-        case .awaitingHandoff: return "Signed IPA transferred. Reopen Zag Store after iOS finishes installing."
-        case .awaitingVerification: return "Installation not verified. Reopen Zag Store to check."
-        case .handedOff, .confirmed: return "Update successful. Reopen Zag Store to complete."
+        case .handedOff: return "Update successful. Reopen Zag Store to complete."
         }
     }
-    var offersGuidance: Bool {
-        switch self { case .handedOff, .confirmed: return true; default: return false }
-    }
+    var offersGuidance: Bool { self == .handedOff }
     /// Short manual steps shown inline after an explicit tap, never a modal.
     var reopenInstruction: String {
-        if self == .confirmed {
-            return "Close Zag Store in the App Switcher, then open it again."
-        }
-        return "After iOS finishes installing, close Zag Store in the App Switcher and reopen it."
+        "After iOS finishes installing, close Zag Store in the App Switcher and reopen it."
     }
 
     /// Detailed explanations are for the existing developer diagnostics only.
     var guidance: String {
         switch self {
-        case .confirmed:
-            return "The installed replacement is verified. iOS cannot restart Zag Store automatically. Open the App Switcher, swipe up Zag Store, then open it again."
         case .handedOff:
-            return "The installer reported a successful handoff, but this running app cannot verify its replacement. Wait for installation to finish on the Home Screen. Then open Zag Store again to verify the installed update. If needed, close it in the App Switcher first."
-        case .awaitingHandoff:
-            return "The signed IPA is transferred and verified. The installation service has not yet confirmed completion. Check the Zag Store icon on the Home Screen and wait while it installs. Reopen after installation. If nothing changes, use the existing recovery tools; do not start another update while this attempt is pending."
+            return "The signed IPA is staged on the device at its verified size and Zag Store then sends the Upgrade request, or the installer reported completion. This running app cannot verify its replacement. Close Zag Store in the App Switcher and open it again to verify the installed update."
         default:
             return "The earlier installation attempt is unverified. Check the Zag Store icon on the Home Screen. Wait if installation is in progress, then reopen Zag Store to verify the installed version. If it did not install, use Clear and Try Again in recovery."
         }
     }
     var showsProgress: Bool {
-        switch self { case .progress, .awaitingHandoff, .awaitingVerification: return true; default: return false }
+        if case .progress = self { return true }
+        return false
     }
     var fraction: Double? {
         if case .progress(_, let fraction) = self { return fraction.map { min(1, max(0, $0)) } }
@@ -121,12 +111,38 @@ enum ZagSelfUpdateActionState: Equatable {
     }
 }
 
+extension ZagSelfUpdateActionState {
+    /// The control for a self-update with a pending installation record. The
+    /// coordinator's handoff state decides the outcome; raw installer stages
+    /// only describe progress while the attempt is in flight.
+    static func pendingAttempt(handoff: ZagUpdateHandoffState, installerRunning: Bool,
+                               installerTitle: String, installerFraction: Double?,
+                               preparingMessage: String) -> ZagSelfUpdateActionState {
+        // Verified staging (209) or a native completion ends the in-app
+        // operation; iOS reports nothing further while Zag Store stays open.
+        if handoff.isSuccessfulHandoff { return .handedOff }
+        if handoff == .uncertain { return .awaitingVerification }
+        if installerRunning { return .progress(message: installerTitle, fraction: installerFraction) }
+        // Recorded, installer not yet started (or just returned): still busy.
+        return .progress(message: preparingMessage, fraction: nil)
+    }
+}
+
 /// Presentation facts only. The installer and its recovery policy remain authoritative.
 enum ZagUpdateHandoffState: Equatable {
     case none
     case waiting
+    /// Native 209 for this attempt: the device holds the complete signed IPA
+    /// at its verified size and the Upgrade request follows. While Zag Store
+    /// stays open iOS reports nothing further, so this is the successful end
+    /// of the in-app operation. Not installed-executable proof.
+    case stagedOnDevice
     case reportedComplete
     case uncertain
+
+    /// A later installer error still replaces either state (`.uncertain`, or
+    /// `.none` when the retry policy releases the pending record).
+    var isSuccessfulHandoff: Bool { self == .stagedOnDevice || self == .reportedComplete }
 }
 
 /// The outer slot never changes height. Only the capsule inside it compresses;

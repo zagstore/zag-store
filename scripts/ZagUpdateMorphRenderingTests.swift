@@ -79,7 +79,7 @@ import SwiftUI
         var controlHeights: [Int] = []
         for state in [ZagSelfUpdateActionState.idle, .progress(message: "Downloading update...", fraction: 0.55),
                       .progress(message: "Preparing signed update...", fraction: nil),
-                      .awaitingHandoff, .handedOff, .awaitingVerification, .confirmed] {
+                      .handedOff, .awaitingVerification] {
             let content = ZagSelfUpdateActionControl(state: state, disabled: state.offersGuidance) {}
                 .frame(width: 350)
                 .defaultAppStorage(defaults)
