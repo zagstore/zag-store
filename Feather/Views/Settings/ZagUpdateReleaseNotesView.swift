@@ -3,12 +3,15 @@ import SwiftUI
 /// Inline expansion inside the existing update card; the outer Form owns scrolling.
 struct ZagUpdateReleaseNotesView: View {
     @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
-    let blocks: [ZagUpdateReleaseNotes.Block]
+    @StateObject private var content: ZagUpdateReleaseNotesContent
+    private var blocks: [ZagUpdateReleaseNotes.Block] { content.blocks }
     @State private var expanded = false
     @State private var measurements = ReleaseNotesMeasurements()
 
     init(markdown: String, version: String? = nil, build: String? = nil) {
-        blocks = ZagUpdateReleaseNotes(markdown: markdown).inlineBlocks(version: version, build: build)
+        // StateObject's creation closure is lazy: progress publications must not
+        // repeatedly parse the same signed release notes on the main thread.
+        _content = StateObject(wrappedValue: ZagUpdateReleaseNotesContent(markdown: markdown, version: version, build: build))
     }
 
     private var canExpand: Bool {
@@ -131,5 +134,12 @@ private struct ReleaseNotesMeasurementsKey: PreferenceKey {
         let next = nextValue()
         if let full = next.full { value.full = full }
         if let fourLines = next.fourLines { value.fourLines = fourLines }
+    }
+}
+
+private final class ZagUpdateReleaseNotesContent: ObservableObject {
+    let blocks: [ZagUpdateReleaseNotes.Block]
+    init(markdown: String, version: String?, build: String?) {
+        blocks = ZagUpdateReleaseNotes(markdown: markdown).inlineBlocks(version: version, build: build)
     }
 }

@@ -368,7 +368,8 @@ struct ZagSelfUpdateStatusView: View {
     }
 
     private var verifiedReplacementKey: String? {
-        guard coordinator.pendingInstallation == nil,
+        guard coordinator.installedIdentityVerified,
+              coordinator.pendingInstallation == nil,
               let verified = coordinator.lastVerifiedInstallation,
               verified.bundleIdentifier == (Bundle.main.bundleIdentifier ?? ""),
               verified.version == installedVersion,
@@ -380,7 +381,9 @@ struct ZagSelfUpdateStatusView: View {
     }
 
     private var shouldCelebrateVerifiedReplacement: Bool {
-        guard let key = verifiedReplacementKey else { return false }
+        guard coordinator.availableRelease == nil,
+              !releaseDownloadBusy, !installBusy, !coordinator.userUpdateInProgress, !gate4.isGate4Running,
+              let key = verifiedReplacementKey else { return false }
         return acknowledgedReplacement != key
     }
 
@@ -399,10 +402,6 @@ struct ZagSelfUpdateStatusView: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 
-            ZagSelfUpdateRainbowProgress(progress: 1)
-                .frame(height: 16)
-                .accessibilityLabel("Self-update fully verified")
-
             Label("Installation verified successfully", systemImage: "checkmark.shield.fill")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.green)
@@ -412,20 +411,17 @@ struct ZagSelfUpdateStatusView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            Button {
-                if let key = verifiedReplacementKey {
-                    acknowledgedReplacement = key
-                }
-            } label: {
-                Text("Continue to Zag Store")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            Text("Update completed. Please restart Zag Store.")
+                .font(.subheadline)
+                .multilineTextAlignment(.center)
+            ZagSelfUpdateActionControl(state: .confirmed) { showRestartGuidance = true }
+            Text("Shows instructions to close and reopen the app.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 16)
-        .padding(.horizontal, 6)
     }
 
     private var gate4ProgressTitle: String {
@@ -437,7 +433,7 @@ struct ZagSelfUpdateStatusView: View {
         case .rsd: return "Establishing installation service"
         case .installing: return "Uploading signed update"
         case .uploading: return "Transferring signed IPA"
-        case .staged: return "IPA verified — waiting for iOS handoff"
+        case .staged: return "IPA verified - waiting for iOS handoff"
         case .upgradeSubmitted: return "Ready to finish on Home Screen"
         case .progress(let value): return "Installing update — \(value)%"
         case .complete: return "Installer reported completion — verify after relaunch"
@@ -590,6 +586,8 @@ struct ZagSelfUpdateStatusView: View {
     @State private var preparedOfficialRelease: ZagSelfUpdateCoordinator.Release?
     @State private var showInstallConfirmation = false
     @State private var installBusy = false
+    @State private var showRestartGuidance = false
+    @State private var selectingUpdateCertificate = false
     @State private var installStatus = "No installation attempted"
 
     private static let preparationFailurePrefix = "Update could not be prepared: "
@@ -625,6 +623,63 @@ struct ZagSelfUpdateStatusView: View {
             let candidate = matches[0]
             return "Signed candidate: " + (candidate.version ?? "Unknown version")
         default: return "Multiple signed candidates — selection required"
+        }
+    }
+
+    private var updateActionState: ZagSelfUpdateActionState {
+        if gate4.isGate4Running {
+            return .progress(message: gate4ProgressTitle,
+                             fraction: gate4MeasuredPercentage.map { Double($0) / 100 })
+        }
+        if selectingUpdateCertificate { return .progress(message: "Selecting signing certificate…", fraction: nil) }
+        if releaseDownloadBusy || installBusy || coordinator.userUpdateInProgress {
+            return .progress(message: coordinator.preparationState.message,
+                             fraction: coordinator.preparationState.fraction)
+        }
+        if coordinator.pendingInstallation != nil { return .awaitingVerification }
+        switch coordinator.preparationState {
+        case .downloading, .verifying:
+            return .progress(message: coordinator.preparationState.message, fraction: coordinator.preparationState.fraction)
+        default: return .idle
+        }
+    }
+
+    private func beginUpdate(_ release: ZagSelfUpdateCoordinator.Release) {
+        guard !releaseDownloadBusy, !installBusy, !gate4.isGate4Running,
+              coordinator.pendingInstallation == nil else { return }
+        guard coordinator.beginUserUpdateOperation() else { return }
+        releaseDownloadBusy = true
+        selectingUpdateCertificate = true
+        let channel = ZagSelfUpdateCoordinator.UpdateChannel.selected
+        Task { @MainActor in
+            defer {
+                releaseDownloadBusy = false
+                installBusy = false
+                selectingUpdateCertificate = false
+                coordinator.finishUserUpdateOperation()
+            }
+            releaseCheckStatus = "Downloading and verifying update…"
+            do {
+                guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
+                    releaseCheckStatus = "Update cancelled — no signing certificate selected."
+                    return
+                }
+                selectingUpdateCertificate = false
+                guard channel == ZagSelfUpdateCoordinator.UpdateChannel.selected else { throw CancellationError() }
+                let signed = try await coordinator.prepareSignedUpdate(release, certificate: certificate)
+                guard channel == ZagSelfUpdateCoordinator.UpdateChannel.selected else { throw CancellationError() }
+                preparedCandidateUUID = signed.uuid
+                preparedOfficialRelease = release
+                installBusy = true
+                releaseCheckStatus = "IPA verified - waiting for iOS handoff"
+                // Update Now is the explicit user authorization. The existing
+                // upgrade-only installer retains all certificate/identity checks.
+                try await coordinator.installVerifiedSignedUpdate(signed, release: release,
+                                                                 userConfirmedSelfReplacement: true)
+                installStatus = "Installation handoff completed; reopen Zag Store to verify the installed version."
+            } catch {
+                releaseCheckStatus = Self.preparationFailurePrefix + error.localizedDescription
+            }
         }
     }
 
@@ -707,7 +762,7 @@ struct ZagSelfUpdateStatusView: View {
                 }
                 if let release = coordinator.availableRelease {
                     VStack(alignment: .leading, spacing: 18) {
-                        HStack(alignment: .top, spacing: 14) {
+                        HStack(alignment: .center, spacing: 14) {
                             if let icon = UIImage(named: "AppIcon") ?? ZagSelfUpdateStatusView.installedAppIcon {
                                 Image(uiImage: icon)
                                     .resizable()
@@ -744,52 +799,9 @@ struct ZagSelfUpdateStatusView: View {
                         ZagUpdateReleaseNotesView(markdown: release.releaseNotes ?? "Release notes are not available for this update.", version: release.version, build: release.build)
                             .id([release.version, release.build, release.ipaURL.absoluteString, release.releaseNotes ?? ""])
                         Divider()
-                        if releaseDownloadBusy || installBusy || gate4ShouldShowProgress {
-                            VStack(spacing: 8) {
-                                ZagSelfUpdateRainbowProgress(
-                                    progress: Double(gate4MeasuredPercentage ?? 0) / 100,
-                                    isIndeterminate: gate4MeasuredPercentage == nil
-                                )
-                                .frame(height: 14)
-                                Text(gate4ShouldShowProgress ? gate4ProgressTitle : "Preparing Update…")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, minHeight: 54)
-                        } else {
-                        Button {
-                            guard !releaseDownloadBusy else { return }
-                            releaseDownloadBusy = true
-                            Task { @MainActor in
-                                defer { releaseDownloadBusy = false }
-                                releaseCheckStatus = "Downloading and verifying update…"
-                                do {
-                                    guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
-                                        releaseCheckStatus = "Update cancelled — no signing certificate selected."
-                                        return
-                                    }
-                                    let signed = try await coordinator.prepareSignedUpdate(release, certificate: certificate)
-                                    preparedCandidateUUID = signed.uuid
-                                    preparedOfficialRelease = release
-                                    releaseCheckStatus = "Verified and signed. Confirm installation to continue."
-                                    showInstallConfirmation = true
-                                } catch {
-                                    releaseCheckStatus = Self.preparationFailurePrefix + error.localizedDescription
-                                }
-                            }
-                        } label: {
-                            Text("Update Now")
-                                .font(.system(size: 19, weight: .semibold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 54)
-                                .foregroundStyle(.white)
-                                .background(Color(uiColor: UIColor(displayP3Red: 0.0, green: 0.54, blue: 1.0, alpha: 1)), in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        // Starting again while an attempt is unconfirmed would
-                        // download and sign only to be refused at installation.
-                        .disabled(coordinator.pendingInstallation != nil)
-                        .opacity(coordinator.pendingInstallation != nil ? 0.5 : 1)
+                        ZagSelfUpdateActionControl(state: updateActionState,
+                                                   disabled: coordinator.pendingInstallation != nil) {
+                            beginUpdate(release)
                         }
 
                         Link("Learn More", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
@@ -1036,6 +1048,13 @@ struct ZagSelfUpdateStatusView: View {
             }
         } message: {
             Text("Zag Store will attempt an in-place upgrade using the selected signed update. iOS may close the app during replacement. No automatic uninstall or fresh-install fallback will be attempted. Continue only if you have a recovery copy.")
+        }
+        .alert("Restart Zag Store", isPresented: $showRestartGuidance) {
+            Button("Got It") {
+                if let key = verifiedReplacementKey { acknowledgedReplacement = key }
+            }
+        } message: {
+            Text("The update is verified. iOS does not allow Zag Store to restart itself. Open the App Switcher, swipe up Zag Store, then open it again.")
         }
         .navigationTitle("Zag Store Update")
         .navigationBarTitleDisplayMode(.inline)

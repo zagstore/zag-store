@@ -244,6 +244,7 @@ enum ZagSplashPreferences {
 /// colour-preserving still/native Core Animation path.
 private struct ZagAnimatedLaunchOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var updateCoordinator = ZagSelfUpdateCoordinator.shared
     @AppStorage(ZagSplashPreferences.enabledKey) private var enabled = true
     @AppStorage("ZagStore.splashSoundEnabled") private var soundEnabled = true
     @State private var opacity: Double = 1
@@ -267,7 +268,9 @@ private struct ZagAnimatedLaunchOverlay: View {
                             soundEnabled: soundEnabled,
                             skipRequested: skipVideoRequested,
                             onExitReady: beginVideoFade,
-                            onFinished: finishVideo
+                            onFinished: finishVideo,
+                            postUpdateMessage: { updateCoordinator.postUpdateMessage },
+                            onPostUpdateMessageDisplayed: acknowledgePostUpdateMessage
                         )
                         // A transparent full-screen gesture surface: no Skip
                         // affordance competes with the original Z artwork.
@@ -281,7 +284,9 @@ private struct ZagAnimatedLaunchOverlay: View {
                     } else {
                         ZagSplashAnimationStage(
                             reduceMotion: reduceMotion,
-                            exiting: exitRequested
+                            exiting: exitRequested,
+                            postUpdateMessage: { updateCoordinator.postUpdateMessage },
+                            onPostUpdateMessageDisplayed: acknowledgePostUpdateMessage
                         )
                     }
                 }
@@ -362,6 +367,11 @@ private struct ZagAnimatedLaunchOverlay: View {
             ))
             complete()
         }
+    }
+
+    private func acknowledgePostUpdateMessage(_ message: ZagPostUpdateMessage) {
+        guard opacity > 0.5, !dismissed, !exitRequested, !videoFadeStarted else { return }
+        updateCoordinator.acknowledgePostUpdateMessageDisplayed(message)
     }
 
     private func complete() {

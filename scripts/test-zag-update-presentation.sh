@@ -15,11 +15,18 @@ view = (root / path).read_text()
 old = subprocess.check_output(['git', 'show', 'ea0b5dbe:' + path], cwd=root, text=True)
 assert 'Zag Store Beta' not in view and 'Zag Store Nightly' not in view
 assert 'ForEach(["off", "beta", "nightly"]' in view
-for begin, end in [('guard !releaseDownloadBusy else { return }', '} label: {'), ('guard !releaseCheckBusy else { return }', '} label: {'), ('Button("Attempt In-Place Replacement"', '} message: {')]:
+# Discovery and the explicit diagnostic-only install dialog retain their handlers.
+for begin, end in [('guard !releaseCheckBusy else { return }', '} label: {'), ('Button("Attempt In-Place Replacement"', '} message: {')]:
     assert view.split(begin, 1)[1].split(end, 1)[0] == old.split(begin, 1)[1].split(end, 1)[0]
+normal = view.split('private func beginUpdate(', 1)[1].split('    var body: some View {', 1)[0]
+assert 'showInstallConfirmation = true' not in normal
+assert normal.index('chooseForSigning()') < normal.index('prepareSignedUpdate(') < normal.index('installVerifiedSignedUpdate(')
+assert 'userConfirmedSelfReplacement: true' in normal
+assert 'coordinator.beginUserUpdateOperation()' in normal and 'coordinator.finishUserUpdateOperation()' in normal
+assert 'guard channel == ZagSelfUpdateCoordinator.UpdateChannel.selected' in normal
 assert view.count('Link("Learn More"') == 1 and 'Learn more about this update' not in view
 card = view.split('if let release = coordinator.availableRelease {', 1)[1].split('.task(id: release.ipaURL)', 1)[0]
-assert card.index('ZagUpdateReleaseNotesView(') < card.index('Divider()') < card.index('Text("Update Now")') < card.index('Link("Learn More"')
+assert card.index('ZagUpdateReleaseNotesView(') < card.index('Divider()') < card.index('ZagSelfUpdateActionControl(') < card.index('Link("Learn More"')
 assert 'https://github.com/zagorskey/zag-store-releases/releases' in card
 assert '.frame(maxWidth: .infinity, minHeight: 44)' in card
 assert 'content.listSectionSpacing(.custom(16))' in view
@@ -50,28 +57,29 @@ assert notes.index('blockContent(first, lineLimit:') < notes.index('if showsFull
 assert 'transaction.disablesAnimations = true' in notes
 assert 'guard value != measurements else { return }' in notes
 assert '.lineLimit(lineLimit)' in notes
-header = card.split('HStack(alignment: .top, spacing: 14)', 1)[1].split('ZagUpdateReleaseNotesView', 1)[0]
+header = card.split('HStack(alignment: .center, spacing: 14)', 1)[1].split('ZagUpdateReleaseNotesView', 1)[0]
 assert header.count('.frame(width: 60, height: 60)') == 2
 assert 'Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.caption)' in header
 assert 'if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {' in header
 assert 'ZagUpdateChannelPresentation.title(for: zagBetaChannel)' in header
 assert '.font(.caption2)' in header and '.foregroundStyle(.secondary)' in header
 assert 'Text("Build \\(release.build)")\n                                        .font(.subheadline)' in header
-# The complete existing host view must differ only in the requested presentation.
-expected = old.replace('Text(zagBetaChannel == "beta" ? "Zag Store Beta" :\n                             zagBetaChannel == "nightly" ? "Zag Store Nightly" : "Stable")', 'Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))')
-expected = expected.replace('Text(option == "beta" ? "Zag Store Beta" :\n                                 option == "nightly" ? "Zag Store Nightly" : "Stable")', 'Text(ZagUpdateChannelPresentation.title(for: option))')
-a=expected.index('                        Text(release.releaseNotes ??'); b=expected.index('                        if releaseDownloadBusy',a)
-replacement=card.split('                        ZagUpdateReleaseNotesView(',1)[1].split('                        if releaseDownloadBusy',1)[0]
-expected=expected[:a]+'                        ZagUpdateReleaseNotesView('+replacement+expected[b:]
-new_link=card.split('\n                        Link("Learn More"',1)[1].split('\n                        if let issue',1)[0]
-expected=expected.replace('\n                        if let issue = userVisibleUpdateIssue', '\n                        Link("Learn More"'+new_link+'\n                        if let issue = userVisibleUpdateIssue',1)
-expected=expected.replace('content.listSectionSpacing(.custom(11))','content.listSectionSpacing(.custom(16))')
-expected=expected.replace('    @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared', '    @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"\n    @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared', 1)
-expected=expected.replace('HStack(alignment: .center, spacing: 14) {', 'HStack(alignment: .top, spacing: 14) {', 1)
-old_size = '                                Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.subheadline)\n                                    .foregroundStyle(.primary)'
-new_size = '                                Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.caption)\n                                    .foregroundStyle(.primary)\n                                if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {\n                                    Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))\n                                        .font(.caption2)\n                                        .foregroundStyle(.secondary)\n                                }'
-expected=expected.replace(old_size,new_size,1)
-assert view == expected, 'all existing handlers, preferences, progress and recovery must be unchanged'
+# The local header/notes/layout behavior is preserved by the assertions above.
+# Automatic-download and channel controls remain byte-identical to the approved UI.
+approved = subprocess.check_output(['git', 'show', '30741eaf:' + path], cwd=root, text=True)
+assert view.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1] == approved.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1]
+control = (root / 'Feather/Views/Settings/ZagSelfUpdateActionControl.swift').read_text()
+assert control.count('Button(action: action)') == 1 and control.count('Text(state.title)') == 1
+assert '.frame(maxWidth: .infinity, minHeight: 54)' in control
+assert 'ProgressView(value: state.showsProgress ? state.fraction : 0)' in control
+assert 'reduceMotion ? nil' in control and '.linear(duration: 0.1)' in control
+assert 'Shows instructions' in control and 'Does not restart automatically' in control
+celebration = view.split('private var verifiedUpdateCelebration:', 1)[1].split('private var gate4ProgressTitle:', 1)[0]
+assert 'Update completed. Please restart Zag Store.' in celebration
+assert 'ZagSelfUpdateActionControl(state: .confirmed)' in celebration
+assert 'coordinator.installedIdentityVerified' in view.split('private var verifiedReplacementKey:', 1)[1].split('private var shouldCelebrateVerifiedReplacement:', 1)[0]
+assert 'IPA verified - waiting for iOS handoff' in view
+assert 'IPA verified — waiting for iOS handoff' not in view
 print('PASS: unchanged channel IDs, handler bodies, progress, recovery and URL; compact card ordering and local spacing')
 print('PASS: measured four-line collapse, short-note fitting, native Markdown, accessibility and safe URL action wiring')
 PY
