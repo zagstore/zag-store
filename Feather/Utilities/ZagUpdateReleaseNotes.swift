@@ -87,6 +87,39 @@ struct ZagUpdateReleaseNotes {
         return Array(blocks.dropFirst())
     }
 
+    /// The user-facing part of signed release notes: the introduction under
+    /// the title and the "What's New" section, without its heading. Download,
+    /// Updating, Source and any other section are left out. Notes without
+    /// sections are kept whole, minus the title. Nil when nothing remains.
+    static func whatsNew(from markdown: String?) -> String? {
+        guard let markdown else { return nil }
+        var kept: [String] = []
+        var inSection = false
+        var sawSection = false
+        for line in markdown.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("# ") || trimmed == "#" { continue }
+            if let level = sectionLevel(trimmed), level == 2 {
+                sawSection = true
+                let title = trimmed.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
+                    .replacingOccurrences(of: "\u{2019}", with: "'").lowercased()
+                inSection = title.hasPrefix("what's new")
+                continue
+            }
+            if !sawSection || inSection { kept.append(line) }
+        }
+        let text = kept.joined(separator: "\n")
+            .replacingOccurrences(of: "\n\n\n+", with: "\n\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
+    private static func sectionLevel(_ line: String) -> Int? {
+        let hashes = line.prefix(while: { $0 == "#" }).count
+        guard (2...6).contains(hashes), line.dropFirst(hashes).first == " " else { return nil }
+        return hashes
+    }
+
     static func isSafeWebURL(_ url: URL) -> Bool {
         guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
               ["https", "http"].contains(parts.scheme?.lowercased() ?? ""),
