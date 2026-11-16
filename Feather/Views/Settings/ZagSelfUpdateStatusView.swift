@@ -646,8 +646,7 @@ struct ZagSelfUpdateStatusView: View {
                     HStack {
                         Text("Release Channel")
                         Spacer()
-                        Text(zagBetaChannel == "beta" ? "Zag Store Beta" :
-                             zagBetaChannel == "nightly" ? "Zag Store Nightly" : "Stable")
+                        Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -736,12 +735,9 @@ struct ZagSelfUpdateStatusView: View {
                             }
                             Spacer(minLength: 0)
                         }
-                        Text(release.releaseNotes ?? "Release notes are not available for this update.")
-                            .font(.body)
-                        Link("Learn more about this update", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
-                            .font(.subheadline)
-                            .foregroundStyle(.primary)
-                            .underline()
+                        ZagUpdateReleaseNotesView(markdown: release.releaseNotes ?? "Release notes are not available for this update.")
+                            .id([release.version, release.build, release.ipaURL.absoluteString, release.releaseNotes ?? ""])
+                        Divider()
                         if releaseDownloadBusy || installBusy || gate4ShouldShowProgress {
                             VStack(spacing: 8) {
                                 ZagSelfUpdateRainbowProgress(
@@ -789,6 +785,11 @@ struct ZagSelfUpdateStatusView: View {
                         .disabled(coordinator.pendingInstallation != nil)
                         .opacity(coordinator.pendingInstallation != nil ? 0.5 : 1)
                         }
+
+                        Link("Learn More", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
+                            .font(.body)
+                            .foregroundStyle(.tint)
+                            .frame(maxWidth: .infinity, minHeight: 44)
 
                         if let issue = userVisibleUpdateIssue {
                             Text(issue)
@@ -1136,8 +1137,7 @@ private struct ZagStoreUpdateBetaPreferencesView: View {
                         ZagSelfUpdateCoordinator.shared.preferencesChanged()
                     } label: {
                         HStack {
-                            Text(option == "beta" ? "Zag Store Beta" :
-                                 option == "nightly" ? "Zag Store Nightly" : "Stable")
+                            Text(ZagUpdateChannelPresentation.title(for: option))
                                 .foregroundStyle(.primary)
                             Spacer()
                             if channel == option {
@@ -1162,7 +1162,7 @@ private struct ZagSelfUpdateSectionSpacing: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(iOS 17.0, *) {
-            content.listSectionSpacing(.custom(11))
+            content.listSectionSpacing(.custom(8))
         } else {
             content
         }
