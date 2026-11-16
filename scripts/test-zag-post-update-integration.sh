@@ -19,9 +19,9 @@ assert 'expectedContentLength' in package and 'ZagUpdateProgressSampler' in pack
 view=read('Feather/Views/Settings/ZagSelfUpdateStatusView.swift')
 assert 'IPA verified - waiting for iOS handoff' in view
 assert 'IPA verified — waiting for iOS handoff' not in view
-assert view.count('Update completed. Please restart Zag Store.') == 1
+assert read('Feather/Utilities/ZagUpdateProgressPresentation.swift').count('Update completed. Please restart Zag Store.') == 1
 assert 'coordinator.installedIdentityVerified' in view
-assert 'Restart guidance' in view or 'App Switcher' in view
+assert 'presentUpdateGuidance' in view and 'Text(updateGuidance)' in view
 for p in ['Feather/Views/TabView/Bars/ZagCinematicSplashView.swift','Feather/Views/TabView/Bars/ZagSplashAnimationStage.swift']:
     s=read(p)
     assert 'signatureMessage?.tokens ?? ["Sideloading", "and", "beyond."]' in s

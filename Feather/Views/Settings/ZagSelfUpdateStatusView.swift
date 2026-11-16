@@ -5,9 +5,8 @@ import CryptoKit
 import AltSourceKit
 import UniformTypeIdentifiers
 
-/// Dedicated, non-destructive self-update status screen.
-/// Installation remains disabled until signature authorization and recovery
-/// are implemented and verified. Never route self-updates through Library.
+/// Dedicated upgrade-only self-update screen. Preparation and handoff retain
+/// certificate, signed-identity and recovery checks. Never route through Library.
 struct ZagSelfUpdateStatusView: View {
     @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared
@@ -411,10 +410,7 @@ struct ZagSelfUpdateStatusView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            Text("Update completed. Please restart Zag Store.")
-                .font(.subheadline)
-                .multilineTextAlignment(.center)
-            ZagSelfUpdateActionControl(state: .confirmed) { showRestartGuidance = true }
+            ZagSelfUpdateActionControl(state: .confirmed) { presentUpdateGuidance(.confirmed) }
             Text("Shows instructions to close and reopen the app.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -427,15 +423,15 @@ struct ZagSelfUpdateStatusView: View {
     private var gate4ProgressTitle: String {
         switch gate4.gate4State {
         case .idle: return "Waiting to start"
-        case .starting: return "Preparing installation"
+        case .starting: return "Preparing installation..."
         case .pairVerified: return "Device pairing verified"
-        case .tunnel: return "Connecting to device"
-        case .rsd: return "Establishing installation service"
-        case .installing: return "Uploading signed update"
-        case .uploading: return "Transferring signed IPA"
+        case .tunnel: return "Connecting to device..."
+        case .rsd: return "Connecting to installation service..."
+        case .installing: return "Transferring signed IPA..."
+        case .uploading: return "Transferring signed IPA..."
         case .staged: return "IPA verified - waiting for iOS handoff"
-        case .upgradeSubmitted: return "Ready to finish on Home Screen"
-        case .progress(let value): return "Installing update — \(value)%"
+        case .upgradeSubmitted: return "Update handed off to iOS. Reopen Zag Store after installation."
+        case .progress: return "Installing update..."
         case .complete: return "Installer reported completion — verify after relaunch"
         case .failed(let reason): return "Installation error: \(reason)"
         }
@@ -587,6 +583,7 @@ struct ZagSelfUpdateStatusView: View {
     @State private var showInstallConfirmation = false
     @State private var installBusy = false
     @State private var showRestartGuidance = false
+    @State private var updateGuidance = ""
     @State private var selectingUpdateCertificate = false
     @State private var installStatus = "No installation attempted"
 
@@ -627,21 +624,33 @@ struct ZagSelfUpdateStatusView: View {
     }
 
     private var updateActionState: ZagSelfUpdateActionState {
-        if gate4.isGate4Running {
-            return .progress(message: gate4ProgressTitle,
-                             fraction: gate4MeasuredPercentage.map { Double($0) / 100 })
+        // Only a pending self-update may interpret the shared installer's events.
+        if coordinator.pendingInstallation != nil {
+            if coordinator.handoffState == .reportedComplete { return .handedOff }
+            if coordinator.handoffState == .uncertain { return .awaitingVerification }
+            if case .staged = gate4.gate4State { return .awaitingHandoff }
+            if case .upgradeSubmitted = gate4.gate4State { return .handedOff }
+            if gate4.isGate4Running {
+                return .progress(message: gate4ProgressTitle,
+                                 fraction: gate4MeasuredPercentage.map { Double($0) / 100 })
+            }
+            return .awaitingVerification
         }
-        if selectingUpdateCertificate { return .progress(message: "Selecting signing certificate…", fraction: nil) }
+        if selectingUpdateCertificate { return .progress(message: "Selecting signing certificate...", fraction: nil) }
         if releaseDownloadBusy || installBusy || coordinator.userUpdateInProgress {
             return .progress(message: coordinator.preparationState.message,
                              fraction: coordinator.preparationState.fraction)
         }
-        if coordinator.pendingInstallation != nil { return .awaitingVerification }
         switch coordinator.preparationState {
         case .downloading, .verifying:
             return .progress(message: coordinator.preparationState.message, fraction: coordinator.preparationState.fraction)
         default: return .idle
         }
+    }
+
+    private func presentUpdateGuidance(_ state: ZagSelfUpdateActionState) {
+        updateGuidance = state.guidance
+        showRestartGuidance = true
     }
 
     private func beginUpdate(_ release: ZagSelfUpdateCoordinator.Release) {
@@ -716,6 +725,11 @@ struct ZagSelfUpdateStatusView: View {
                     Text("Zag Store could not confirm that the last update was installed. If iOS is still finishing it, wait and reopen Zag Store. Otherwise clear it and try again.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    if coordinator.availableRelease == nil {
+                        ZagSelfUpdateActionControl(state: updateActionState) {
+                            presentUpdateGuidance(updateActionState)
+                        }
+                    }
                     Button("Clear and Try Again", role: .destructive) {
                         showClearPendingConfirmation = true
                     }
@@ -801,7 +815,11 @@ struct ZagSelfUpdateStatusView: View {
                         Divider()
                         ZagSelfUpdateActionControl(state: updateActionState,
                                                    disabled: coordinator.pendingInstallation != nil) {
-                            beginUpdate(release)
+                            if updateActionState.offersGuidance {
+                                presentUpdateGuidance(updateActionState)
+                            } else {
+                                beginUpdate(release)
+                            }
                         }
 
                         Link("Learn More", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
@@ -1049,12 +1067,12 @@ struct ZagSelfUpdateStatusView: View {
         } message: {
             Text("Zag Store will attempt an in-place upgrade using the selected signed update. iOS may close the app during replacement. No automatic uninstall or fresh-install fallback will be attempted. Continue only if you have a recovery copy.")
         }
-        .alert("Restart Zag Store", isPresented: $showRestartGuidance) {
+        .alert("Installation and Reopening", isPresented: $showRestartGuidance) {
             Button("Got It") {
                 if let key = verifiedReplacementKey { acknowledgedReplacement = key }
             }
         } message: {
-            Text("The update is verified. iOS does not allow Zag Store to restart itself. Open the App Switcher, swipe up Zag Store, then open it again.")
+            Text(updateGuidance)
         }
         .navigationTitle("Zag Store Update")
         .navigationBarTitleDisplayMode(.inline)
@@ -1062,54 +1080,16 @@ struct ZagSelfUpdateStatusView: View {
 }
 
 
-// The rotating spectrum and five-second linear animation are intentionally
-// identical to ZagRepositoryFeaturedPill in SourceAppsView.swift.
+// Diagnostics reuse the same spectrum renderer as the primary morphing control.
 private struct ZagSelfUpdateRainbowProgress: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var rotating = false
-
     let progress: Double
     var isIndeterminate = false
 
-    private let spectrum = ZagSelfUpdateSpectrum.colors
-
     var body: some View {
-        GeometryReader { geometry in
-            let fraction = isIndeterminate ? 1 : min(max(progress, 0), 1)
-
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.primary.opacity(0.10))
-
-                Capsule()
-                    .fill(
-                        LinearGradient(
-                            colors: spectrum,
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .frame(width: geometry.size.width * fraction)
-            }
-            .overlay {
-                Capsule()
-                    .strokeBorder(
-                        AngularGradient(
-                            colors: spectrum,
-                            center: .center,
-                            angle: .degrees(rotating ? 360 : 0)
-                        ),
-                        lineWidth: 1.5
-                    )
-            }
-        }
-        .animation(.easeInOut(duration: 0.35), value: progress)
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(.linear(duration: 5).repeatForever(autoreverses: false)) {
-                rotating = true
-            }
-        }
+        ZagUpdateSpectrumSurface(morph: 1, progress: isIndeterminate ? 1 : progress,
+                                 theme: .accentColor, moving: true)
+            .animation(reduceMotion ? nil : .linear(duration: 0.1), value: progress)
     }
 }
 

@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// One button, label and capsule throughout the operation. The native progress
-/// meter interpolates only between measured fractions, never predicted progress.
+/// A persistent button/surface in a stable slot. Its visible capsule compresses
+/// into the original spectrum track and expands for every actionable outcome.
 struct ZagSelfUpdateActionControl: View {
     let state: ZagSelfUpdateActionState
     var disabled = false
@@ -11,46 +11,53 @@ struct ZagSelfUpdateActionControl: View {
     @ScaledMetric(relativeTo: .headline) private var actionFontSize = 19.0
 
     private var theme: Color { ZagWideGamutTint.color(hex: themeColorHex) }
-    private var morphAnimation: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.24) }
+    private var morphAnimation: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.42) }
 
     var body: some View {
-        Button(action: action) {
-            Text(state.title)
-                .font(state.showsProgress ? .footnote : .system(size: actionFontSize, weight: .semibold))
-                .foregroundStyle(state.showsProgress ? Color.primary : Color.white)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, state.showsProgress ? 20 : 12)
-                .frame(maxWidth: .infinity, minHeight: 54)
-                .transaction { $0.animation = nil }
-                .background {
-                    ZStack {
-                        Capsule().fill(theme)
-                            .opacity(state.showsProgress ? 0 : 1)
-                        Capsule().fill(.thinMaterial)
-                            .opacity(state.showsProgress ? 1 : 0)
+        VStack(spacing: 8) {
+            Button(action: action) {
+                // A single stationary label. Busy-phase messages belong below
+                // the bar; they never resize or slide the button's text baseline.
+                Text(state.showsProgress ? "Update Now" : state.title)
+                    .font(.system(size: actionFontSize, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .opacity(state.showsProgress ? 0 : 1)
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: state.showsProgress)
+                    .background {
+                        ZagUpdateSpectrumSurface(morph: state.showsProgress ? 1 : 0,
+                                                 progress: state.fraction ?? 1,
+                                                 theme: theme, moving: state.showsProgress)
+                            .animation(morphAnimation, value: state.showsProgress)
+                            .animation(reduceMotion ? nil : .linear(duration: 0.1), value: state.fraction)
                     }
-                    .animation(morphAnimation, value: state.showsProgress)
-                }
-                .overlay(alignment: .bottom) {
-                    ProgressView(value: state.showsProgress ? state.fraction : 0)
-                        .progressViewStyle(.linear)
-                        .tint(theme)
-                        .frame(height: 4)
-                        .padding(.horizontal, 18)
-                        .padding(.bottom, 8)
-                        .opacity(state.showsProgress ? 1 : 0)
-                        .animation(morphAnimation, value: state.showsProgress)
-                        .animation(reduceMotion ? nil : .linear(duration: 0.1), value: state.fraction)
-                        .accessibilityHidden(true)
-                }
-                .contentShape(Capsule())
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(state.showsProgress || (disabled && !state.offersGuidance))
+            .accessibilityLabel(state.title)
+            .accessibilityValue(state.fraction.map { "\(Int($0 * 100)) percent" } ?? "")
+            .accessibilityHint(state.offersGuidance ? "Shows manual installation and reopening instructions. Does not restart automatically." : "")
+
+            // Reserve the same status area in idle, busy and terminal states.
+            // Dynamic Type can grow it, without changing the capsule's centre.
+            ZStack(alignment: .top) {
+                Text("Update handed off to iOS. Reopen Zag Store after installation.")
+                    .hidden().accessibilityHidden(true)
+                Text(state.status ?? " ")
+                    .frame(maxWidth: .infinity, alignment: .top)
+                    .transaction { $0.animation = nil }
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(state.status ?? "")
+            .accessibilityHidden(state.status == nil)
         }
-        .buttonStyle(.plain)
-        .disabled(disabled || state.showsProgress)
-        .accessibilityLabel(state.title)
-        .accessibilityValue(state.fraction.map { "\(Int($0 * 100)) percent" } ?? (state.showsProgress ? "In progress" : ""))
-        .accessibilityHint(state == .confirmed ? "Shows instructions for closing and reopening Zag Store. Does not restart automatically." : "")
     }
 }
