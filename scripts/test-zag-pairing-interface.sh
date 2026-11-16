@@ -141,7 +141,15 @@ assert '.font(ZagInstallationStatusStyle.font)' in compact
 old_mobile = subprocess.check_output(['git', 'show', '8c26dda6:Feather/Views/Settings/Installation/ZagMobileDataFixView.swift'], cwd=root, text=True)
 old_destination = old_mobile.split('/// Setup and verification', 1)[1]
 new_destination = mobile.split('/// Setup and verification', 1)[1]
-assert new_destination.replace('ZagMobileDataFixStatusLabel(status: status, compact: true)', 'ZagMobileDataFixStatusLabel(status: status)') == old_destination
+normalized_destination = new_destination.replace('ZagMobileDataFixStatusLabel(status: status, compact: true)', 'ZagMobileDataFixStatusLabel(status: status)')
+normalized_destination = normalized_destination.replace('Text(verified)\n                                .font(ZagInstallationStatusStyle.font)\n                                .foregroundStyle(.secondary)', 'Text(verified).foregroundStyle(.secondary)')
+assert normalized_destination == old_destination
+assert new_destination.count('Text(verified)\n                                .font(ZagInstallationStatusStyle.font)') == 2
+# Exactly the two requested visual corrections relative to this checkpoint.
+prior_guide = subprocess.check_output(['git', 'show', '7df4c00b:Feather/Views/Settings/Installation/ZagDeveloperModeGuidanceView.swift'], cwd=root, text=True)
+assert guide == prior_guide.replace('.font(.footnote.weight(.semibold))\n                            .foregroundStyle(.secondary)', '.font(.caption.weight(.semibold))\n                            .foregroundStyle(.tertiary)', 1)
+settings = (root / 'Feather/Views/Settings/SettingsView.swift').read_text()
+assert '.font(.caption.weight(.semibold))\n\t\t\t\t\t\t\t.foregroundStyle(.tertiary)' in settings
 assert 'case .verificationRequired: return ("questionmark.circle.fill", .orange)' in mobile
 for competing in ['disclosureGroupStyle', 'withAnimation', '.animation(', '.transition(', 'if expanded {']:
     assert competing not in guide

@@ -84,8 +84,8 @@ struct ZagDeveloperModeGuidanceView: View {
                     Color.clear.preference(key: DeveloperModeRowRect.self, value: geometry[anchor])
                     if indicatorRow != nil {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
                             .frame(width: 22, alignment: .center)
                             .position(x: geometry.size.width - 11, y: geometry[anchor].midY)
                     }

@@ -103,12 +103,16 @@ struct ZagMobileDataFixView: View {
 						HStack {
 							Text("Last Verified")
 							Spacer()
-							Text(verified).foregroundStyle(.secondary)
+							Text(verified)
+                                .font(ZagInstallationStatusStyle.font)
+                                .foregroundStyle(.secondary)
 						}
 						.lineLimit(1)
 						VStack(alignment: .leading, spacing: 2) {
 							Text("Last Verified")
-							Text(verified).foregroundStyle(.secondary)
+							Text(verified)
+                                .font(ZagInstallationStatusStyle.font)
+                                .foregroundStyle(.secondary)
 						}
 					}
 				}
