@@ -2458,7 +2458,15 @@ private struct ZagActivityPage: View {
                 )
                 .frame(width: 0, height: 0)
             }
-            .onAppear(perform: probeSystemDictation)
+            .onAppear {
+                #if DEBUG
+                ZagLogger.shared.info("Navigation", "Activity appeared; probing dictation")
+                #endif
+                probeSystemDictation()
+                #if DEBUG
+                ZagLogger.shared.info("Navigation", "Activity ready")
+                #endif
+            }
             .sheet(isPresented: $showStatistics) {
                 NavigationStack {
                     List {

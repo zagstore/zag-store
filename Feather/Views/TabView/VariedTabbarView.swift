@@ -175,6 +175,9 @@ struct VariedTabbarView: View {
         guard let tab = TabEnum(rawValue: route.tab) else { return }
         if ZagDockConfiguration.tabs.contains(tab) {
             linkedTab = nil
+        } else if linkedTab == tab, route == .activity {
+            // Reuse an already-presented hidden destination without another sheet.
+            ZagStoreRouter.consume(route)
         } else {
             linkedTab = tab
         }
@@ -433,6 +436,7 @@ private struct ZagCircularToolbarBorder: ViewModifier {
 struct ZagProfileToolbarButton: View {
 	@StateObject private var updateManager = UpdateManager.shared
 	@State private var isAccountPresenting = false
+    @State private var activityHandoff = ZagAccountActivityHandoff()
 	@State private var avatarRevision = UUID()
 	var body: some View {
 		Button {
@@ -453,7 +457,21 @@ struct ZagProfileToolbarButton: View {
 		.onReceive(NotificationCenter.default.publisher(for: .zagProfileAvatarDidChange)) { _ in
 			avatarRevision = UUID()
 		}
-		.sheet(isPresented: $isAccountPresenting) { ZagAccountPopup(onClose: { isAccountPresenting = false }) }
+        .sheet(isPresented: $isAccountPresenting, onDismiss: {
+            guard let route = activityHandoff.takeAfterDismissal() else { return }
+            #if DEBUG
+            ZagLogger.shared.info("Navigation", "Account dismissed; routing Activity")
+            #endif
+            _ = ZagStoreRouter.open(route.url)
+        }) {
+            ZagAccountPopup(onClose: { isAccountPresenting = false }, onOpenActivity: {
+                #if DEBUG
+                ZagLogger.shared.info("Navigation", "Account Activity requested")
+                #endif
+                activityHandoff.request()
+                isAccountPresenting = false
+            })
+        }
 	}
 }
 
@@ -503,6 +521,7 @@ struct ZagGlobalProfileAvatar: View {
 
 struct ZagAccountPopup: View {
     let onClose: () -> Void
+    let onOpenActivity: () -> Void
     @ObservedObject private var updateManager = UpdateManager.shared
     @ObservedObject private var selfUpdateCoordinator = ZagSelfUpdateCoordinator.shared
     @Environment(\.dismiss) private var dismiss
@@ -512,7 +531,7 @@ struct ZagAccountPopup: View {
     @State private var accountPath: [AccountDestination] = []
 
     private enum AccountDestination: Hashable {
-        case profile, updates, certificates, installation, signing, notifications, devices, activity, selfUpdate, settings
+        case profile, updates, certificates, installation, signing, notifications, devices, selfUpdate, settings
     }
 
     private var themeTint: Color { Color(hex: themeColorHex) }
@@ -582,8 +601,8 @@ struct ZagAccountPopup: View {
                     NavigationLink(value: AccountDestination.devices) {
                         Text("Devices")
                     }
-                    NavigationLink(value: AccountDestination.activity) {
-                        Text("Activity")
+                    Button(action: onOpenActivity) {
+                        Text("Activity").foregroundStyle(.primary)
                     }
                     NavigationLink(value: AccountDestination.notifications) {
                         Text("Notifications")
@@ -641,7 +660,6 @@ struct ZagAccountPopup: View {
                     case .signing: ConfigurationView()
                     case .notifications: ZagAccountNotificationsView()
                     case .devices: ZagDevicesPage().tint(themeTint)
-                    case .activity: TabEnum.view(for: .activity).tint(themeTint)
                     case .selfUpdate: ZagSelfUpdateStatusView()
                     case .settings:
                         SettingsView(
