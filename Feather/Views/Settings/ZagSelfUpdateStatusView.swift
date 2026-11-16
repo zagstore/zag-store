@@ -707,7 +707,7 @@ struct ZagSelfUpdateStatusView: View {
                 }
                 if let release = coordinator.availableRelease {
                     VStack(alignment: .leading, spacing: 18) {
-                        HStack(alignment: .center, spacing: 14) {
+                        HStack(alignment: .top, spacing: 14) {
                             if let icon = UIImage(named: "AppIcon") ?? ZagSelfUpdateStatusView.installedAppIcon {
                                 Image(uiImage: icon)
                                     .resizable()
@@ -731,12 +731,17 @@ struct ZagSelfUpdateStatusView: View {
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.8)
                                 Text(releaseDownloadSize ?? "Checking download size…")
-                                    .font(.subheadline)
+                                    .font(.caption)
                                     .foregroundStyle(.primary)
+                                if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {
+                                    Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             Spacer(minLength: 0)
                         }
-                        ZagUpdateReleaseNotesView(markdown: release.releaseNotes ?? "Release notes are not available for this update.")
+                        ZagUpdateReleaseNotesView(markdown: release.releaseNotes ?? "Release notes are not available for this update.", version: release.version, build: release.build)
                             .id([release.version, release.build, release.ipaURL.absoluteString, release.releaseNotes ?? ""])
                         Divider()
                         if releaseDownloadBusy || installBusy || gate4ShouldShowProgress {

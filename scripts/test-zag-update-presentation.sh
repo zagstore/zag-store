@@ -31,7 +31,7 @@ assert '16 × 3 = 48 target pixels' in reference
 assert 765 - 717 == 48 and (765 - 717) / 3 == 16
 assert 852 - 828 == 24 and (852 - 828) / 3 == 8
 notes = (root / 'Feather/Views/Settings/ZagUpdateReleaseNotesView.swift').read_text()
-assert '.lineLimit(4)' in notes and 'Text("Line\\nLine\\nLine\\nLine")' in notes
+assert 'blockContent(first, lineLimit: showsFullContent ? nil : 4)' in notes and 'Text("Line\\nLine\\nLine\\nLine")' in notes
 assert '@State private var expanded = false' in notes and '.onAppear { expanded = false }' in notes
 assert 'if canExpand {' in notes and 'return full > fourLines + 0.5' in notes
 assert 'ScrollView' not in notes and '.accessibilityValue(expanded ? "Expanded" : "Collapsed")' in notes
@@ -43,7 +43,20 @@ assert '.foregroundStyle(ZagWideGamutTint.color(hex: themeColorHex))' in notes
 assert '@AppStorage("Feather.userTintColor")' in notes and '@AppStorage("Feather.userTintColor")' in view
 assert '.foregroundStyle(ZagWideGamutTint.color(hex: themeColorHex))' in card
 assert '.tint(ZagWideGamutTint.color(hex: themeColorHex))' in card
-assert 'reduceMotion ? nil' in notes
+assert 'withAnimation' not in notes and '.transition(' not in notes
+assert 'Text(document.preview)' not in notes
+assert 'if let first = blocks.first {' in notes and 'ForEach(Array(blocks.dropFirst()))' in notes
+assert notes.index('blockContent(first, lineLimit:') < notes.index('if showsFullContent {')
+assert 'transaction.disablesAnimations = true' in notes
+assert 'guard value != measurements else { return }' in notes
+assert '.lineLimit(lineLimit)' in notes
+header = card.split('HStack(alignment: .top, spacing: 14)', 1)[1].split('ZagUpdateReleaseNotesView', 1)[0]
+assert header.count('.frame(width: 60, height: 60)') == 2
+assert 'Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.caption)' in header
+assert 'if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {' in header
+assert 'ZagUpdateChannelPresentation.title(for: zagBetaChannel)' in header
+assert '.font(.caption2)' in header and '.foregroundStyle(.secondary)' in header
+assert 'Text("Build \\(release.build)")\n                                        .font(.subheadline)' in header
 # The complete existing host view must differ only in the requested presentation.
 expected = old.replace('Text(zagBetaChannel == "beta" ? "Zag Store Beta" :\n                             zagBetaChannel == "nightly" ? "Zag Store Nightly" : "Stable")', 'Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))')
 expected = expected.replace('Text(option == "beta" ? "Zag Store Beta" :\n                                 option == "nightly" ? "Zag Store Nightly" : "Stable")', 'Text(ZagUpdateChannelPresentation.title(for: option))')
@@ -54,6 +67,10 @@ new_link=card.split('\n                        Link("Learn More"',1)[1].split('\
 expected=expected.replace('\n                        if let issue = userVisibleUpdateIssue', '\n                        Link("Learn More"'+new_link+'\n                        if let issue = userVisibleUpdateIssue',1)
 expected=expected.replace('content.listSectionSpacing(.custom(11))','content.listSectionSpacing(.custom(16))')
 expected=expected.replace('    @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared', '    @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"\n    @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared', 1)
+expected=expected.replace('HStack(alignment: .center, spacing: 14) {', 'HStack(alignment: .top, spacing: 14) {', 1)
+old_size = '                                Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.subheadline)\n                                    .foregroundStyle(.primary)'
+new_size = '                                Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.caption)\n                                    .foregroundStyle(.primary)\n                                if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {\n                                    Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))\n                                        .font(.caption2)\n                                        .foregroundStyle(.secondary)\n                                }'
+expected=expected.replace(old_size,new_size,1)
 assert view == expected, 'all existing handlers, preferences, progress and recovery must be unchanged'
 print('PASS: unchanged channel IDs, handler bodies, progress, recovery and URL; compact card ordering and local spacing')
 print('PASS: measured four-line collapse, short-note fitting, native Markdown, accessibility and safe URL action wiring')

@@ -3,12 +3,13 @@ import SwiftUI
 /// Inline expansion inside the existing update card; the outer Form owns scrolling.
 struct ZagUpdateReleaseNotesView: View {
     @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
-    let document: ZagUpdateReleaseNotes
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let blocks: [ZagUpdateReleaseNotes.Block]
     @State private var expanded = false
     @State private var measurements = ReleaseNotesMeasurements()
 
-    init(markdown: String) { document = ZagUpdateReleaseNotes(markdown: markdown) }
+    init(markdown: String, version: String? = nil, build: String? = nil) {
+        blocks = ZagUpdateReleaseNotes(markdown: markdown).inlineBlocks(version: version, build: build)
+    }
 
     private var canExpand: Bool {
         guard let full = measurements.full, let fourLines = measurements.fourLines else { return false }
@@ -17,17 +18,23 @@ struct ZagUpdateReleaseNotesView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if expanded || (measurements.full != nil && measurements.fourLines != nil && !canExpand) {
-                formattedContent
-            } else {
-                Text(document.preview)
-                    .font(.body)
-                    .lineLimit(4)
-                    .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 12) {
+                // This first block keeps the same view identity and attributed text
+                // in both states. Only its native line limit changes.
+                if let first = blocks.first {
+                    blockContent(first, lineLimit: showsFullContent ? nil : 4)
+                }
+                if showsFullContent {
+                    ForEach(Array(blocks.dropFirst())) { block in
+                        blockContent(block)
+                    }
+                }
             }
             if canExpand {
                 Button {
-                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) { expanded.toggle() }
+                    var transaction = Transaction(animation: nil)
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) { expanded.toggle() }
                 } label: {
                     Text(expanded ? "less" : "more")
                         .frame(minWidth: 44, minHeight: 44, alignment: .trailing)
@@ -69,29 +76,47 @@ struct ZagUpdateReleaseNotesView: View {
                 .accessibilityHidden(true)
                 .allowsHitTesting(false)
         }
-        .onPreferenceChange(ReleaseNotesMeasurementsKey.self) { measurements = $0 }
+        .onPreferenceChange(ReleaseNotesMeasurementsKey.self) { value in
+            guard value != measurements else { return }
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { measurements = value }
+        }
         .onAppear { expanded = false }
         .environment(\.openURL, OpenURLAction { url in
             ZagUpdateReleaseNotes.isSafeWebURL(url) ? .systemAction : .discarded
         })
     }
 
+    private var showsFullContent: Bool {
+        expanded || (measurements.full != nil && measurements.fourLines != nil && !canExpand)
+    }
+
     private var formattedContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(document.blocks) { block in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    if let marker = block.marker {
-                        Text(marker).accessibilityHidden(true)
-                    }
-                    Text(block.text)
-                        .font(block.heading == nil ? .body : .headline)
-                        .accessibilityAddTraits(block.heading == nil ? [] : .isHeader)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(blocks) { block in
+                blockContent(block)
             }
         }
+    }
+
+    private func blockContent(_ block: ZagUpdateReleaseNotes.Block, lineLimit: Int? = nil) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if let marker = block.marker {
+                Text(marker).accessibilityHidden(true)
+            }
+            Text(block.text)
+                .font(block.heading == nil ? .body : .headline)
+                .accessibilityAddTraits(block.heading == nil ? [] : .isHeader)
+                .lineLimit(lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+        }
         .font(.body)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .transaction { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+        }
     }
 }
 

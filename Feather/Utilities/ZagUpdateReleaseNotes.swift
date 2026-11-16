@@ -73,6 +73,20 @@ struct ZagUpdateReleaseNotes {
         return result
     }
 
+    /// The card already presents this exact release identity. Keep all other
+    /// headings/content in order; never insert a duplicate title above the preview.
+    func inlineBlocks(version: String?, build: String?) -> [Block] {
+        guard let version, let build, let first = blocks.first, first.heading == 1 else { return blocks }
+        let title = String(first.text.characters).lowercased()
+        let identity = "zag store \(version.lowercased())"
+        let suffix = " (build \(build.lowercased()))"
+        let duplicateTitles = [identity + suffix,
+                               identity + " — beta \(build.lowercased())" + suffix,
+                               identity + " — nightly \(build.lowercased())" + suffix]
+        guard duplicateTitles.contains(title), blocks.count > 1 else { return blocks }
+        return Array(blocks.dropFirst())
+    }
+
     static func isSafeWebURL(_ url: URL) -> Bool {
         guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
               ["https", "http"].contains(parts.scheme?.lowercased() ?? ""),
