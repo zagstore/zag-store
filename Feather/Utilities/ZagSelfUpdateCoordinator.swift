@@ -120,6 +120,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         // Optional for backward compatibility; unknown legacy channels do not
         // produce a post-update channel announcement.
         var releaseChannel: String? = nil
+        var originatingVersion: String? = nil
     }
 
     enum UpdateError: LocalizedError {
@@ -167,6 +168,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     @Published private(set) var automaticDownloadStatus = "Not downloaded"
     private var wifiMonitor: NWPathMonitor?
     private var wifiAvailable = false
+    @Published private(set) var handoffState: ZagUpdateHandoffState = .none
     @Published private(set) var preparationState: ZagUpdatePreparationState = .idle
     @Published private(set) var userUpdateInProgress = false
     private var userUpdateGeneration: Int?
@@ -308,6 +310,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
 
     private init() {
         pendingInstallation = Self.read(PendingInstallation.self, key: pendingKey)
+        if pendingInstallation != nil { handoffState = .uncertain }
         lastVerifiedInstallation = Self.read(PendingInstallation.self, key: completedKey)
         Task { @MainActor [weak self] in await self?.reconcileOnLaunch() }
         Self.removeAbandonedPartialDownloads()
@@ -361,6 +364,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         let pending = pendingInstallation
         guard !currentBundleID.isEmpty, !currentVersion.isEmpty, !currentBuild.isEmpty,
               let candidate = pending ?? lastVerifiedInstallation,
+              ZagPostUpdateMessage.isReleaseAdvance(version: candidate.version, build: candidate.build,
+                                                   fromVersion: candidate.originatingVersion, fromBuild: candidate.originatingBuild),
               candidate.bundleIdentifier == currentBundleID,
               candidate.version == currentVersion,
               candidate.build == currentBuild,
@@ -385,7 +390,9 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
                                                 version: pending.version, build: pending.build,
                                                 channel: pending.releaseChannel,
                                                 expectedExecutableSHA256: pending.expectedExecutableSHA256,
-                                                originatingExecutableSHA256: pending.originatingExecutableSHA256),
+                                                originatingExecutableSHA256: pending.originatingExecutableSHA256,
+                                                originatingVersion: pending.originatingVersion,
+                                                originatingBuild: pending.originatingBuild),
                                           running: running)
             UserDefaults.standard.removeObject(forKey: pendingKey)
             pendingInstallation = nil
@@ -563,6 +570,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     /// the device installer. A callback from the old process is not required.
     func recordInstallationHandoff(for release: Release, signed: Signed) async throws {
         let generation = checkGeneration
+        guard ZagPostUpdateMessage.isReleaseAdvance(version: release.version, build: release.build,
+                                                   fromVersion: currentVersion, fromBuild: currentBuild) else {
+            throw UpdateError.noUpdateAvailable
+        }
         guard isSupportedReleaseIdentity(release.bundleIdentifier),
               let appURL = Storage.shared.getAppDirectory(for: signed),
               let info = NSDictionary(contentsOf: appURL.appendingPathComponent("Info.plist")),
@@ -587,7 +598,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             originatingBuild: currentBuild,
             expectedExecutableSHA256: candidateHash,
             originatingExecutableSHA256: originalHash,
-            releaseChannel: release.authenticatedChannel?.rawValue
+            releaseChannel: release.authenticatedChannel?.rawValue,
+            originatingVersion: currentVersion
         )
         let data = try JSONEncoder().encode(pending)
         UserDefaults.standard.set(data, forKey: pendingKey)
@@ -1205,6 +1217,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             if ZagSelfUpdateRetryPolicy.mayReleasePendingRecord(after: .notStarted) { clearFailedHandoff() }
             throw CancellationError()
         }
+        handoffState = .waiting
         var installerStarted = false
         var finishedEvents: [ZagGate4Event]?
         do {
@@ -1213,6 +1226,9 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
                 onStarted: { installerStarted = true },
                 onFinished: { finishedEvents = $0 }
             )
+            // Only the native terminal success callback resumes this call.
+            // It is a handoff report, not installed-executable proof.
+            handoffState = .reportedComplete
         } catch {
             // Release the record only if the callbacks prove the Upgrade
             // request was never sent, so the user can retry. Anything else
@@ -1227,6 +1243,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             } else {
                 ZagLogger.shared.warning("SelfUpdate", "Installer result is ambiguous; pending record kept for launch verification")
             }
+            handoffState = pendingInstallation == nil ? .none : .uncertain
             throw error
         }
     }
@@ -1283,5 +1300,6 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     func clearFailedHandoff() {
         UserDefaults.standard.removeObject(forKey: pendingKey)
         pendingInstallation = nil
+        handoffState = .none
     }
 }

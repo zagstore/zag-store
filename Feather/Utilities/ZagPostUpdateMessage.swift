@@ -20,9 +20,13 @@ struct ZagPostUpdateMessage: Codable, Equatable {
         let channel: String?
         let expectedExecutableSHA256: String?
         let originatingExecutableSHA256: String?
+        var originatingVersion: String? = nil
+        var originatingBuild: String? = nil
 
         func verifiedMessage(running: RunningIdentity) -> ZagPostUpdateMessage? {
-            guard !bundleIdentifier.isEmpty, !version.isEmpty, !build.isEmpty,
+            guard ZagPostUpdateMessage.isReleaseAdvance(version: version, build: build,
+                                                        fromVersion: originatingVersion, fromBuild: originatingBuild),
+                  !bundleIdentifier.isEmpty, !version.isEmpty, !build.isEmpty,
                   bundleIdentifier == running.bundleIdentifier,
                   version == running.version, build == running.build,
                   let channel = channel.flatMap(Channel.init(rawValue:)),
@@ -51,6 +55,18 @@ struct ZagPostUpdateMessage: Codable, Equatable {
         bundleIdentifier == running.bundleIdentifier && version == running.version && build == running.build
             && Self.isDigest(executableSHA256)
             && executableSHA256.caseInsensitiveCompare(running.executableSHA256) == .orderedSame
+    }
+
+    /// A differently signed executable with identical release labels is not a
+    /// new release. Legacy records without a source version require a higher build.
+    static func isReleaseAdvance(version: String, build: String,
+                                 fromVersion: String?, fromBuild: String?) -> Bool {
+        guard let fromBuild, !fromBuild.isEmpty else { return false }
+        guard let fromVersion, !fromVersion.isEmpty else {
+            return fromBuild.compare(build, options: .numeric) == .orderedAscending
+        }
+        let order = fromVersion.compare(version, options: .numeric)
+        return order == .orderedAscending || (order == .orderedSame && fromBuild.compare(build, options: .numeric) == .orderedAscending)
     }
 
     static func isDigest(_ value: String) -> Bool {
