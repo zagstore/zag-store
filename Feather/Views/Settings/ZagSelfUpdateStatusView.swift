@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 /// Installation remains disabled until signature authorization and recovery
 /// are implemented and verified. Never route self-updates through Library.
 struct ZagSelfUpdateStatusView: View {
+    @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared
     @ObservedObject private var gate4 = ZagRPPairingCore.shared
 
@@ -788,7 +789,8 @@ struct ZagSelfUpdateStatusView: View {
 
                         Link("Learn More", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
                             .font(.body)
-                            .foregroundStyle(.tint)
+                            .foregroundStyle(ZagWideGamutTint.color(hex: themeColorHex))
+                            .tint(ZagWideGamutTint.color(hex: themeColorHex))
                             .frame(maxWidth: .infinity, minHeight: 44)
 
                         if let issue = userVisibleUpdateIssue {
@@ -1162,7 +1164,7 @@ private struct ZagSelfUpdateSectionSpacing: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(iOS 17.0, *) {
-            content.listSectionSpacing(.custom(8))
+            content.listSectionSpacing(.custom(16))
         } else {
             content
         }

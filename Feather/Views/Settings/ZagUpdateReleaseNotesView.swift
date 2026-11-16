@@ -2,6 +2,7 @@ import SwiftUI
 
 /// Inline expansion inside the existing update card; the outer Form owns scrolling.
 struct ZagUpdateReleaseNotesView: View {
+    @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     let document: ZagUpdateReleaseNotes
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expanded = false
@@ -25,12 +26,17 @@ struct ZagUpdateReleaseNotesView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if canExpand {
-                Button(expanded ? "Less" : "More") {
+                Button {
                     withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) { expanded.toggle() }
+                } label: {
+                    Text(expanded ? "less" : "more")
+                        .frame(minWidth: 44, minHeight: 44, alignment: .trailing)
+                        .contentShape(Rectangle())
                 }
                 .font(.body)
-                .foregroundStyle(.tint)
+                .foregroundStyle(ZagWideGamutTint.color(hex: themeColorHex))
                 .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .trailing)
                 .accessibilityLabel(expanded ? "Show fewer release notes" : "Show full release notes")
                 .accessibilityValue(expanded ? "Expanded" : "Collapsed")
             }
