@@ -544,7 +544,7 @@ struct ZagAccountPopup: View {
                             ZagGlobalProfileAvatar(revision: avatarRevision)
                                 .frame(width: 54, height: 54)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Petar Zagorski")
+                                Text("Guest User")
                                     .font(.system(size: 20, weight: .semibold))
                                     .foregroundStyle(.primary)
                                 Text("Account info and settings")

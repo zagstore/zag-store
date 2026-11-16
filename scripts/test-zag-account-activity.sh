@@ -21,6 +21,8 @@ old = subprocess.check_output(['git', 'show', '0ff5181d:Feather/Views/TabView/Va
 normalized = account.replace('    let onOpenActivity: () -> Void\n', '').replace('devices, selfUpdate, settings', 'devices, activity, selfUpdate, settings', 1)
 normalized = normalized.replace('Button(action: onOpenActivity) {\n                        Text("Activity").foregroundStyle(.primary)\n                    }', 'NavigationLink(value: AccountDestination.activity) {\n                        Text("Activity")\n                    }', 1)
 normalized = normalized.replace('                    case .selfUpdate: ZagSelfUpdateStatusView()', '                    case .activity: TabEnum.view(for: .activity).tint(themeTint)\n                    case .selfUpdate: ZagSelfUpdateStatusView()', 1)
+assert account.count('Text("Guest User")') == 1
+old = old.replace('Text("Petar Zagorski")', 'Text("Guest User")', 1)
 assert normalized == old, 'other Account destinations must be unchanged'
 tabs = (root / 'Feather/Views/TabView/TabEnum.swift').read_text()
 assert 'case .activity: ZagActivityPage()' in tabs and 'NBNavigationView("Activity")' in tabs
