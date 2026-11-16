@@ -30,6 +30,9 @@ struct ZagFrameSample {
     let capsuleHeight: Int
     let statusInk: Int
     let centre: [Int]
+    /// Leftmost and rightmost visible columns on the capsule's middle row,
+    /// relative to the control's 360-point layout frame.
+    let extent: ClosedRange<Int>
 }
 
 @main
@@ -64,12 +67,14 @@ final class ZagChoreographyApp: UIResponder, UIApplicationDelegate {
     private var capsuleTop: CGFloat { 0 }
     private func sample() {
         guard let window else { return }
-        let width = 360, height = 140
-        let originX = (window.bounds.width - 360) / 2
+        // Captures a margin either side of the control, so drawing beyond its
+        // layout frame (or clipping at it) is visible.
+        let margin = 10, width = 360 + 2 * margin, height = 140
+        let originX = (window.bounds.width - 360) / 2 - CGFloat(margin)
         // Cheap capture of the current layer tree, clipped to the control, so
         // sampling leaves the main thread free to render SwiftUI's frames.
         let format = UIGraphicsImageRendererFormat(); format.scale = 1
-        let renderer = UIGraphicsImageRenderer(bounds: CGRect(x: originX, y: capsuleTop, width: 360, height: CGFloat(height)), format: format)
+        let renderer = UIGraphicsImageRenderer(bounds: CGRect(x: originX, y: capsuleTop, width: CGFloat(width), height: CGFloat(height)), format: format)
         let image = renderer.image { context in window.layer.render(in: context.cgContext) }
         if let dump = ProcessInfo.processInfo.environment["ZAG_DUMP"] {
             dumped += 1
@@ -83,20 +88,23 @@ final class ZagChoreographyApp: UIResponder, UIApplicationDelegate {
             ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
         // Bitmap memory row 0 is the top row of the drawn image.
-        func px(_ x: Int, _ y: Int) -> [Int] { let i = (y * width + x) * 4; return [Int(rgba[i]), Int(rgba[i+1]), Int(rgba[i+2])] }
+        // `x` is relative to the control's layout frame.
+        func px(_ x: Int, _ y: Int) -> [Int] { let i = (y * width + x + margin) * 4; return [Int(rgba[i]), Int(rgba[i+1]), Int(rgba[i+2])] }
         func lit(_ p: [Int]) -> Bool { p.reduce(0, +) > 60 }
         // The capsule is the first contiguous lit run down the centre column
         // (a two-line title makes it taller than 54); the status line lies below it.
         guard let top = (0..<height).first(where: { lit(px(180, $0)) }) else {
-            samples.append(ZagFrameSample(time: CACurrentMediaTime() - origin, capsuleHeight: 0, statusInk: 0, centre: px(180, 27)))
+            samples.append(ZagFrameSample(time: CACurrentMediaTime() - origin, capsuleHeight: 0, statusInk: 0, centre: px(180, 27), extent: 0...0))
             return
         }
         var bottom = top
         while bottom + 1 < height, lit(px(180, bottom + 1)) || lit(px(60, bottom + 1)) { bottom += 1 }
         var ink = 0
-        for y in min(height, bottom + 4)..<height { for x in stride(from: 4, to: width - 4, by: 2) where lit(px(x, y)) { ink += 1 } }
+        for y in min(height, bottom + 4)..<height { for x in stride(from: 4, to: 356, by: 2) where lit(px(x, y)) { ink += 1 } }
+        let middle = (top + bottom) / 2
+        let row = (-margin..<(360 + margin)).filter { px($0, middle).reduce(0, +) > 12 }
         samples.append(ZagFrameSample(time: CACurrentMediaTime() - origin, capsuleHeight: bottom - top + 1,
-                                      statusInk: ink, centre: px(180, (top + bottom) / 2)))
+                                      statusInk: ink, centre: px(180, middle), extent: (row.first ?? 0)...(row.last ?? 0)))
     }
 
     private func record(for seconds: Double, _ change: () -> Void) async -> [ZagFrameSample] {
@@ -153,6 +161,12 @@ final class ZagChoreographyApp: UIResponder, UIApplicationDelegate {
         let minInk = rolling.map(\.statusInk).min() ?? 0, maxInk = rolling.map(\.statusInk).max() ?? 0
         check(minInk > maxInk / 2, "percentage updates within a stage never fade the line (ink \(minInk)…\(maxInk))")
         check(Set(rolling.map(\.capsuleHeight)).count <= 2, "percentage updates never move the bar's geometry")
+        // Rounded ends: the bar's halo and rim are stroked on its edge, so they
+        // must show past both ends of the 360-point frame, equally, not clipped flat.
+        let bar = rolling.last!.extent
+        print("bar extent:", bar)
+        check(bar.lowerBound < 0 && bar.upperBound > 359, "the bar's rounded ends are drawn past its layout frame, not clipped (\(bar))")
+        check(abs(-bar.lowerBound - (bar.upperBound - 359)) <= 1, "both rounded ends are drawn identically")
 
         // 3. Bar → success capsule. The old line leaves, the capsule turns green,
         //    and the success line appears only after the capsule has arrived.
@@ -171,6 +185,8 @@ final class ZagChoreographyApp: UIResponder, UIApplicationDelegate {
               "no new status text is visible while the capsule is mid-morph (exiting)")
         let returning = exiting.map(\.capsuleHeight).filter { $0 > 0 }
         check(zip(returning, returning.dropFirst()).allSatisfy { $1 + 1 >= $0 }, "bar→pill height increases monotonically: \(returning.prefix(24))")
+        let resting = exiting.last!.extent
+        check(resting == 0...359, "the settled success capsule fills exactly its layout frame (\(resting))")
         let final = exiting.last!.centre
         check(abs(final[0] - 0x00) <= 16 && abs(final[1] - 0xc5) <= 16 && abs(final[2] - 0x65) <= 16,
               "the settled capsule centre is the website's #00c565 (sampled \(final))")

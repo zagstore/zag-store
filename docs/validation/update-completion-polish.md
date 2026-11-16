@@ -178,3 +178,22 @@ row and activated the link. The frames never overlapped. Fix: the link, now
 only within its own frame. A simulator screenshot of the card is pixel-identical
 before and after.
 
+## Bar end clipping (follow-up)
+
+Device report: both rounded ends of the progress bar were cut flat. Root cause:
+the capsule path spans the Canvas's full width, and its halo (5 pt) and rim
+(1.5 pt) are stroked centred on that edge, so half of each lies outside the
+Canvas, which draws only inside its own bounds. No ancestor clips. Fix: the
+Canvas extends `ZagUpdateSpectrumSurface.drawingOutset` (4 pt) past the layout
+frame on every side (`.padding(-drawingOutset)`), and the shape is drawn at
+exactly the same coordinates. Layout, width, height, radius, glow, spectrum,
+morph and the success capsule are unchanged.
+
+Measured on screen in the iOS simulator (`test-zag-update-choreography.sh`):
+with the old bounds the bar's visible extent is exactly the 360-point frame
+(0…359, clipped); with the fix it is −3…362, the same at both ends, while the
+resting success capsule still fills exactly 0…359. On macOS the host renderer
+does not clip a Canvas, so `test-zag-update-morph.sh` instead checks that the
+strokes stay within the outset, equal at both ends, across bar and intermediate
+morph frames.
+

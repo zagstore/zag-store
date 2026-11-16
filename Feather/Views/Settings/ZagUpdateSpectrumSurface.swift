@@ -55,11 +55,14 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
             // This tiny vector track presents with the current display frame;
             // it needs no additional asynchronous presentation queue.
             Canvas(opaque: false, rendersAsynchronously: false) { context, size in
-                draw(in: &context, size: size,
-                     phase: timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 5) / 5,
-                     displayedProgress: (reduceMotion || lowPower) ? progress : visualProgress.value(at: timeline.date.timeIntervalSinceReferenceDate))
+                drawExtended(in: &context, canvasSize: size,
+                             phase: timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 5) / 5,
+                             displayedProgress: (reduceMotion || lowPower) ? progress : visualProgress.value(at: timeline.date.timeIntervalSinceReferenceDate))
             }
         }
+        // The Canvas reaches past the control's layout frame so the strokes
+        // centred on the capsule's edge are not cut off; layout is unchanged.
+        .padding(-Self.drawingOutset)
         .onChange(of: progress) { value in
             visualProgress.update(value, at: Date.timeIntervalSinceReferenceDate,
                                   immediate: reduceMotion || lowPower)
@@ -68,6 +71,20 @@ struct ZagUpdateSpectrumSurface: View, Animatable {
             lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
         }
         .accessibilityHidden(true)
+    }
+
+    /// The halo (5 pt) and rim (1.5 pt) are stroked centred on the capsule's
+    /// edge, so half of each lies outside the layout frame. A Canvas draws only
+    /// inside its own bounds, which cut both rounded ends of the bar flat.
+    static let drawingOutset = 4.0
+
+    /// Draws into a Canvas that extends `drawingOutset` beyond the layout frame
+    /// on every side; the shape keeps the layout frame's exact geometry.
+    func drawExtended(in context: inout GraphicsContext, canvasSize: CGSize, phase: Double, displayedProgress: Double? = nil) {
+        let outset = Self.drawingOutset
+        context.translateBy(x: outset, y: outset)
+        draw(in: &context, size: CGSize(width: canvasSize.width - 2 * outset, height: canvasSize.height - 2 * outset),
+             phase: phase, displayedProgress: displayedProgress)
     }
 
     /// `morph` is interpolated, not used to exchange two shapes. The same path

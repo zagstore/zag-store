@@ -109,6 +109,42 @@ import SwiftUI
               "green coverage grows continuously with the returning morph: \(greenCoverage)")
         check(!isGreen(pixel(render(morph: 0, progress: 1), x: 180)) && isGreen(pixel(resting, x: 180)),
               "only the success state paints green; the ordinary capsule keeps its theme")
+        // Edge clipping: the real surface view, laid out at 360 x 54 inside a
+        // 10-point margin, so anything drawn beyond its frame is visible.
+        func renderInMargin(morph: Double, success: Bool = false) -> [UInt8] {
+            let view = ZagUpdateSpectrumSurface(morph: morph, progress: 0.55, theme: .blue, moving: false, success: success)
+                .frame(width: 360, height: 54).padding(10).background(Color.black).environment(\.colorScheme, .dark)
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 1
+            let image = renderer.cgImage!
+            precondition(image.width == 380 && image.height == 74, "surface keeps its 360 x 54 layout frame")
+            var rgba = [UInt8](repeating: 0, count: 380 * 74 * 4)
+            rgba.withUnsafeMutableBytes { bytes in
+                let context = CGContext(data: bytes.baseAddress, width: 380, height: 74, bitsPerComponent: 8,
+                    bytesPerRow: 380 * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                context.draw(image, in: CGRect(x: 0, y: 0, width: 380, height: 74))
+            }
+            return rgba
+        }
+        func litColumns(_ image: [UInt8], y: Int) -> [Int] {
+            (0..<380).filter { x in let i = (y * 380 + x) * 4; return Int(image[i]) + Int(image[i+1]) + Int(image[i+2]) > 12 }
+        }
+        let outset = Int(ZagUpdateSpectrumSurface.drawingOutset)
+        for amount in [1.0, 0.75, 0.5, 0.25] {
+            let image = renderInMargin(morph: amount)
+            let lit = litColumns(image, y: 37)
+            let left = lit.first!, right = lit.last!
+            check(left < 10 && right > 369, "morph \(amount): the rounded halo and rim extend past both layout edges (\(left)...\(right))")
+            check(left > 10 - outset && right < 369 + outset,
+                  "morph \(amount): the strokes fade out inside the drawing area, so neither end is cut off")
+            check(abs((10 - left) - (right - 369)) <= 1, "morph \(amount): both rounded ends are drawn identically")
+        }
+        for success in [false, true] {
+            let lit = litColumns(renderInMargin(morph: 0, success: success), y: 37)
+            check(lit.first == 10 && lit.last == 369,
+                  "resting \(success ? "success" : "Update Now") capsule fills exactly its layout frame (\(lit.first!)...\(lit.last!))")
+        }
         let suite = "ZagStore.morph-rendering.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
