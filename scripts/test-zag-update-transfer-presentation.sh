@@ -17,6 +17,7 @@ swiftc -module-cache-path "${CLANG_MODULE_CACHE_PATH:-$WORK/module-cache}" -pars
  "$ROOT/Feather/Utilities/ZagUpdateTransferPresentation.swift" \
  "$ROOT/Feather/Views/Settings/ZagUpdateInstallerPresentation.swift" \
  "$ROOT/Feather/Views/Settings/ZagSelfUpdateActionControl.swift" \
+ "$ROOT/Feather/Views/Common/ZagNumericTextTransition.swift" \
  "$ROOT/Feather/Views/Settings/ZagUpdateSpectrumSurface.swift" \
  "$ROOT/Feather/RPPairing/ZagGate4PublicationPolicy.swift" \
  "$ROOT/scripts/ZagUpdateTransferCoreStub.swift" "$WORK/Adapters.swift" \

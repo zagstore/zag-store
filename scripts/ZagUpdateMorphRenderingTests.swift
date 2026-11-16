@@ -9,8 +9,9 @@ import SwiftUI
         func check(_ value: Bool, _ label: String) {
             precondition(value, label); checks += 1; print("PASS: \(label)")
         }
-        func render(morph: Double, progress: Double = 0.55, phase: Double = 0.15, transparent: Bool = false) -> [UInt8] {
-            let surface = ZagUpdateSpectrumSurface(morph: morph, progress: progress, theme: .blue, moving: false)
+        func render(morph: Double, progress: Double = 0.55, phase: Double = 0.15, transparent: Bool = false,
+                    success: Bool = false) -> [UInt8] {
+            let surface = ZagUpdateSpectrumSurface(morph: morph, progress: progress, theme: .blue, moving: false, success: success)
             let view = Canvas { context, size in
                 surface.draw(in: &context, size: size, phase: phase)
             }.frame(width: 360, height: 54).background(transparent ? Color.clear : Color.black).environment(\.colorScheme, .dark)
@@ -73,6 +74,41 @@ import SwiftUI
         let geometryBeforeProgress = isolatedSurface.animatableData
         isolatedSurface.progress = 0.85
         check(isolatedSurface.animatableData == geometryBeforeProgress, "incoming percentages cannot retarget the Canvas geometry animation channel")
+        // Website success green, rendered by the production drawing function.
+        func pixel(_ image: [UInt8], x: Int, y: Int = 27) -> [Int] { (0..<3).map { Int(image[(y * 360 + x) * 4 + $0]) } }
+        func expectedGreen(x: Double, y: Double, width: Double) -> [Double] {
+            let layer = CGRect(x: 0, y: 0, width: width + ZagUpdateSuccessWave.overhang, height: 54)
+            let line = ZagUpdateSuccessPalette.gradientLine(in: layer)
+            let dx = line.end.x - line.start.x, dy = line.end.y - line.start.y
+            let t = ((x - line.start.x) * dx + (y - line.start.y) * dy) / (dx * dx + dy * dy)
+            let stops = ZagUpdateSuccessPalette.stops
+            let upper = stops.firstIndex { $0.location >= t } ?? stops.count - 1
+            let a = stops[max(0, upper - 1)], b = stops[upper]
+            let f = b.location == a.location ? 0 : (t - a.location) / (b.location - a.location)
+            return [Double(a.red) + (Double(b.red) - Double(a.red)) * f, Double(a.green) + (Double(b.green) - Double(a.green)) * f,
+                    Double(a.blue) + (Double(b.blue) - Double(a.blue)) * f]
+        }
+        let resting = render(morph: 0, progress: 1, success: true)
+        for x in [40, 180, 320] {
+            let actual = pixel(resting, x: x), expected = expectedGreen(x: Double(x) + 0.5, y: 27.5, width: 360)
+            // The website's sheen adds at most a few percent of white at mid-height.
+            check(zip(actual, expected).allSatisfy { abs(Double($0) - $1) <= 12 },
+                  "resting success capsule is the website gradient at x=\(x): \(actual) vs \(expected.map { Int($0.rounded()) })")
+        }
+        check(render(morph: 0, progress: 1, transparent: true, success: true)[(27 * 360 + 180) * 4 + 3] == 255,
+              "the success capsule is fully opaque")
+        let midWave = render(morph: 0.5, progress: 1, success: true)
+        func isGreen(_ p: [Int]) -> Bool { p[1] > p[0] + 80 && p[1] > p[2] + 40 }
+        check(isGreen(pixel(midWave, x: 40)) && !isGreen(pixel(midWave, x: 330)),
+              "mid-morph, green has arrived from the left while the spectrum remains on the right")
+        let greenCoverage = [1.0, 0.75, 0.5, 0.25, 0.0].map { morph -> Int in
+            let image = render(morph: morph, progress: 1, success: true)
+            return (0..<360).filter { isGreen(pixel(image, x: $0)) }.count
+        }
+        check(zip(greenCoverage, greenCoverage.dropFirst()).allSatisfy { $0 <= $1 } && greenCoverage.first == 0 && greenCoverage.last! >= 356,
+              "green coverage grows continuously with the returning morph: \(greenCoverage)")
+        check(!isGreen(pixel(render(morph: 0, progress: 1), x: 180)) && isGreen(pixel(resting, x: 180)),
+              "only the success state paints green; the ordinary capsule keeps its theme")
         let suite = "ZagStore.morph-rendering.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -80,7 +116,7 @@ import SwiftUI
         for state in [ZagSelfUpdateActionState.idle, .progress(message: "Downloading update...", fraction: 0.55),
                       .progress(message: "Preparing signed update...", fraction: nil),
                       .handedOff, .awaitingVerification] {
-            let content = ZagSelfUpdateActionControl(state: state, disabled: state.offersGuidance) {}
+            let content = ZagSelfUpdateActionControl(state: state, disabled: !state.isActionable) {}
                 .frame(width: 350)
                 .defaultAppStorage(defaults)
             let image = ImageRenderer(content: content).cgImage!

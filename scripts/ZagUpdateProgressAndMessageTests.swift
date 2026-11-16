@@ -43,14 +43,13 @@ import Foundation
         check(ZagUpdateControlGeometry.height(slotHeight: 86, morph: 1) == 14, "Dynamic Type progress track remains inside the same slot")
         check(ZagUpdateControlGeometry.filledFraction(progress: 0.25, morph: 1) == 0.25, "real byte fraction determines the filled track")
         check(ZagUpdateControlGeometry.filledFraction(progress: 0.25, morph: 0) == 1, "idle and terminal pills have a continuous full body")
-        check(!ZagSelfUpdateActionState.handedOff.showsProgress && ZagSelfUpdateActionState.handedOff.offersGuidance, "the successful handoff expands to an actionable capsule")
+        check(!ZagSelfUpdateActionState.handedOff.showsProgress && !ZagSelfUpdateActionState.handedOff.isActionable, "the successful handoff expands to a statement capsule; tapping it does nothing")
         check(ZagSelfUpdateActionState.handedOff.guidance.contains("install"), "outcome guidance describes actual installation proof")
         check(ZagSelfUpdateActionState.handedOff.status == "Update successful. Reopen Zag Store to complete.", "successful handoff uses exact requested final wording")
         check(!ZagSelfUpdateActionState.awaitingVerification.showsProgress, "a failed or ambiguous attempt ends the progress bar")
-        check(!ZagSelfUpdateActionState.awaitingVerification.offersGuidance, "an unverified attempt offers no success guidance")
+        check(!ZagSelfUpdateActionState.awaitingVerification.isActionable && !ZagSelfUpdateActionState.awaitingVerification.showsSuccess, "an unverified attempt is neither actionable nor shown as success")
         check(ZagSelfUpdateActionState.awaitingVerification.title.contains("not verified"), "ambiguous failure never claims handoff success")
         check(ZagSelfUpdateActionState.awaitingVerification.status == nil, "the unverified capsule does not repeat its title below")
-        check(ZagSelfUpdateActionState.handedOff.reopenInstruction.contains("App Switcher"), "restart action supplies safe manual steps")
         check(ZagUpdateHandoffState.stagedOnDevice.isSuccessfulHandoff && ZagUpdateHandoffState.reportedComplete.isSuccessfulHandoff,
               "verified on-device staging (209) and native completion (207) end the in-app operation")
         for state in [ZagUpdateHandoffState.none, .waiting, .uncertain] {
@@ -102,7 +101,54 @@ import Foundation
               "failed and ambiguous attempts never reuse either completion string")
         check(pending(.none, running: false) != .handedOff && pending(.waiting, running: false) != .handedOff,
               "released or in-flight attempts never select success")
-        check(ZagUpdateMorphSpecification.duration == 0.42, "both directions retain the accepted final-morph duration")
+        check(ZagUpdateMorphSpecification.duration == 0.35 && (0.34...0.36).contains(ZagUpdateMorphSpecification.duration),
+              "both directions share the faster 0.35-second morph")
+        check(ZagUpdateMorphSpecification.x1 == 0.42 && ZagUpdateMorphSpecification.y1 == 0 &&
+              ZagUpdateMorphSpecification.x2 == 0.58 && ZagUpdateMorphSpecification.y2 == 1, "the approved easing curve is unchanged")
+
+        // Status line: a stage message plus a separately rolling percentage.
+        let downloading = ZagSelfUpdateActionState.progress(message: "Downloading update...", fraction: 0.58).statusLine!
+        check(downloading == ZagUpdateStatusLine(message: "Downloading update...", percent: 58) && downloading.text == "Downloading update... 58%",
+              "the status line keeps the exact message and the measured integer percentage")
+        let nextPercent = ZagSelfUpdateActionState.progress(message: "Downloading update...", fraction: 0.61).statusLine!
+        check(nextPercent.isSameStage(as: downloading), "a new percentage in the same stage rolls digits instead of crossfading")
+        check(!ZagSelfUpdateActionState.progress(message: "Transferring signed IPA...", fraction: 0.01).statusLine!.isSameStage(as: downloading),
+              "a new stage message is a stage change")
+        check(!ZagSelfUpdateActionState.progress(message: "Downloading update...", fraction: nil).statusLine!.isSameStage(as: downloading),
+              "a percentage appearing or disappearing is a stage change")
+        check(!downloading.isSameStage(as: nil), "the first line is always revealed by the choreography")
+        check(ZagSelfUpdateActionState.handedOff.statusLine == ZagUpdateStatusLine(message: "Update successful. Reopen Zag Store to complete.", percent: nil),
+              "the final status is exactly the requested sentence with no percentage")
+        check(ZagSelfUpdateActionState.awaitingVerification.statusLine == nil && ZagSelfUpdateActionState.idle.statusLine == nil,
+              "no status line is shown under idle or unverified capsules")
+        check((0.050...0.080).contains(ZagUpdateStatusTiming.pauseAfterMorph), "the pause after geometry arrival is 50-80 ms")
+        check((0.150...0.220).contains(ZagUpdateStatusTiming.crossfade), "a stage-change crossfade lasts 150-220 ms")
+
+        // Website signing-success green and its wave.
+        check(ZagUpdateSuccessPalette.stops == [.init(red: 0x1f, green: 0xe2, blue: 0x7e, location: 0),
+                                                .init(red: 0x00, green: 0xc5, blue: 0x65, location: 0.5),
+                                                .init(red: 0x00, green: 0xa3, blue: 0x52, location: 1)] &&
+              ZagUpdateSuccessPalette.angleDegrees == 100, "success colour is the website --zds-green gradient, exactly")
+        let line = ZagUpdateSuccessPalette.gradientLine(in: CGRect(x: 0, y: 0, width: 350, height: 54))
+        let length = hypot(line.end.x - line.start.x, line.end.y - line.start.y)
+        check(abs(length - (350 * sin(100 * Double.pi / 180) + 54 * abs(cos(100 * Double.pi / 180)))) < 1e-9 &&
+              line.end.x > line.start.x && line.end.y > line.start.y && abs((line.start.x + line.end.x) / 2 - 175) < 1e-9,
+              "the gradient follows CSS 100deg geometry: through the centre, rightwards and slightly down")
+        check(ZagUpdateSuccessWave.layerMinX(width: 350, amount: 0) == -490 && ZagUpdateSuccessWave.layerMinX(width: 350, amount: 1) == 0,
+              "the wave travels from fully outside to fully covering the capsule")
+        let fronts = stride(from: 0.0, through: 1.0, by: 0.05).map { ZagUpdateSuccessWave.layerMinX(width: 350, amount: $0) }
+        check(zip(fronts, fronts.dropFirst()).allSatisfy { $0 < $1 }, "the green front moves strictly left to right")
+        check(350 + ZagUpdateSuccessWave.overhang - ZagUpdateSuccessWave.featherStart >= 350,
+              "at rest the green is opaque across the whole capsule")
+        check(ZagUpdateSuccessWave.crestOpacity(0) == 0 && ZagUpdateSuccessWave.crestOpacity(0.5) == 1 && ZagUpdateSuccessWave.crestOpacity(1) == 0,
+              "the crest of light exists only while the wave travels; the resting capsule is pure green")
+        check(ZagSelfUpdateActionState.handedOff.showsSuccess, "the successful handoff shows the success green")
+        for other in [ZagSelfUpdateActionState.idle, .awaitingVerification, .progress(message: "Transferring signed IPA...", fraction: 1),
+                      .progress(message: "Installation error: x", fraction: nil)] {
+            check(!other.showsSuccess, "no failed, cancelled, unverified or incomplete state is ever green")
+        }
+        check(ZagSelfUpdateActionState.idle.isActionable && !ZagSelfUpdateActionState.handedOff.isActionable,
+              "only Update Now acts; the final capsule has no tap behaviour")
         check(abs(ZagUpdateMorphSpecification.x1 + ZagUpdateMorphSpecification.x2 - 1) < 1e-12 &&
               abs(ZagUpdateMorphSpecification.y1 + ZagUpdateMorphSpecification.y2 - 1) < 1e-12,
               "one shared easing curve is mathematically symmetric under time reversal")

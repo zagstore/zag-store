@@ -46,8 +46,9 @@ in-app operation.
   policy). Late 206 percentages cannot pull the capsule back into a bar.
 - `.awaitingVerification` is now a still capsule, not an endless bar, and has no
   status line repeating its title.
-- The capsule morph is unchanged: one geometry channel, 0.42 s, cubic
-  (0.42, 0)–(0.58, 1) in both directions.
+- The capsule morph keeps one geometry channel and the cubic (0.42, 0)–(0.58, 1)
+  in both directions (0.42 s here; 0.35 s since the completion polish, see
+  `update-completion-polish.md`).
 
 ## B. Exact strings
 
@@ -59,8 +60,9 @@ in-app operation.
 `awaitingHandoff` (unreachable) and `confirmed` were removed. `confirmed` showed
 `Restart to Complete...` inside the post-relaunch "Zag Store Updated" card, after
 the replacement was already running; that card now ends with its verification
-text. The inline App Switcher instruction after tapping the capsule is kept; no
-popup, diagnostic button, private API, `exit` or forced termination is added.
+text. No popup, diagnostic button, private API, `exit` or forced termination is
+added. (The inline App Switcher instruction shown on tap was later removed; see
+`update-completion-polish.md`.)
 Installed-identity proof for the splash is unchanged.
 
 ## C. Transfer-stage stutter
@@ -109,7 +111,7 @@ rate is claimed; device verification is required (see below).
 
 ## Remaining device checks
 
-1. Update to a build containing this branch: bar → capsule within 0.42 s of 209,
+1. Update to a build containing this branch: bar → capsule within the morph duration of 209,
    with both exact strings, and the reverse of the entry morph.
 2. Close and reopen: the new build runs; one splash `Updated to <version> <channel>`.
 3. Next ordinary launch: `Sideloading and beyond.`

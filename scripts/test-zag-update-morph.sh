@@ -19,6 +19,7 @@ swiftc -module-cache-path "${CLANG_MODULE_CACHE_PATH:-$WORK/module-cache}" -pars
  "$ROOT/Feather/Utilities/ZagUpdateProgressPresentation.swift" \
  "$ROOT/Feather/Views/Settings/ZagUpdateSpectrumSurface.swift" \
  "$ROOT/Feather/Views/Settings/ZagSelfUpdateActionControl.swift" \
+ "$ROOT/Feather/Views/Common/ZagNumericTextTransition.swift" \
  "$WORK/Spectrum.swift" "$WORK/HostTint.swift" "$ROOT/scripts/ZagUpdateMorphRenderingTests.swift" -o "$WORK/tests"
 "$WORK/tests"
 python3 - "$ROOT" <<'PY'
@@ -33,7 +34,10 @@ view=read('Feather/Views/Settings/ZagSelfUpdateStatusView.swift')
 coord=read('Feather/Utilities/ZagSelfUpdateCoordinator.swift')
 assert control.count('            Button {') == 1
 assert control.count('ZagUpdateSpectrumSurface(') == 1
+# Label (carrying the arrival tracker) and surface share one transaction and curve.
 assert control.count('.animation(morphAnimation, value: state.showsProgress)') == 2
+assert 'disablesAnimations = true' not in control
+assert 'ZagAnimationArrival(value: state.showsProgress ? 1 : 0)' in control
 assert 'ZagUpdateMorphSpecification.duration' in control and '.timingCurve(' in control
 assert 'value: state.fraction' not in control
 assert '.id(' not in surface and 'AnimatablePair' not in surface
@@ -58,17 +62,53 @@ assert '.blur(' not in surface and '.shadow(' not in surface
 assert 'ObservableObject' not in surface and '@ObservedObject' not in surface
 assert 'ZagUpdateDecorationPolicy.animates' in surface
 assert 'minimumInterval: 1' not in surface
-assert 'state.offersGuidance' in control and 'state.fraction ?? 1' in control
+assert 'state.isActionable' in control and 'state.fraction ?? 1' in control
 assert 'View Installation Steps' not in view and 'presentUpdateGuidance' not in view
 assert 'Installation and Reopening' not in view and 'showRestartGuidance' not in view
-assert 'if showsReopenInstructions && state.offersGuidance' in control
-assert 'Text(state.reopenInstruction)' in control
+assert 'showsReopenInstructions' not in control and 'reopenInstruction' not in control and 'reopenInstruction' not in policy
+assert 'App Switcher' not in control
+assert 'App Switcher' not in policy.split('var guidance: String {',1)[0]  # diagnostics-only text stays
 diagnostics=view.split('private var zagDeveloperDiagnostics:',1)[1].split('private var gate4ProgressDisplay:',1)[0]
 assert 'Text(updateActionState.guidance)' in diagnostics
 assert 'Text(updateActionState.guidance)' not in view.split('    var body: some View {',1)[1]
 assert '.alert(' not in control
-assert '.hidden()' not in control and 'if let status = state.status' in control
-assert '.disabled(' not in control and 'guard !state.showsProgress' in control
+# Status line: revealed after tracked geometry arrival, never on a guessed delay.
+assert 'morphArrived(' in control and 'revealIfReady(pause: ZagUpdateStatusTiming.pauseAfterMorph)' in control
+assert control.count('asyncAfter') == 1 and 'deadline: .now() + pause' in control
+assert 'ZagUpdateMorphSpecification.duration +' not in control and 'Task.sleep' not in control
+assert 'expected == generation' in control and 'generation += 1' in control
+assert 'withAnimation(.easeIn(duration: ZagUpdateStatusTiming.fadeOut))' in control
+assert 'withAnimation(.easeOut(duration: ZagUpdateStatusTiming.fadeIn))' in control
+assert '.offset(' not in control and '.scaleEffect(' not in control and '.move(' not in control
+assert 'line.isSameStage(as: shownLine)' in control
+assert '.id(shownLine.message)' in control
+# Reduce Motion: no animation to observe, so arrival is reported directly; same-stage
+# percentages never restart the choreography; deferred work never reads stale `state`.
+assert 'if morphing && morphAnimation == nil { morphArrived(target.showsProgress) }' in control
+assert '.onChange(of: ZagStatusTarget(' in control and control.count('.onChange(of:') == 1
+choreo=control.split('// MARK: Choreography',1)[1].split('private struct ZagStatusTarget',1)[0]
+assert 'state.' not in choreo
+# Percentages: one shared digit-roll technique for Sources and the update line.
+numeric=read('Feather/Views/Common/ZagNumericTextTransition.swift')
+assert '.contentTransition(.numericText(value: Double(value)))' in numeric and 'reduceMotion' in numeric
+assert 'ZagNumericTextTransition(value: totalApps)' in read('Feather/Views/Sources/SourcesView.swift')
+assert 'ZagAppCountTransition' not in read('Feather/Views/Sources/SourcesView.swift')
+assert 'ZagNumericTextTransition(value: line.percent ?? 0)' in control and '.monospacedDigit()' in control
+assert 'contentTransition' not in surface
+# Success green: one gate, exact website palette, no generic system green.
+assert 'success: state.showsSuccess' in control and 'var showsSuccess: Bool { self == .handedOff }' in policy
+import re
+system_green=re.compile(r'(?<![\w$)\]])\.green\b|Color\.green|UIColor\.systemGreen')
+assert not any(system_green.search(x) for x in (surface, control, policy))
+assert 'ZagUpdateSuccessPalette.stops' in surface and 'Color(.sRGB' in surface
+assert 'ZagUpdateSuccessWave.layerMinX' in surface and 'ZagUpdateSuccessWave.crestOpacity' in surface
+# The final capsule acts on nothing and never fakes closing the app.
+assert 'var isActionable: Bool { self == .idle }' in policy
+for forbidden in ['exit(', 'suspend', 'perform(NSSelectorFromString', 'abort()', 'fatalError(', 'kill(']:
+    assert forbidden not in control and forbidden not in policy, forbidden
+assert '.sheet(' not in control and '.popover(' not in control and '.confirmationDialog(' not in control
+assert '.hidden()' not in control and 'if let shownLine' in control
+assert '.disabled(' not in control and 'guard actionable else { return }' in control
 assert 'rect.width * (phase - 1)' in surface and 'rect.width * (phase + 1)' in surface
 assert 'if amount < 1 { context.fill(fill, with: .color(theme)) }' in surface
 pending=view.split('private var updateActionState:',1)[1].split('private func beginUpdate',1)[0]

@@ -76,7 +76,7 @@ assert 'ProgressView(' not in control
 assert 'morph: state.showsProgress ? 1 : 0' in control
 assert 'reduceMotion ? nil' in control and 'ZagUpdateMorphSpecification.duration' in control
 assert 'value: state.fraction' not in control
-assert 'Shows short manual steps below' in control and 'Cannot close or restart the app' in control
+assert 'Shows short manual steps below' not in control and '.accessibilityHint(' not in control
 celebration = view.split('private var verifiedUpdateCelebration:', 1)[1].split('private var gate4ProgressTitle:', 1)[0]
 assert 'Update successful. Reopen Zag Store to complete.' in (root / 'Feather/Utilities/ZagUpdateProgressPresentation.swift').read_text()
 # After a verified relaunch the update is complete: no "Restart to Complete..." pill.
