@@ -429,8 +429,7 @@ struct ZagSelfUpdateStatusView: View {
         case .installing: return "Transferring signed IPA..."
         case .uploading: return "Transferring signed IPA..."
         case .staged: return "IPA verified - waiting for iOS handoff"
-        case .upgradeSubmitted: return "Upgrade request sent - waiting for iOS"
-        case .upgradeAccepted: return "Update accepted by iOS. Reopen Zag Store after installation."
+        case .upgradeSubmitted: return "Update handed off to iOS. Reopen Zag Store after installation."
         case .progress: return "Installing update..."
         case .complete: return "Installer reported completion — verify after relaunch"
         case .failed(let reason): return "Installation error: \(reason)"
@@ -451,7 +450,7 @@ struct ZagSelfUpdateStatusView: View {
     private var gate4PhaseLabel: String {
         switch gate4.gate4State {
         case .uploading: return "Uploading update"
-        case .staged, .upgradeSubmitted, .upgradeAccepted, .progress, .complete:
+        case .staged, .upgradeSubmitted, .progress, .complete:
             return "Finishing installation"
         case .failed: return "Installation interrupted"
         default: return "Preparing update"
@@ -463,9 +462,7 @@ struct ZagSelfUpdateStatusView: View {
         case .uploading:
             return "Transferring the signed update to your iPhone"
         case .staged, .upgradeSubmitted:
-            return "Update transferred. Waiting for iOS to accept it."
-        case .upgradeAccepted:
-            return "iOS accepted the update and is preparing to replace Zag Store."
+            return "Update transferred. iOS is preparing to replace Zag Store."
         case .progress:
             return "iOS is installing the update"
         case .complete:
@@ -554,7 +551,7 @@ struct ZagSelfUpdateStatusView: View {
 
                     if coordinator.pendingInstallation != nil {
                         switch gate4.gate4State {
-                        case .upgradeAccepted, .complete:
+                        case .staged, .upgradeSubmitted, .complete:
                             VStack(alignment: .leading, spacing: 8) {
                                 Label("Finish on Home Screen", systemImage: "house.fill")
                                     .font(.subheadline.weight(.semibold))

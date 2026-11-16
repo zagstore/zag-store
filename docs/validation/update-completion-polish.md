@@ -112,9 +112,8 @@ distribution channels. It is a normal exit, not a crash: no `abort`,
   <channel>` appears; a failed install, same-build reinstall or unchanged
   executable does not show it.
 
-Superseded for Beta 4 (see "Upgrade acknowledgment" below): success, and with
-it `Restart to Complete...`, now waits for installation_proxy's own answer to
-the Upgrade request, not for staging (209).
+Briefly superseded in Beta 4 (`e968f353`, "Upgrade acknowledgment" below) and
+restored by the regression repair: success is verified staging (209) again.
 
 ## Upgrade acknowledgment (Beta 4)
 
@@ -156,6 +155,42 @@ timeout transitions, 209 and 210 alone stay a progress bar, an unanswered
 request is never success, and termination only after `.acceptedByInstaller` or
 completion. Device check: on the iPhone, confirm 211 arrives in the foreground
 (the Gate4 history shows `Gate4 callback 211`) before iOS replaces the app.
+
+## Beta 4 regression repair
+
+Device report (Beta 4, build 4): the transfer reached 100 %, the card stayed on
+`Upgrade request sent - waiting for iOS`, then showed the two-line "not
+verified" outcome instead of the green capsule; the update nevertheless
+installed and the next launch showed `Updated to 1.0.0 Beta 4`.
+
+Root cause: `e968f353` moved the only success transition from 209 (verified
+staging) to 211 (installd's first reply to the Upgrade request). On the device
+that reply never reached the running process within the 20 s bound, so the
+handoff became `.unacknowledged`. A self-update replaces the very process
+listening for the reply: iOS can end Zag Store before any installd reply (or
+207) is delivered, so a reply can never be required for success.
+
+Repair: the Swift side of `e968f353` is reverted; the success transition,
+states, strings, capsule, wave and timing are byte-identical to `b8524f82`, the
+last device-confirmed version (`git diff b8524f82 -- Feather` touches only the
+splash files below). 209 sets `.stagedOnDevice` in the same main-thread turn,
+which shows `Restart to Complete...` with `Update successful. Reopen Zag Store
+to complete.` No timer is involved. What success means is unchanged: the signed
+IPA is on the device at its verified size and the request follows; it is not
+installed-executable proof. An installer error after 209 (any `Error` reply,
+closed stream or invalid frame from installd) still replaces it with
+`.uncertain`, never green. The next launch's executable-hash verification alone
+decides whether `Updated to …` appears.
+
+The native exchange (`run_self_upgrade`) is kept: 210 and 211 are recorded in
+the Gate4 history as diagnostics only, and installd's rejections still fail the
+attempt.
+
+Splash: the post-update signature is `Updated` (light), `to` (ultra-light),
+then the whole release, e.g. `1.0.0 Beta 4`, bold, as three separately
+animated groups. It is built from the verified identity (version, channel,
+build); the motto keeps its semibold last word. Artwork, colours, lighting,
+timings and positions are unchanged.
 
 ## Validation
 

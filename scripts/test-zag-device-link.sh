@@ -54,7 +54,7 @@ check "probe uses default TCP parameters (any interface)" grep -q 'using: .tcp' 
 check "probe always cancels its connection" grep -q 'connection.cancel()' "$PROBE"
 check "toolbar keeps the three-line LOCAL / VPN / status layout" bash -c "grep -q 'Text(\"LOCAL\")' '$TABBAR' && grep -q 'Text(\"VPN\")' '$TABBAR' && grep -q 'Text(statusText)' '$TABBAR'"
 check "Gate4 classifies failures before deciding on a retry" grep -q 'ZagRPPairingFailure.classify(message, installationStarted: installationStarted)' "$CORE"
-check "Gate4 never retries once installation has begun" grep -q 'gate4InstallationCodes: Set<Int32> = \[205, 206, 208, 209, 210, 211\]' "$CORE"
+check "Gate4 never retries once installation has begun" grep -q 'gate4InstallationCodes: Set<Int32> = \[205, 206, 208, 209, 210\]' "$CORE"
 check "Gate4 retries are opt-in" grep -q 'retryTransientFailures: Bool = false' "$CORE"
 check "self-update does not opt in to retries" absent 'retryTransientFailures' "$(cat "$SELFUPDATE")"
 gate4=$(sed -n '/fileprivate func receiveGate4(/,/^\t}/p' "$CORE")
@@ -133,24 +133,7 @@ def excluding_local_cleanup(source):
     start = source.index('\tfunc forgetPairing() throws {')
     end = source.index('\n\tfileprivate func receive(code:', start)
     return source[:start] + '<local cleanup>\n' + source[end:]
-def excluding_upgrade_acknowledgment(source):
-    # Native 210 (request written) and 211 (installd's answer) for Beta 4;
-    # each edit is reversed exactly to the 209-hook state.
-    for new, old in [
-        ('\t\t/// 210: the Upgrade request was written. Not an acknowledgment.\n\t\tcase upgradeSubmitted\n\t\t/// 211: installation_proxy replied to it without an error.\n\t\tcase upgradeAccepted\n', '\t\tcase upgradeSubmitted\n'),
-        ('.upgradeSubmitted, .upgradeAccepted, .progress: return true', '.upgradeSubmitted, .progress: return true'),
-        ('\tprivate var gate4Submitted: (() -> Void)?\n\tprivate var gate4Acknowledged: (() -> Void)?\n', '\tprivate var gate4Staged: (() -> Void)?\n'),
-        ('[205, 206, 208, 209, 210, 211]', '[205, 206, 208, 209, 210]'),
-        ('\t\tsubmitted: (() -> Void)? = nil,\n\t\tacknowledged: (() -> Void)? = nil,\n', '\t\tstaged: (() -> Void)? = nil,\n'),
-        ('\t\tgate4Submitted = submitted\n\t\tgate4Acknowledged = acknowledged\n', '\t\tgate4Staged = staged\n'),
-        ("\t\tcase 209:\n\t\t\tgate4State = .staged\n\t\tcase 210:\n\t\t\t// Written to the tunnel only: iOS may still reject it, or never get it.\n\t\t\tgate4SelfUpdateCommandSent = true\n\t\t\tgate4State = .upgradeSubmitted\n\t\t\tgate4Submitted?()\n\t\tcase 211:\n\t\t\t// installation_proxy's first error-free reply. Same main-thread turn\n\t\t\t// as the stage change, so the screen never renders the stage without\n\t\t\t// the attempt's handoff state.\n\t\t\tgate4State = .upgradeAccepted\n\t\t\tgate4Acknowledged?()\n",
-         "\t\tcase 209:\n\t\t\tgate4State = .staged\n\t\t\t// Same main-thread turn as the stage change, so the screen never\n\t\t\t// renders the stage without the attempt's handoff state.\n\t\t\tgate4Staged?()\n\t\tcase 210:\n\t\t\tgate4SelfUpdateCommandSent = true\n\t\t\tgate4State = .upgradeSubmitted\n"),
-    ]:
-        assert source.count(new) == 1, new[:60]
-        source = source.replace(new, old)
-    return source.replace('\t\t\tgate4Submitted = nil\n\t\t\tgate4Acknowledged = nil\n', '\t\t\tgate4Staged = nil\n')
 def excluding_gate4_presentation(source):
-    source = excluding_upgrade_acknowledgment(source)
     # Gate4 publication cadence and the verified-staging (209) hook only;
     # each documented edit is reversed exactly, so any other change still fails.
     for new, old in [('\t/// The exact native state. Views observing the whole core are invalidated\n\t/// for every stage change but for a percentage only every ten points: one\n\t/// publication per transfer callback re-evaluated the tab hierarchy up to\n\t/// a hundred times while the update control was animating. Every exact\n\t/// value still reaches gate4StatePublisher.\n\tprivate(set) var gate4State: Gate4State = .idle {\n\t\twillSet {\n\t\t\tif Self.gate4StateInvalidatesViews(from: gate4State, to: newValue) { objectWillChange.send() }\n\t\t}\n\t\tdidSet { gate4StateSubject.send(gate4State) }\n\t}\n\tprivate let gate4StateSubject = CurrentValueSubject<Gate4State, Never>(.idle)\n\t/// Every native state, including each percentage, after it is stored.\n\tvar gate4StatePublisher: AnyPublisher<Gate4State, Never> { gate4StateSubject.eraseToAnyPublisher() }\n\n\tnonisolated static func gate4StateInvalidatesViews(from old: Gate4State, to new: Gate4State) -> Bool {\n\t\tswitch (old, new) {\n\t\tcase let (.uploading(previous), .uploading(next)), let (.progress(previous), .progress(next)):\n\t\t\treturn ZagGate4PublicationPolicy.invalidatesViews(fromPercent: previous, toPercent: next)\n\t\tdefault:\n\t\t\treturn old != new\n\t\t}\n\t}\n', '\t@Published private(set) var gate4State: Gate4State = .idle\n'), ('\t\tgate4AttemptEvents.append(ZagGate4Event(code: code, message: message))\n\t\t// Percentages arrive up to a hundred times per phase on the main\n\t\t// thread. Keep the diagnostic record and log at the same ten-point\n\t\t// cadence as view invalidation; the retry policy still sees every event.\n\t\tvar percentage: Gate4State?\n\t\tif code == 208 { percentage = Int(message).map { .uploading($0) } }\n\t\tif code == 206 { percentage = Int(message).map { .progress($0) } }\n\t\tif percentage == nil || Self.gate4StateInvalidatesViews(from: gate4State, to: percentage!) {\n\t\t\trecordGate4Event("Gate4 callback \\(code): \\(message)")\n\t\t\t// Record native installation stages for diagnostics.\n\t\t\tif code == 206 {\n\t\t\t\tZagLogger.shared.info("RPPairing", "Gate4 install progress: \\(message)%")\n\t\t\t} else {\n\t\t\t\tZagLogger.shared.info("RPPairing", "Gate4 callback stage=\\(code) detail=\\(message)")\n\t\t\t}\n\t\t}\n', '\t\tgate4AttemptEvents.append(ZagGate4Event(code: code, message: message))\n\t\trecordGate4Event("Gate4 callback \\(code): \\(message)")\n\t\t// Record native installation stages for diagnostics.\n\t\tif code == 206 {\n\t\t\tZagLogger.shared.info("RPPairing", "Gate4 install progress: \\(message)%")\n\t\t} else {\n\t\t\tZagLogger.shared.info("RPPairing", "Gate4 callback stage=\\(code) detail=\\(message)")\n\t\t}\n'), ("\t\tcase 209:\n\t\t\tgate4State = .staged\n\t\t\t// Same main-thread turn as the stage change, so the screen never\n\t\t\t// renders the stage without the attempt's handoff state.\n\t\t\tgate4Staged?()\n", '\t\tcase 209: gate4State = .staged\n')]:

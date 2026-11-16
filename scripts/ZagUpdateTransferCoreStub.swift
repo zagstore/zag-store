@@ -7,7 +7,7 @@ import Combine
     static let shared = ZagRPPairingCore()
     enum Gate4State: Equatable {
         case idle, starting, pairVerified, tunnel, rsd, installing
-        case uploading(Int), staged, upgradeSubmitted, upgradeAccepted, progress(Int), complete, failed(String)
+        case uploading(Int), staged, upgradeSubmitted, progress(Int), complete, failed(String)
     }
     private(set) var gate4State: Gate4State = .idle {
         willSet {
@@ -24,7 +24,7 @@ import Combine
     var gate4StatePublisher: AnyPublisher<Gate4State, Never> { subject.eraseToAnyPublisher() }
     var isGate4Running: Bool {
         switch gate4State {
-        case .starting, .pairVerified, .tunnel, .rsd, .installing, .uploading, .staged, .upgradeSubmitted, .upgradeAccepted, .progress: return true
+        case .starting, .pairVerified, .tunnel, .rsd, .installing, .uploading, .staged, .upgradeSubmitted, .progress: return true
         default: return false
         }
     }

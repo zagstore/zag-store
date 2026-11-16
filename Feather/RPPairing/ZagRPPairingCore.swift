@@ -176,10 +176,7 @@ final class ZagRPPairingCore: ObservableObject {
 		case installing
 		case uploading(Int)
 		case staged
-		/// 210: the Upgrade request was written. Not an acknowledgment.
 		case upgradeSubmitted
-		/// 211: installation_proxy replied to it without an error.
-		case upgradeAccepted
 		case progress(Int)
 		case complete
 		case failed(String)
@@ -226,8 +223,7 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 	private var gate4Completion: ((Result<Void, Error>) -> Void)?
 	private var gate4Progress: ((Int) -> Void)?
-	private var gate4Submitted: (() -> Void)?
-	private var gate4Acknowledged: (() -> Void)?
+	private var gate4Staged: (() -> Void)?
 	/// Retries apply only to user installs that opt in, and only to failures
 	/// before installation began on the device (see ZagRPPairingFailure).
 	private var gate4RetryPlan = ZagGate4RetryPlan()
@@ -235,7 +231,7 @@ final class ZagRPPairingCore: ObservableObject {
 	private var gate4StagedIPA: URL?
 	private var gate4DeviceIP = ZagDeviceLink.peerAddress
 	/// Callback codes that mean the device has started changing state.
-	private static let gate4InstallationCodes: Set<Int32> = [205, 206, 208, 209, 210, 211]
+	private static let gate4InstallationCodes: Set<Int32> = [205, 206, 208, 209, 210]
 	private var gate4UninstallCompletion: ((Result<Void, Error>) -> Void)?
 	private var gate4UninstallRunning = false
 	private var gate2DeviceInfo: (name: String, model: String, version: String, build: String)?
@@ -268,7 +264,7 @@ final class ZagRPPairingCore: ObservableObject {
 
 	var isGate4Running: Bool {
 		switch gate4State {
-		case .starting, .pairVerified, .tunnel, .rsd, .installing, .uploading, .staged, .upgradeSubmitted, .upgradeAccepted, .progress: return true
+		case .starting, .pairVerified, .tunnel, .rsd, .installing, .uploading, .staged, .upgradeSubmitted, .progress: return true
 		default: return false
 		}
 	}
@@ -278,8 +274,7 @@ final class ZagRPPairingCore: ObservableObject {
 		deviceIP: String = ZagDeviceLink.peerAddress,
 		retryTransientFailures: Bool = false,
 		progress: ((Int) -> Void)? = nil,
-		submitted: (() -> Void)? = nil,
-		acknowledged: (() -> Void)? = nil,
+		staged: (() -> Void)? = nil,
 		completion: ((Result<Void, Error>) -> Void)? = nil
 	) throws {
 		guard !isGate4Running, acquireTransport("Gate4 install") else {
@@ -291,8 +286,7 @@ final class ZagRPPairingCore: ObservableObject {
 		gate4AttemptEvents = []
 		gate4Completion = completion
 		gate4Progress = progress
-		gate4Submitted = submitted
-		gate4Acknowledged = acknowledged
+		gate4Staged = staged
 		let localURL: URL
 		do {
 			let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -310,8 +304,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4RetryPlan.end()
 			gate4Completion = nil
 			gate4Progress = nil
-			gate4Submitted = nil
-			gate4Acknowledged = nil
+			gate4Staged = nil
 			throw error
 		}
 
@@ -328,8 +321,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4State = .failed(error.localizedDescription)
 			gate4Completion = nil
 			gate4Progress = nil
-			gate4Submitted = nil
-			gate4Acknowledged = nil
+			gate4Staged = nil
 			throw error
 		}
 		recordGate4Event("Native Gate4 worker accepted startup; awaiting callback")
@@ -417,17 +409,12 @@ final class ZagRPPairingCore: ObservableObject {
 			}
 		case 209:
 			gate4State = .staged
+			// Same main-thread turn as the stage change, so the screen never
+			// renders the stage without the attempt's handoff state.
+			gate4Staged?()
 		case 210:
-			// Written to the tunnel only: iOS may still reject it, or never get it.
 			gate4SelfUpdateCommandSent = true
 			gate4State = .upgradeSubmitted
-			gate4Submitted?()
-		case 211:
-			// installation_proxy's first error-free reply. Same main-thread turn
-			// as the stage change, so the screen never renders the stage without
-			// the attempt's handoff state.
-			gate4State = .upgradeAccepted
-			gate4Acknowledged?()
 		case 206:
 			if let percent = Int(message), (0...100).contains(percent) {
 				gate4State = .progress(percent)
@@ -441,8 +428,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4Completion?(.success(()))
 			gate4Completion = nil
 			gate4Progress = nil
-			gate4Submitted = nil
-			gate4Acknowledged = nil
+			gate4Staged = nil
 		case -4:
 			let installationStarted = gate4AttemptEvents.contains { Self.gate4InstallationCodes.contains($0.code) }
 			let kind = ZagRPPairingFailure.classify(message, installationStarted: installationStarted)
@@ -462,8 +448,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4Completion?(.failure(error))
 			gate4Completion = nil
 			gate4Progress = nil
-			gate4Submitted = nil
-			gate4Acknowledged = nil
+			gate4Staged = nil
 		default: break
 		}
 	}

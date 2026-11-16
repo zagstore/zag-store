@@ -46,8 +46,9 @@ struct ZagPostUpdateMessage: Codable, Equatable {
     let channel: Channel
     let executableSHA256: String
 
-    /// Exactly three reveal groups preserve the cinematic signature's timing.
-    var tokens: [String] { ["Updated to", version, "\(channel.title) \(build)"] }
+    /// Exactly three reveal groups preserve the cinematic signature's timing:
+    /// "Updated" (light), "to" (ultra-light), then the whole release, bold.
+    var tokens: [String] { ["Updated", "to", "\(version) \(channel.title) \(build)"] }
     var text: String { tokens.joined(separator: " ") }
     var identity: String { [bundleIdentifier, version, build, executableSHA256].joined(separator: "|") }
 

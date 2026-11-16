@@ -123,7 +123,7 @@ assert 'if amount < 1 { context.fill(fill, with: .color(theme)) }' in surface
 pending=view.split('private var updateActionState:',1)[1].split('private func beginUpdate',1)[0]
 assert '.pendingAttempt(handoff: coordinator.handoffState,' in pending
 derive=policy.split('static func pendingAttempt(',1)[1].split('\n    }\n',1)[0]
-assert derive.index('if handoff.isSuccessfulHandoff') < derive.index('handoff == .uncertain || handoff == .unacknowledged') < derive.index('if installerRunning')
+assert derive.index('if handoff.isSuccessfulHandoff') < derive.index('handoff == .uncertain') < derive.index('if installerRunning')
 assert derive.count('return .handedOff') == 1
 assert 'pendingInstallation != nil && !coordinator.handoffState.isSuccessfulHandoff && !gate4.isGate4Running && !installBusy' in view
 # Busy until the coordinator records the outcome; no view-level reading of 209/210.
@@ -131,18 +131,8 @@ assert 'gate4.gate4State { return' not in pending
 assert 'return .progress(message: preparingMessage, fraction: nil)' in derive
 handoff=coord.split('private func performPreparedHandoff(',1)[1].split('/// Explicitly confirmed upgrade-only',1)[0]
 assert handoff.index('try await submitStagedUpdateToGate4(') < handoff.index('handoffState = .reportedComplete') < handoff.index('} catch {')
-# Success is recorded only from iOS's answer (211), only for the attempt in flight;
-# a written request (210) only starts the bounded wait for it.
-assert handoff.index('handoffState = .waiting') < handoff.index('onSubmitted: { [weak self] in self?.awaitUpgradeAcknowledgement(attempt) }') < handoff.index('guard let self, self.handoffAttempt == attempt else { return }') < handoff.index('ZagUpgradeAcknowledgement.afterAcknowledgement(self.handoffState)')
-assert 'stagedOnDevice' not in coord
-wait=coord.split('private func awaitUpgradeAcknowledgement(',1)[1].split('\n    }\n',1)[0]
-assert 'self.handoffAttempt == attempt' in wait and 'ZagUpgradeAcknowledgement.afterTimeout(' in wait
-core_src=open('Feather/RPPairing/ZagRPPairingCore.swift').read()
-c209=core_src.split('\t\tcase 209:',1)[1].split('\t\tcase 210:',1)[0]
-c210=core_src.split('\t\tcase 210:',1)[1].split('\t\tcase 211:',1)[0]
-c211=core_src.split('\t\tcase 211:',1)[1].split('\t\tcase 206:',1)[0]
-assert 'gate4Acknowledged?()' not in c209 + c210 and 'gate4Acknowledged?()' in c211
-assert 'gate4Submitted?()' in c210
+# Verified staging (209) is recorded only for the attempt in flight.
+assert handoff.index('handoffState = .waiting') < handoff.index('guard let self, self.handoffState == .waiting else { return }') < handoff.index('self.handoffState = .stagedOnDevice')
 assert 'handoffState = pendingInstallation == nil ? .none : .uncertain' in handoff
 assert 'mayReleasePendingRecord(after: progress)' in handoff
 assert 'if pendingInstallation != nil { handoffState = .uncertain }' in coord
@@ -160,15 +150,21 @@ assert 'Review Beta v2 In-Place Update' in view.split('showInstallConfirmation =
 assert 'No automatic uninstall or fresh-install fallback will be attempted' in view
 assert 'userConfirmedSelfReplacement: true' in view
 native=read('RPPairingCore/rust-core/src/lib.rs')
-# Success waits for installd's answer (211); writing the request is only 210.
+# The native exchange reports 210 (written) and 211 (installd's first reply) as
+# diagnostics only; success stays verified staging (209), which needs no reply
+# from iOS because a self-update replaces the process that would receive it.
 upgrade=native.split('async fn run_self_upgrade<',1)[1].split('\n}\n',1)[0]
 assert upgrade.index('connection.send_frame(frame).await?') < upgrade.index('event(210,') < upgrade.index('connection.read_bytes(4)') < upgrade.index('event(211,')
 assert 'tokio::time' not in upgrade and 'sleep' not in upgrade
-# No edits to cryptographic admission, rollback, splash or metadata; the only
-# native change is the self-update Upgrade exchange in lib.rs.
+core_src=open('Feather/RPPairing/ZagRPPairingCore.swift').read()
+c209=core_src.split('\t\tcase 209:',1)[1].split('\t\tcase 210:',1)[0]
+assert 'gate4Staged?()' in c209 and core_src.count('gate4Staged?()') == 1
+assert 'case 211' not in core_src and 'Acknowledg' not in coord
+# No edits to cryptographic admission, rollback or metadata; the only native
+# change is the self-update Upgrade exchange in lib.rs.
 changed=subprocess.check_output(['git','diff','ea191fff','--name-only'],cwd=root,text=True).splitlines()
 assert {p for p in changed if p.startswith('RPPairingCore/')} <= {'RPPairingCore/rust-core/src/lib.rs'}
-# Swift core changes are limited to publication cadence and the Upgrade hooks.
+# Swift core changes are limited to publication cadence and the 209 hook.
 assert {p for p in changed if p.startswith('Feather/RPPairing/')} <= {
  'Feather/RPPairing/ZagRPPairingCore.swift','Feather/RPPairing/ZagGate4PublicationPolicy.swift'}
 core=read('Feather/RPPairing/ZagRPPairingCore.swift')
@@ -181,7 +177,10 @@ oldPlist=plistlib.loads(subprocess.check_output(['git','show','ea191fff:'+plistP
 newPlist=plistlib.loads((root/plistPath).read_bytes())
 assert newPlist.pop('CADisableMinimumFrameDurationOnPhone') is True
 assert newPlist == oldPlist, 'only documented ProMotion opt-in may change in Info.plist'
-for p in ['Feather/FeatherApp.swift','Feather/Views/TabView/Bars/ZagCinematicSplashView.swift','Feather/Views/TabView/Bars/ZagSplashAnimationStage.swift']:
- assert p not in changed, p
+assert 'Feather/FeatherApp.swift' not in changed
+# The splash may differ only by the post-update release group's bold weight.
+for p in ['Feather/Views/TabView/Bars/ZagCinematicSplashView.swift','Feather/Views/TabView/Bars/ZagSplashAnimationStage.swift']:
+ restored=(root/p).read_text().replace('        // The motto ends semibold; an update\'s release group is bold.\n','').replace('signatureMessage == nil ? .semibold : .bold]','.semibold]').replace('[.light, .ultraLight, .bold]','[.light, .ultraLight, .semibold]')
+ assert restored == subprocess.check_output(['git','show','ea191fff:'+p],cwd=root,text=True), p
 print('PASS: persistent Canvas morph, original spectrum/rim timing, independent cadence, terminal guidance, callback truth, prompt and security boundaries')
 PY

@@ -50,22 +50,11 @@ import Foundation
         check(!ZagSelfUpdateActionState.awaitingVerification.isActionable && !ZagSelfUpdateActionState.awaitingVerification.showsSuccess, "an unverified attempt is neither actionable nor shown as success")
         check(ZagSelfUpdateActionState.awaitingVerification.title.contains("not verified"), "ambiguous failure never claims handoff success")
         check(ZagSelfUpdateActionState.awaitingVerification.status == nil, "the unverified capsule does not repeat its title below")
-        check(ZagUpdateHandoffState.acceptedByInstaller.isSuccessfulHandoff && ZagUpdateHandoffState.reportedComplete.isSuccessfulHandoff,
-              "iOS accepting the Upgrade request (211) and native completion (207) end the in-app operation")
-        for state in [ZagUpdateHandoffState.none, .waiting, .uncertain, .unacknowledged] {
-            check(!state.isSuccessfulHandoff, "no handoff, an attempt in flight, an unanswered request and an ambiguous failure never select success")
+        check(ZagUpdateHandoffState.stagedOnDevice.isSuccessfulHandoff && ZagUpdateHandoffState.reportedComplete.isSuccessfulHandoff,
+              "verified on-device staging (209) and native completion (207) end the in-app operation")
+        for state in [ZagUpdateHandoffState.none, .waiting, .uncertain] {
+            check(!state.isSuccessfulHandoff, "no handoff, an attempt in flight and an ambiguous failure never select success")
         }
-        // Native 211 is the only acknowledgment; 209 (staged) and 210 (written) are not.
-        check(ZagUpgradeAcknowledgement.afterAcknowledgement(.waiting) == .acceptedByInstaller, "iOS answering the request (211) is success")
-        check(ZagUpgradeAcknowledgement.afterAcknowledgement(.unacknowledged) == .acceptedByInstaller, "a late answer after the timeout still counts")
-        for settled in [ZagUpdateHandoffState.none, .uncertain, .reportedComplete] {
-            check(ZagUpgradeAcknowledgement.afterAcknowledgement(settled) == settled, "an acknowledgment never overrides a settled attempt (\(settled))")
-        }
-        check(ZagUpgradeAcknowledgement.afterTimeout(.waiting) == .unacknowledged, "an unanswered request stops being in progress")
-        for other in [ZagUpdateHandoffState.none, .acceptedByInstaller, .reportedComplete, .uncertain] {
-            check(ZagUpgradeAcknowledgement.afterTimeout(other) == other, "the timeout changes only a request still waiting (\(other))")
-        }
-        check(ZagUpgradeAcknowledgement.timeout >= 10 && ZagUpgradeAcknowledgement.timeout <= 60, "the acknowledgment timeout is bounded")
         check(ZagSelfUpdateActionState.idle.showsProgress == false, "failed pre-handoff operation can restore the original capsule")
         check(!ZagPostUpdateMessage.isReleaseAdvance(version: "2.4.6", build: "21", fromVersion: "2.4.6", fromBuild: "21"), "same version/build re-signing is not a new release")
         check(ZagPostUpdateMessage.isReleaseAdvance(version: "2.5.0", build: "1", fromVersion: "2.4.6", fromBuild: "21"), "newer semantic version supports reset build numbers")
@@ -98,17 +87,11 @@ import Foundation
               "a pending record before the installer starts stays busy, never 'not verified'")
         check(pending(.waiting, running: true, fraction: 0.88).showsProgress, "transfer at 88% is a progress bar")
         check(pending(.waiting, running: true, fraction: 1).showsProgress, "a complete transfer alone does not end the operation")
-        check(pending(.waiting, running: true, title: "IPA verified - waiting for iOS handoff").showsProgress,
-              "verified staging (209) alone stays a progress bar")
-        check(pending(.waiting, running: true, title: "Upgrade request sent - waiting for iOS").showsProgress,
-              "a written but unanswered Upgrade request (210) stays a progress bar")
-        let unanswered = pending(.unacknowledged, running: true, title: "Upgrade request sent - waiting for iOS")
-        check(unanswered == .awaitingVerification && !unanswered.showsSuccess, "a request iOS never answered ends without success")
-        let staged = pending(.acceptedByInstaller, running: true, title: "Update accepted by iOS. Reopen Zag Store after installation.")
-        check(staged == .handedOff && !staged.showsProgress, "iOS accepting the request (211) morphs back to the final capsule")
+        let staged = pending(.stagedOnDevice, running: true, title: "IPA verified - waiting for iOS handoff")
+        check(staged == .handedOff && !staged.showsProgress, "verified staging (209) morphs back to the final capsule while iOS stays silent")
         check(staged.title == "Restart to Complete..." && staged.status == "Update successful. Reopen Zag Store to complete.",
               "the device sequence ends with the two exact requested strings")
-        check(pending(.acceptedByInstaller, running: true, title: "Installing update...", fraction: 0.4) == .handedOff,
+        check(pending(.stagedOnDevice, running: true, title: "Installing update...", fraction: 0.4) == .handedOff,
               "a late installer percentage cannot pull the capsule back into a bar")
         check(pending(.reportedComplete, running: false) == .handedOff, "a native completion (207) also ends on the final capsule")
         let failedAfterStaging = pending(.uncertain, running: false)
@@ -167,24 +150,24 @@ import Foundation
         check(ZagSelfUpdateActionState.idle.isActionable && !ZagSelfUpdateActionState.handedOff.isActionable,
               "only Update Now starts an update; the final capsule completes instead")
         // Restart to Complete: termination only after a successful handoff with its record.
-        let handoffs: [ZagUpdateHandoffState] = [.none, .waiting, .acceptedByInstaller, .reportedComplete, .uncertain, .unacknowledged]
+        let handoffs: [ZagUpdateHandoffState] = [.none, .waiting, .stagedOnDevice, .reportedComplete, .uncertain]
         let actions: [ZagSelfUpdateActionState] = [.idle, .progress(message: "Transferring signed IPA...", fraction: 1),
                                                    .progress(message: "Installing update...", fraction: nil),
                                                    .awaitingVerification, .handedOff]
         for handoff in handoffs { for action in actions { for recorded in [false, true] {
             let allowed = ZagUpdateCompletion.allowsTermination(actionState: action, handoff: handoff, pendingRecorded: recorded)
-            check(allowed == (action == .handedOff && (handoff == .acceptedByInstaller || handoff == .reportedComplete) && recorded),
-                  "termination only after iOS accepted the request or completion, with the pending record (\(handoff), \(action), \(recorded))")
+            check(allowed == (action == .handedOff && (handoff == .stagedOnDevice || handoff == .reportedComplete) && recorded),
+                  "termination only after verified staging or completion, with the pending record (\(handoff), \(action), \(recorded))")
         } } }
         MainActor.assumeIsolated {
             var terminations = 0
             check(!ZagUpdateCompletion.complete(actionState: .awaitingVerification, handoff: .uncertain, pendingRecorded: true) { terminations += 1 },
                   "an unverified attempt never terminates")
-            check(!ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .acceptedByInstaller, pendingRecorded: false) { terminations += 1 },
+            check(!ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .stagedOnDevice, pendingRecorded: false) { terminations += 1 },
                   "without the pending record, the next launch could not verify, so no termination")
-            check(ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .acceptedByInstaller, pendingRecorded: true) { terminations += 1 },
+            check(ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .stagedOnDevice, pendingRecorded: true) { terminations += 1 },
                   "a successful handoff terminates")
-            check(!ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .acceptedByInstaller, pendingRecorded: true) { terminations += 1 },
+            check(!ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .stagedOnDevice, pendingRecorded: true) { terminations += 1 },
                   "racing or repeated requests terminate at most once")
             check(terminations == 1, "the terminator runs exactly once")
         }
@@ -227,7 +210,7 @@ import Foundation
         for channel in ZagPostUpdateMessage.Channel.allCases {
             let message = candidate(channel: channel.rawValue).verifiedMessage(running: running)
             check(message?.channel == channel && message?.matches(running) == true, "verified installed identity supports \(channel.rawValue)")
-            check(message?.tokens.count == 3, "\(channel.rawValue) preserves exactly three cinematic reveal groups")
+            check(message?.tokens == ["Updated", "to", "2.4.6 \(channel.title) 21"], "\(channel.rawValue) keeps the three reveal groups, the release as one")
             check(message?.text == "Updated to 2.4.6 \(channel.title) 21", "\(channel.rawValue) message uses actual version/channel/build")
         }
         check(candidate(version: "2.4.7").verifiedMessage(running: running) == nil, "downloaded newer version is not installation proof")
