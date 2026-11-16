@@ -102,13 +102,22 @@ system_green=re.compile(r'(?<![\w$)\]])\.green\b|Color\.green|UIColor\.systemGre
 assert not any(system_green.search(x) for x in (surface, control, policy))
 assert 'ZagUpdateSuccessPalette.stops' in surface and 'Color(.sRGB' in surface
 assert 'ZagUpdateSuccessWave.layerMinX' in surface and 'ZagUpdateSuccessWave.crestOpacity' in surface
-# The final capsule acts on nothing and never fakes closing the app.
+# Update Now starts the update; only the success capsule completes, through the
+# dedicated, owner-authorised exit path. No crash, abort or private API anywhere.
+completion=read('Feather/Utilities/ZagUpdateCompletion.swift')
 assert 'var isActionable: Bool { self == .idle }' in policy
 for forbidden in ['exit(', 'suspend', 'perform(NSSelectorFromString', 'abort()', 'fatalError(', 'kill(']:
     assert forbidden not in control and forbidden not in policy, forbidden
+for forbidden in ['suspend', 'NSSelectorFromString', 'abort()', 'fatalError(', 'kill(', 'raise(', 'preconditionFailure(']:
+    assert forbidden not in completion, forbidden
+assert completion.count('\n        exit(0)\n') == 1 and completion.count('exit(') == completion.count('exit(0)') and 'UserDefaults.standard.synchronize()' in completion
+assert 'actionState == .handedOff && handoff.isSuccessfulHandoff && pendingRecorded' in completion
+assert 'acknowledgePostUpdateMessage' not in completion and 'postUpdateMessage' not in completion and 'ZagPostUpdateMessageStore' not in completion  # never consumes the splash
+assert 'state.showsSuccess && complete != nil && settledMorph == state.showsProgress && lineVisible && !completionRequested' in control
+assert 'completionRequested = true' in control
 assert '.sheet(' not in control and '.popover(' not in control and '.confirmationDialog(' not in control
 assert '.hidden()' not in control and 'if let shownLine' in control
-assert '.disabled(' not in control and 'guard actionable else { return }' in control
+assert '.disabled(' not in control and '.allowsHitTesting(actionable)' in control
 assert 'rect.width * (phase - 1)' in surface and 'rect.width * (phase + 1)' in surface
 assert 'if amount < 1 { context.fill(fill, with: .color(theme)) }' in surface
 pending=view.split('private var updateActionState:',1)[1].split('private func beginUpdate',1)[0]

@@ -48,6 +48,7 @@ struct ZagUpdateTransferActionControl: View {
     let usesInstallerProgress: Bool
     var disabled = false
     @ObservedObject var progress: ZagUpdateTransferPresentation
+    var complete: (() -> Void)?
     let action: () -> Void
 
     private var presentedState: ZagSelfUpdateActionState {
@@ -58,7 +59,7 @@ struct ZagUpdateTransferActionControl: View {
         return state
     }
     var body: some View {
-        ZagSelfUpdateActionControl(state: presentedState, disabled: disabled, action: action)
+        ZagSelfUpdateActionControl(state: presentedState, disabled: disabled, complete: complete, action: action)
     }
 }
 

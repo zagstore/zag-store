@@ -7,6 +7,8 @@ struct ZagSelfUpdateActionControl: View {
     let state: ZagSelfUpdateActionState
     var disabled = false
     let action: () -> Void
+    /// `Restart to Complete...`. Offered only by the successful handoff.
+    var complete: (() -> Void)?
     @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ScaledMetric(relativeTo: .headline) private var actionFontSize = 19.0
@@ -23,10 +25,13 @@ struct ZagSelfUpdateActionControl: View {
     @State private var fadingOut = false
     @State private var awaitingReveal = false
     @State private var generation = 0
+    @State private var completionRequested = false
 
-    init(state: ZagSelfUpdateActionState, disabled: Bool = false, action: @escaping () -> Void) {
+    init(state: ZagSelfUpdateActionState, disabled: Bool = false,
+         complete: (() -> Void)? = nil, action: @escaping () -> Void) {
         self.state = state
         self.disabled = disabled
+        self.complete = complete
         self.action = action
         // The first frame already shows the current line, with no layout jump.
         _targetLine = State(initialValue: state.statusLine)
@@ -40,7 +45,13 @@ struct ZagSelfUpdateActionControl: View {
     private var morphAnimation: Animation? { reduceMotion ? nil : .timingCurve(ZagUpdateMorphSpecification.x1, ZagUpdateMorphSpecification.y1,
                                                     ZagUpdateMorphSpecification.x2, ZagUpdateMorphSpecification.y2,
                                                     duration: ZagUpdateMorphSpecification.duration) }
-    private var actionable: Bool { state.isActionable && !disabled }
+    private var startsUpdate: Bool { state.isActionable && !disabled }
+    /// The success capsule acts once its presentation has settled: geometry
+    /// arrived and the success line shown. Same view, no visual change.
+    private var completes: Bool {
+        state.showsSuccess && complete != nil && settledMorph == state.showsProgress && lineVisible && !completionRequested
+    }
+    private var actionable: Bool { startsUpdate || completes }
     private var ink: Color {
         let ink = ZagUpdateSuccessPalette.labelInk
         return Color(.sRGB, red: Double(ink.red) / 255, green: Double(ink.green) / 255, blue: Double(ink.blue) / 255)
@@ -51,8 +62,12 @@ struct ZagSelfUpdateActionControl: View {
             Button {
                 // Guard repeated/busy activation without applying a disabled
                 // appearance filter to the luminous Canvas.
-                guard actionable else { return }
-                action()
+                if completes {
+                    completionRequested = true
+                    complete?()
+                } else if startsUpdate {
+                    action()
+                }
             } label: {
                 // A single stationary label. Busy-phase messages belong below
                 // the bar; they never resize or slide the button's text baseline.
@@ -82,8 +97,9 @@ struct ZagSelfUpdateActionControl: View {
             }
             .buttonStyle(.plain)
             .allowsHitTesting(actionable)
-            .accessibilityRemoveTraits(state.isActionable ? [] : .isButton)
-            .accessibilityAddTraits(state.showsProgress ? .updatesFrequently : (state.isActionable ? .isButton : .isStaticText))
+            .accessibilityRemoveTraits(state.isActionable || state.showsSuccess && complete != nil ? [] : .isButton)
+            .accessibilityAddTraits(state.showsProgress ? .updatesFrequently
+                                    : (state.isActionable || state.showsSuccess && complete != nil ? .isButton : .isStaticText))
             .accessibilityLabel(state.title)
             .accessibilityValue(state.fraction.map { "\(ZagUpdateProgressFormatting.percent($0)) percent" } ?? "")
 

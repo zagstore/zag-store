@@ -8,7 +8,7 @@ final class ZagUpdateCardTapUITests: XCTestCase {
     private func launch(_ state: String) {
         continueAfterFailure = false
         app = XCUIApplication()
-        app.launchEnvironment["ZAG_CARD_STATE"] = state
+        app.launchEnvironment = ["ZAG_CARD_STATE": state]
         app.launch()
     }
 
@@ -48,22 +48,43 @@ final class ZagUpdateCardTapUITests: XCTestCase {
          ("right edge", CGPoint(x: frame.maxX - 8, y: frame.midY))]
     }
 
-    func testSuccessCapsuleTapsNeverOpenLearnMore() {
-        launch("handedOff")
-        let frame = capsule("Restart to Complete...").frame
-        let link = learnMore.frame
-        XCTAssertFalse(frame.intersects(link), "capsule \(frame) and Learn More \(link) must not overlap")
-        XCTAssertGreaterThanOrEqual(link.minY - frame.maxY, 8, "capsule and Learn More keep separate frames with a gap")
-        for (name, point) in capsulePoints(frame) {
+    func testSuccessCapsuleCompletesOnceAcrossItsBoundsAndNeverOpensLearnMore() {
+        for index in 0..<3 {
+            launch("handedOff")
+            let frame = capsule("Restart to Complete...").frame
+            let link = learnMore.frame
+            XCTAssertFalse(frame.intersects(link), "capsule \(frame) and Learn More \(link) must not overlap")
+            XCTAssertGreaterThanOrEqual(link.minY - frame.maxY, 8, "capsule and Learn More keep separate frames with a gap")
+            let (name, point) = capsulePoints(frame)[index]
             reset(); tap(at: point)
-            settle("none", "tapping the success capsule's \(name) must do nothing")
+            settle("complete", "the success capsule's \(name) invokes the completion action")
+            // Repeated taps never invoke it again, and never reach Learn More.
+            for (_, again) in capsulePoints(frame) { tap(at: again) }
+            settle("complete", "the completion action runs exactly once")
+            // Exactly the two approved strings; no instruction, popup or sheet.
+            XCTAssertTrue(app.staticTexts["Update successful. Reopen Zag Store to complete."].exists)
+            XCTAssertEqual(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'App Switcher'")).count, 0)
+            XCTAssertEqual(app.alerts.count, 0)
+            XCTAssertEqual(app.sheets.count, 0)
+            XCTAssertEqual(capsule("Restart to Complete...").frame, frame, "the capsule does not move or resize after taps")
+            app.terminate()
         }
-        // Exactly the two approved strings; no instruction, popup or sheet.
-        XCTAssertTrue(app.staticTexts["Update successful. Reopen Zag Store to complete."].exists)
-        XCTAssertEqual(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'App Switcher'")).count, 0)
-        XCTAssertEqual(app.alerts.count, 0)
-        XCTAssertEqual(app.sheets.count, 0)
-        XCTAssertEqual(capsule("Restart to Complete...").frame, frame, "the capsule does not move or resize after taps")
+    }
+
+    /// The production path: `ZagUpdateCompletion.complete` → `exit(0)`.
+    func testRestartToCompleteEndsTheProcessAndKeepsPreferences() {
+        continueAfterFailure = false
+        app = XCUIApplication()
+        app.launchEnvironment = ["ZAG_CARD_STATE": "handedOff", "ZAG_CARD_TERMINATE": "1", "ZAG_CARD_CLEAR_MARKER": "1"]
+        app.launch()
+        XCTAssertEqual(app.staticTexts["marker"].label, "no marker")
+        let frame = capsule("Restart to Complete...").frame
+        tap(at: CGPoint(x: frame.midX, y: frame.midY))
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 5), "the process ends after Restart to Complete...")
+        // Relaunch without clearing: the preference written just before exit(0) survived.
+        app.launchEnvironment = ["ZAG_CARD_STATE": "handedOff"]
+        app.launch()
+        XCTAssertEqual(app.staticTexts["marker"].label, "written before exit")
     }
 
     func testLearnMoreStillOpensItsDestination() {
@@ -72,11 +93,33 @@ final class ZagUpdateCardTapUITests: XCTestCase {
         settle("learnMore", "Learn More opens its release page")
     }
 
-    func testRowBackgroundAroundTheControlsDoesNothing() {
-        launch("handedOff")
-        let frame = capsule("Restart to Complete...").frame
-        reset(); tap(at: CGPoint(x: frame.midX, y: frame.minY - 12))
-        settle("none", "tapping the card between its controls does not open Learn More")
+    /// Empty card space well away from both controls. (Within a few points of
+    /// an active button iOS's usual touch tolerance applies, as it always has
+    /// for Update Now; see the next test.)
+    func testEmptyCardSpaceDoesNothing() {
+        for state in ["handedOff", "idle"] {
+            launch(state)
+            let header = app.staticTexts["Zag Store 1.0.0"].frame
+            let capsuleFrame = capsule(state == "idle" ? "Update Now" : "Restart to Complete...").frame
+            reset(); tap(at: CGPoint(x: capsuleFrame.maxX - 24, y: header.midY))
+            settle("none", "tapping empty card space in \(state) does nothing and never opens Learn More")
+            app.terminate()
+        }
+    }
+
+    /// The success capsule's tap tolerance matches Update Now's: same button,
+    /// same shape, so a near-miss behaves identically in both states.
+    func testSuccessCapsuleToleranceMatchesUpdateNow() {
+        var results: [String] = []
+        for (state, title) in [("idle", "Update Now"), ("handedOff", "Restart to Complete...")] {
+            launch(state)
+            let frame = capsule(title).frame
+            reset(); tap(at: CGPoint(x: frame.midX, y: frame.minY - 12))
+            Thread.sleep(forTimeInterval: 0.6)
+            results.append(events == "none" ? "miss" : "hit")
+            app.terminate()
+        }
+        XCTAssertEqual(results[0], results[1], "Update Now and the success capsule share one tap tolerance: \(results)")
     }
 
     func testBusyBarTapsNeverOpenLearnMore() {

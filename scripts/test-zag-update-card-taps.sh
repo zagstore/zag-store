@@ -3,6 +3,9 @@
 # a simulator): the production update control and Learn More link in a Form
 # section row, tapped by screen coordinate. Link activations are captured in the
 # harness, so nothing is opened, signed, installed on a device or published.
+# One test drives the production Restart to Complete path (exit(0)); a crash
+# report from the harness during the run fails the suite, so an intentional
+# exit is distinguished from a crash.
 #
 #   SIMULATOR_ID=<udid>   simulator to use (default: first booted iPhone)
 set -euo pipefail
@@ -16,6 +19,7 @@ fi
 
 rm -rf "$WORK"
 mkdir -p "$WORK/TapHarness.xcodeproj/xcshareddata/xcschemes"
+touch "$WORK/started"
 
 python3 -I - "$WORK" "$ROOT" <<'PY'
 import sys, hashlib
@@ -25,6 +29,7 @@ app_sources = [f"{root}/Feather/Utilities/ZagUpdateProgressPresentation.swift",
                f"{root}/Feather/Views/Settings/ZagUpdateSpectrumSurface.swift",
                f"{root}/Feather/Views/Settings/ZagSelfUpdateActionControl.swift",
                f"{root}/Feather/Views/Settings/ZagSelfUpdateLearnMoreLink.swift",
+               f"{root}/Feather/Utilities/ZagUpdateCompletion.swift",
                f"{root}/Feather/Views/Common/ZagNumericTextTransition.swift",
                f"{work}/Spectrum.swift", f"{work}/HostTint.swift",
                f"{root}/scripts/ZagUpdateCardTapHarness.swift"]
@@ -91,6 +96,11 @@ xcodebuild test \
 	CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$WORK/xcodebuild.log" \
 	| grep -E "Test Case .*(passed|failed)|error:|XCTAssert|\*\* TEST" || true
 
+CRASHES=$(find "$HOME/Library/Logs/DiagnosticReports" -name 'TapHarness*' -newer "$WORK/started" 2>/dev/null || true)
+if [ -n "$CRASHES" ]; then
+	echo "TapHarness crashed during the run: $CRASHES"
+	exit 1
+fi
 if grep -q '\*\* TEST SUCCEEDED \*\*' "$WORK/xcodebuild.log"; then
 	echo "Update card tap tests passed"
 else

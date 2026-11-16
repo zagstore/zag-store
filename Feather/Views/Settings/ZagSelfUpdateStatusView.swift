@@ -651,6 +651,13 @@ struct ZagSelfUpdateStatusView: View {
         }
     }
 
+    /// `Restart to Complete...`: ends the process only after a successful handoff.
+    private func completeUpdate() {
+        ZagUpdateCompletion.complete(actionState: updateActionState,
+                                     handoff: coordinator.handoffState,
+                                     pendingRecorded: coordinator.pendingInstallation != nil)
+    }
+
     private func beginUpdate(_ release: ZagSelfUpdateCoordinator.Release) {
         guard !releaseDownloadBusy, !installBusy, !gate4.isGate4Running,
               coordinator.pendingInstallation == nil else { return }
@@ -813,7 +820,8 @@ struct ZagSelfUpdateStatusView: View {
                         ZagUpdateTransferActionControl(state: updateActionState,
                                                    usesInstallerProgress: coordinator.pendingInstallation != nil,
                                                    disabled: coordinator.pendingInstallation != nil,
-                                                   progress: installerPresentation.progress) {
+                                                   progress: installerPresentation.progress,
+                                                   complete: completeUpdate) {
                             beginUpdate(release)
                         }
 

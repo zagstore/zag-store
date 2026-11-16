@@ -148,7 +148,29 @@ import Foundation
             check(!other.showsSuccess, "no failed, cancelled, unverified or incomplete state is ever green")
         }
         check(ZagSelfUpdateActionState.idle.isActionable && !ZagSelfUpdateActionState.handedOff.isActionable,
-              "only Update Now acts; the final capsule has no tap behaviour")
+              "only Update Now starts an update; the final capsule completes instead")
+        // Restart to Complete: termination only after a successful handoff with its record.
+        let handoffs: [ZagUpdateHandoffState] = [.none, .waiting, .stagedOnDevice, .reportedComplete, .uncertain]
+        let actions: [ZagSelfUpdateActionState] = [.idle, .progress(message: "Transferring signed IPA...", fraction: 1),
+                                                   .progress(message: "Installing update...", fraction: nil),
+                                                   .awaitingVerification, .handedOff]
+        for handoff in handoffs { for action in actions { for recorded in [false, true] {
+            let allowed = ZagUpdateCompletion.allowsTermination(actionState: action, handoff: handoff, pendingRecorded: recorded)
+            check(allowed == (action == .handedOff && (handoff == .stagedOnDevice || handoff == .reportedComplete) && recorded),
+                  "termination only after verified staging or completion, with the pending record (\(handoff), \(action), \(recorded))")
+        } } }
+        MainActor.assumeIsolated {
+            var terminations = 0
+            check(!ZagUpdateCompletion.complete(actionState: .awaitingVerification, handoff: .uncertain, pendingRecorded: true) { terminations += 1 },
+                  "an unverified attempt never terminates")
+            check(!ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .stagedOnDevice, pendingRecorded: false) { terminations += 1 },
+                  "without the pending record, the next launch could not verify, so no termination")
+            check(ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .stagedOnDevice, pendingRecorded: true) { terminations += 1 },
+                  "a successful handoff terminates")
+            check(!ZagUpdateCompletion.complete(actionState: .handedOff, handoff: .stagedOnDevice, pendingRecorded: true) { terminations += 1 },
+                  "racing or repeated requests terminate at most once")
+            check(terminations == 1, "the terminator runs exactly once")
+        }
         check(abs(ZagUpdateMorphSpecification.x1 + ZagUpdateMorphSpecification.x2 - 1) < 1e-12 &&
               abs(ZagUpdateMorphSpecification.y1 + ZagUpdateMorphSpecification.y2 - 1) < 1e-12,
               "one shared easing curve is mathematically symmetric under time reversal")

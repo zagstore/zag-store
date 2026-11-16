@@ -79,19 +79,48 @@ any installer error are never green.
 - Capsule: `Restart to Complete...`
 - Status: `Update successful. Reopen Zag Store to complete.`
 
-The App Switcher instruction on tap is removed. The final capsule is not
-actionable (`isActionable` is true only for `.idle`); hit testing is off and
-VoiceOver reads it as static text.
+The App Switcher instruction on tap is removed. (Superseded below: the
+capsule now ends the process.)
 
-## Closing the app on tap
+## Restart to Complete ends the process (follow-up)
 
-There is no public iOS API for an app to terminate or relaunch itself.
-`exit()` is unsupported for user-facing apps (Apple QA1561) and is excluded by
-the owner; `UIApplication.suspend` is private;
-`UIApplication.requestSceneSessionDestruction` closes a scene on iPad
-multi-window, not the process on iPhone, so the original executable would keep
-running. The tap therefore does nothing, and the status line tells the user what
-to do.
+There is no public iOS API for an app to terminate or relaunch itself;
+`UIApplication.suspend` is private and scene destruction does not end the
+process on iPhone. The owner has explicitly authorised `exit(0)` for Zag
+Store's sideloaded distribution. `exit(0)` is an unsupported iOS lifecycle
+operation (Apple Technical Q&A QA1561) and may not be acceptable for other
+distribution channels. It is a normal exit, not a crash: no `abort`,
+`fatalError`, signal or private API.
+
+- The same control and rendering: in the success state the existing button
+  becomes interactive once its presentation has settled (capsule arrived,
+  success line visible). Nothing visual changes; the whole capsule is the tap
+  target, with the same touch tolerance as `Update Now`.
+- `ZagUpdateCompletion.allowsTermination`: the action state is `.handedOff`, the
+  coordinator's handoff is `.stagedOnDevice` or `.reportedComplete`, and the
+  pending-installation record exists. Staging (209) comes after signing,
+  hashing and the complete, size-verified transfer, so none of those is still
+  running. Every other state (idle, busy, failed, cancelled, unverified) is
+  refused.
+- At most once: the control ignores further taps, and `complete` refuses a
+  second request.
+- Persistence: the pending record (expected and originating executable hashes)
+  is written to preferences before the transfer begins. The tap only calls
+  `UserDefaults.synchronize()` before `exit(0)`. Nothing is marked installed and
+  the one-shot splash is not touched. On the next launch the existing
+  executable-hash verification alone decides whether `Updated to <version>
+  <channel>` appears; a failed install, same-build reinstall or unchanged
+  executable does not show it.
+
+Known native limitation: callback 209 is emitted before the native layer opens
+installation_proxy and sends the Upgrade request, and no callback reports that
+the request was sent (210 is documented but deliberately not emitted). The tap
+is accepted only after the 0.35 s morph, the 65 ms pause and the status fade,
+which leaves that window for the request. It is not a guarantee. If the process
+ends first, iOS installs nothing; the next launch finds the original executable,
+shows no update message and offers the existing "Previous update not confirmed"
+recovery. Closing the window fully would need a native 210 emitted after the
+Upgrade request is written, which requires a Rust rebuild (out of scope).
 
 ## Validation
 
@@ -132,6 +161,9 @@ to do.
 6. Interrupted morph (a stage change within ~0.1 s of tapping): a two-line
    title can briefly overhang the shrinking capsule while the labels crossfade.
    This was already the case at `983e8dc4` and only occurs on this path.
+7. Restart to Complete on the iPhone: Zag Store exits; how SpringBoard and the
+   App Switcher present this, and whether iOS then completes the upgrade, have
+   not been observed on a device.
 
 ## Card tap boundaries (follow-up)
 
