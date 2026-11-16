@@ -478,7 +478,6 @@ struct ZagProfileToolbarButton: View {
 struct ZagGlobalProfileAvatar: View {
     let revision: UUID
     var animatedBorder: Bool = false
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var borderRotation = false
 
@@ -495,7 +494,7 @@ struct ZagGlobalProfileAvatar: View {
             if let image = ZagProfileAvatarStore.customImage() {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
-                Image(colorScheme == .dark ? "ZagProfileDark" : "ZagProfileLight")
+                Image("ZagProfileDark")
                     .resizable().scaledToFill()
             }
         }
