@@ -4,6 +4,7 @@ import NimbleViews
 /// Installation Settings row for the Mobile Data Fix.
 struct ZagMobileDataFixRow: View {
 	@ObservedObject private var controller = ZagMobileDataToggleController.shared
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
 	var body: some View {
 		let status = controller.status
@@ -14,7 +15,8 @@ struct ZagMobileDataFixRow: View {
 			HStack(spacing: 12) {
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
-						Text(status.isVerified ? "Mobile Data Fix" : ZagMobileDataToggle.setupActionTitle)
+						Text(status.isVerified ? "Mobile Data Fix" : "Apply Fix")
+                            .lineLimit(dynamicTypeSize > .large ? nil : 1)
 						if case .notSetUp = status {
 							Text("Enable app installation over Mobile Data")
 								.font(.footnote)
@@ -29,7 +31,7 @@ struct ZagMobileDataFixRow: View {
 					EmptyView()
 				} else {
 					ZagMobileDataFixStatusLabel(status: status, compact: true)
-						.font(.subheadline)
+						.font(ZagInstallationStatusStyle.font)
 				}
 			}
 		}
@@ -48,10 +50,11 @@ struct ZagMobileDataFixStatusLabel: View {
                 Text(compactTitle)
                     .lineLimit(dynamicTypeSize > .large ? nil : 1)
                     .fixedSize(horizontal: dynamicTypeSize <= .large, vertical: true)
-                Image(systemName: style.icon)
+                ZagInstallationStatusIndicator(systemName: style.icon)
                     .frame(width: 22, alignment: .center)
                     .accessibilityHidden(true)
             }
+            .font(ZagInstallationStatusStyle.font)
             .foregroundStyle(style.color)
         } else {
             Label(status.title, systemImage: style.icon)
@@ -90,7 +93,7 @@ struct ZagMobileDataFixView: View {
 				HStack {
 					Text("Status")
 					Spacer()
-					ZagMobileDataFixStatusLabel(status: status)
+					ZagMobileDataFixStatusLabel(status: status, compact: true)
 				}
 				if case .verified(_, let at) = status {
 					// Absolute date and time in the device's locale, calendar and

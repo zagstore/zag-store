@@ -56,7 +56,7 @@ prior_page = subprocess.check_output(['git', 'show', '4d1b426a:Feather/Views/Set
 assert current_page.split('struct RPPairingDiagnosticsView:', 1)[1] == prior_page.split('struct RPPairingDiagnosticsView:', 1)[1]
 assert current_page.split('private func confirmLocalCleanup()', 1)[1].split('private var tunnelVerified', 1)[0] == prior_page.split('private func confirmLocalCleanup()', 1)[1].split('private var tunnelVerified', 1)[0]
 footer = view.split('private var pairingFooter:', 1)[1].split('private var directInstallStatusColor:', 1)[0]
-assert 'if case .verified = pairingMonitor.model.pairing' in footer
+assert 'if case .verified = pairingVerification.currentVerification' in footer
 assert '!pairingCore.localPairingCleanupPending && pairingCore.pairingFileExists' in footer
 assert 'Settings App → Privacy & Security → Developer Mode → Zag Store' in footer
 assert 'Settings App → Privacy & Security → Developer Mode → Pair with Zag Store' in footer
@@ -64,10 +64,10 @@ assert 'Settings App → Privacy & Security → Developer Mode → Pair with Zag
 import tempfile
 footer_source = 'private var pairingFooter:' + footer
 fixture = '''import Foundation
-struct Monitor { var model = ZagDeviceLinkModel() }
+struct Verification { var currentVerification: ZagOnboardingPolicy.Verification = .unknown }
 struct Core { var localPairingCleanupPending = false; var pairingFileExists = true }
 struct Fixture {
-    var pairingMonitor = Monitor()
+    var pairingVerification = Verification()
     var pairingCore = Core()
 ''' + footer_source + '''
     var text: String { pairingFooter }
@@ -75,9 +75,8 @@ struct Fixture {
 var fixture = Fixture()
 let missing = "Settings App → Privacy & Security → Developer Mode → Pair with Zag Store"
 let paired = "Settings App → Privacy & Security → Developer Mode → Zag Store"
-let now = Date()
 precondition(fixture.text == missing) // a record without verification
-fixture.pairingMonitor.model.pairingEvent(.verified(now))
+fixture.pairingVerification.currentVerification = .verified
 precondition(fixture.text == paired)
 fixture.pairingCore.localPairingCleanupPending = true
 precondition(fixture.text == missing)
@@ -85,21 +84,28 @@ fixture.pairingCore.localPairingCleanupPending = false
 fixture.pairingCore.pairingFileExists = false
 precondition(fixture.text == missing)
 fixture.pairingCore.pairingFileExists = true
-fixture.pairingMonitor.model.pairingEvent(.failed(.pairingRejected, now.addingTimeInterval(1)))
+fixture.pairingVerification.currentVerification = .invalid
 precondition(fixture.text == missing)
-fixture.pairingMonitor.model.pairingEvent(.verified(now.addingTimeInterval(2)))
+fixture.pairingVerification.currentVerification = .verified
 precondition(fixture.text == paired) // re-pair / new successful verification
-fixture.pairingMonitor.model.expire(now: now.addingTimeInterval(1000))
+fixture.pairingVerification.currentVerification = .unknown
 precondition(fixture.text == missing)
-print("PASS: actual footer responds to verified, missing, cleanup, rejected, re-verified and expired pairing")
+print("PASS: actual footer responds to verified, missing, cleanup, rejected, re-verified and unknown pairing")
 '''
 with tempfile.TemporaryDirectory(prefix='zag-footer-') as work:
     source = Path(work) / 'main.swift'
     source.write_text(fixture)
     binary = str(Path(work) / 'tests')
-    subprocess.run(['xcrun', 'swiftc', str(root / 'Feather/Utilities/ZagDeviceLink.swift'), str(source), '-module-cache-path', '/tmp/zag-checkpoint-module-cache', '-o', binary], check=True)
+    subprocess.run(['xcrun', 'swiftc', str(root / 'Feather/Utilities/ZagOnboardingPolicy.swift'), str(source), '-module-cache-path', '/tmp/zag-checkpoint-module-cache', '-o', binary], check=True)
     subprocess.run([binary], check=True)
 assert 'Text(pairingFooter)' in view
+status_style = (root / 'Feather/Views/Settings/Installation/ZagInstallationStatusStyle.swift').read_text()
+assert 'static let font: Font = .subheadline' in status_style
+assert '.font(ZagInstallationStatusStyle.font)' in status_style
+assert '.frame(width: ZagInstallationStatusStyle.indicatorColumn' in status_style
+assert view.count('ZagInstallationStatusIndicator(systemName:') == 2
+assert view.count('.font(ZagInstallationStatusStyle.font)') == 2
+assert '.font(ZagInstallationStatusStyle.font)' in guide
 assert '.frame(width: 25, height: 25, alignment: .center)' in view
 assert '.presentationCornerRadius' not in popup  # same native rounded sheet geometry as Apps
 assert '.ignoresSafeArea' not in popup and '.frame(maxHeight: .infinity)' not in popup
@@ -119,13 +125,23 @@ assert 'CGRect(x: indicatorRow.maxX' in guide and 'geometry.size.width - indicat
 assert 'if indicatorRow != nil' in guide
 assert guide.count('Image(systemName: expanded ? "chevron.down" : "chevron.right")') == 1
 mobile = (root / 'Feather/Views/Settings/Installation/ZagMobileDataFixView.swift').read_text()
-assert 'ZagMobileDataFixStatusLabel(status: status, compact: true)' in mobile
+assert mobile.count('ZagMobileDataFixStatusLabel(status: status, compact: true)') == 2
+assert 'ZagMobileDataFixStatusLabel(status: status)\n' not in mobile
+assert 'Text(status.isVerified ? "Mobile Data Fix" : "Apply Fix")' in mobile
+assert 'NBList(status.isVerified ? "Mobile Data Fix" : ZagMobileDataToggle.setupActionTitle)' in mobile
+assert '.font(ZagInstallationStatusStyle.font)' in mobile
 assert 'if case .verificationRequired = status { return "Not Verified" }' in mobile
 compact = mobile.split('if compact {', 1)[1].split('} else {', 1)[0]
-assert compact.index('Text(compactTitle)') < compact.index('Image(systemName: style.icon)')
+assert compact.index('Text(compactTitle)') < compact.index('ZagInstallationStatusIndicator(systemName: style.icon)')
 assert 'HStack(spacing: 8)' in compact and '.frame(width: 22, alignment: .center)' in compact
 assert '.lineLimit(dynamicTypeSize > .large ? nil : 1)' in compact
 assert '.fixedSize(horizontal: dynamicTypeSize <= .large, vertical: true)' in compact
+assert '.font(ZagInstallationStatusStyle.font)' in compact
+# Destination help and all shortcut actions are unchanged outside its status call.
+old_mobile = subprocess.check_output(['git', 'show', '8c26dda6:Feather/Views/Settings/Installation/ZagMobileDataFixView.swift'], cwd=root, text=True)
+old_destination = old_mobile.split('/// Setup and verification', 1)[1]
+new_destination = mobile.split('/// Setup and verification', 1)[1]
+assert new_destination.replace('ZagMobileDataFixStatusLabel(status: status, compact: true)', 'ZagMobileDataFixStatusLabel(status: status)') == old_destination
 assert 'case .verificationRequired: return ("questionmark.circle.fill", .orange)' in mobile
 for competing in ['disclosureGroupStyle', 'withAnimation', '.animation(', '.transition(', 'if expanded {']:
     assert competing not in guide
@@ -143,6 +159,7 @@ assert "".join(current_control.split()) == "".join(original_control.split())
 # File and both export branches also retain the original native row tree.
 current_files = view.split('Label("Pairing File"', 1)[1].split('if case .pin', 1)[0]
 original_files = baseline.split('Label("Pairing File"', 1)[1].split('if case .pin', 1)[0]
+current_files = current_files.replace('.font(ZagInstallationStatusStyle.font)', '').replace('ZagInstallationStatusIndicator(systemName:', 'Image(systemName:')
 assert "".join(current_files.split()) == "".join(original_files.split())
 
 for forbidden in ['.listRowInsets', '.listRowSeparator', '.defaultMinListRowHeight']:

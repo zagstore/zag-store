@@ -54,6 +54,7 @@ struct ZagDeveloperModeGuidanceView: View {
                 .layoutPriority(1)
                 Spacer()
                 Text(ZagDeveloperModeGuidance.status)
+                    .font(ZagInstallationStatusStyle.font)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.trailing)
                     .fixedSize(horizontal: true, vertical: false)

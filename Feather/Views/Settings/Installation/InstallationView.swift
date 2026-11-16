@@ -38,7 +38,7 @@ struct InstallationView: View {
 private struct RPPairingView: View {
 	@State private var isLocalDevVpnAvailable = true
 	@StateObject private var pairingCore = ZagRPPairingCore.shared
-    @ObservedObject private var pairingMonitor = ZagLocalVPNMonitor.shared
+    @ObservedObject private var pairingVerification = ZagRPPairingLaunchService.shared
 	@State private var showGate4Importer = false
 	@State private var showUnpairConfirmation = false
     @State private var cleanupFeedback: CleanupFeedback?
@@ -138,8 +138,9 @@ private struct RPPairingView: View {
 				Label("Pairing File", systemImage: "doc.badge.gearshape")
 				Spacer()
 				Text(pairingCore.pairingFileExists ? "Saved" : "Not Saved")
+                    .font(ZagInstallationStatusStyle.font)
 					.foregroundStyle(pairingCore.pairingFileExists ? .green : .secondary)
-				Image(systemName: pairingCore.pairingFileExists ? "checkmark.circle.fill" : "circle")
+				ZagInstallationStatusIndicator(systemName: pairingCore.pairingFileExists ? "checkmark.circle.fill" : "circle")
 					.foregroundStyle(pairingCore.pairingFileExists ? .green : .secondary)
 					.frame(width: 22, alignment: .center)
 			}
@@ -356,7 +357,7 @@ private struct RPPairingView: View {
 
     private var pairingFooter: String {
         let verified: Bool
-        if case .verified = pairingMonitor.model.pairing {
+        if case .verified = pairingVerification.currentVerification {
             verified = !pairingCore.localPairingCleanupPending && pairingCore.pairingFileExists
         } else {
             verified = false
@@ -394,8 +395,9 @@ private struct RPPairingView: View {
                 .labelStyle(.titleAndIcon)
 			Spacer()
 			Text(value)
+                .font(ZagInstallationStatusStyle.font)
 				.foregroundStyle(color)
-			Image(systemName: systemImage)
+			ZagInstallationStatusIndicator(systemName: systemImage)
 				.foregroundStyle(color)
 				.frame(width: 22, alignment: .center)
 		}

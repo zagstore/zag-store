@@ -9,7 +9,7 @@ import Combine
     @Published var state: State = .idle
     @Published var gate2State: Gate2State = .idle
     var pairingFileExists = true
-    var localPairingCleanupPending = false
+    @Published var localPairingCleanupPending = false
     var isTransportBusy = false
     var isGate2Running = false
     var isRunning = false
@@ -38,6 +38,7 @@ import Combine
         let setupSubscription = service.setupSuccesses.sink { successes += 1 }
         defer { checkSubscription.cancel(); setupSubscription.cancel() }
         check(results.isEmpty && successes == 0, "cached health-check/setup successes never grant entry")
+        check(service.currentVerification == .unknown, "presentation never adopts cached native success")
         core.localPairingCleanupPending = true
         check(!service.hasPairingRecord, "pending local cleanup blocks cold-launch entry even if a file remains")
         core.gate2State = .complete
@@ -67,6 +68,25 @@ import Combine
         check(successes == 0, "opening/starting pairing is not success")
         core.state = .paired
         check(successes == 1, "only fresh native setup completion exits welcome")
-        print("SUCCESS: 14 production pairing event-bridge checks passed")
+        check(service.currentVerification == .verified, "presentation retains authenticated setup success for main app")
+        core.gate2State = .failed("RPPairing pair-verify failed: rejected")
+        check(service.currentVerification == .invalid, "live rejection invalidates presentation after onboarding has finished")
+        core.state = .paired
+        check(service.currentVerification == .verified, "re-established native pairing restores paired description")
+        core.localPairingCleanupPending = true
+        check(service.currentVerification == .missing, "local cleanup immediately invalidates paired description")
+        core.localPairingCleanupPending = false
+        core.pairingFileExists = false
+        core.gate2State = .idle
+        check(service.currentVerification == .missing, "removed record cannot retain paired description")
+        core.pairingFileExists = true
+        core.gate2State = .starting
+        core.gate2State = .complete
+        check(service.currentVerification == .verified, "fresh production verification restores paired description")
+        var readiness = ZagDeviceLinkModel()
+        readiness.pairingEvent(.verified(Date()))
+        readiness.expire(now: Date().addingTimeInterval(1000))
+        check(service.currentVerification == .verified, "VPN readiness expiry does not erase authenticated pairing")
+        print("SUCCESS: 22 production pairing event-bridge checks passed")
     }
 }
