@@ -21,6 +21,11 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         let sha256: String
         let minimumIOSVersion: String?
         let releaseNotes: String?
+        // Set by validated discovery, never decoded from an unsigned extra field.
+        var authenticatedChannel: UpdateChannel? = nil
+        private enum CodingKeys: String, CodingKey {
+            case version, build, bundleIdentifier, ipaURL, sha256, minimumIOSVersion, releaseNotes
+        }
     }
 
     // Stable is the default. Existing "off" preferences migrate without changing
@@ -88,7 +93,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             ipaURL: ipaURL,
             sha256: payload.sha256,
             minimumIOSVersion: payload.minimumIOSVersion,
-            releaseNotes: payload.releaseNotes
+            releaseNotes: payload.releaseNotes,
+            authenticatedChannel: channel
         )
         let versionOrder = currentVersion.compare(release.version, options: .numeric)
         let buildOrder = currentBuild.compare(release.build, options: .numeric)
@@ -111,6 +117,9 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         let expectedExecutableSHA256: String?
         // A candidate identical to the original executable cannot prove replacement.
         let originatingExecutableSHA256: String?
+        // Optional for backward compatibility; unknown legacy channels do not
+        // produce a post-update channel announcement.
+        var releaseChannel: String? = nil
     }
 
     enum UpdateError: LocalizedError {
@@ -158,6 +167,25 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     @Published private(set) var automaticDownloadStatus = "Not downloaded"
     private var wifiMonitor: NWPathMonitor?
     private var wifiAvailable = false
+    @Published private(set) var preparationState: ZagUpdatePreparationState = .idle
+    @Published private(set) var userUpdateInProgress = false
+    private var userUpdateGeneration: Int?
+    private var handoffInProgress = false
+
+    func beginUserUpdateOperation() -> Bool {
+        guard !userUpdateInProgress, !downloadInProgress, pendingInstallation == nil else { return false }
+        userUpdateInProgress = true
+        userUpdateGeneration = checkGeneration
+        preparationState = .idle
+        return true
+    }
+
+    func finishUserUpdateOperation() {
+        userUpdateInProgress = false
+        userUpdateGeneration = nil
+        preparationState = .idle
+    }
+    private var activeDownloadToken: UUID?
     private var downloadInProgress = false
     private var downloadedReleaseIdentity: String?
 
@@ -167,7 +195,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
 
     private func downloadOnWiFiIfEnabled(_ release: Release) async {
         guard UserDefaults.standard.bool(forKey: Self.automaticWiFiDownloadKey),
-              wifiAvailable, !downloadInProgress, pendingInstallation == nil else { return }
+              wifiAvailable, !downloadInProgress, !userUpdateInProgress, pendingInstallation == nil else { return }
         let identity = releaseIdentity(release)
         guard downloadedReleaseIdentity != identity else { return }
         let generation = checkGeneration
@@ -188,9 +216,11 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             preparedIPA = staged
             downloadedReleaseIdentity = identity
             automaticDownloadStatus = "Downloaded and SHA-256 verified — ready to sign"
+            preparationState = .idle
         } catch {
             guard generation == checkGeneration else { return }
             automaticDownloadStatus = "Wi-Fi download failed: " + error.localizedDescription
+            preparationState = .idle
         }
     }
     private var lastAutomaticCheck: Date?
@@ -245,6 +275,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
 
     func preferencesChanged() {
         checkGeneration += 1
+        activeDownloadToken = nil
+        preparationState = .idle
         availableRelease = nil
         discardPreparedIPA()
         automaticDownloadStatus = "Not downloaded"
@@ -266,6 +298,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     @Published private(set) var availableRelease: Release?
     @Published private(set) var lastVerifiedInstallation: PendingInstallation?
     @Published private(set) var pendingInstallation: PendingInstallation?
+    @Published private(set) var installedIdentityVerified = false
+    @Published private(set) var postUpdateMessage: ZagPostUpdateMessage?
+    private let postUpdateMessageStore = ZagPostUpdateMessageStore()
+    private var launchReconciliationStarted = false
 
     private let pendingKey = "zagStore.selfUpdate.pending"
     private let completedKey = "zagStore.selfUpdate.completed"
@@ -273,7 +309,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     private init() {
         pendingInstallation = Self.read(PendingInstallation.self, key: pendingKey)
         lastVerifiedInstallation = Self.read(PendingInstallation.self, key: completedKey)
-        reconcileOnLaunch()
+        Task { @MainActor [weak self] in await self?.reconcileOnLaunch() }
         Self.removeAbandonedPartialDownloads()
         let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
         wifiMonitor = monitor
@@ -315,30 +351,54 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
     }
 
-    private static func executableSHA256(at url: URL) throws -> String {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    nonisolated private static func executableSHA256(at url: URL) throws -> String {
+        try ZagPackageIntegrity.sha256(of: url)
     }
 
-    func reconcileOnLaunch() {
-        guard let pending = pendingInstallation else { return }
-        // A version/build match alone cannot prove the replacement occurred.
-        // Legacy pending records without a candidate hash remain unconfirmed.
-        guard pending.bundleIdentifier == currentBundleID,
-              pending.version == currentVersion,
-              pending.build == currentBuild,
-              let expectedHash = pending.expectedExecutableSHA256,
+    func reconcileOnLaunch() async {
+        guard !launchReconciliationStarted else { return }
+        launchReconciliationStarted = true
+        let pending = pendingInstallation
+        guard !currentBundleID.isEmpty, !currentVersion.isEmpty, !currentBuild.isEmpty,
+              let candidate = pending ?? lastVerifiedInstallation,
+              candidate.bundleIdentifier == currentBundleID,
+              candidate.version == currentVersion,
+              candidate.build == currentBuild,
+              let expectedHash = candidate.expectedExecutableSHA256,
+              let originalHash = candidate.originatingExecutableSHA256,
+              ZagPostUpdateMessage.isDigest(originalHash),
               let executable = Bundle.main.executableURL,
-              let actualHash = try? Self.executableSHA256(at: executable),
+              let actualHash = try? await ZagPackageIntegrity.sha256InBackground(of: executable),
               actualHash.caseInsensitiveCompare(expectedHash) == .orderedSame,
-              let originalHash = pending.originatingExecutableSHA256,
               actualHash.caseInsensitiveCompare(originalHash) != .orderedSame else { return }
-        if let data = try? JSONEncoder().encode(pending) {
+        let running = ZagPostUpdateMessage.RunningIdentity(bundleIdentifier: currentBundleID,
+                                                          version: currentVersion, build: currentBuild,
+                                                          executableSHA256: actualHash)
+        if let pending {
+            // Revalidate the record after suspended I/O; clearing/replacing an
+            // attempt while its executable is hashed must not resurrect it.
+            guard pendingInstallation?.startedAt == pending.startedAt,
+                  pendingInstallation?.expectedExecutableSHA256 == pending.expectedExecutableSHA256,
+                  let data = try? JSONEncoder().encode(pending) else { return }
             UserDefaults.standard.set(data, forKey: completedKey)
+            postUpdateMessageStore.record(.init(bundleIdentifier: pending.bundleIdentifier,
+                                                version: pending.version, build: pending.build,
+                                                channel: pending.releaseChannel,
+                                                expectedExecutableSHA256: pending.expectedExecutableSHA256,
+                                                originatingExecutableSHA256: pending.originatingExecutableSHA256),
+                                          running: running)
+            UserDefaults.standard.removeObject(forKey: pendingKey)
+            pendingInstallation = nil
+            lastVerifiedInstallation = pending
         }
-        UserDefaults.standard.removeObject(forKey: pendingKey)
-        pendingInstallation = nil
-        lastVerifiedInstallation = pending
+        installedIdentityVerified = true
+        postUpdateMessage = postUpdateMessageStore.pending(running: running)
+    }
+
+    func acknowledgePostUpdateMessageDisplayed(_ message: ZagPostUpdateMessage) {
+        guard postUpdateMessage == message else { return }
+        postUpdateMessageStore.acknowledgeDisplayed(message)
+        postUpdateMessage = nil
     }
 
     func checkForUpdate(manifestURL: URL) async throws -> Release? {
@@ -367,7 +427,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         }
         if http.statusCode == 404 { throw UpdateError.channelNotPublished }
         guard http.statusCode == 200 else { throw UpdateError.invalidRelease }
-        let release = try JSONDecoder().decode(Release.self, from: data)
+        var release = try JSONDecoder().decode(Release.self, from: data)
+        release.authenticatedChannel = UpdateChannel.allCases.first { $0.manifestURL == manifestURL }
         guard !release.version.isEmpty, !release.build.isEmpty,
               isSupportedReleaseIdentity(release.bundleIdentifier) else {
             throw UpdateError.incompatibleBundleIdentifier
@@ -411,16 +472,27 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         guard release.ipaURL.scheme?.lowercased() == "https" else {
             throw UpdateError.insecureDownload
         }
-        if downloadedReleaseIdentity == releaseIdentity(release),
-           let cached = preparedIPA, FileManager.default.fileExists(atPath: cached.path),
-           (try? ZagPackageIntegrity.verify(cached, expectedSHA256: release.sha256)) != nil {
-            return cached
-        }
-        // Whatever was prepared before is stale now. Discard it first, so a
-        // failed attempt can never leave an earlier file available to import.
-        discardPreparedIPA()
+        // Reserve the operation before awaiting cached verification as well as
+        // network work, so a second caller cannot race reuse of the same file.
         downloadInProgress = true
         defer { downloadInProgress = false }
+        let generation = checkGeneration
+        if downloadedReleaseIdentity == releaseIdentity(release),
+           let cached = preparedIPA, FileManager.default.fileExists(atPath: cached.path) {
+            preparationState = .verifying
+            do {
+                try await ZagPackageIntegrity.verifyInBackground(cached, expectedSHA256: release.sha256)
+                guard generation == checkGeneration else { throw CancellationError() }
+                return cached
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Preserve the existing recovery strategy: invalid cached bytes
+                // are discarded and downloaded/verified again.
+            }
+        }
+        guard generation == checkGeneration else { throw CancellationError() }
+        discardPreparedIPA()
         let destination = try await downloadVerifiedIPA(release, session: .shared)
         preparedIPA = destination
         downloadedReleaseIdentity = releaseIdentity(release)
@@ -437,6 +509,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     /// rejected, interrupted or cancelled download removes its partial file.
     private func downloadVerifiedIPA(_ release: Release, session: URLSession) async throws -> URL {
         let generation = checkGeneration
+        let token = UUID()
+        activeDownloadToken = token
+        preparationState = .downloading(.init(received: 0, expected: nil))
+        defer { if activeDownloadToken == token { activeDownloadToken = nil } }
         let folder = Self.selfUpdateFolder
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let partial = folder.appendingPathComponent("incoming-\(UUID().uuidString).partial")
@@ -447,7 +523,14 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         defer { try? FileManager.default.removeItem(at: partial) }
         do {
             try await ZagPackageIntegrity.download(
-                release.ipaURL, expectedSHA256: release.sha256, session: session, to: partial
+                release.ipaURL, expectedSHA256: release.sha256, session: session, to: partial,
+                progress: { [weak self] bytes in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.activeDownloadToken == token,
+                              self.checkGeneration == generation else { return }
+                        self.preparationState = .downloading(bytes)
+                    }
+                }
             )
         } catch ZagPackageIntegrity.Failure.checksumMismatch {
             throw UpdateError.checksumMismatch
@@ -458,6 +541,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         // A channel/preference change invalidates this attempt even if its
         // network request completed successfully while the actor was suspended.
         guard generation == checkGeneration else { throw CancellationError() }
+        preparationState = .verifying
         let destination = folder.appendingPathComponent("verified-release.ipa")
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
@@ -477,18 +561,21 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
 
     /// Call immediately before handing a signed, identity-validated IPA to
     /// the device installer. A callback from the old process is not required.
-    func recordInstallationHandoff(for release: Release, signed: Signed) throws {
+    func recordInstallationHandoff(for release: Release, signed: Signed) async throws {
+        let generation = checkGeneration
         guard isSupportedReleaseIdentity(release.bundleIdentifier),
               let appURL = Storage.shared.getAppDirectory(for: signed),
               let info = NSDictionary(contentsOf: appURL.appendingPathComponent("Info.plist")),
               let executableName = info["CFBundleExecutable"] as? String else {
             throw UpdateError.signedIdentityMismatch
         }
-        let candidateHash = try Self.executableSHA256(at: appURL.appendingPathComponent(executableName))
+        let candidateExecutable = appURL.appendingPathComponent(executableName)
+        let candidateHash = try await ZagPackageIntegrity.sha256InBackground(of: candidateExecutable)
         guard let currentExecutable = Bundle.main.executableURL else {
             throw UpdateError.signedIdentityMismatch
         }
-        let originalHash = try Self.executableSHA256(at: currentExecutable)
+        let originalHash = try await ZagPackageIntegrity.sha256InBackground(of: currentExecutable)
+        guard generation == checkGeneration else { throw CancellationError() }
         guard candidateHash.caseInsensitiveCompare(originalHash) != .orderedSame else {
             throw UpdateError.noUpdateAvailable
         }
@@ -499,7 +586,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             startedAt: Date(),
             originatingBuild: currentBuild,
             expectedExecutableSHA256: candidateHash,
-            originatingExecutableSHA256: originalHash
+            originatingExecutableSHA256: originalHash,
+            releaseChannel: release.authenticatedChannel?.rawValue
         )
         let data = try JSONEncoder().encode(pending)
         UserDefaults.standard.set(data, forKey: pendingKey)
@@ -573,9 +661,23 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         _ release: Release,
         certificate: CertificatePair
     ) async throws -> Signed {
-        _ = try await prepare(release)
-        let imported = try await importPreparedRelease(release)
-        return try await signImportedRelease(imported, release: release, certificate: certificate)
+        let generation = userUpdateInProgress ? userUpdateGeneration ?? checkGeneration : checkGeneration
+        guard generation == checkGeneration else { throw CancellationError() }
+        do {
+            _ = try await prepare(release)
+            guard generation == checkGeneration else { throw CancellationError() }
+            preparationState = .importing
+            let imported = try await importPreparedRelease(release)
+            guard generation == checkGeneration else { throw CancellationError() }
+            preparationState = .signing
+            let signed = try await signImportedRelease(imported, release: release, certificate: certificate)
+            guard generation == checkGeneration else { throw CancellationError() }
+            preparationState = .readyForHandoff
+            return signed
+        } catch {
+            preparationState = .idle
+            throw error
+        }
     }
 
     /// Explicit, test-only authenticated v2 preparation. The caller supplies a
@@ -604,7 +706,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             ipaURL: ipaURL,
             sha256: payload.sha256,
             minimumIOSVersion: payload.minimumIOSVersion,
-            releaseNotes: payload.releaseNotes
+            releaseNotes: payload.releaseNotes,
+            authenticatedChannel: UpdateChannel(rawValue: channel)
         )
         // A signed manifest is not authorization to downgrade or reinstall.
         let versionOrder = currentVersion.compare(release.version, options: .numeric)
@@ -1070,9 +1173,9 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
 
     /// Record a pending handoff only after staging and identity checks pass.
     /// This helper does not contact the installation service.
-    private func persistStagedHandoff(for release: Release, signed: Signed) throws {
+    private func persistStagedHandoff(for release: Release, signed: Signed) async throws {
         try validateSignedApp(signed, release: release)
-        try recordInstallationHandoff(for: release, signed: signed)
+        try await recordInstallationHandoff(for: release, signed: signed)
     }
 
     /// Stages an IPA and records the expected executable before installation.
@@ -1081,8 +1184,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         _ signed: Signed,
         release: Release
     ) async throws -> URL {
+        let generation = checkGeneration
         let packageURL = try await stageSignedSelfUpdate(signed, release: release)
-        try persistStagedHandoff(for: release, signed: signed)
+        guard generation == checkGeneration else { throw CancellationError() }
+        try await persistStagedHandoff(for: release, signed: signed)
         return packageURL
     }
 
@@ -1092,7 +1197,14 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         _ signed: Signed,
         release: Release
     ) async throws {
+        let generation = checkGeneration
         let packageURL = try await prepareInstallationHandoff(signed, release: release)
+        guard generation == checkGeneration else {
+            // No installer call has occurred; this exclusively owned staged
+            // attempt is safe to release using the existing recovery policy.
+            if ZagSelfUpdateRetryPolicy.mayReleasePendingRecord(after: .notStarted) { clearFailedHandoff() }
+            throw CancellationError()
+        }
         var installerStarted = false
         var finishedEvents: [ZagGate4Event]?
         do {
@@ -1127,6 +1239,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         userConfirmedSelfReplacement: Bool
     ) async throws {
         guard userConfirmedSelfReplacement else { throw UpdateError.invalidRelease }
+        guard !handoffInProgress else { throw UpdateError.installationAlreadyRunning }
+        guard !userUpdateInProgress || userUpdateGeneration == checkGeneration else { throw CancellationError() }
+        handoffInProgress = true
+        defer { handoffInProgress = false }
         guard pendingInstallation == nil else { throw UpdateError.previousAttemptUnverified }
         guard signed.identifier == currentBundleID else { throw UpdateError.incompatibleBundleIdentifier }
         try await performPreparedHandoff(signed, release: release)
