@@ -177,7 +177,17 @@ oldPlist=plistlib.loads(subprocess.check_output(['git','show','ea191fff:'+plistP
 newPlist=plistlib.loads((root/plistPath).read_bytes())
 assert newPlist.pop('CADisableMinimumFrameDurationOnPhone') is True
 assert newPlist == oldPlist, 'only documented ProMotion opt-in may change in Info.plist'
-assert 'Feather/FeatherApp.swift' not in changed
+# FeatherApp may differ only by the pairing launch fix (docs/validation/pairing-launch-offline.md).
+oldApp=subprocess.check_output(['git','show','ea191fff:Feather/FeatherApp.swift'],cwd=root,text=True)
+newApp=(root/'Feather/FeatherApp.swift').read_text()
+for added in ['\t\t\t\t\t.zagPairingRepairPrompt()\n',
+              '            // Connection status refreshes on its own; a reconnect re-checks\n',
+              '            // pairing once if the last check could not reach the device.\n',
+              '            .onReceive(ZagLocalVPNMonitor.shared.$model.map(\\.tunnel).removeDuplicates()) { tunnel in\n',
+              '                if tunnel == .operational { launch.connectionAvailable() }\n            }\n']:
+    assert newApp.count(added)==1, added
+    newApp=newApp.replace(added,'',1)
+assert newApp == oldApp, 'FeatherApp changed beyond the pairing launch fix'
 # The splash may differ only by the post-update release group's bold weight.
 for p in ['Feather/Views/TabView/Bars/ZagCinematicSplashView.swift','Feather/Views/TabView/Bars/ZagSplashAnimationStage.swift']:
  restored=(root/p).read_text().replace('        // The motto ends semibold; an update\'s release group is bold.\n','').replace('signatureMessage == nil ? .semibold : .bold]','.semibold]').replace('[.light, .ultraLight, .bold]','[.light, .ultraLight, .semibold]')

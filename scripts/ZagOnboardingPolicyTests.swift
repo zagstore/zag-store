@@ -6,9 +6,11 @@ import Combine
     var isBusy = false
     let events = PassthroughSubject<ZagOnboardingPolicy.Verification, Never>()
     let successes = PassthroughSubject<Void, Never>()
+    let removals = PassthroughSubject<Void, Never>()
     var checks = 0
     var verificationEvents: AnyPublisher<ZagOnboardingPolicy.Verification, Never> { events.eraseToAnyPublisher() }
     var setupSuccesses: AnyPublisher<Void, Never> { successes.eraseToAnyPublisher() }
+    var recordRemovals: AnyPublisher<Void, Never> { removals.eraseToAnyPublisher() }
     func verify() { checks += 1 }
 }
 
@@ -46,47 +48,112 @@ import Combine
         check(defaults.bool(forKey: "ZagStore.activityOptOut"), "unrelated consent preferences retained")
         check(launch(missing).policy.status == .missing, "completed onboarding followed by unpairing shows welcome")
 
-        for result in [ZagOnboardingPolicy.Verification.invalid, .failed, .unknown] {
+        // Saved pairing, VPN connected: the main interface opens at once and
+        // verification completes in the background.
+        let connected = PairingService(); connected.hasPairingRecord = true
+        let online = launch(connected)
+        check(online.policy.canEnterMain && online.policy.hasSavedPairing && !online.policy.isPairingVerified,
+              "saved pairing opens main immediately without being treated as verified")
+        await settle()
+        check(connected.checks == 1, "one asynchronous check requested for a saved pairing")
+        connected.events.send(.verified)
+        check(online.policy.isPairingVerified && online.policy.canEnterMain, "VPN connected: live check verifies pairing")
+        online.startIfNeeded()
+        online.connectionAvailable()
+        check(connected.checks == 1 && online.policy.isPairingVerified,
+              "background/foreground, repeated tasks and reconnects never re-probe verified pairing")
+
+        // Saved pairing, VPN disconnected: unreachable results keep the app open
+        // and never read as missing pairing or as verification.
+        for result in [ZagOnboardingPolicy.Verification.unknown, .failed] {
             let service = PairingService(); service.hasPairingRecord = true
             let gate = launch(service)
-            check(!gate.policy.canEnterMain, "saved file cannot bypass pending \(result) verification")
             await settle()
-            check(service.checks == 1, "one authoritative check requested for \(result)")
             service.events.send(result)
-            check(!gate.policy.canEnterMain && gate.policy.status != .checking,
-                  "invalid/stale/revoked, failed or unknown verification shows recoverable welcome: \(result)")
+            check(gate.policy.canEnterMain && gate.policy.isConnectionUnavailable && gate.policy.hasSavedPairing
+                  && !gate.policy.isPairingVerified && gate.policy.status != .missing,
+                  "VPN disconnected (\(result)): main stays open, connectivity unavailable, pairing kept but unverified")
         }
+
+        // Explicit rejection: open, not verified, not a connectivity problem.
+        let rejectedService = PairingService(); rejectedService.hasPairingRecord = true
+        let rejected = launch(rejectedService)
+        await settle()
+        rejectedService.events.send(.invalid)
+        check(rejected.policy.status == .invalid && rejected.policy.canEnterMain && rejected.policy.hasSavedPairing
+              && !rejected.policy.isPairingVerified && !rejected.policy.isConnectionUnavailable,
+              "rejected pairing stays saved, unverified and distinct from connectivity (repair prompt)")
+        rejected.connectionAvailable()
+        check(rejectedService.checks == 1, "reconnect does not re-probe a rejected pairing")
+        rejectedService.successes.send(())
+        check(rejected.policy.isPairingVerified, "repairing from inside the main interface verifies pairing")
 
         let stalled = PairingService(); stalled.hasPairingRecord = true
         let timeout = launch(stalled, timeout: 20_000_000)
         await settle()
         try await Task.sleep(nanoseconds: 80_000_000)
-        check(timeout.policy.status == .timedOut && !timeout.policy.canEnterMain, "verification timeout cannot block indefinitely or enter app")
+        check(timeout.policy.status == .timedOut && timeout.policy.canEnterMain && timeout.policy.isConnectionUnavailable
+              && timeout.policy.hasSavedPairing && !timeout.policy.isPairingVerified,
+              "verification timeout is unavailable connectivity: never missing pairing, never verification")
         stalled.events.send(.verified)
         check(timeout.policy.status == .timedOut, "late result after timeout ignored")
+
+        // VPN reconnect after the timeout: exactly one new check.
+        timeout.connectionAvailable()
+        await settle()
+        check(stalled.checks == 2 && timeout.policy.status == .checking, "VPN reconnect after timeout starts one new check")
+        timeout.connectionAvailable()
         timeout.retry()
         await settle()
+        check(stalled.checks == 2, "repeated reconnects while checking never overlap checks")
         stalled.events.send(.verified)
-        check(timeout.policy.status == .verified, "retry recovers from timeout")
+        check(timeout.policy.isPairingVerified, "reconnect re-check verifies pairing for device operations")
 
         let busy = PairingService(); busy.hasPairingRecord = true; busy.isBusy = true
         let busyGate = launch(busy, timeout: 20_000_000)
         try await Task.sleep(nanoseconds: 80_000_000)
         check(busy.checks == 0 && busyGate.policy.status == .timedOut, "unavailable/busy service is bounded and never overlaps native workers")
 
+        // Pairing removed during the session.
+        let removedService = PairingService(); removedService.hasPairingRecord = true
+        let removed = launch(removedService)
+        await settle()
+        removedService.events.send(.verified)
+        removedService.hasPairingRecord = false
+        removedService.removals.send(())
+        check(removed.policy.status == .missing && !removed.policy.hasSavedPairing && !removed.policy.isPairingVerified
+              && removed.policy.canEnterMain, "removal during the session clears verification without leaving main")
+        removed.connectionAvailable()
+        check(removedService.checks == 1, "no probe runs without a record")
+        check(launch(removedService).policy.status == .missing && !launch(removedService).policy.canEnterMain,
+              "cold launch after removal shows the first-run welcome")
+        let inFlightService = PairingService(); inFlightService.hasPairingRecord = true
+        let inFlight = launch(inFlightService)
+        await settle()
+        inFlightService.hasPairingRecord = false
+        inFlightService.removals.send(())
+        inFlightService.events.send(.verified)
+        check(inFlight.policy.status == .missing, "a check result after removal is discarded")
+        let staleRemoval = PairingService(); staleRemoval.hasPairingRecord = true
+        let kept = launch(staleRemoval)
+        staleRemoval.removals.send(())
+        check(kept.policy.hasSavedPairing && kept.policy.status == .checking, "removal signal without a removed record changes nothing")
+
+        // Deep links before and after the splash.
+        let url = URL(string: "zagstore://settings/installation")!
         let valid = PairingService(); valid.hasPairingRecord = true
         let verified = launch(valid)
-        let url = URL(string: "zagstore://settings/installation")!
         verified.enqueue(url)
-        check(verified.takeURLs().isEmpty, "deep link held while verification and splash pending")
+        check(verified.takeURLs().isEmpty, "deep link before the splash is held")
         verified.finishSplash()
-        check(verified.takeURLs().isEmpty, "splash completion cannot dispatch links or expose main before verification")
-        await settle()
-        valid.events.send(.verified)
-        check(verified.policy.canEnterMain, "positively verified operational pairing bypasses welcome")
-        check(verified.takeURLs() == [url] && verified.takeURLs().isEmpty, "pending deep link delivered once after verification and splash")
-        verified.startIfNeeded()
-        check(valid.checks == 1 && verified.policy.canEnterMain, "background/foreground or repeated view task does not restart onboarding")
+        check(verified.takeURLs() == [url] && verified.takeURLs().isEmpty,
+              "saved pairing: link released once after the splash, without waiting for the network")
+        verified.enqueue(url)
+        check(verified.takeURLs() == [url], "link after the splash is delivered immediately")
+        let firstRun = launch(missing)
+        firstRun.enqueue(url)
+        firstRun.finishSplash()
+        check(firstRun.takeURLs().isEmpty, "no pairing: links wait behind the first-run welcome")
 
         let skipped = launch(missing)
         skipped.enqueue(url)
@@ -106,10 +173,10 @@ import Combine
         setup.successes.send(())
         check(pairing.policy.status == .verified, "fresh authenticated native pairing success exits welcome")
         let next = launch(setup)
-        check(next.policy.status == .checking && !next.policy.canEnterMain, "successful pairing followed by cold relaunch must reverify")
+        check(next.policy.status == .checking && !next.policy.isPairingVerified, "successful pairing followed by cold relaunch must reverify")
         await settle()
         setup.events.send(.failed)
-        check(!next.policy.canEnterMain, "previous native success cannot hide stale pairing on next cold launch")
+        check(!next.policy.isPairingVerified, "previous native success cannot hide stale pairing on next cold launch")
 
         var policy = ZagOnboardingPolicy()
         let old = policy.beginIfNeeded(hasRecord: true)!
