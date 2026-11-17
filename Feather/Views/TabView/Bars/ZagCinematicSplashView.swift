@@ -211,7 +211,8 @@ final class ZagCinematicSplashStage: UIView {
         signatureMessage = postUpdateMessage?()
         let tokens = signatureMessage?.tokens ?? ["Sideloading", "and", "beyond."]
         let size = min(23, max(16, bounds.width * 0.054))
-        let weights: [UIFont.Weight] = [.light, .ultraLight, .semibold]
+        // The motto ends semibold; an update's release group is bold.
+        let weights: [UIFont.Weight] = [.light, .ultraLight, signatureMessage == nil ? .semibold : .bold]
         let tracking: [CGFloat] = [1.1, 0.9, 0.35]
         let gap = size * 0.49
         let widths = tokens.enumerated().map { i, word -> CGFloat in

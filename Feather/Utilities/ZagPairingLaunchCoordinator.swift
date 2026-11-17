@@ -7,6 +7,8 @@ import Combine
     var isBusy: Bool { get }
     var verificationEvents: AnyPublisher<ZagOnboardingPolicy.Verification, Never> { get }
     var setupSuccesses: AnyPublisher<Void, Never> { get }
+    /// The saved record was removed (or its local cleanup began) while running.
+    var recordRemovals: AnyPublisher<Void, Never> { get }
     func verify()
 }
 
@@ -16,6 +18,7 @@ import Combine
     private let timeoutNanoseconds: UInt64
     private var verification: AnyCancellable?
     private var setup: AnyCancellable?
+    private var removal: AnyCancellable?
     private var worker: Task<Void, Never>?
     private var deadline: Task<Void, Never>?
 
@@ -23,10 +26,16 @@ import Combine
         self.service = service
         self.timeoutNanoseconds = timeoutNanoseconds
         setup = service.setupSuccesses.sink { [weak self] in
-            guard let self, !self.policy.canEnterMain else { return }
+            guard let self, !self.policy.isPairingVerified else { return }
             // A new authenticated native setup completion, never a replayed file/status.
+            // Also repairs a rejected pairing from inside the main interface.
             self.policy.setupSucceeded()
             self.stopWaiting()
+        }
+        removal = service.recordRemovals.sink { [weak self] in
+            guard let self, !self.service.hasPairingRecord else { return }
+            self.stopWaiting()
+            self.policy.pairingRemoved()
         }
     }
 
@@ -37,9 +46,17 @@ import Combine
     }
 
     func retry() {
-        guard !policy.canEnterMain, policy.status != .checking else { return }
+        guard policy.status != .checking else { return }
         stopWaiting()
         if let token = policy.retry(hasRecord: service.hasPairingRecord) { check(token) }
+    }
+
+    /// The LocalDevVPN tunnel answered again. Checks once more only if the
+    /// last check could not reach the device; a verified, rejected, missing
+    /// or in-progress state is left alone, so reconnects never queue probes.
+    func connectionAvailable() {
+        guard policy.started, policy.isConnectionUnavailable else { return }
+        retry()
     }
 
     func skip() { policy.skip(); stopWaiting() }
@@ -60,7 +77,11 @@ import Combine
                 do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return }
             }
             guard !Task.isCancelled, self.policy.generation == token else { return }
-            guard self.service.hasPairingRecord else { self.finish(.missing, token: token); return }
+            guard self.service.hasPairingRecord else {
+                self.stopWaiting()
+                self.policy.pairingRemoved()
+                return
+            }
             self.verification = self.service.verificationEvents.sink { [weak self] result in
                 self?.finish(result, token: token)
             }

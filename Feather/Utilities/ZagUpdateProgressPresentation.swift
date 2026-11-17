@@ -122,10 +122,10 @@ extension ZagSelfUpdateActionState {
     static func pendingAttempt(handoff: ZagUpdateHandoffState, installerRunning: Bool,
                                installerTitle: String, installerFraction: Double?,
                                preparingMessage: String) -> ZagSelfUpdateActionState {
-        // iOS accepting the Upgrade request (211) or a native completion ends
-        // the in-app operation. Nothing earlier is success.
+        // Verified staging (209) or a native completion ends the in-app
+        // operation; iOS reports nothing further while Zag Store stays open.
         if handoff.isSuccessfulHandoff { return .handedOff }
-        if handoff == .uncertain || handoff == .unacknowledged { return .awaitingVerification }
+        if handoff == .uncertain { return .awaitingVerification }
         if installerRunning { return .progress(message: installerTitle, fraction: installerFraction) }
         // Recorded, installer not yet started (or just returned): still busy.
         return .progress(message: preparingMessage, fraction: nil)
@@ -136,39 +136,17 @@ extension ZagSelfUpdateActionState {
 enum ZagUpdateHandoffState: Equatable {
     case none
     case waiting
-    /// Native 211 for this attempt: installation_proxy answered the Upgrade
-    /// request for the verified staged IPA without an error, so iOS has it and
-    /// is processing it. The successful end of the in-app operation. Not
-    /// installed-executable proof.
-    case acceptedByInstaller
+    /// Native 209 for this attempt: the device holds the complete signed IPA
+    /// at its verified size and the Upgrade request follows. While Zag Store
+    /// stays open iOS reports nothing further, so this is the successful end
+    /// of the in-app operation. Not installed-executable proof.
+    case stagedOnDevice
     case reportedComplete
     case uncertain
-    /// The Upgrade request was written (210) but iOS has not answered within
-    /// `ZagUpgradeAcknowledgement.timeout`. Never success; a late answer
-    /// still counts.
-    case unacknowledged
 
     /// A later installer error still replaces either state (`.uncertain`, or
     /// `.none` when the retry policy releases the pending record).
-    var isSuccessfulHandoff: Bool { self == .acceptedByInstaller || self == .reportedComplete }
-}
-
-/// The success state waits for installation_proxy's own answer to the
-/// Upgrade request (native 211), never for the request merely being written.
-enum ZagUpgradeAcknowledgement {
-    /// How long a written request may go unanswered before the screen stops
-    /// presenting the attempt as in progress. installd normally answers with
-    /// its first Status well within a second; this bounds a lost or ignored
-    /// request. The native call keeps listening, so a late answer still counts.
-    static let timeout: TimeInterval = 20
-
-    static func afterAcknowledgement(_ handoff: ZagUpdateHandoffState) -> ZagUpdateHandoffState {
-        handoff == .waiting || handoff == .unacknowledged ? .acceptedByInstaller : handoff
-    }
-
-    static func afterTimeout(_ handoff: ZagUpdateHandoffState) -> ZagUpdateHandoffState {
-        handoff == .waiting ? .unacknowledged : handoff
-    }
+    var isSuccessfulHandoff: Bool { self == .stagedOnDevice || self == .reportedComplete }
 }
 
 /// The outer slot never changes height. Only the capsule inside it compresses;

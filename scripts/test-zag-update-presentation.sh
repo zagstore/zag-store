@@ -16,8 +16,18 @@ old = subprocess.check_output(['git', 'show', 'ea0b5dbe:' + path], cwd=root, tex
 assert 'Zag Store Beta' not in view and 'Zag Store Nightly' not in view
 assert 'ForEach(["off", "beta", "nightly"]' in view
 # Discovery and the explicit diagnostic-only install dialog retain their handlers.
-for begin, end in [('guard !releaseCheckBusy else { return }', '} label: {'), ('Button("Attempt In-Place Replacement"', '} message: {')]:
+for begin, end in [('Button("Attempt In-Place Replacement"', '} message: {')]:
     assert view.split(begin, 1)[1].split(end, 1)[0] == old.split(begin, 1)[1].split(end, 1)[0]
+# The manual check moved into checkSelectedChannel() (shared with pull to
+# refresh) with the same statements in the same order; only its Task wrapper
+# became the function.
+oldCheck = [l.strip() for l in old.split('guard !releaseCheckBusy else { return }', 1)[1].split('} label: {', 1)[0].splitlines()]
+oldCheck = [l for l in oldCheck if l and l not in ('Task { @MainActor in', '}')]
+newCheck = view.split('private func checkSelectedChannel() async {', 1)[1].split('\n    }\n', 1)[0]
+newCheck = [l.strip() for l in newCheck.splitlines()]
+newCheck = [l for l in newCheck if l and l not in ('guard !releaseCheckBusy else { return }', '}')]
+assert oldCheck == newCheck, (oldCheck, newCheck)
+assert 'Task { @MainActor in await checkSelectedChannel() }' in view and '.refreshable { await checkSelectedChannel() }' in view
 normal = view.split('private func beginUpdate(', 1)[1].split('    var body: some View {', 1)[0]
 assert 'showInstallConfirmation = true' not in normal
 assert normal.index('chooseForSigning()') < normal.index('prepareSignedUpdate(') < normal.index('installVerifiedSignedUpdate(')
@@ -60,9 +70,18 @@ assert notes.index('blockContent(first, lineLimit:') < notes.index('if showsFull
 assert 'transaction.disablesAnimations = true' in notes
 assert 'guard value != measurements else { return }' in notes
 assert '.lineLimit(lineLimit)' in notes
+control_src = (root / 'Feather/Views/Settings/ZagSelfUpdateActionControl.swift').read_text()
 header = card.split('HStack(alignment: .center, spacing: 14)', 1)[1].split('ZagUpdateReleaseNotesView', 1)[0]
 assert header.count('.frame(width: 60, height: 60)') == 2
-assert 'Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.caption)' in header
+assert 'ZagUpdateCrossfadeText(ZagUpdateCardStatus.text(action: updateActionState,' in header
+assert 'size: releaseDownloadSize))\n                                    .font(.caption)\n                                    .foregroundStyle(.primary)' in header
+assert 'ZagUpdateDownloadSize.lookup(release.ipaURL)' in view and 'if !Task.isCancelled { releaseDownloadSize = size }' in view
+# The card line shares the control's state: one lifecycle, never a second machine.
+assert view.count('ZagUpdateTransferActionControl(state: updateActionState,') == 1
+crossfade = (root / 'Feather/Views/Settings/ZagUpdateCrossfadeText.swift').read_text()
+assert 'ZagUpdateStatusTiming.fadeOut' in crossfade and 'ZagUpdateStatusTiming.fadeIn' in crossfade
+assert '.easeIn(duration: ZagUpdateStatusTiming.fadeOut)' in control_src and '.easeOut(duration: ZagUpdateStatusTiming.fadeIn)' in control_src
+assert 'ZagAnimationArrival(' in crossfade and '.accessibilityLabel(text)' in crossfade and '.lineLimit(1)' in crossfade
 assert 'if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {' in header
 assert 'ZagUpdateChannelPresentation.title(for: zagBetaChannel)' in header
 assert '.font(.caption2)' in header and '.foregroundStyle(.secondary)' in header
@@ -80,12 +99,26 @@ assert 'morph: state.showsProgress ? 1 : 0' in control
 assert 'reduceMotion ? nil' in control and 'ZagUpdateMorphSpecification.duration' in control
 assert 'value: state.fraction' not in control
 assert 'Shows short manual steps below' not in control and '.accessibilityHint(' not in control
-celebration = view.split('private var verifiedUpdateCelebration:', 1)[1].split('private var gate4ProgressTitle:', 1)[0]
 assert 'Update successful. Reopen Zag Store to complete.' in (root / 'Feather/Utilities/ZagUpdateProgressPresentation.swift').read_text()
-# After a verified relaunch the update is complete: no "Restart to Complete..." pill.
-assert 'ZagSelfUpdateActionControl(' not in celebration and 'Installation verified successfully' in celebration
+# Nothing newer and nothing in progress: the native up-to-date state, never the
+# old celebration card and never a "Restart to Complete..." pill.
+assert 'verifiedUpdateCelebration' not in view and 'Installation verified successfully' not in view
+uptodate = (root / 'Feather/Views/Settings/ZagSoftwareUpToDateView.swift').read_text()
+assert 'ZagSelfUpdateActionControl(' not in uptodate and 'Zag Store is up to date' in uptodate
+shows = view.split('private var showsUpToDate: Bool {', 1)[1].split('\n    }\n', 1)[0]
+for term in ['coordinator.availableRelease == nil', 'coordinator.upToDateChannel == ZagSelfUpdateCoordinator.UpdateChannel.selected',
+             'coordinator.pendingInstallation == nil', '!releaseDownloadBusy', '!installBusy',
+             '!coordinator.userUpdateInProgress', '!gate4.isGate4Running']:
+    assert term in shows, term
+# Details come only from the record verification matched to this executable.
+coord = (root / 'Feather/Utilities/ZagSelfUpdateCoordinator.swift').read_text()
+installed = coord.split('var installedRelease: ZagInstalledRelease {', 1)[1].split('\n    }\n', 1)[0]
+assert 'installedIdentityVerified ? lastVerifiedInstallation : nil' in installed
+assert coord.count('pending.installedAt = ') == 1 and coord.count('UserDefaults.standard.set(data, forKey: completedKey)') == 1
+assert coord.index('pending.installedAt = ') < coord.index('UserDefaults.standard.set(data, forKey: completedKey)')
+# The available-update card shows only What's New.
+assert 'ZagUpdateReleaseNotesView(markdown: ZagUpdateReleaseNotes.whatsNew(from: release.releaseNotes)' in view
 assert 'presentUpdateGuidance' not in view
-assert 'coordinator.installedIdentityVerified' in view.split('private var verifiedReplacementKey:', 1)[1].split('private var shouldCelebrateVerifiedReplacement:', 1)[0]
 assert 'IPA verified - waiting for iOS handoff' in view
 assert 'IPA verified — waiting for iOS handoff' not in view
 print('PASS: unchanged channel IDs, handler bodies, progress, recovery and URL; compact card ordering and local spacing')

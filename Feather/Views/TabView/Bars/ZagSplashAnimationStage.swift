@@ -302,7 +302,8 @@ final class ZagSplashStageView: UIView {
         let captionSize = min(20, max(16.5, bounds.width * 0.0475))
         signatureMessage = postUpdateMessage?()
         let tokens = signatureMessage?.tokens ?? ["Sideloading", "and", "beyond."]
-        let weight: [UIFont.Weight] = [.light, .ultraLight, .semibold]
+        // The motto ends semibold; an update's release group is bold.
+        let weight: [UIFont.Weight] = [.light, .ultraLight, signatureMessage == nil ? .semibold : .bold]
         let kern: [CGFloat] = [1.0, 1.1, 0.45]
         let gap: CGFloat = max(9, captionSize * 0.48)
         let measured: [CGFloat] = tokens.enumerated().map { i, word in
@@ -595,7 +596,7 @@ final class ZagSplashStageView: UIView {
               reduceMotion || CACurrentMediaTime() < clock + ZagSplashTimeline.firstWord else { return }
         let tokens = message.tokens
         let size = min(20, max(16.5, bounds.width * 0.0475))
-        let weights: [UIFont.Weight] = [.light, .ultraLight, .semibold]
+        let weights: [UIFont.Weight] = [.light, .ultraLight, .bold]
         let kern: [CGFloat] = [1.0, 1.1, 0.45]
         let gap = max(9, size * 0.48)
         let widths = tokens.enumerated().map { index, token in

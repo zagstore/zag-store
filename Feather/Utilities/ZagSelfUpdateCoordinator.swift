@@ -61,12 +61,18 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
 
     func checkForSelectedChannel() async throws -> Release? {
         let channel = UpdateChannel.selected
-        if channel == .beta, let endpoint = channel.authenticatedV2ManifestURL {
-            return try await checkAuthenticatedV2Channel(
-                endpoint: endpoint, channel: channel, rollbackStore: betaV2RollbackStore
-            )
+        do {
+            if channel == .beta, let endpoint = channel.authenticatedV2ManifestURL {
+                return try await checkAuthenticatedV2Channel(
+                    endpoint: endpoint, channel: channel, rollbackStore: betaV2RollbackStore
+                )
+            }
+            return try await checkForUpdate(manifestURL: channel.manifestURL)
+        } catch {
+            // A failed check confirms nothing.
+            if channel == UpdateChannel.selected { upToDateChannel = nil }
+            throw error
         }
-        return try await checkForUpdate(manifestURL: channel.manifestURL)
     }
 
     /// Authenticated discovery for a future v2 channel cutover. This method
@@ -103,6 +109,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         let result: Release? = newer ? release : nil
         guard generation == checkGeneration, channel == UpdateChannel.selected else { return nil }
         availableRelease = result
+        upToDateChannel = result == nil ? channel : nil
         return result
     }
 
@@ -121,6 +128,12 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         // produce a post-update channel announcement.
         var releaseChannel: String? = nil
         var originatingVersion: String? = nil
+        /// The release's own What's New from its signed notes, kept for More
+        /// Details after the update. Shown only once the record is verified.
+        var whatsNew: String? = nil
+        /// Set only when next-launch verification finalises the record; see
+        /// `ZagInstalledRelease.installationDate`.
+        var installedAt: Date? = nil
     }
 
     enum UpdateError: LocalizedError {
@@ -169,8 +182,6 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     private var wifiMonitor: NWPathMonitor?
     private var wifiAvailable = false
     @Published private(set) var handoffState: ZagUpdateHandoffState = .none
-    /// Identifies the installer attempt that late callbacks and timeouts belong to.
-    private var handoffAttempt = 0
     @Published private(set) var preparationState: ZagUpdatePreparationState = .idle
     @Published private(set) var userUpdateInProgress = false
     private var userUpdateGeneration: Int?
@@ -260,6 +271,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             }
             guard generation == checkGeneration, channel == UpdateChannel.selected else { return }
             availableRelease = release
+            upToDateChannel = release == nil ? channel : nil
             if let release {
                 automaticCheckStatus = "Update available: \(release.version) (Build \(release.build)) — \(channel.rawValue.capitalized)"
                 await downloadOnWiFiIfEnabled(release)
@@ -269,6 +281,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         } catch {
             guard generation == checkGeneration, channel == UpdateChannel.selected else { return }
             availableRelease = nil
+            upToDateChannel = nil
             if case UpdateError.channelNotPublished = error {
                 automaticCheckStatus = "No release published — \(channel.rawValue.capitalized)"
             } else {
@@ -282,6 +295,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         activeDownloadToken = nil
         preparationState = .idle
         availableRelease = nil
+        upToDateChannel = nil
         discardPreparedIPA()
         automaticDownloadStatus = "Not downloaded"
         lastAutomaticCheck = nil
@@ -299,7 +313,12 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     }
 
     @Published private(set) var preparedIPA: URL?
-    @Published private(set) var availableRelease: Release?
+    @Published private(set) var availableRelease: Release? {
+        didSet { if availableRelease != nil { upToDateChannel = nil } }
+    }
+    /// The channel whose latest completed check found nothing newer. Cleared
+    /// by a newer release, a failed check or a channel change.
+    @Published private(set) var upToDateChannel: UpdateChannel?
     @Published private(set) var lastVerifiedInstallation: PendingInstallation?
     @Published private(set) var pendingInstallation: PendingInstallation?
     @Published private(set) var installedIdentityVerified = false
@@ -381,7 +400,13 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         let running = ZagPostUpdateMessage.RunningIdentity(bundleIdentifier: currentBundleID,
                                                           version: currentVersion, build: currentBuild,
                                                           executableSHA256: actualHash)
-        if let pending {
+        if var pending {
+            // The first verified launch of the new executable: the installation
+            // happened no later than now.
+            let verifiedAt = Date()
+            pending.installedAt = ZagInstalledRelease.installationDate(
+                startedAt: pending.startedAt, bundleCreated: Self.bundleCreationDate, latest: verifiedAt
+            ) ?? verifiedAt
             // Revalidate the record after suspended I/O; clearing/replacing an
             // attempt while its executable is hashed must not resurrect it.
             guard pendingInstallation?.startedAt == pending.startedAt,
@@ -404,6 +429,32 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         postUpdateMessage = postUpdateMessageStore.pending(running: running)
     }
 
+    private static var bundleCreationDate: Date? {
+        try? Bundle.main.bundleURL.resourceValues(forKeys: [.creationDateKey]).creationDate
+    }
+
+    /// The running release for Software Update's More Details. The verified
+    /// record supplies the date and What's New only when it describes this
+    /// very executable; otherwise the running identity and selected channel
+    /// alone, with no date or notes. Records from before these fields existed
+    /// get the bundle date only inside their own installation window.
+    var installedRelease: ZagInstalledRelease {
+        let record = installedIdentityVerified ? lastVerifiedInstallation : nil
+        let verified = record.flatMap {
+            $0.bundleIdentifier == currentBundleID && $0.version == currentVersion && $0.build == currentBuild ? $0 : nil
+        }
+        return ZagInstalledRelease(
+            version: currentVersion,
+            build: currentBuild,
+            channel: verified?.releaseChannel ?? UpdateChannel.selected.rawValue,
+            installedAt: verified.flatMap {
+                $0.installedAt ?? ZagInstalledRelease.installationDate(
+                    startedAt: $0.startedAt, bundleCreated: Self.bundleCreationDate, latest: Date())
+            },
+            whatsNew: verified?.whatsNew
+        )
+    }
+
     func acknowledgePostUpdateMessageDisplayed(_ message: ZagPostUpdateMessage) {
         guard postUpdateMessage == message else { return }
         postUpdateMessageStore.acknowledgeDisplayed(message)
@@ -416,6 +467,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         guard generation == checkGeneration,
               manifestURL == UpdateChannel.selected.manifestURL else { return nil }
         availableRelease = release
+        upToDateChannel = release == nil ? UpdateChannel.selected : nil
         return release
     }
 
@@ -601,7 +653,8 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             expectedExecutableSHA256: candidateHash,
             originatingExecutableSHA256: originalHash,
             releaseChannel: release.authenticatedChannel?.rawValue,
-            originatingVersion: currentVersion
+            originatingVersion: currentVersion,
+            whatsNew: ZagUpdateReleaseNotes.whatsNew(from: release.releaseNotes)
         )
         let data = try JSONEncoder().encode(pending)
         UserDefaults.standard.set(data, forKey: pendingKey)
@@ -1164,8 +1217,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
     private func submitStagedUpdateToGate4(
         _ packageURL: URL,
         onStarted: () -> Void,
-        onSubmitted: @escaping () -> Void,
-        onAcknowledged: @escaping () -> Void,
+        onStaged: @escaping () -> Void,
         onFinished: @escaping ([ZagGate4Event]) -> Void
     ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1173,8 +1225,7 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
                 try ZagRPPairingCore.shared.installGate4IPA(
                     at: packageURL,
                     deviceIP: "10.7.0.1",
-                    submitted: onSubmitted,
-                    acknowledged: onAcknowledged,
+                    staged: onStaged,
                     completion: { result in
                         // Snapshot this attempt's callbacks at the moment it
                         // ended, before any later attempt can reset them.
@@ -1186,19 +1237,6 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             } catch {
                 continuation.resume(throwing: error)
             }
-        }
-    }
-
-    /// Stops presenting a written but unanswered Upgrade request as in
-    /// progress once `ZagUpgradeAcknowledgement.timeout` passes. Never success.
-    private func awaitUpgradeAcknowledgement(_ attempt: Int) {
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(ZagUpgradeAcknowledgement.timeout * 1_000_000_000))
-            guard let self, self.handoffAttempt == attempt else { return }
-            let next = ZagUpgradeAcknowledgement.afterTimeout(self.handoffState)
-            guard next != self.handoffState else { return }
-            ZagLogger.shared.warning("SelfUpdate", "iOS has not answered the Upgrade request; pending record kept for launch verification")
-            self.handoffState = next
         }
     }
 
@@ -1236,8 +1274,6 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             if ZagSelfUpdateRetryPolicy.mayReleasePendingRecord(after: .notStarted) { clearFailedHandoff() }
             throw CancellationError()
         }
-        handoffAttempt += 1
-        let attempt = handoffAttempt
         handoffState = .waiting
         var installerStarted = false
         var finishedEvents: [ZagGate4Event]?
@@ -1245,10 +1281,9 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
             try await submitStagedUpdateToGate4(
                 packageURL,
                 onStarted: { installerStarted = true },
-                onSubmitted: { [weak self] in self?.awaitUpgradeAcknowledgement(attempt) },
-                onAcknowledged: { [weak self] in
-                    guard let self, self.handoffAttempt == attempt else { return }
-                    self.handoffState = ZagUpgradeAcknowledgement.afterAcknowledgement(self.handoffState)
+                onStaged: { [weak self] in
+                    guard let self, self.handoffState == .waiting else { return }
+                    self.handoffState = .stagedOnDevice
                 },
                 onFinished: { finishedEvents = $0 }
             )

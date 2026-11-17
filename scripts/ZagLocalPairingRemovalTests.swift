@@ -89,9 +89,9 @@ import Foundation
         try seed()
         var rePair = ZagOnboardingPolicy()
         let generation = rePair.beginIfNeeded(hasRecord: true)!
-        check(!rePair.canEnterMain, "new pairing record still requires verification")
+        check(!rePair.isPairingVerified, "new pairing record still requires verification")
         rePair.receive(.verified, generation: generation)
-        check(rePair.canEnterMain, "re-pairing can pass the existing verification gate")
+        check(rePair.isPairingVerified, "re-pairing can pass the existing verification gate")
         check(!ZagLocalPairingRemoval.localOnlyMessage.contains("fully unpaired"), "local outcome never claims full system unpairing")
         check(ZagLocalPairingRemoval.localOnlyMessage.contains("has not been revoked"), "remaining system trust is stated explicitly")
         check(ZagLocalPairingRemoval.systemRemovalInstructions.contains("Select only Zag Store"), "manual removal is scoped to Zag Store")

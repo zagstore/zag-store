@@ -20,7 +20,7 @@ view=read('Feather/Views/Settings/ZagSelfUpdateStatusView.swift')
 assert 'IPA verified - waiting for iOS handoff' in view
 assert 'IPA verified — waiting for iOS handoff' not in view
 assert read('Feather/Utilities/ZagUpdateProgressPresentation.swift').count('Update successful. Reopen Zag Store to complete.') == 1
-assert 'coordinator.installedIdentityVerified' in view
+assert 'installedIdentityVerified ? lastVerifiedInstallation : nil' in coord  # More Details: verified record only
 assert 'presentUpdateGuidance' not in view and 'showRestartGuidance' not in view
 assert 'reopenInstruction' not in read('Feather/Views/Settings/ZagSelfUpdateActionControl.swift')
 for p in ['Feather/Views/TabView/Bars/ZagCinematicSplashView.swift','Feather/Views/TabView/Bars/ZagSplashAnimationStage.swift']:
@@ -29,6 +29,9 @@ for p in ['Feather/Views/TabView/Bars/ZagCinematicSplashView.swift','Feather/Vie
     assert 'signatureCompletion' in s and 'window != nil' in s
     assert 'UIApplication.shared.applicationState == .active' in s
     assert 'onPostUpdateMessageDisplayed?(message)' in s
+    # Updated (light), to (ultra-light), release bold; the motto keeps its semibold.
+    assert s.count('[.light, .ultraLight, signatureMessage == nil ? .semibold : .bold]') == 1
+    assert '.semibold]' not in s
     old=subprocess.check_output(['git','show','30741eaf:'+p],cwd=root,text=True)
     # Original timings, artwork identifiers, sound resources and animation values
     # must remain verbatim; caption geometry can adapt to the new text.

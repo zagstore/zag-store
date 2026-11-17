@@ -37,6 +37,7 @@ struct FeatherApp: App {
                 VariedTabbarView()
 					.environment(\.managedObjectContext, storage.context)
 					.modifier(ZagMobileDataInstallOverlay())
+					.zagPairingRepairPrompt()
 					.overlay(alignment: .top) {
 						// Manual transfers float above the app rather than
 						// resizing the tab/navigation hierarchy.
@@ -58,6 +59,11 @@ struct FeatherApp: App {
                 await ZagLaunchGate.shared.waitUntilSplashFinishes()
                 launch.finishSplash()
                 drainPendingURLs()
+            }
+            // Connection status refreshes on its own; a reconnect re-checks
+            // pairing once if the last check could not reach the device.
+            .onReceive(ZagLocalVPNMonitor.shared.$model.map(\.tunnel).removeDuplicates()) { tunnel in
+                if tunnel == .operational { launch.connectionAvailable() }
             }
             .onChange(of: launch.policy.canEnterMain) { _ in
                 Task { @MainActor in

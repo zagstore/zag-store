@@ -50,6 +50,11 @@ import Combine
         }.eraseToAnyPublisher()
     }
 
+    var recordRemovals: AnyPublisher<Void, Never> {
+        // Set only when the record is absent or its local cleanup is pending.
+        $currentVerification.dropFirst().filter { $0 == .missing }.map { _ in () }.eraseToAnyPublisher()
+    }
+
     func verify() {
         // Diagnostic mode validates a copy of the saved credentials without
         // pair-setup fallback or rewriting them, then checks the device services.

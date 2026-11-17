@@ -36,7 +36,7 @@ struct ZagUpdateCardTapHost: View {
         guard environment["ZAG_CARD_TERMINATE"] == "1" else { events.append("complete"); return }
         // Written immediately before the exit, the latest a real write could be.
         UserDefaults.standard.set("written before exit", forKey: Self.markerKey)
-        ZagUpdateCompletion.complete(actionState: state, handoff: .acceptedByInstaller, pendingRecorded: true)
+        ZagUpdateCompletion.complete(actionState: state, handoff: .stagedOnDevice, pendingRecorded: true)
     }
 
     var body: some View {

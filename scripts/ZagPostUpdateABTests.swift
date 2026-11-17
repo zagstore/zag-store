@@ -38,7 +38,7 @@ import Foundation
         let message = launch().record(handoff, running: runningB)
         check(message?.text == "Updated to 1.0.0 Beta 3", "B's first launch builds the exact message from its actual identity")
         check(tagline(launch().pending(running: runningB)) == "Updated to 1.0.0 Beta 3", "the splash replaces the tagline on B's first launch")
-        check(message?.tokens == ["Updated to", "1.0.0", "Beta 3"], "three reveal groups keep the signature timing")
+        check(message?.tokens == ["Updated", "to", "1.0.0 Beta 3"], "three reveal groups: Updated, to, then the whole release")
 
         // The reveal was skipped (or the app ended) before the signature appeared.
         check(launch().pending(running: runningB) == message, "an unrevealed notice stays pending for the next launch")
