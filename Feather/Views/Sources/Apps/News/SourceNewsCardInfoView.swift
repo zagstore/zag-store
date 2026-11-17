@@ -62,7 +62,7 @@ struct SourceNewsCardInfoView: View {
 								.multilineTextAlignment(.leading)
 						}
 						
-						if let url = new.url {
+						if let url = new.url, ZagDeepLink.isWebLink(url) {
 							Button {
 								UIApplication.shared.open(url)
 							} label: {

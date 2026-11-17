@@ -25,6 +25,7 @@ xcrun swiftc -parse-as-library -module-name Zip -emit-module -emit-module-path "
 xcrun swiftc -parse-as-library -module-name ZagImportIntegrity -I "$WORK/modules" \
 	"$ROOT/Feather/Utilities/Handlers/AppFileHandler.swift" \
 	"$ROOT/Feather/Utilities/ZagPackageIntegrity.swift" \
+	"$ROOT/Feather/Utilities/ZagUpdateProgressPresentation.swift" \
 	"$ROOT/NimbleKit/Sources/NimbleExtensions/FileManager/FileManager+shortcuts.swift" \
 	"$ROOT/NimbleKit/Sources/NimbleExtensions/Bundle/Bundle+keys.swift" \
 	"$WORK/FRImport.swift" \

@@ -25,6 +25,7 @@ final class StubProtocol: URLProtocol {
 		case stallAfter(Data)
 	}
 	static var behaviour = Behaviour.respond(status: 404, body: Data())
+	static var stalled: StubProtocol?
 	static var releaseRequests = 0
 	static var unexpectedRequests: [String] = []
 
@@ -52,6 +53,7 @@ final class StubProtocol: URLProtocol {
 			client?.urlProtocol(self, didLoad: partial)
 			client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
 		case .stallAfter(let partial):
+			Self.stalled = self
 			let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
 			                               headerFields: ["Content-Length": String(partial.count * 2)])!
 			client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -172,7 +174,34 @@ struct ZagSelfUpdateIntegrityTests {
 		UserDefaults.standard.set(false, forKey: Coordinator.automaticChecksKey)
 		UserDefaults.standard.set(false, forKey: Coordinator.automaticWiFiDownloadKey)
 		URLProtocol.registerClass(StubProtocol.self)
+		// 0. Next-launch verification finalises the installed-release record:
+		// a pending record for this very executable, written before launch.
+		let startedAt = Date().addingTimeInterval(-3600)
+		let ownHash = try! ZagPackageIntegrity.sha256(of: Bundle.main.executableURL!)
+		UserDefaults.standard.removeObject(forKey: "zagStore.selfUpdate.completed")
+		UserDefaults.standard.set(try! JSONEncoder().encode(Coordinator.PendingInstallation(
+			version: "1.0.0", build: "2", bundleIdentifier: Bundle.main.bundleIdentifier!, startedAt: startedAt,
+			originatingBuild: "1", expectedExecutableSHA256: ownHash,
+			originatingExecutableSHA256: String(repeating: "0", count: 64),
+			releaseChannel: "beta", originatingVersion: "1.0.0", whatsNew: "Harness What's New")),
+			forKey: "zagStore.selfUpdate.pending")
 		let coordinator = Coordinator.shared
+		for _ in 0..<100 where coordinator.lastVerifiedInstallation?.installedAt == nil {
+			try? await Task.sleep(nanoseconds: 50_000_000)
+		}
+		let verified = coordinator.lastVerifiedInstallation
+		let stored = UserDefaults.standard.data(forKey: "zagStore.selfUpdate.completed")
+			.flatMap { try? JSONDecoder().decode(Coordinator.PendingInstallation.self, from: $0) }
+		check(coordinator.installedIdentityVerified && coordinator.pendingInstallation == nil
+			&& UserDefaults.standard.data(forKey: "zagStore.selfUpdate.pending") == nil,
+			"verification finalises the pending record")
+		check(stored?.installedAt != nil && stored?.installedAt == verified?.installedAt
+			&& stored!.installedAt! >= startedAt && stored!.installedAt! <= Date(),
+			"the installation time is persisted, inside the update's window")
+		check(stored?.whatsNew == "Harness What's New", "the installed release keeps its own What's New")
+		let installed = coordinator.installedRelease
+		check(installed.title == "Zag Store 1.0.0 Beta 2" && installed.whatsNew == "Harness What's New"
+			&& installed.installedAt == stored?.installedAt, "More Details reads the verified record")
 		let authenticSHA = sha256(authentic)
 		var replacement = authentic
 		replacement[100] ^= 0xFF
@@ -184,11 +213,41 @@ struct ZagSelfUpdateIntegrityTests {
 			check(staged == destination && coordinator.preparedIPA == destination,
 			      "verified download is staged at verified-release.ipa")
 			check(sha256(try Data(contentsOf: staged)) == authenticSHA, "staged bytes match the signed SHA-256")
+			let requests = StubProtocol.releaseRequests
+			_ = try await coordinator.prepare(release())
+			check(StubProtocol.releaseRequests == requests, "repeated prepare reuses checksum-verified bytes without another request")
 			_ = try await coordinator.importPreparedRelease(release())
 			check(FR.importedDigests == [authenticSHA], "importer receives exactly the authenticated bytes")
 		} catch {
 			fail("normal prepare and import failed: \(error)")
 		}
+
+		coordinator.preferencesChanged()
+		check(coordinator.preparedIPA == nil && !FileManager.default.fileExists(atPath: destination.path),
+		      "preference change deletes the previously prepared file")
+
+		// Preferences invalidate a suspended download before it can publish.
+		reset(coordinator, serving: .stallAfter(authentic.prefix(authentic.count / 2)))
+		StubProtocol.stalled = nil
+		let invalidated = Task { try await coordinator.prepare(release()) }
+		for _ in 0..<100 where StubProtocol.stalled == nil {
+			try? await Task.sleep(nanoseconds: 10_000_000)
+		}
+		check(StubProtocol.stalled != nil, "download reaches suspended network state")
+		let overlapping = await errorName { _ = try await coordinator.prepare(release()) }
+		check(overlapping?.contains("downloadAlreadyRunning") == true, "overlapping preparation is rejected")
+		coordinator.preferencesChanged()
+		if let stalled = StubProtocol.stalled {
+			stalled.client?.urlProtocol(stalled, didLoad: authentic.dropFirst(authentic.count / 2))
+			stalled.client?.urlProtocolDidFinishLoading(stalled)
+		} else {
+			invalidated.cancel()
+		}
+		let invalidatedError = await errorName { _ = try await invalidated.value }
+		StubProtocol.stalled = nil
+		check(invalidatedError != nil && coordinator.preparedIPA == nil,
+		      "preference change prevents in-flight download from restoring prepared state")
+		check(partialDownloads().isEmpty, "invalidated download removes its partial file")
 
 		// 2. The UI path (prepareSignedUpdate) hands the authenticated bytes to
 		//    the importer; the signing stub stops it after import.
@@ -283,9 +342,11 @@ struct ZagSelfUpdateIntegrityTests {
 		check(replaced?.contains("checksumMismatch") == true && FR.importAttempts == 1 && FR.importedDigests.isEmpty,
 		      "file replaced after verification is rejected by the importer before extraction (\(replaced ?? "imported"))")
 
-		// 11. A failed retry after an earlier success discards the earlier file.
+		// 11. If the cached file was damaged, prepare must download again;
+		//     a failed retry discards the earlier file.
 		reset(coordinator, serving: .respond(status: 200, body: authentic))
 		_ = await errorName { _ = try await coordinator.prepare(release()) }
+		try? replacement.write(to: destination)
 		StubProtocol.behaviour = .respond(status: 200, body: replacement)
 		let retry = await errorName { _ = try await coordinator.prepare(release()) }
 		check(retry?.contains("checksumMismatch") == true, "corrupted retry is rejected")

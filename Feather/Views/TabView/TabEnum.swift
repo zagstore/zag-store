@@ -92,18 +92,8 @@ enum TabEnum: String, CaseIterable, Hashable {
     var internalURL: URL? { URL(string: "zagstore://\(rawValue == "library" ? "apps" : rawValue)") }
 
     static func tab(for url: URL) -> TabEnum? {
-        guard url.scheme?.lowercased() == "zagstore" else { return nil }
-        let destination = (url.host ?? "").lowercased()
-        switch destination {
-        case "discover", "home": return .discover
-        case "sources": return .sources
-        case "apps", "library": return .library
-        case "activity": return .activity
-        case "games": return .games
-        case "devices": return .devices
-        case "settings": return .settings
-        default: return nil
-        }
+        guard let route = ZagStoreRoute.parse(url) else { return nil }
+        return TabEnum(rawValue: route.tab)
     }
 
 	var title: String {
@@ -2468,7 +2458,15 @@ private struct ZagActivityPage: View {
                 )
                 .frame(width: 0, height: 0)
             }
-            .onAppear(perform: probeSystemDictation)
+            .onAppear {
+                #if DEBUG
+                ZagLogger.shared.info("Navigation", "Activity appeared; probing dictation")
+                #endif
+                probeSystemDictation()
+                #if DEBUG
+                ZagLogger.shared.info("Navigation", "Activity ready")
+                #endif
+            }
             .sheet(isPresented: $showStatistics) {
                 NavigationStack {
                     List {

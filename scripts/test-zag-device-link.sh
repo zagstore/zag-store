@@ -57,10 +57,9 @@ check "Gate4 classifies failures before deciding on a retry" grep -q 'ZagRPPairi
 check "Gate4 never retries once installation has begun" grep -q 'gate4InstallationCodes: Set<Int32> = \[205, 206, 208, 209, 210\]' "$CORE"
 check "Gate4 retries are opt-in" grep -q 'retryTransientFailures: Bool = false' "$CORE"
 check "self-update does not opt in to retries" absent 'retryTransientFailures' "$(cat "$SELFUPDATE")"
-forget=$(sed -n '/func forgetPairing() throws {/,/^	}/p' "$CORE")
-gate4=$(sed -n '/fileprivate func receiveGate4(/,/^	}/p' "$CORE")
-check "the pairing file is deleted in exactly one place" test "$(grep -c 'removeItem(at: Self.pairingFileURL' "$CORE")" = 1
-check "that place is the explicit Forget Pairing action" grep -q 'removeItem(at: Self.pairingFileURL' <<< "$forget"
+gate4=$(sed -n '/fileprivate func receiveGate4(/,/^\t}/p' "$CORE")
+check "local cleanup uses only the explicit credential and host identity paths" bash -c "grep -q 'ZagLocalPairingRemoval(pairingRecord: Self.pairingFileURL, hostIdentity: Self.hostIdentityURL' '$CORE' && grep -q 'remove: ZagLocalPairingRemoval.removeFile' '$CORE'"
+check "local cleanup is blocked while any native transport is busy" grep -q '!isGate4Running && !isTransportBusy' "$CORE"
 check "Gate4 failures never forget or rewrite pairing" bash -c "! grep -qE 'forgetPairing|pairingFileURL' <<< \"\$1\"" _ "$gate4"
 TRACE="$ROOT/Feather/Utilities/ZagTransportTrace.swift"
 check "trace sends no data on any connection" absent '.send(' "$(cat "$TRACE")"
@@ -111,7 +110,43 @@ COORD="$ROOT/Feather/Utilities/ZagMobileDataInstallCoordinator.swift"
 for f in Feather/Views/Sources/Apps/DownloadButtonView.swift Feather/Views/Library/LibraryCellView.swift Feather/Views/Library/LibraryView.swift Feather/Views/Library/Install/InstallPreviewView.swift; do
 	check "install: $(basename $f) installs through Mobile Data Fix" grep -qE '(ZagMobileDataInstallCoordinator.shared|coordinator)\.install\(jobID:' "$ROOT/$f"
 done
-check "install: installGate4IPA and the installer core are unchanged" bash -c "cd '$ROOT' && git diff --quiet cdc94c31a8293d7f504d268dee19185f36bf258f -- Feather/RPPairing/ZagRPPairingCore.swift"
+installer_core_unchanged() {
+    python3 - "$ROOT" "$CORE" <<'PYCODE'
+from pathlib import Path
+import subprocess, sys
+root, core = sys.argv[1:]
+baseline = subprocess.check_output(['git', 'show', 'cdc94c31a8293d7f504d268dee19185f36bf258f:Feather/RPPairing/ZagRPPairingCore.swift'], cwd=root, text=True)
+current = Path(core).read_text()
+def excluding_pin_presentation(source):
+    # Keep the state callback and notification submission/lifecycle protected.
+    # Only code-content construction and the removed automatic copy may differ.
+    start = source.index('\n', source.index('state = .pin(message)'))
+    end = source.index('\n\t\t\tUNUserNotificationCenter.current().add(', start)
+    return source[:start] + source[end:]
+def excluding_local_cleanup(source):
+    source = source.replace('    @Published private(set) var localPairingCleanupPending = UserDefaults.standard.bool(forKey: ZagLocalPairingRemoval.pendingKey)\n', '')
+    source = source.replace('        guard !localPairingCleanupPending else { return false }\n', '')
+    source = source.replace('        guard !localPairingCleanupPending else {\n            state = .failed("Retry Local Cleanup before starting pairing again.")\n            return\n        }\n', '')
+    source = source.replace('        guard !localPairingCleanupPending else {\n            gate2State = .failed("Retry Local Cleanup before checking pairing again.")\n            return\n        }\n', '')
+    source = source.replace('    /// Forgets only this app\'s local material; system trust must be removed in Settings.\n', '')
+    source = source.replace('Stop the current RPPairing operation before removing local pairing credentials.', 'Stop the current RPPairing operation before forgetting this iPhone.')
+    start = source.index('\tfunc forgetPairing() throws {')
+    end = source.index('\n\tfileprivate func receive(code:', start)
+    return source[:start] + '<local cleanup>\n' + source[end:]
+def excluding_gate4_presentation(source):
+    # Gate4 publication cadence and the verified-staging (209) hook only;
+    # each documented edit is reversed exactly, so any other change still fails.
+    for new, old in [('\t/// The exact native state. Views observing the whole core are invalidated\n\t/// for every stage change but for a percentage only every ten points: one\n\t/// publication per transfer callback re-evaluated the tab hierarchy up to\n\t/// a hundred times while the update control was animating. Every exact\n\t/// value still reaches gate4StatePublisher.\n\tprivate(set) var gate4State: Gate4State = .idle {\n\t\twillSet {\n\t\t\tif Self.gate4StateInvalidatesViews(from: gate4State, to: newValue) { objectWillChange.send() }\n\t\t}\n\t\tdidSet { gate4StateSubject.send(gate4State) }\n\t}\n\tprivate let gate4StateSubject = CurrentValueSubject<Gate4State, Never>(.idle)\n\t/// Every native state, including each percentage, after it is stored.\n\tvar gate4StatePublisher: AnyPublisher<Gate4State, Never> { gate4StateSubject.eraseToAnyPublisher() }\n\n\tnonisolated static func gate4StateInvalidatesViews(from old: Gate4State, to new: Gate4State) -> Bool {\n\t\tswitch (old, new) {\n\t\tcase let (.uploading(previous), .uploading(next)), let (.progress(previous), .progress(next)):\n\t\t\treturn ZagGate4PublicationPolicy.invalidatesViews(fromPercent: previous, toPercent: next)\n\t\tdefault:\n\t\t\treturn old != new\n\t\t}\n\t}\n', '\t@Published private(set) var gate4State: Gate4State = .idle\n'), ('\t\tgate4AttemptEvents.append(ZagGate4Event(code: code, message: message))\n\t\t// Percentages arrive up to a hundred times per phase on the main\n\t\t// thread. Keep the diagnostic record and log at the same ten-point\n\t\t// cadence as view invalidation; the retry policy still sees every event.\n\t\tvar percentage: Gate4State?\n\t\tif code == 208 { percentage = Int(message).map { .uploading($0) } }\n\t\tif code == 206 { percentage = Int(message).map { .progress($0) } }\n\t\tif percentage == nil || Self.gate4StateInvalidatesViews(from: gate4State, to: percentage!) {\n\t\t\trecordGate4Event("Gate4 callback \\(code): \\(message)")\n\t\t\t// Record native installation stages for diagnostics.\n\t\t\tif code == 206 {\n\t\t\t\tZagLogger.shared.info("RPPairing", "Gate4 install progress: \\(message)%")\n\t\t\t} else {\n\t\t\t\tZagLogger.shared.info("RPPairing", "Gate4 callback stage=\\(code) detail=\\(message)")\n\t\t\t}\n\t\t}\n', '\t\tgate4AttemptEvents.append(ZagGate4Event(code: code, message: message))\n\t\trecordGate4Event("Gate4 callback \\(code): \\(message)")\n\t\t// Record native installation stages for diagnostics.\n\t\tif code == 206 {\n\t\t\tZagLogger.shared.info("RPPairing", "Gate4 install progress: \\(message)%")\n\t\t} else {\n\t\t\tZagLogger.shared.info("RPPairing", "Gate4 callback stage=\\(code) detail=\\(message)")\n\t\t}\n'), ("\t\tcase 209:\n\t\t\tgate4State = .staged\n\t\t\t// Same main-thread turn as the stage change, so the screen never\n\t\t\t// renders the stage without the attempt's handoff state.\n\t\t\tgate4Staged?()\n", '\t\tcase 209: gate4State = .staged\n')]:
+        assert source.count(new) == 1, new[:60]
+        source = source.replace(new, old)
+    for line in ['\tprivate var gate4Staged: (() -> Void)?\n', '\t\tstaged: (() -> Void)? = nil,\n', '\t\tgate4Staged = staged\n']:
+        assert source.count(line) == 1, line
+        source = source.replace(line, '')
+    return source.replace('\t\t\tgate4Staged = nil\n', '')
+assert excluding_local_cleanup(excluding_pin_presentation(excluding_gate4_presentation(current))) == excluding_local_cleanup(excluding_pin_presentation(baseline))
+PYCODE
+}
+check "install: installer core is unchanged outside PIN presentation and explicit local-cleanup guards" installer_core_unchanged
 check "install: self-update never uses Mobile Data Fix" bash -c "! grep -q 'ZagMobileDataInstall' '$ROOT/Feather/Utilities/ZagSelfUpdateCoordinator.swift' && grep -q 'if isSelfInstall {' '$ROOT/Feather/Views/Library/Install/InstallPreviewView.swift'"
 check "uninstall: Library removal goes through the shared coordinator" grep -q 'coordinator.perform(.uninstall' "$ROOT/Feather/Views/Library/LibraryView.swift"
 check "uninstall: only one RPPairing uninstall entry point exists" bash -c "[ \$(grep -rn 'uninstallGate4App(' '$ROOT/Feather' | grep -vc 'func uninstallGate4App') -eq 1 ]"

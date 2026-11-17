@@ -36,7 +36,8 @@ REAL=(
 	"$U/ZagUpdateVerifiedPipeline.swift" "$U/ZagUpdateV2Discovery.swift"
 	"$U/ZagDeviceFamilyPolicy.swift" "$U/ZagSelfUpdateRetryPolicy.swift" "$U/ZagSelfUpdateKeychainProbe.swift"
 	"$U/ZagMachOSignatureInspector.swift" "$U/ZagLogger.swift" "$U/AnyCodable.swift"
-	"$U/ZagPackageIntegrity.swift"
+	"$U/ZagPackageIntegrity.swift" "$U/ZagUpdateProgressPresentation.swift" "$U/ZagPostUpdateMessage.swift"
+	"$U/ZagInstalledRelease.swift" "$U/ZagUpdateReleaseNotes.swift"
 )
 
 # Source checks for code the harness cannot compile or must not contain.
