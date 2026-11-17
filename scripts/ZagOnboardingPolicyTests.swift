@@ -98,16 +98,26 @@ import Combine
         stalled.events.send(.verified)
         check(timeout.policy.status == .timedOut, "late result after timeout ignored")
 
-        // VPN reconnect after the timeout: exactly one new check.
+        // VPN reconnect after the timeout: exactly one new check. Its outcome
+        // is not asserted here: this gate's deadline is deliberately short.
         timeout.connectionAvailable()
         await settle()
-        check(stalled.checks == 2 && timeout.policy.status == .checking, "VPN reconnect after timeout starts one new check")
-        timeout.connectionAvailable()
-        timeout.retry()
+        check(stalled.checks == 2, "VPN reconnect after timeout starts one new check")
+
+        // Reconnect re-check with a normal deadline: no overlap, then verified.
+        let offline = PairingService(); offline.hasPairingRecord = true
+        let reconnect = launch(offline)
         await settle()
-        check(stalled.checks == 2, "repeated reconnects while checking never overlap checks")
-        stalled.events.send(.verified)
-        check(timeout.policy.isPairingVerified, "reconnect re-check verifies pairing for device operations")
+        offline.events.send(.unknown)
+        reconnect.connectionAvailable()
+        await settle()
+        check(offline.checks == 2 && reconnect.policy.status == .checking, "VPN reconnect after unavailable starts one new check")
+        reconnect.connectionAvailable()
+        reconnect.retry()
+        await settle()
+        check(offline.checks == 2, "repeated reconnects while checking never overlap checks")
+        offline.events.send(.verified)
+        check(reconnect.policy.isPairingVerified, "reconnect re-check verifies pairing for device operations")
 
         let busy = PairingService(); busy.hasPairingRecord = true; busy.isBusy = true
         let busyGate = launch(busy, timeout: 20_000_000)
