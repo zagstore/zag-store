@@ -174,7 +174,34 @@ struct ZagSelfUpdateIntegrityTests {
 		UserDefaults.standard.set(false, forKey: Coordinator.automaticChecksKey)
 		UserDefaults.standard.set(false, forKey: Coordinator.automaticWiFiDownloadKey)
 		URLProtocol.registerClass(StubProtocol.self)
+		// 0. Next-launch verification finalises the installed-release record:
+		// a pending record for this very executable, written before launch.
+		let startedAt = Date().addingTimeInterval(-3600)
+		let ownHash = try! ZagPackageIntegrity.sha256(of: Bundle.main.executableURL!)
+		UserDefaults.standard.removeObject(forKey: "zagStore.selfUpdate.completed")
+		UserDefaults.standard.set(try! JSONEncoder().encode(Coordinator.PendingInstallation(
+			version: "1.0.0", build: "2", bundleIdentifier: Bundle.main.bundleIdentifier!, startedAt: startedAt,
+			originatingBuild: "1", expectedExecutableSHA256: ownHash,
+			originatingExecutableSHA256: String(repeating: "0", count: 64),
+			releaseChannel: "beta", originatingVersion: "1.0.0", whatsNew: "Harness What's New")),
+			forKey: "zagStore.selfUpdate.pending")
 		let coordinator = Coordinator.shared
+		for _ in 0..<100 where coordinator.lastVerifiedInstallation?.installedAt == nil {
+			try? await Task.sleep(nanoseconds: 50_000_000)
+		}
+		let verified = coordinator.lastVerifiedInstallation
+		let stored = UserDefaults.standard.data(forKey: "zagStore.selfUpdate.completed")
+			.flatMap { try? JSONDecoder().decode(Coordinator.PendingInstallation.self, from: $0) }
+		check(coordinator.installedIdentityVerified && coordinator.pendingInstallation == nil
+			&& UserDefaults.standard.data(forKey: "zagStore.selfUpdate.pending") == nil,
+			"verification finalises the pending record")
+		check(stored?.installedAt != nil && stored?.installedAt == verified?.installedAt
+			&& stored!.installedAt! >= startedAt && stored!.installedAt! <= Date(),
+			"the installation time is persisted, inside the update's window")
+		check(stored?.whatsNew == "Harness What's New", "the installed release keeps its own What's New")
+		let installed = coordinator.installedRelease
+		check(installed.title == "Zag Store 1.0.0 Beta 2" && installed.whatsNew == "Harness What's New"
+			&& installed.installedAt == stored?.installedAt, "More Details reads the verified record")
 		let authenticSHA = sha256(authentic)
 		var replacement = authentic
 		replacement[100] ^= 0xFF

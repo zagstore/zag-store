@@ -34,6 +34,9 @@ import Combine
         let service = ZagRPPairingLaunchService()
         var results: [ZagOnboardingPolicy.Verification] = []
         var successes = 0
+        var removals = 0
+        let removalSubscription = service.recordRemovals.sink { removals += 1 }
+        defer { removalSubscription.cancel() }
         let checkSubscription = service.verificationEvents.sink { results.append($0) }
         let setupSubscription = service.setupSuccesses.sink { successes += 1 }
         defer { checkSubscription.cancel(); setupSubscription.cancel() }
@@ -73,8 +76,10 @@ import Combine
         check(service.currentVerification == .invalid, "live rejection invalidates presentation after onboarding has finished")
         core.state = .paired
         check(service.currentVerification == .verified, "re-established native pairing restores paired description")
+        let removalsBefore = removals
         core.localPairingCleanupPending = true
         check(service.currentVerification == .missing, "local cleanup immediately invalidates paired description")
+        check(removals == removalsBefore + 1, "local cleanup during the session signals removal to the launch gate")
         core.localPairingCleanupPending = false
         core.pairingFileExists = false
         core.gate2State = .idle
@@ -87,6 +92,9 @@ import Combine
         readiness.pairingEvent(.verified(Date()))
         readiness.expire(now: Date().addingTimeInterval(1000))
         check(service.currentVerification == .verified, "VPN readiness expiry does not erase authenticated pairing")
-        print("SUCCESS: 22 production pairing event-bridge checks passed")
+        let removalsBeforeUnreachable = removals
+        core.gate2State = .failed("Unable to reach RPPairing at 10.7.0.1:49152")
+        check(service.currentVerification == .unknown && removals == removalsBeforeUnreachable, "VPN unreachable during the session is never a removal")
+        print("SUCCESS: 24 production pairing event-bridge checks passed")
     }
 }

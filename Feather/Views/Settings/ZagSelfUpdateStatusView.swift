@@ -19,10 +19,8 @@ struct ZagSelfUpdateStatusView: View {
     @AppStorage("ZagStore.updatePreferences.betaChannel.placeholder")
     private var zagBetaChannel = "off"
 
-    // A verified replacement receives a one-time success celebration.
-    // Never acknowledge the next build in advance.
-    @AppStorage("zagStore.selfUpdate.acknowledgedReplacement.v1")
-    private var acknowledgedReplacement = ""
+    @State private var showsInstalledDetails = false
+    @State private var upToDateLayout = ZagUpToDateLayout()
 
 
 
@@ -69,7 +67,7 @@ struct ZagSelfUpdateStatusView: View {
     @State private var checkStatus = "Not checked"
     @State private var releaseCheckStatus = "Not checked"
     @State private var releaseCheckBusy = false
-    @State private var releaseDownloadSize: String?
+    @State private var releaseDownloadSize = ZagUpdateDownloadSize.checking
     @State private var releaseDownloadBusy = false
     @State private var markerStatus = "Not checked"
 
@@ -367,55 +365,38 @@ struct ZagSelfUpdateStatusView: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"
     }
 
-    private var verifiedReplacementKey: String? {
-        guard coordinator.installedIdentityVerified,
-              coordinator.pendingInstallation == nil,
-              let verified = coordinator.lastVerifiedInstallation,
-              verified.bundleIdentifier == (Bundle.main.bundleIdentifier ?? ""),
-              verified.version == installedVersion,
-              verified.build == installedBuild,
-              let expected = verified.expectedExecutableSHA256,
-              !expected.isEmpty else { return nil }
-        return [verified.bundleIdentifier, verified.version, verified.build, expected]
-            .joined(separator: "|")
+    /// Native up-to-date state: only after a completed check of the selected
+    /// channel found nothing newer, with no update in progress or unresolved.
+    private var showsUpToDate: Bool {
+        coordinator.availableRelease == nil
+            && coordinator.upToDateChannel == ZagSelfUpdateCoordinator.UpdateChannel.selected
+            && coordinator.pendingInstallation == nil
+            && !releaseDownloadBusy && !installBusy && !coordinator.userUpdateInProgress && !gate4.isGate4Running
     }
 
-    private var shouldCelebrateVerifiedReplacement: Bool {
-        guard coordinator.availableRelease == nil,
-              !releaseDownloadBusy, !installBusy, !coordinator.userUpdateInProgress, !gate4.isGate4Running,
-              let key = verifiedReplacementKey else { return false }
-        return acknowledgedReplacement != key
-    }
-
-    private var verifiedUpdateCelebration: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "checkmark.seal.fill")
-                .font(.system(size: 54, weight: .medium))
-                .foregroundStyle(.green)
-                .accessibilityHidden(true)
-
-            Text("Zag Store Updated")
-                .font(.system(.title2, design: .rounded, weight: .bold))
-                .multilineTextAlignment(.center)
-
-            Text("Version \(installedVersion) · Build \(installedBuild)")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-
-            Label("Installation verified successfully", systemImage: "checkmark.shield.fill")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.green)
-
-            Text("The running executable exactly matches the signed update prepared before installation. Your replacement is verified.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
-        .onDisappear {
-            // Acknowledge the notice when leaving it, so it stays readable while open.
-            if let key = verifiedReplacementKey { acknowledgedReplacement = key }
+    private func checkSelectedChannel() async {
+        guard !releaseCheckBusy else { return }
+        releaseCheckBusy = true
+        releaseCheckStatus = "Checking " + (zagBetaChannel == "off" ? "Stable" : zagBetaChannel.capitalized) + "…"
+        defer { releaseCheckBusy = false }
+        do {
+            let selectedChannel = ZagSelfUpdateCoordinator.UpdateChannel.selected
+            let release = try await coordinator.checkForSelectedChannel()
+            guard selectedChannel == ZagSelfUpdateCoordinator.UpdateChannel.selected else {
+                releaseCheckStatus = "Channel changed — check the selected channel again"
+                return
+            }
+            if let release {
+                releaseCheckStatus = "Available: " + release.version + " (Build " + release.build + ")"
+            } else {
+                releaseCheckStatus = "No newer release on this channel"
+            }
+        } catch {
+            if case ZagSelfUpdateCoordinator.UpdateError.channelNotPublished = error {
+                releaseCheckStatus = "No releases published for this channel yet"
+            } else {
+                releaseCheckStatus = "Check failed: " + error.localizedDescription
+            }
         }
     }
 
@@ -608,6 +589,12 @@ struct ZagSelfUpdateStatusView: View {
         return nil
     }
 
+    /// The visible failure above, for the card's secondary line.
+    private var updateCardFailure: ZagUpdateCardStatus.Failure? {
+        guard let issue = userVisibleUpdateIssue else { return nil }
+        return issue.hasPrefix("Update cancelled") ? .cancelled : .failed
+    }
+
     private var candidateSummary: String {
         let request: NSFetchRequest<Signed> = Signed.fetchRequest()
         request.predicate = NSPredicate(format: "identifier == %@", Bundle.main.bundleIdentifier ?? "")
@@ -740,34 +727,18 @@ struct ZagSelfUpdateStatusView: View {
                 }
             }
 
+            if showsUpToDate {
+                Section {
+                    ZagSoftwareUpToDateView(release: coordinator.installedRelease) {
+                        showsInstalledDetails = true
+                    }
+                    .zagUpToDateRow(upToDateLayout)
+                }
+            } else {
             Section {
                 if coordinator.availableRelease == nil {
                 Button {
-                    guard !releaseCheckBusy else { return }
-                    releaseCheckBusy = true
-                    releaseCheckStatus = "Checking " + (zagBetaChannel == "off" ? "Stable" : zagBetaChannel.capitalized) + "…"
-                    Task { @MainActor in
-                        defer { releaseCheckBusy = false }
-                        do {
-                            let selectedChannel = ZagSelfUpdateCoordinator.UpdateChannel.selected
-                            let release = try await coordinator.checkForSelectedChannel()
-                            guard selectedChannel == ZagSelfUpdateCoordinator.UpdateChannel.selected else {
-                                releaseCheckStatus = "Channel changed — check the selected channel again"
-                                return
-                            }
-                            if let release {
-                                releaseCheckStatus = "Available: " + release.version + " (Build " + release.build + ")"
-                            } else {
-                                releaseCheckStatus = "No newer release on this channel"
-                            }
-                        } catch {
-                            if case ZagSelfUpdateCoordinator.UpdateError.channelNotPublished = error {
-                                releaseCheckStatus = "No releases published for this channel yet"
-                            } else {
-                                releaseCheckStatus = "Check failed: " + error.localizedDescription
-                            }
-                        }
-                    }
+                    Task { @MainActor in await checkSelectedChannel() }
                 } label: {
                     Label("Check for Updates", systemImage: "arrow.clockwise")
                 }
@@ -803,7 +774,9 @@ struct ZagSelfUpdateStatusView: View {
                                 }
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.8)
-                                Text(releaseDownloadSize ?? "Checking download size…")
+                                ZagUpdateCrossfadeText(ZagUpdateCardStatus.text(action: updateActionState,
+                                                                                failure: updateCardFailure,
+                                                                                size: releaseDownloadSize))
                                     .font(.caption)
                                     .foregroundStyle(.primary)
                                 if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {
@@ -814,7 +787,7 @@ struct ZagSelfUpdateStatusView: View {
                             }
                             Spacer(minLength: 0)
                         }
-                        ZagUpdateReleaseNotesView(markdown: release.releaseNotes ?? "Release notes are not available for this update.", version: release.version, build: release.build)
+                        ZagUpdateReleaseNotesView(markdown: ZagUpdateReleaseNotes.whatsNew(from: release.releaseNotes) ?? "Release notes are not available for this update.", version: release.version, build: release.build)
                             .id([release.version, release.build, release.ipaURL.absoluteString, release.releaseNotes ?? ""])
                         Divider()
                         ZagUpdateTransferActionControl(state: updateActionState,
@@ -836,17 +809,10 @@ struct ZagSelfUpdateStatusView: View {
 
                     }
                     .task(id: release.ipaURL) {
-                        releaseDownloadSize = nil
-                        var request = URLRequest(url: release.ipaURL)
-                        request.httpMethod = "HEAD"
-                        if let response = try? await URLSession.shared.data(for: request).1 as? HTTPURLResponse,
-                           response.statusCode == 200,
-                           let length = response.value(forHTTPHeaderField: "Content-Length"),
-                           let bytes = Int64(length), bytes > 0 {
-                            releaseDownloadSize = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-                        } else {
-                            releaseDownloadSize = "Download size unavailable"
-                        }
+                        releaseDownloadSize = .checking
+                        let size = await ZagUpdateDownloadSize.lookup(release.ipaURL)
+                        // A newer release's lookup replaces this one.
+                        if !Task.isCancelled { releaseDownloadSize = size }
                     }
                 }
                 if coordinator.availableRelease == nil {
@@ -855,11 +821,6 @@ struct ZagSelfUpdateStatusView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-
-            if shouldCelebrateVerifiedReplacement {
-                Section {
-                    verifiedUpdateCelebration
-                }
             }
 
             if isAdmin && zagAdvancedSettingsUnlocked {
@@ -1007,6 +968,11 @@ struct ZagSelfUpdateStatusView: View {
 
         }
         .modifier(ZagSelfUpdateSectionSpacing())
+        .refreshable { await checkSelectedChannel() }
+        .navigationDestination(isPresented: $showsInstalledDetails) {
+            ZagInstalledVersionView(release: coordinator.installedRelease)
+        }
+        .zagUpToDateForm($upToDateLayout)
         .fileImporter(isPresented: $showImportPicker, allowedContentTypes: [.json]) { result in
             inspectRecoveryFile(result)
         }
