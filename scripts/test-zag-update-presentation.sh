@@ -70,9 +70,18 @@ assert notes.index('blockContent(first, lineLimit:') < notes.index('if showsFull
 assert 'transaction.disablesAnimations = true' in notes
 assert 'guard value != measurements else { return }' in notes
 assert '.lineLimit(lineLimit)' in notes
+control_src = (root / 'Feather/Views/Settings/ZagSelfUpdateActionControl.swift').read_text()
 header = card.split('HStack(alignment: .center, spacing: 14)', 1)[1].split('ZagUpdateReleaseNotesView', 1)[0]
 assert header.count('.frame(width: 60, height: 60)') == 2
-assert 'Text(releaseDownloadSize ?? "Checking download size…")\n                                    .font(.caption)' in header
+assert 'ZagUpdateCrossfadeText(ZagUpdateCardStatus.text(action: updateActionState,' in header
+assert 'size: releaseDownloadSize))\n                                    .font(.caption)\n                                    .foregroundStyle(.primary)' in header
+assert 'ZagUpdateDownloadSize.lookup(release.ipaURL)' in view and 'if !Task.isCancelled { releaseDownloadSize = size }' in view
+# The card line shares the control's state: one lifecycle, never a second machine.
+assert view.count('ZagUpdateTransferActionControl(state: updateActionState,') == 1
+crossfade = (root / 'Feather/Views/Settings/ZagUpdateCrossfadeText.swift').read_text()
+assert 'ZagUpdateStatusTiming.fadeOut' in crossfade and 'ZagUpdateStatusTiming.fadeIn' in crossfade
+assert '.easeIn(duration: ZagUpdateStatusTiming.fadeOut)' in control_src and '.easeOut(duration: ZagUpdateStatusTiming.fadeIn)' in control_src
+assert 'ZagAnimationArrival(' in crossfade and '.accessibilityLabel(text)' in crossfade and '.lineLimit(1)' in crossfade
 assert 'if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {' in header
 assert 'ZagUpdateChannelPresentation.title(for: zagBetaChannel)' in header
 assert '.font(.caption2)' in header and '.foregroundStyle(.secondary)' in header
