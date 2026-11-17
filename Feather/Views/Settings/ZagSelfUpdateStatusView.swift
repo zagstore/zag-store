@@ -67,7 +67,7 @@ struct ZagSelfUpdateStatusView: View {
     @State private var checkStatus = "Not checked"
     @State private var releaseCheckStatus = "Not checked"
     @State private var releaseCheckBusy = false
-    @State private var releaseDownloadSize: String?
+    @State private var releaseDownloadSize = ZagUpdateDownloadSize.checking
     @State private var releaseDownloadBusy = false
     @State private var markerStatus = "Not checked"
 
@@ -589,6 +589,12 @@ struct ZagSelfUpdateStatusView: View {
         return nil
     }
 
+    /// The visible failure above, for the card's secondary line.
+    private var updateCardFailure: ZagUpdateCardStatus.Failure? {
+        guard let issue = userVisibleUpdateIssue else { return nil }
+        return issue.hasPrefix("Update cancelled") ? .cancelled : .failed
+    }
+
     private var candidateSummary: String {
         let request: NSFetchRequest<Signed> = Signed.fetchRequest()
         request.predicate = NSPredicate(format: "identifier == %@", Bundle.main.bundleIdentifier ?? "")
@@ -768,7 +774,9 @@ struct ZagSelfUpdateStatusView: View {
                                 }
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.8)
-                                Text(releaseDownloadSize ?? "Checking download size…")
+                                ZagUpdateCrossfadeText(ZagUpdateCardStatus.text(action: updateActionState,
+                                                                                failure: updateCardFailure,
+                                                                                size: releaseDownloadSize))
                                     .font(.caption)
                                     .foregroundStyle(.primary)
                                 if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {
@@ -801,17 +809,10 @@ struct ZagSelfUpdateStatusView: View {
 
                     }
                     .task(id: release.ipaURL) {
-                        releaseDownloadSize = nil
-                        var request = URLRequest(url: release.ipaURL)
-                        request.httpMethod = "HEAD"
-                        if let response = try? await URLSession.shared.data(for: request).1 as? HTTPURLResponse,
-                           response.statusCode == 200,
-                           let length = response.value(forHTTPHeaderField: "Content-Length"),
-                           let bytes = Int64(length), bytes > 0 {
-                            releaseDownloadSize = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-                        } else {
-                            releaseDownloadSize = "Download size unavailable"
-                        }
+                        releaseDownloadSize = .checking
+                        let size = await ZagUpdateDownloadSize.lookup(release.ipaURL)
+                        // A newer release's lookup replaces this one.
+                        if !Task.isCancelled { releaseDownloadSize = size }
                     }
                 }
                 if coordinator.availableRelease == nil {
