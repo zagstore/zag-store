@@ -213,7 +213,7 @@ struct SettingsView: View {
 	}
 
     
-	private let _githubUrl = "https://github.com/claration/Feather"
+	private let _githubUrl = "https://github.com/zagstore/zag-store"
     
 	private var settingsContent: some View {
 			Form {

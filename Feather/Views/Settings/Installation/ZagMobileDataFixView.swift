@@ -4,6 +4,7 @@ import NimbleViews
 /// Installation Settings row for the Mobile Data Fix.
 struct ZagMobileDataFixRow: View {
 	@ObservedObject private var controller = ZagMobileDataToggleController.shared
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
 	var body: some View {
 		let status = controller.status
@@ -14,7 +15,8 @@ struct ZagMobileDataFixRow: View {
 			HStack(spacing: 12) {
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
-						Text(status.isVerified ? "Mobile Data Fix" : ZagMobileDataToggle.setupActionTitle)
+						Text(status.isVerified ? "Mobile Data Fix" : "Apply Fix")
+                            .lineLimit(dynamicTypeSize > .large ? nil : 1)
 						if case .notSetUp = status {
 							Text("Enable app installation over Mobile Data")
 								.font(.footnote)
@@ -28,8 +30,8 @@ struct ZagMobileDataFixRow: View {
 				if case .notSetUp = status {
 					EmptyView()
 				} else {
-					ZagMobileDataFixStatusLabel(status: status)
-						.font(.subheadline)
+					ZagMobileDataFixStatusLabel(status: status, compact: true)
+						.font(ZagInstallationStatusStyle.font)
 				}
 			}
 		}
@@ -38,13 +40,33 @@ struct ZagMobileDataFixRow: View {
 
 struct ZagMobileDataFixStatusLabel: View {
 	let status: ZagMobileDataToggle.Status
+    var compact = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
 	var body: some View {
 		let style = Self.style(for: status)
-		Label(status.title, systemImage: style.icon)
-			.foregroundStyle(style.color)
-			.labelStyle(.titleAndIcon)
+        if compact {
+            HStack(spacing: 8) {
+                Text(compactTitle)
+                    .lineLimit(dynamicTypeSize > .large ? nil : 1)
+                    .fixedSize(horizontal: dynamicTypeSize <= .large, vertical: true)
+                ZagInstallationStatusIndicator(systemName: style.icon)
+                    .frame(width: 22, alignment: .center)
+                    .accessibilityHidden(true)
+            }
+            .font(ZagInstallationStatusStyle.font)
+            .foregroundStyle(style.color)
+        } else {
+            Label(status.title, systemImage: style.icon)
+                .foregroundStyle(style.color)
+                .labelStyle(.titleAndIcon)
+        }
 	}
+
+    private var compactTitle: String {
+        if case .verificationRequired = status { return "Not Verified" }
+        return status.title
+    }
 
 	static func style(for status: ZagMobileDataToggle.Status) -> (icon: String, color: Color) {
 		switch status {
@@ -71,7 +93,7 @@ struct ZagMobileDataFixView: View {
 				HStack {
 					Text("Status")
 					Spacer()
-					ZagMobileDataFixStatusLabel(status: status)
+					ZagMobileDataFixStatusLabel(status: status, compact: true)
 				}
 				if case .verified(_, let at) = status {
 					// Absolute date and time in the device's locale, calendar and
@@ -81,12 +103,16 @@ struct ZagMobileDataFixView: View {
 						HStack {
 							Text("Last Verified")
 							Spacer()
-							Text(verified).foregroundStyle(.secondary)
+							Text(verified)
+                                .font(ZagInstallationStatusStyle.font)
+                                .foregroundStyle(.secondary)
 						}
 						.lineLimit(1)
 						VStack(alignment: .leading, spacing: 2) {
 							Text("Last Verified")
-							Text(verified).foregroundStyle(.secondary)
+							Text(verified)
+                                .font(ZagInstallationStatusStyle.font)
+                                .foregroundStyle(.secondary)
 						}
 					}
 				}

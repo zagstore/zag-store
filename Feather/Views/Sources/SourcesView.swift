@@ -400,7 +400,7 @@ struct SourcesView: View {
 				style: .default
 			) { _ in
 				UIApplication.open(
-					"https://github.com/khcrysalis/Feather"
+					"https://github.com/zagstore/zag-store"
 				)
 			}
 			let cancel = UIAlertAction(
@@ -816,7 +816,7 @@ struct SourcesView: View {
 								}
 								.font(.system(size: 15, weight: .regular))
 								.lineLimit(1)
-								.modifier(ZagAppCountTransition(value: totalApps))
+								.modifier(ZagNumericTextTransition(value: totalApps))
 							}
 						}
 						.frame(
@@ -1465,23 +1465,6 @@ private struct ZagRepositoriesHeader:
 			),
 			count: count
 		)
-	}
-}
-
-
-private struct ZagAppCountTransition: ViewModifier {
-	let value: Int
-
-	@ViewBuilder
-	func body(content: Content) -> some View {
-		if #available(iOS 17.0, *) {
-			content
-				.contentTransition(.numericText(value: Double(value)))
-				.animation(.snappy(duration: 0.35), value: value)
-		} else {
-			content
-				.animation(.easeInOut(duration: 0.2), value: value)
-		}
 	}
 }
 

@@ -7,6 +7,25 @@
 
 import Foundation
 
+/// Preserve HTTP repository compatibility while preventing HTTPS downgrades,
+/// credential-bearing redirects and redirects into local/custom URL schemes.
+public enum NBFetchRedirectPolicy {
+    public static func allows(original: URL?, destination: URL?) -> Bool {
+        guard let destination, let parts = URLComponents(url: destination, resolvingAgainstBaseURL: false),
+              let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = parts.host, !host.isEmpty, parts.user == nil, parts.password == nil else { return false }
+        return original?.scheme?.lowercased() != "https" || scheme == "https"
+    }
+}
+
+private final class NBFetchRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    static let shared = NBFetchRedirectDelegate()
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(NBFetchRedirectPolicy.allows(original: task.originalRequest?.url ?? response.url, destination: request.url) ? request : nil)
+    }
+}
+
 // MARK: - Repository diagnostics
 
 public struct NBRepositoryFetchMetric: Codable, Identifiable, Sendable {
@@ -56,7 +75,13 @@ public enum NBRepositoryFetchDiagnostics {
 		var current = load().filter { $0.url != metric.url }
 		current.append(metric)
 		guard let fileURL, let data = try? JSONEncoder().encode(current) else { return }
-		try? data.write(to: fileURL, options: .atomic)
+		do {
+			try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+			try data.write(to: fileURL, options: .atomic)
+		} catch {
+			// Retain legacy metrics if the cache is unavailable or unwritable.
+			return
+		}
 		// One-time migration: the file now holds the older metrics as well.
 		if UserDefaults.standard.object(forKey: legacyKey) != nil {
 			UserDefaults.standard.removeObject(forKey: legacyKey)
@@ -327,7 +352,7 @@ extension NBFetchService {
 
 			let requestStartedAt = CFAbsoluteTimeGetCurrent()
 			let startedAtDate = Date()
-			URLSession.shared.dataTask(with: request) { data, response, error in
+			let task = URLSession.shared.dataTask(with: request) { data, response, error in
 				let networkElapsed = CFAbsoluteTimeGetCurrent() - requestStartedAt
 				let http = response as? HTTPURLResponse
 				let received = data?.count ?? 0
@@ -460,7 +485,9 @@ extension NBFetchService {
 					// response decoded successfully.
 					self.completeFromCache(url: url, cachedData: cachedData, networkElapsed: networkElapsed, failure: NBFetchServiceError.parsingError(error), response: http, receivedBytes: received, startedAt: startedAtDate, completion: completion)
 				}
-			}.resume()
+            }
+            task.delegate = NBFetchRedirectDelegate.shared
+            task.resume()
 		}
 	}
 }

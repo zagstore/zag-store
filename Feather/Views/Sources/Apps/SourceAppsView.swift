@@ -657,7 +657,7 @@ struct SourceAppsView: View {
 
 	private var _repositoryActionPills: some View {
 		HStack(spacing: 6) {
-			if object.count == 1, let website = _sources?.first?.website {
+			if object.count == 1, let website = _sources?.first?.website, ZagDeepLink.isWebLink(website) {
 				Button {
 					UIApplication.open(website)
 				} label: {

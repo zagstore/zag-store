@@ -17,7 +17,7 @@ import UIKit
 ///
 /// No prompt (owner's decision, 2026-11-12; production 2026-11-13): on by
 /// default, explained in Settings › Privacy, where turning it off stops any
-/// pending report. That row appears only in copies that have a report.
+/// pending report. Copies without attribution show reporting as unavailable.
 ///
 /// Report v2 also sends the OS build, and a jailbreak classification only
 /// when the user turned "Share Jailbreak Status" on (off by default): in the

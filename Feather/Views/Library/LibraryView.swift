@@ -522,63 +522,19 @@ struct LibraryView: View {
 
 	@ViewBuilder
 	private func _removeAppSheetContent(_ app: AnyApp) -> some View {
-		VStack(spacing: 10) {
-			Text(
-				String(
-					format: .localized("Remove “%@”?"),
-					app.base.name ?? .localized("this app")
-				)
-			)
-			.font(.system(size: 22, weight: .semibold))
-			.multilineTextAlignment(.center)
-
-			Text(.localized("This will uninstall the app from your iPhone. Its stored copy will remain in Zag Store so you can install it again later."))
-				.font(.system(size: 17))
-				.foregroundStyle(.secondary)
-				.multilineTextAlignment(.center)
-				.fixedSize(horizontal: false, vertical: true)
-
-			Spacer().frame(height: 10)
-
-			Button {
-				let target = app.base
-				_pendingRemoveApp = nil
-				DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-					_removeManagedApp(target)
-				}
-			} label: {
-				Text(.localized("Delete App"))
-					.font(.system(size: 20, weight: .semibold))
-					.foregroundStyle(.red)
-					.frame(maxWidth: .infinity)
-					.frame(height: 52)
-					.background(
-						Color(uiColor: .tertiarySystemFill),
-						in: RoundedRectangle(cornerRadius: 26, style: .continuous)
-					)
-			}
-			.buttonStyle(.plain)
-
-			Button {
-				_pendingRemoveApp = nil
-			} label: {
-				Text(.localized("Cancel"))
-					.font(.system(size: 20, weight: .semibold))
-					.foregroundStyle(.primary)
-					.frame(maxWidth: .infinity)
-					.frame(height: 52)
-					.background(
-						Color(uiColor: .tertiarySystemFill),
-						in: RoundedRectangle(cornerRadius: 26, style: .continuous)
-					)
-			}
-			.buttonStyle(.plain)
-		}
-		.padding(.horizontal, 20)
-		.padding(.top, 24)
-		.padding(.bottom, 8)
-		.presentationDetents([.height(302)])
-		.presentationDragIndicator(.visible)
+        ZagRemovalConfirmationSheet(
+            title: String(format: .localized("Remove “%@”?"), app.base.name ?? .localized("this app")),
+            message: .localized("This will uninstall the app from your iPhone. Its stored copy will remain in Zag Store so you can install it again later."),
+            destructiveTitle: .localized("Delete App"),
+            confirm: {
+                let target = app.base
+                _pendingRemoveApp = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    _removeManagedApp(target)
+                }
+            },
+            cancel: { _pendingRemoveApp = nil }
+        )
 	}
 
 	@ViewBuilder
@@ -1122,6 +1078,7 @@ struct LibraryView: View {
 
 			.sheet(item: $_pendingRemoveApp) { app in
 				_removeAppSheetContent(app)
+                .modifier(ZagRemovalSheetPresentation())
 			}
 
 			.sheet(item: $_selectedInfoAppPresenting) { app in

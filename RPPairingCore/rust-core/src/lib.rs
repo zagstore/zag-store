@@ -1688,8 +1688,10 @@ async fn run_installed_app_icons(
 /// 207 = installation complete
 /// 208 = signed IPA staging progress (actual transferred byte percentage)
 /// 209 = signed IPA fully staged via AFC
-/// 210 = Upgrade request transmitted (NOT a completion acknowledgment)
-/// 211 = real installation_proxy Status (not a completion guarantee)
+/// 210 = self-update Upgrade request written to the tunnel (NOT an acknowledgment)
+/// 211 = installation_proxy's first reply to that request, without an error:
+///       installd has accepted it and is processing (message = its Status).
+///       Not a completion guarantee.
 /// -4  = Gate 4 failure
 #[no_mangle]
 pub unsafe extern "C" fn zag_gate4_install(
@@ -1884,25 +1886,17 @@ async fn run_gate4_install(
                     InstallationProxyClient::connect_rsd(&mut adapter, &mut handshake)
                         .await
                         .map_err(|error| format!("Self-update installation_proxy failed: {error}"))?;
-                let mut options = plist::Dictionary::new();
-                options.insert(
-                    "CFBundleIdentifier".to_string(),
-                    plist::Value::String(bundle_id.clone()),
-                );
 
-                // The public API sends Upgrade and waits for real iOS completion.
-                // Do not emit 210 here: transmission is not separately observable.
-                installation_proxy
-                    .upgrade_with_callback(
-                        "PublicStaging/idevice.ipa",
-                        Some(plist::Value::Dictionary(options)),
-                        |(percent, callback)| async move {
-                            emit(callback, 206, percent.to_string());
-                        },
-                        callback,
-                    )
-                    .await
-                    .map_err(|error| format!("Self-update Upgrade failed: {error}"))?;
+                // The Upgrade exchange is run here rather than through the
+                // crate helper, which hides installd's replies without a
+                // percentage. Its first error-free reply (211) is the only
+                // proof that iOS has the request; writing it (210) is not,
+                // because unsent bytes die with this process.
+                let frame = upgrade_command_frame("PublicStaging/idevice.ipa", &bundle_id)?;
+                run_self_upgrade(&mut installation_proxy.idevice, &frame, |code, message| {
+                    emit(callback, code, message)
+                })
+                .await?;
             } else if is_upgrade {
                 upgrade_package_with_callback_rsd(
                     &mut adapter,
@@ -2089,6 +2083,271 @@ async fn run_gate4_uninstall(
 
     emit(callback, 307, format!("Uninstalled {bundle_id}"));
     Ok(())
+}
+
+/// Length-prefixed plist frames on an installation_proxy connection: a
+/// big-endian u32 length, then the plist (XML when sending), as the crate's
+/// own private send_plist/read_plist use.
+trait PlistFrames {
+    async fn send_frame(&mut self, frame: &[u8]) -> Result<(), String>;
+    async fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, String>;
+}
+
+impl PlistFrames for idevice::Idevice {
+    async fn send_frame(&mut self, frame: &[u8]) -> Result<(), String> {
+        self.send_raw(frame).await.map_err(|error| format!("Self-update Upgrade request failed: {error}"))
+    }
+    async fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, String> {
+        self.read_raw(len).await.map_err(|error| format!("Self-update Upgrade reply failed: {error}"))
+    }
+}
+
+/// installd's replies are small status dictionaries; anything larger is not one.
+const MAX_INSTALLD_REPLY: usize = 1 << 20;
+
+fn upgrade_command_frame(package_path: &str, bundle_id: &str) -> Result<Vec<u8>, String> {
+    let mut options = plist::Dictionary::new();
+    options.insert("CFBundleIdentifier".to_string(), plist::Value::String(bundle_id.to_string()));
+    let mut command = plist::Dictionary::new();
+    command.insert("Command".to_string(), plist::Value::String("Upgrade".to_string()));
+    command.insert("ClientOptions".to_string(), plist::Value::Dictionary(options));
+    command.insert("PackagePath".to_string(), plist::Value::String(package_path.to_string()));
+    let mut body = Vec::new();
+    plist::Value::Dictionary(command)
+        .to_writer_xml(&mut body)
+        .map_err(|error| format!("Cannot encode Upgrade request: {error}"))?;
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+#[derive(Debug, PartialEq)]
+enum InstalldReply {
+    Failed(String),
+    Status { status: Option<String>, percent: Option<u64> },
+}
+
+/// Mirrors the crate's error handling: an `Error` (string, or integer with
+/// `ErrorString`), optionally with `ErrorDescription`, or an `ErrorDescription`
+/// on its own, is a rejection.
+fn classify_installd_reply(reply: &plist::Dictionary) -> InstalldReply {
+    let description = reply.get("ErrorDescription").and_then(|value| value.as_string());
+    if let Some(error) = reply.get("Error") {
+        let error = match error {
+            plist::Value::String(text) => text.clone(),
+            plist::Value::Integer(code) => reply
+                .get("ErrorString")
+                .and_then(|value| value.as_string())
+                .map(str::to_string)
+                .unwrap_or_else(|| code.to_string()),
+            other => format!("{other:?}"),
+        };
+        return InstalldReply::Failed(match description {
+            Some(description) => format!("{error} ({description})"),
+            None => error,
+        });
+    }
+    if let Some(description) = description {
+        return InstalldReply::Failed(description.to_string());
+    }
+    InstalldReply::Status {
+        status: reply.get("Status").and_then(|value| value.as_string()).map(str::to_string),
+        percent: reply.get("PercentComplete").and_then(|value| value.as_unsigned_integer()),
+    }
+}
+
+/// Sends the Upgrade request and follows installd until `Complete`:
+/// 210 once written, 211 on installd's first error-free reply, 206 for each
+/// percentage. A rejection at any point is an error; nothing here waits on a
+/// timer, so a silent installd leaves the caller without an acknowledgment.
+async fn run_self_upgrade<T: PlistFrames>(
+    connection: &mut T,
+    frame: &[u8],
+    mut event: impl FnMut(i32, String),
+) -> Result<(), String> {
+    connection.send_frame(frame).await?;
+    event(210, "Upgrade request written to installation_proxy".to_string());
+    let mut acknowledged = false;
+    loop {
+        let header = connection.read_bytes(4).await?;
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if length == 0 || length > MAX_INSTALLD_REPLY {
+            return Err(format!("Self-update Upgrade reply has an invalid length ({length})"));
+        }
+        let body = connection.read_bytes(length).await?;
+        let reply: plist::Dictionary = plist::from_bytes(&body)
+            .map_err(|error| format!("Self-update Upgrade reply is not a dictionary: {error}"))?;
+        match classify_installd_reply(&reply) {
+            InstalldReply::Failed(error) => return Err(format!("Self-update Upgrade rejected: {error}")),
+            InstalldReply::Status { status, percent } => {
+                if !acknowledged {
+                    acknowledged = true;
+                    event(211, status.clone().unwrap_or_else(|| "Accepted".to_string()));
+                }
+                if let Some(percent) = percent {
+                    event(206, percent.min(100).to_string());
+                }
+                if status.as_deref() == Some("Complete") {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod self_upgrade_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct Scripted {
+        sent: Vec<Vec<u8>>,
+        incoming: VecDeque<u8>,
+        fail_send: bool,
+    }
+
+    impl Scripted {
+        fn replying(replies: &[plist::Dictionary]) -> Self {
+            let mut incoming = VecDeque::new();
+            for reply in replies {
+                let mut body = Vec::new();
+                plist::Value::Dictionary(reply.clone()).to_writer_binary(&mut body).unwrap();
+                incoming.extend((body.len() as u32).to_be_bytes());
+                incoming.extend(body);
+            }
+            Scripted { sent: Vec::new(), incoming, fail_send: false }
+        }
+    }
+
+    impl PlistFrames for Scripted {
+        async fn send_frame(&mut self, frame: &[u8]) -> Result<(), String> {
+            if self.fail_send { return Err("Self-update Upgrade request failed: broken pipe".to_string()); }
+            self.sent.push(frame.to_vec());
+            Ok(())
+        }
+        async fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, String> {
+            if self.incoming.len() < len {
+                return Err("Self-update Upgrade reply failed: early eof".to_string());
+            }
+            Ok(self.incoming.drain(..len).collect())
+        }
+    }
+
+    fn dict(pairs: &[(&str, plist::Value)]) -> plist::Dictionary {
+        pairs.iter().map(|(key, value)| (key.to_string(), value.clone())).collect()
+    }
+    fn status(text: &str, percent: Option<u64>) -> plist::Dictionary {
+        let mut reply = dict(&[("Status", plist::Value::String(text.into()))]);
+        if let Some(percent) = percent { reply.insert("PercentComplete".into(), plist::Value::Integer(percent.into())); }
+        reply
+    }
+    fn run(connection: &mut Scripted) -> (Result<(), String>, Vec<(i32, String)>) {
+        let frame = upgrade_command_frame("PublicStaging/idevice.ipa", "com.cwd43.gu29").unwrap();
+        let mut events = Vec::new();
+        let result = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            .block_on(run_self_upgrade(connection, &frame, |code, message| events.push((code, message))));
+        (result, events)
+    }
+
+    #[test]
+    fn request_matches_the_crate_upgrade_command() {
+        let frame = upgrade_command_frame("PublicStaging/idevice.ipa", "com.cwd43.gu29").unwrap();
+        let length = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        assert_eq!(length, frame.len() - 4);
+        assert!(frame[4..].starts_with(b"<?xml"), "XML plist like the crate's send_plist");
+        let command: plist::Dictionary = plist::from_bytes(&frame[4..]).unwrap();
+        assert_eq!(command.get("Command").and_then(|v| v.as_string()), Some("Upgrade"));
+        assert_eq!(command.get("PackagePath").and_then(|v| v.as_string()), Some("PublicStaging/idevice.ipa"));
+        let options = command.get("ClientOptions").and_then(|v| v.as_dictionary()).unwrap();
+        assert_eq!(options.get("CFBundleIdentifier").and_then(|v| v.as_string()), Some("com.cwd43.gu29"));
+        assert_eq!(command.len(), 3);
+    }
+
+    #[test]
+    fn first_error_free_reply_is_the_acknowledgment() {
+        let mut connection = Scripted::replying(&[
+            status("CreatingStagingDirectory", Some(5)),
+            status("InstallingApplication", Some(60)),
+            status("Complete", None),
+        ]);
+        let (result, events) = run(&mut connection);
+        assert_eq!(result, Ok(()));
+        assert_eq!(connection.sent.len(), 1);
+        assert_eq!(events, vec![
+            (210, "Upgrade request written to installation_proxy".to_string()),
+            (211, "CreatingStagingDirectory".to_string()),
+            (206, "5".to_string()),
+            (206, "60".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn a_status_without_percentage_still_acknowledges() {
+        let mut connection = Scripted::replying(&[status("TakingInstallLock", None)]);
+        let (result, events) = run(&mut connection);
+        assert!(result.is_err(), "the stream then ends before Complete");
+        assert_eq!(events[1], (211, "TakingInstallLock".to_string()));
+    }
+
+    #[test]
+    fn an_immediate_rejection_is_never_acknowledged() {
+        for reply in [
+            dict(&[("Error", plist::Value::String("APIInternalError".into())),
+                   ("ErrorDescription", plist::Value::String("Could not upgrade".into()))]),
+            dict(&[("Error", plist::Value::Integer(3892346904i64.into())),
+                   ("ErrorString", plist::Value::String("PackageInspectionFailed".into()))]),
+            dict(&[("ErrorDescription", plist::Value::String("Failed to verify code signature".into()))]),
+        ] {
+            let mut connection = Scripted::replying(&[reply]);
+            let (result, events) = run(&mut connection);
+            let error = result.unwrap_err();
+            assert!(error.starts_with("Self-update Upgrade rejected: "), "{error}");
+            assert!(events.iter().all(|(code, _)| *code != 211), "{events:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_rejection_fails_after_acknowledgment() {
+        let mut connection = Scripted::replying(&[
+            status("CreatingStagingDirectory", Some(5)),
+            dict(&[("Error", plist::Value::String("DeviceOSVersionTooLow".into()))]),
+        ]);
+        let (result, events) = run(&mut connection);
+        assert_eq!(result, Err("Self-update Upgrade rejected: DeviceOSVersionTooLow".to_string()));
+        assert_eq!(events.iter().filter(|(code, _)| *code == 211).count(), 1);
+    }
+
+    #[test]
+    fn silence_or_a_closed_stream_is_not_an_acknowledgment() {
+        let mut connection = Scripted::replying(&[]);
+        let (result, events) = run(&mut connection);
+        assert!(result.unwrap_err().contains("early eof"));
+        assert_eq!(events, vec![(210, "Upgrade request written to installation_proxy".to_string())]);
+    }
+
+    #[test]
+    fn a_failed_send_reports_neither_210_nor_211() {
+        let mut connection = Scripted::replying(&[status("Complete", None)]);
+        connection.fail_send = true;
+        let (result, events) = run(&mut connection);
+        assert!(result.is_err());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn malformed_replies_are_rejected() {
+        let mut oversized = Scripted::replying(&[]);
+        oversized.incoming.extend(((MAX_INSTALLD_REPLY as u32) + 1).to_be_bytes());
+        assert!(run(&mut oversized).0.unwrap_err().contains("invalid length"));
+        let mut not_a_dictionary = Scripted::replying(&[]);
+        let mut body = Vec::new();
+        plist::Value::String("nope".into()).to_writer_xml(&mut body).unwrap();
+        not_a_dictionary.incoming.extend((body.len() as u32).to_be_bytes());
+        not_a_dictionary.incoming.extend(body);
+        let (result, events) = run(&mut not_a_dictionary);
+        assert!(result.unwrap_err().contains("not a dictionary"));
+        assert!(events.iter().all(|(code, _)| *code != 211));
+    }
 }
 
 #[cfg(test)]

@@ -108,7 +108,7 @@ if [[ -f "$RUST" ]]; then
 	staged_before_upgrade() {
 		local staged upgrade
 		staged=$(grep -n 'emit(callback, 209' <<< "$install_fn" | head -1 | cut -d: -f1)
-		upgrade=$(grep -n 'upgrade_with_callback' <<< "$install_fn" | head -1 | cut -d: -f1)
+		upgrade=$(grep -n 'run_self_upgrade(' <<< "$install_fn" | head -1 | cut -d: -f1)
 		[[ -n "$staged" && -n "$upgrade" && "$staged" -lt "$upgrade" ]]
 	}
 	check "Rust emits 209 before the streamed Upgrade request" staged_before_upgrade

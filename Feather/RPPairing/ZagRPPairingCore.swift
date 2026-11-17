@@ -77,6 +77,7 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 
 	@Published private(set) var state: State = .idle
+    @Published private(set) var localPairingCleanupPending = UserDefaults.standard.bool(forKey: ZagLocalPairingRemoval.pendingKey)
 
 	enum InstalledAppsState: Equatable {
 		case idle
@@ -126,6 +127,7 @@ final class ZagRPPairingCore: ObservableObject {
 	/// check starts; every check without an explicit endpoint uses LocalDevVPN.
 	@Published private(set) var gate2Endpoint: ZagRPPairingEndpoint = .localDevVPN
 	private func acquireTransport(_ operation: String) -> Bool {
+        guard !localPairingCleanupPending else { return false }
 		guard transportOwner == nil else {
 			ZagLogger.shared.warning("RPPairing", "Transport busy | requested=\(operation) owner=\(transportOwner ?? "unknown")")
 			return false
@@ -180,7 +182,29 @@ final class ZagRPPairingCore: ObservableObject {
 		case failed(String)
 	}
 
-	@Published private(set) var gate4State: Gate4State = .idle
+	/// The exact native state. Views observing the whole core are invalidated
+	/// for every stage change but for a percentage only every ten points: one
+	/// publication per transfer callback re-evaluated the tab hierarchy up to
+	/// a hundred times while the update control was animating. Every exact
+	/// value still reaches gate4StatePublisher.
+	private(set) var gate4State: Gate4State = .idle {
+		willSet {
+			if Self.gate4StateInvalidatesViews(from: gate4State, to: newValue) { objectWillChange.send() }
+		}
+		didSet { gate4StateSubject.send(gate4State) }
+	}
+	private let gate4StateSubject = CurrentValueSubject<Gate4State, Never>(.idle)
+	/// Every native state, including each percentage, after it is stored.
+	var gate4StatePublisher: AnyPublisher<Gate4State, Never> { gate4StateSubject.eraseToAnyPublisher() }
+
+	nonisolated static func gate4StateInvalidatesViews(from old: Gate4State, to new: Gate4State) -> Bool {
+		switch (old, new) {
+		case let (.uploading(previous), .uploading(next)), let (.progress(previous), .progress(next)):
+			return ZagGate4PublicationPolicy.invalidatesViews(fromPercent: previous, toPercent: next)
+		default:
+			return old != new
+		}
+	}
 	@Published private(set) var gate4SelfUpdateCommandSent = false
 	/// Callbacks received for the current or most recent Gate4 attempt, in
 	/// order. Used to tell whether a failure happened before the Upgrade request.
@@ -199,6 +223,7 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 	private var gate4Completion: ((Result<Void, Error>) -> Void)?
 	private var gate4Progress: ((Int) -> Void)?
+	private var gate4Staged: (() -> Void)?
 	/// Retries apply only to user installs that opt in, and only to failures
 	/// before installation began on the device (see ZagRPPairingFailure).
 	private var gate4RetryPlan = ZagGate4RetryPlan()
@@ -249,6 +274,7 @@ final class ZagRPPairingCore: ObservableObject {
 		deviceIP: String = ZagDeviceLink.peerAddress,
 		retryTransientFailures: Bool = false,
 		progress: ((Int) -> Void)? = nil,
+		staged: (() -> Void)? = nil,
 		completion: ((Result<Void, Error>) -> Void)? = nil
 	) throws {
 		guard !isGate4Running, acquireTransport("Gate4 install") else {
@@ -260,6 +286,7 @@ final class ZagRPPairingCore: ObservableObject {
 		gate4AttemptEvents = []
 		gate4Completion = completion
 		gate4Progress = progress
+		gate4Staged = staged
 		let localURL: URL
 		do {
 			let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -277,6 +304,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4RetryPlan.end()
 			gate4Completion = nil
 			gate4Progress = nil
+			gate4Staged = nil
 			throw error
 		}
 
@@ -293,6 +321,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4State = .failed(error.localizedDescription)
 			gate4Completion = nil
 			gate4Progress = nil
+			gate4Staged = nil
 			throw error
 		}
 		recordGate4Event("Native Gate4 worker accepted startup; awaiting callback")
@@ -351,12 +380,20 @@ final class ZagRPPairingCore: ObservableObject {
 
 	fileprivate func receiveGate4(code: Int32, message: String) {
 		gate4AttemptEvents.append(ZagGate4Event(code: code, message: message))
-		recordGate4Event("Gate4 callback \(code): \(message)")
-		// Record native installation stages for diagnostics.
-		if code == 206 {
-			ZagLogger.shared.info("RPPairing", "Gate4 install progress: \(message)%")
-		} else {
-			ZagLogger.shared.info("RPPairing", "Gate4 callback stage=\(code) detail=\(message)")
+		// Percentages arrive up to a hundred times per phase on the main
+		// thread. Keep the diagnostic record and log at the same ten-point
+		// cadence as view invalidation; the retry policy still sees every event.
+		var percentage: Gate4State?
+		if code == 208 { percentage = Int(message).map { .uploading($0) } }
+		if code == 206 { percentage = Int(message).map { .progress($0) } }
+		if percentage == nil || Self.gate4StateInvalidatesViews(from: gate4State, to: percentage!) {
+			recordGate4Event("Gate4 callback \(code): \(message)")
+			// Record native installation stages for diagnostics.
+			if code == 206 {
+				ZagLogger.shared.info("RPPairing", "Gate4 install progress: \(message)%")
+			} else {
+				ZagLogger.shared.info("RPPairing", "Gate4 callback stage=\(code) detail=\(message)")
+			}
 		}
 		switch code {
 		case 201: gate4State = .starting
@@ -370,7 +407,11 @@ final class ZagRPPairingCore: ObservableObject {
 			if let percent = Int(message), (0...100).contains(percent) {
 				gate4State = .uploading(percent)
 			}
-		case 209: gate4State = .staged
+		case 209:
+			gate4State = .staged
+			// Same main-thread turn as the stage change, so the screen never
+			// renders the stage without the attempt's handoff state.
+			gate4Staged?()
 		case 210:
 			gate4SelfUpdateCommandSent = true
 			gate4State = .upgradeSubmitted
@@ -387,6 +428,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4Completion?(.success(()))
 			gate4Completion = nil
 			gate4Progress = nil
+			gate4Staged = nil
 		case -4:
 			let installationStarted = gate4AttemptEvents.contains { Self.gate4InstallationCodes.contains($0.code) }
 			let kind = ZagRPPairingFailure.classify(message, installationStarted: installationStarted)
@@ -406,6 +448,7 @@ final class ZagRPPairingCore: ObservableObject {
 			gate4Completion?(.failure(error))
 			gate4Completion = nil
 			gate4Progress = nil
+			gate4Staged = nil
 		default: break
 		}
 	}
@@ -714,6 +757,10 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 
 	func startGate2Probe(endpoint: ZagRPPairingEndpoint = .localDevVPN) {
+        guard !localPairingCleanupPending else {
+            gate2State = .failed("Retry Local Cleanup before checking pairing again.")
+            return
+        }
 		guard !isGate2Running else { return }
 		let deviceIP = endpoint.address
 		guard acquireTransport("Gate2 health probe") else {
@@ -869,6 +916,10 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 
 	func start() {
+        guard !localPairingCleanupPending else {
+            state = .failed("Retry Local Cleanup before starting pairing again.")
+            return
+        }
 		guard !isRunning else { return }
 		ZagLogger.shared.info("RPPairing", "Pairing session starting")
 		// The PIN is generated after iOS connects while the user is normally in
@@ -910,24 +961,36 @@ final class ZagRPPairingCore: ObservableObject {
 		state = .idle
 	}
 
+    /// Forgets only this app's local material; system trust must be removed in Settings.
 	func forgetPairing() throws {
-		guard !isRunning && !isGate2Running && !isGate4Running else {
-			throw PairingResetError.busy
-		}
-		advertiser.stop()
-		endPairingBackgroundTime()
-		if FileManager.default.fileExists(atPath: Self.pairingFileURL.path) {
-			try FileManager.default.removeItem(at: Self.pairingFileURL)
-		}
-		if FileManager.default.fileExists(atPath: Self.hostIdentityURL.path) {
-			try FileManager.default.removeItem(at: Self.hostIdentityURL)
-		}
-		gate2DeviceInfo = nil
-		gate2LastAppResult = nil
-		gate2State = .idle
-		gate4State = .idle
-		state = .idle
-	}
+        guard !isRunning && !isGate2Running && !isGate4Running && !isTransportBusy else {
+            throw PairingResetError.busy
+        }
+        advertiser.stop()
+        endPairingBackgroundTime()
+        let removal = ZagLocalPairingRemoval(pairingRecord: Self.pairingFileURL, hostIdentity: Self.hostIdentityURL, env: .init(
+            exists: ZagLocalPairingRemoval.fileExists,
+            remove: ZagLocalPairingRemoval.removeFile,
+            setPending: { pending in
+                UserDefaults.standard.set(pending, forKey: ZagLocalPairingRemoval.pendingKey)
+                self.localPairingCleanupPending = pending
+            }
+        ))
+        do { try removal.run() } catch {
+            invalidateLocalPairingStatus()
+            throw error
+        }
+        invalidateLocalPairingStatus()
+    }
+
+    private func invalidateLocalPairingStatus() {
+        gate2DeviceInfo = nil
+        gate2LastAppResult = nil
+        gate2State = .idle
+        gate4State = .idle
+        state = .idle
+        publishReadiness(.failed(.pairingFile, Date()))
+    }
 
 	fileprivate func receive(code: Int32, message: String) {
 		switch code {
@@ -939,21 +1002,7 @@ final class ZagRPPairingCore: ObservableObject {
 			state = .connected
 		case 4:
 			state = .pin(message)
-			UIPasteboard.general.string = message
-			let content = UNMutableNotificationContent()
-			content.title = "Zag Store Pairing Code"
-			let digits = message.filter(\.isNumber)
-			if digits.count == 6 {
-				let split = digits.index(digits.startIndex, offsetBy: 3)
-				content.body = "\(digits[..<split]) \(digits[split...])  •  Tap to return to Zag Store"
-			} else {
-				content.body = "\(message)  •  Tap to return to Zag Store"
-			}
-			content.sound = .default
-			content.categoryIdentifier = "zag-rppairing-pin-category"
-			if #available(iOS 15.0, *) {
-				content.interruptionLevel = .timeSensitive
-			}
+            guard let content = ZagPairingCodeNotification.content(for: message) else { return }
 			UNUserNotificationCenter.current().add(
 				UNNotificationRequest(
 					identifier: "zag-rppairing-pin",
@@ -1144,7 +1193,7 @@ private enum PairingResetError: LocalizedError {
 	case busy
 
 	var errorDescription: String? {
-		"Stop the current RPPairing operation before forgetting this iPhone."
+		"Stop the current RPPairing operation before removing local pairing credentials."
 	}
 }
 

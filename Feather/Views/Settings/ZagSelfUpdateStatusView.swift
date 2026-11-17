@@ -5,12 +5,13 @@ import CryptoKit
 import AltSourceKit
 import UniformTypeIdentifiers
 
-/// Dedicated, non-destructive self-update status screen.
-/// Installation remains disabled until signature authorization and recovery
-/// are implemented and verified. Never route self-updates through Library.
+/// Dedicated upgrade-only self-update screen. Preparation and handoff retain
+/// certificate, signed-identity and recovery checks. Never route through Library.
 struct ZagSelfUpdateStatusView: View {
+    @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
     @ObservedObject private var coordinator = ZagSelfUpdateCoordinator.shared
-    @ObservedObject private var gate4 = ZagRPPairingCore.shared
+    private let gate4 = ZagRPPairingCore.shared
+    @StateObject private var installerPresentation = ZagUpdateInstallerPresentation()
 
     // Automatic discovery is independent from installation.
     @AppStorage("ZagStore.updatePreferences.automaticChecks.v1")
@@ -18,10 +19,8 @@ struct ZagSelfUpdateStatusView: View {
     @AppStorage("ZagStore.updatePreferences.betaChannel.placeholder")
     private var zagBetaChannel = "off"
 
-    // A verified replacement receives a one-time success celebration.
-    // Never acknowledge the next build in advance.
-    @AppStorage("zagStore.selfUpdate.acknowledgedReplacement.v1")
-    private var acknowledgedReplacement = ""
+    @State private var showsInstalledDetails = false
+    @State private var upToDateLayout = ZagUpToDateLayout()
 
 
 
@@ -68,7 +67,7 @@ struct ZagSelfUpdateStatusView: View {
     @State private var checkStatus = "Not checked"
     @State private var releaseCheckStatus = "Not checked"
     @State private var releaseCheckBusy = false
-    @State private var releaseDownloadSize: String?
+    @State private var releaseDownloadSize = ZagUpdateDownloadSize.checking
     @State private var releaseDownloadBusy = false
     @State private var markerStatus = "Not checked"
 
@@ -366,79 +365,53 @@ struct ZagSelfUpdateStatusView: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"
     }
 
-    private var verifiedReplacementKey: String? {
-        guard coordinator.pendingInstallation == nil,
-              let verified = coordinator.lastVerifiedInstallation,
-              verified.bundleIdentifier == (Bundle.main.bundleIdentifier ?? ""),
-              verified.version == installedVersion,
-              verified.build == installedBuild,
-              let expected = verified.expectedExecutableSHA256,
-              !expected.isEmpty else { return nil }
-        return [verified.bundleIdentifier, verified.version, verified.build, expected]
-            .joined(separator: "|")
+    /// Native up-to-date state: only after a completed check of the selected
+    /// channel found nothing newer, with no update in progress or unresolved.
+    private var showsUpToDate: Bool {
+        coordinator.availableRelease == nil
+            && coordinator.upToDateChannel == ZagSelfUpdateCoordinator.UpdateChannel.selected
+            && coordinator.pendingInstallation == nil
+            && !releaseDownloadBusy && !installBusy && !coordinator.userUpdateInProgress && !gate4.isGate4Running
     }
 
-    private var shouldCelebrateVerifiedReplacement: Bool {
-        guard let key = verifiedReplacementKey else { return false }
-        return acknowledgedReplacement != key
-    }
-
-    private var verifiedUpdateCelebration: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "checkmark.seal.fill")
-                .font(.system(size: 54, weight: .medium))
-                .foregroundStyle(.green)
-                .accessibilityHidden(true)
-
-            Text("Zag Store Updated")
-                .font(.system(.title2, design: .rounded, weight: .bold))
-                .multilineTextAlignment(.center)
-
-            Text("Version \(installedVersion) · Build \(installedBuild)")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-
-            ZagSelfUpdateRainbowProgress(progress: 1)
-                .frame(height: 16)
-                .accessibilityLabel("Self-update fully verified")
-
-            Label("Installation verified successfully", systemImage: "checkmark.shield.fill")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.green)
-
-            Text("The running executable exactly matches the signed update prepared before installation. Your replacement is verified.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-
-            Button {
-                if let key = verifiedReplacementKey {
-                    acknowledgedReplacement = key
-                }
-            } label: {
-                Text("Continue to Zag Store")
-                    .frame(maxWidth: .infinity)
+    private func checkSelectedChannel() async {
+        guard !releaseCheckBusy else { return }
+        releaseCheckBusy = true
+        releaseCheckStatus = "Checking " + (zagBetaChannel == "off" ? "Stable" : zagBetaChannel.capitalized) + "…"
+        defer { releaseCheckBusy = false }
+        do {
+            let selectedChannel = ZagSelfUpdateCoordinator.UpdateChannel.selected
+            let release = try await coordinator.checkForSelectedChannel()
+            guard selectedChannel == ZagSelfUpdateCoordinator.UpdateChannel.selected else {
+                releaseCheckStatus = "Channel changed — check the selected channel again"
+                return
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            if let release {
+                releaseCheckStatus = "Available: " + release.version + " (Build " + release.build + ")"
+            } else {
+                releaseCheckStatus = "No newer release on this channel"
+            }
+        } catch {
+            if case ZagSelfUpdateCoordinator.UpdateError.channelNotPublished = error {
+                releaseCheckStatus = "No releases published for this channel yet"
+            } else {
+                releaseCheckStatus = "Check failed: " + error.localizedDescription
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
-        .padding(.horizontal, 6)
     }
 
     private var gate4ProgressTitle: String {
         switch gate4.gate4State {
         case .idle: return "Waiting to start"
-        case .starting: return "Preparing installation"
+        case .starting: return "Preparing installation..."
         case .pairVerified: return "Device pairing verified"
-        case .tunnel: return "Connecting to device"
-        case .rsd: return "Establishing installation service"
-        case .installing: return "Uploading signed update"
-        case .uploading: return "Transferring signed IPA"
-        case .staged: return "IPA verified — waiting for iOS handoff"
-        case .upgradeSubmitted: return "Ready to finish on Home Screen"
-        case .progress(let value): return "Installing update — \(value)%"
+        case .tunnel: return "Connecting to device..."
+        case .rsd: return "Connecting to installation service..."
+        case .installing: return "Transferring signed IPA..."
+        case .uploading: return "Transferring signed IPA..."
+        case .staged: return "IPA verified - waiting for iOS handoff"
+        case .upgradeSubmitted: return "Update handed off to iOS. Reopen Zag Store after installation."
+        case .progress: return "Installing update..."
         case .complete: return "Installer reported completion — verify after relaunch"
         case .failed(let reason): return "Installation error: \(reason)"
         }
@@ -487,90 +460,99 @@ struct ZagSelfUpdateStatusView: View {
     }
 
     private var zagDeveloperDiagnostics: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            LabeledContent("Native installer event", value: gate4.gate4LastEvent)
-            LabeledContent("Previous event", value: gate4.gate4PreviousEvent)
-            LabeledContent("Signed candidate", value: candidateSummary)
-            LabeledContent("Installation status", value: installStatus)
-            Text("Native installer events are diagnostic information, not proof of successful replacement.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Button("Check Installation Prerequisites") {
-                handoffReadiness = coordinator.inspectInstallationHandoffReadiness()
-            }
-            ForEach(handoffReadiness, id: \.self) { finding in
-                Text(finding)
+        ZagUpdateLiveInstallerDetails {
+            VStack(alignment: .leading, spacing: 10) {
+                LabeledContent("Native installer event", value: gate4.gate4LastEvent)
+                LabeledContent("Previous event", value: gate4.gate4PreviousEvent)
+                LabeledContent("Signed candidate", value: candidateSummary)
+                LabeledContent("Installation status", value: installStatus)
+                Text("Native installer events are diagnostic information, not proof of successful replacement.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-            }
-            if let pending = coordinator.pendingInstallation {
-                LabeledContent("Pending version", value: pending.version)
-                LabeledContent("Pending build", value: pending.build)
-            }
-            if let completed = coordinator.lastVerifiedInstallation {
-                LabeledContent("Verified build", value: completed.build)
+                Button("Check Installation Prerequisites") {
+                    handoffReadiness = coordinator.inspectInstallationHandoffReadiness()
+                }
+                ForEach(handoffReadiness, id: \.self) { finding in
+                    Text(finding)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                if coordinator.pendingInstallation != nil {
+                    Text(updateActionState.guidance)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                if let pending = coordinator.pendingInstallation {
+                    LabeledContent("Pending version", value: pending.version)
+                    LabeledContent("Pending build", value: pending.build)
+                }
+                if let completed = coordinator.lastVerifiedInstallation {
+                    LabeledContent("Verified build", value: completed.build)
+                }
             }
         }
     }
 
     @ViewBuilder
     private var gate4ProgressDisplay: some View {
-        if gate4ShouldShowProgress {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 10) {
-                    Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.cyan)
-                        .accessibilityHidden(true)
-                    Text(gate4PhaseLabel)
-                        .font(.headline)
-                    Spacer(minLength: 8)
-                    if let measured = gate4MeasuredPercentage {
-                        Text("\(measured)%")
-                            .font(.system(.headline, design: .rounded, weight: .semibold))
-                            .monospacedDigit()
-                    } else {
-                        Text("In progress")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                ZagSelfUpdateRainbowProgress(
-                    progress: Double(gate4MeasuredPercentage ?? 0) / 100,
-                    isIndeterminate: gate4MeasuredPercentage == nil
-                )
-                .frame(height: 16)
-                .accessibilityLabel(gate4MeasuredPercentage == nil
-                    ? "Update is in progress"
-                    : "Installation stage progress")
-
-                Text(gate4StageDescription)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
-                if coordinator.pendingInstallation != nil {
-                    switch gate4.gate4State {
-                    case .staged, .upgradeSubmitted, .complete:
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label("Finish on Home Screen", systemImage: "house.fill")
-                                .font(.subheadline.weight(.semibold))
-                            Text("After a few seconds, swipe up to the Home Screen normally. Wait for Zag Store to finish updating, then reopen it.")
-                                .font(.footnote)
-                            Text("Do not force-quit Zag Store or start the installation again.")
-                                .font(.footnote)
+        ZagUpdateLiveInstallerDetails {
+            if gate4ShouldShowProgress {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.cyan)
+                            .accessibilityHidden(true)
+                        Text(gate4PhaseLabel)
+                            .font(.headline)
+                        Spacer(minLength: 8)
+                        if let measured = gate4MeasuredPercentage {
+                            Text("\(measured)%")
+                                .font(.system(.headline, design: .rounded, weight: .semibold))
+                                .monospacedDigit()
+                        } else {
+                            Text("In progress")
+                                .font(.subheadline.weight(.medium))
                                 .foregroundStyle(.secondary)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-                    default:
-                        EmptyView()
+                    }
+
+                    ZagSelfUpdateRainbowProgress(
+                        progress: Double(gate4MeasuredPercentage ?? 0) / 100,
+                        isIndeterminate: gate4MeasuredPercentage == nil
+                    )
+                    .frame(height: 16)
+                    .accessibilityLabel(gate4MeasuredPercentage == nil
+                        ? "Update is in progress"
+                        : "Installation stage progress")
+
+                    Text(gate4StageDescription)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    if coordinator.pendingInstallation != nil {
+                        switch gate4.gate4State {
+                        case .staged, .upgradeSubmitted, .complete:
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label("Finish on Home Screen", systemImage: "house.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                Text("After a few seconds, swipe up to the Home Screen normally. Wait for Zag Store to finish updating, then reopen it.")
+                                    .font(.footnote)
+                                Text("Do not force-quit Zag Store or start the installation again.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                        default:
+                            EmptyView()
+                        }
                     }
                 }
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -589,6 +571,7 @@ struct ZagSelfUpdateStatusView: View {
     @State private var preparedOfficialRelease: ZagSelfUpdateCoordinator.Release?
     @State private var showInstallConfirmation = false
     @State private var installBusy = false
+    @State private var selectingUpdateCertificate = false
     @State private var installStatus = "No installation attempted"
 
     private static let preparationFailurePrefix = "Update could not be prepared: "
@@ -604,6 +587,12 @@ struct ZagSelfUpdateStatusView: View {
             return releaseCheckStatus
         }
         return nil
+    }
+
+    /// The visible failure above, for the card's secondary line.
+    private var updateCardFailure: ZagUpdateCardStatus.Failure? {
+        guard let issue = userVisibleUpdateIssue else { return nil }
+        return issue.hasPrefix("Update cancelled") ? .cancelled : .failed
     }
 
     private var candidateSummary: String {
@@ -627,7 +616,76 @@ struct ZagSelfUpdateStatusView: View {
         }
     }
 
+    private var updateActionState: ZagSelfUpdateActionState {
+        let _ = installerPresentation.stage
+        // Only a pending self-update may interpret the shared installer's events.
+        if coordinator.pendingInstallation != nil {
+            return .pendingAttempt(handoff: coordinator.handoffState,
+                                   installerRunning: gate4.isGate4Running,
+                                   installerTitle: gate4ProgressTitle,
+                                   installerFraction: gate4MeasuredPercentage.map { Double($0) / 100 },
+                                   preparingMessage: coordinator.preparationState.message)
+        }
+        if selectingUpdateCertificate { return .progress(message: "Selecting signing certificate...", fraction: nil) }
+        if releaseDownloadBusy || installBusy || coordinator.userUpdateInProgress {
+            return .progress(message: coordinator.preparationState.message,
+                             fraction: coordinator.preparationState.fraction)
+        }
+        switch coordinator.preparationState {
+        case .downloading, .verifying:
+            return .progress(message: coordinator.preparationState.message, fraction: coordinator.preparationState.fraction)
+        default: return .idle
+        }
+    }
+
+    /// `Restart to Complete...`: ends the process only after a successful handoff.
+    private func completeUpdate() {
+        ZagUpdateCompletion.complete(actionState: updateActionState,
+                                     handoff: coordinator.handoffState,
+                                     pendingRecorded: coordinator.pendingInstallation != nil)
+    }
+
+    private func beginUpdate(_ release: ZagSelfUpdateCoordinator.Release) {
+        guard !releaseDownloadBusy, !installBusy, !gate4.isGate4Running,
+              coordinator.pendingInstallation == nil else { return }
+        guard coordinator.beginUserUpdateOperation() else { return }
+        releaseDownloadBusy = true
+        selectingUpdateCertificate = true
+        let channel = ZagSelfUpdateCoordinator.UpdateChannel.selected
+        Task { @MainActor in
+            defer {
+                releaseDownloadBusy = false
+                installBusy = false
+                selectingUpdateCertificate = false
+                coordinator.finishUserUpdateOperation()
+            }
+            releaseCheckStatus = "Downloading and verifying update…"
+            do {
+                guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
+                    releaseCheckStatus = "Update cancelled — no signing certificate selected."
+                    return
+                }
+                selectingUpdateCertificate = false
+                guard channel == ZagSelfUpdateCoordinator.UpdateChannel.selected else { throw CancellationError() }
+                let signed = try await coordinator.prepareSignedUpdate(release, certificate: certificate)
+                guard channel == ZagSelfUpdateCoordinator.UpdateChannel.selected else { throw CancellationError() }
+                preparedCandidateUUID = signed.uuid
+                preparedOfficialRelease = release
+                installBusy = true
+                releaseCheckStatus = "IPA verified - waiting for iOS handoff"
+                // Update Now is the explicit user authorization. The existing
+                // upgrade-only installer retains all certificate/identity checks.
+                try await coordinator.installVerifiedSignedUpdate(signed, release: release,
+                                                                 userConfirmedSelfReplacement: true)
+                installStatus = "Installation handoff completed; reopen Zag Store to verify the installed version."
+            } catch {
+                releaseCheckStatus = Self.preparationFailurePrefix + error.localizedDescription
+            }
+        }
+    }
+
     var body: some View {
+        let _ = installerPresentation.stage
         Form {
             Section {
                 NavigationLink {
@@ -646,55 +704,41 @@ struct ZagSelfUpdateStatusView: View {
                     HStack {
                         Text("Release Channel")
                         Spacer()
-                        Text(zagBetaChannel == "beta" ? "Zag Store Beta" :
-                             zagBetaChannel == "nightly" ? "Zag Store Nightly" : "Stable")
+                        Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                 }
             }
 
-            if coordinator.pendingInstallation != nil && !gate4.isGate4Running && !installBusy {
+            if coordinator.pendingInstallation != nil && !coordinator.handoffState.isSuccessfulHandoff && !gate4.isGate4Running && !installBusy {
                 Section {
                     Label("Previous update not confirmed", systemImage: "exclamationmark.triangle")
                         .font(.headline)
                     Text("Zag Store could not confirm that the last update was installed. If iOS is still finishing it, wait and reopen Zag Store. Otherwise clear it and try again.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    if coordinator.availableRelease == nil {
+                        ZagSelfUpdateActionControl(state: updateActionState) {}
+                    }
                     Button("Clear and Try Again", role: .destructive) {
                         showClearPendingConfirmation = true
                     }
                 }
             }
 
+            if showsUpToDate {
+                Section {
+                    ZagSoftwareUpToDateView(release: coordinator.installedRelease) {
+                        showsInstalledDetails = true
+                    }
+                    .zagUpToDateRow(upToDateLayout)
+                }
+            } else {
             Section {
                 if coordinator.availableRelease == nil {
                 Button {
-                    guard !releaseCheckBusy else { return }
-                    releaseCheckBusy = true
-                    releaseCheckStatus = "Checking " + (zagBetaChannel == "off" ? "Stable" : zagBetaChannel.capitalized) + "…"
-                    Task { @MainActor in
-                        defer { releaseCheckBusy = false }
-                        do {
-                            let selectedChannel = ZagSelfUpdateCoordinator.UpdateChannel.selected
-                            let release = try await coordinator.checkForSelectedChannel()
-                            guard selectedChannel == ZagSelfUpdateCoordinator.UpdateChannel.selected else {
-                                releaseCheckStatus = "Channel changed — check the selected channel again"
-                                return
-                            }
-                            if let release {
-                                releaseCheckStatus = "Available: " + release.version + " (Build " + release.build + ")"
-                            } else {
-                                releaseCheckStatus = "No newer release on this channel"
-                            }
-                        } catch {
-                            if case ZagSelfUpdateCoordinator.UpdateError.channelNotPublished = error {
-                                releaseCheckStatus = "No releases published for this channel yet"
-                            } else {
-                                releaseCheckStatus = "Check failed: " + error.localizedDescription
-                            }
-                        }
-                    }
+                    Task { @MainActor in await checkSelectedChannel() }
                 } label: {
                     Label("Check for Updates", systemImage: "arrow.clockwise")
                 }
@@ -730,65 +774,31 @@ struct ZagSelfUpdateStatusView: View {
                                 }
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.8)
-                                Text(releaseDownloadSize ?? "Checking download size…")
-                                    .font(.subheadline)
+                                ZagUpdateCrossfadeText(ZagUpdateCardStatus.text(action: updateActionState,
+                                                                                failure: updateCardFailure,
+                                                                                size: releaseDownloadSize))
+                                    .font(.caption)
                                     .foregroundStyle(.primary)
+                                if zagBetaChannel == "beta" || zagBetaChannel == "nightly" {
+                                    Text(ZagUpdateChannelPresentation.title(for: zagBetaChannel))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             Spacer(minLength: 0)
                         }
-                        Text(release.releaseNotes ?? "Release notes are not available for this update.")
-                            .font(.body)
-                        Link("Learn more about this update", destination: URL(string: "https://github.com/zagorskey/zag-store-releases/releases")!)
-                            .font(.subheadline)
-                            .foregroundStyle(.primary)
-                            .underline()
-                        if releaseDownloadBusy || installBusy || gate4ShouldShowProgress {
-                            VStack(spacing: 8) {
-                                ZagSelfUpdateRainbowProgress(
-                                    progress: Double(gate4MeasuredPercentage ?? 0) / 100,
-                                    isIndeterminate: gate4MeasuredPercentage == nil
-                                )
-                                .frame(height: 14)
-                                Text(gate4ShouldShowProgress ? gate4ProgressTitle : "Preparing Update…")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, minHeight: 54)
-                        } else {
-                        Button {
-                            guard !releaseDownloadBusy else { return }
-                            releaseDownloadBusy = true
-                            Task { @MainActor in
-                                defer { releaseDownloadBusy = false }
-                                releaseCheckStatus = "Downloading and verifying update…"
-                                do {
-                                    guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
-                                        releaseCheckStatus = "Update cancelled — no signing certificate selected."
-                                        return
-                                    }
-                                    let signed = try await coordinator.prepareSignedUpdate(release, certificate: certificate)
-                                    preparedCandidateUUID = signed.uuid
-                                    preparedOfficialRelease = release
-                                    releaseCheckStatus = "Verified and signed. Confirm installation to continue."
-                                    showInstallConfirmation = true
-                                } catch {
-                                    releaseCheckStatus = Self.preparationFailurePrefix + error.localizedDescription
-                                }
-                            }
-                        } label: {
-                            Text("Update Now")
-                                .font(.system(size: 19, weight: .semibold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 54)
-                                .foregroundStyle(.white)
-                                .background(Color(uiColor: UIColor(displayP3Red: 0.0, green: 0.54, blue: 1.0, alpha: 1)), in: Capsule())
+                        ZagUpdateReleaseNotesView(markdown: ZagUpdateReleaseNotes.whatsNew(from: release.releaseNotes) ?? "Release notes are not available for this update.", version: release.version, build: release.build)
+                            .id([release.version, release.build, release.ipaURL.absoluteString, release.releaseNotes ?? ""])
+                        Divider()
+                        ZagUpdateTransferActionControl(state: updateActionState,
+                                                   usesInstallerProgress: coordinator.pendingInstallation != nil,
+                                                   disabled: coordinator.pendingInstallation != nil,
+                                                   progress: installerPresentation.progress,
+                                                   complete: completeUpdate) {
+                            beginUpdate(release)
                         }
-                        .buttonStyle(.plain)
-                        // Starting again while an attempt is unconfirmed would
-                        // download and sign only to be refused at installation.
-                        .disabled(coordinator.pendingInstallation != nil)
-                        .opacity(coordinator.pendingInstallation != nil ? 0.5 : 1)
-                        }
+
+                        ZagSelfUpdateLearnMoreLink(tint: ZagWideGamutTint.color(hex: themeColorHex))
 
                         if let issue = userVisibleUpdateIssue {
                             Text(issue)
@@ -799,17 +809,10 @@ struct ZagSelfUpdateStatusView: View {
 
                     }
                     .task(id: release.ipaURL) {
-                        releaseDownloadSize = nil
-                        var request = URLRequest(url: release.ipaURL)
-                        request.httpMethod = "HEAD"
-                        if let response = try? await URLSession.shared.data(for: request).1 as? HTTPURLResponse,
-                           response.statusCode == 200,
-                           let length = response.value(forHTTPHeaderField: "Content-Length"),
-                           let bytes = Int64(length), bytes > 0 {
-                            releaseDownloadSize = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-                        } else {
-                            releaseDownloadSize = "Download size unavailable"
-                        }
+                        releaseDownloadSize = .checking
+                        let size = await ZagUpdateDownloadSize.lookup(release.ipaURL)
+                        // A newer release's lookup replaces this one.
+                        if !Task.isCancelled { releaseDownloadSize = size }
                     }
                 }
                 if coordinator.availableRelease == nil {
@@ -818,11 +821,6 @@ struct ZagSelfUpdateStatusView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-
-            if shouldCelebrateVerifiedReplacement {
-                Section {
-                    verifiedUpdateCelebration
-                }
             }
 
             if isAdmin && zagAdvancedSettingsUnlocked {
@@ -970,6 +968,11 @@ struct ZagSelfUpdateStatusView: View {
 
         }
         .modifier(ZagSelfUpdateSectionSpacing())
+        .refreshable { await checkSelectedChannel() }
+        .navigationDestination(isPresented: $showsInstalledDetails) {
+            ZagInstalledVersionView(release: coordinator.installedRelease)
+        }
+        .zagUpToDateForm($upToDateLayout)
         .fileImporter(isPresented: $showImportPicker, allowedContentTypes: [.json]) { result in
             inspectRecoveryFile(result)
         }
@@ -1035,54 +1038,14 @@ struct ZagSelfUpdateStatusView: View {
 }
 
 
-// The rotating spectrum and five-second linear animation are intentionally
-// identical to ZagRepositoryFeaturedPill in SourceAppsView.swift.
+// Diagnostics reuse the same spectrum renderer as the primary morphing control.
 private struct ZagSelfUpdateRainbowProgress: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var rotating = false
-
     let progress: Double
     var isIndeterminate = false
 
-    private let spectrum = ZagSelfUpdateSpectrum.colors
-
     var body: some View {
-        GeometryReader { geometry in
-            let fraction = isIndeterminate ? 1 : min(max(progress, 0), 1)
-
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.primary.opacity(0.10))
-
-                Capsule()
-                    .fill(
-                        LinearGradient(
-                            colors: spectrum,
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .frame(width: geometry.size.width * fraction)
-            }
-            .overlay {
-                Capsule()
-                    .strokeBorder(
-                        AngularGradient(
-                            colors: spectrum,
-                            center: .center,
-                            angle: .degrees(rotating ? 360 : 0)
-                        ),
-                        lineWidth: 1.5
-                    )
-            }
-        }
-        .animation(.easeInOut(duration: 0.35), value: progress)
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(.linear(duration: 5).repeatForever(autoreverses: false)) {
-                rotating = true
-            }
-        }
+        ZagUpdateSpectrumSurface(morph: 1, progress: isIndeterminate ? 1 : progress,
+                                 theme: .accentColor, moving: true)
     }
 }
 
@@ -1136,8 +1099,7 @@ private struct ZagStoreUpdateBetaPreferencesView: View {
                         ZagSelfUpdateCoordinator.shared.preferencesChanged()
                     } label: {
                         HStack {
-                            Text(option == "beta" ? "Zag Store Beta" :
-                                 option == "nightly" ? "Zag Store Nightly" : "Stable")
+                            Text(ZagUpdateChannelPresentation.title(for: option))
                                 .foregroundStyle(.primary)
                             Spacer()
                             if channel == option {
@@ -1162,7 +1124,7 @@ private struct ZagSelfUpdateSectionSpacing: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(iOS 17.0, *) {
-            content.listSectionSpacing(.custom(11))
+            content.listSectionSpacing(.custom(16))
         } else {
             content
         }

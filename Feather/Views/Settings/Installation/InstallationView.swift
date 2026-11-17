@@ -35,25 +35,16 @@ struct InstallationView: View {
 }
 
 
-private struct ZagInstallationTintedIconLabelStyle: LabelStyle {
-    @AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
-
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: 8) {
-            configuration.icon
-                .foregroundStyle(Color(hex: themeColorHex))
-            configuration.title
-                .foregroundStyle(.primary)
-        }
-    }
-}
-
 private struct RPPairingView: View {
 	@State private var isLocalDevVpnAvailable = true
 	@StateObject private var pairingCore = ZagRPPairingCore.shared
+    @ObservedObject private var pairingVerification = ZagRPPairingLaunchService.shared
 	@State private var showGate4Importer = false
 	@State private var showUnpairConfirmation = false
+    @State private var cleanupFeedback: CleanupFeedback?
+    private enum CleanupFeedback { case removed, failed(String) }
 	@State private var unpairError: String?
+    @State private var localRemovalMessage: String?
 	@State private var pairingExportURL: URL?
 	@State private var pairingExportError: String?
 	@State private var pairingDocumentController: UIDocumentInteractionController?
@@ -63,9 +54,10 @@ private struct RPPairingView: View {
 			directStatusRow(
 				"Pairing",
 				titleSystemImage: "iphone.radiowaves.left.and.right",
-				value: pairingCore.pairingFileExists ? "Paired" : "Setup Required",
-				systemImage: pairingCore.pairingFileExists ? "checkmark.circle.fill" : "exclamationmark.circle",
-				color: pairingCore.pairingFileExists ? .green : .orange
+                usesPairingIcon: true,
+				value: pairingCore.localPairingCleanupPending ? "Cleanup Required" : (pairingCore.pairingFileExists ? "Saved Locally" : "Setup Required"),
+				systemImage: pairingCore.pairingFileExists && !pairingCore.localPairingCleanupPending ? "checkmark.circle.fill" : "exclamationmark.circle",
+				color: pairingCore.pairingFileExists && !pairingCore.localPairingCleanupPending ? .green : .orange
 			)
 
 			Button {
@@ -93,6 +85,8 @@ private struct RPPairingView: View {
 				systemImage: directInstallStatusIcon,
 				color: directInstallStatusColor
 			)
+
+            ZagDeveloperModeGuidanceView()
 		} header: {
 			Text("Status")
 		} footer: {
@@ -100,12 +94,53 @@ private struct RPPairingView: View {
 		}
 
 		Section {
+			Button(role: (pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending) ? .destructive : nil) {
+				if (pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending) {
+					showUnpairConfirmation = true
+				} else {
+					pairingCore.start()
+				}
+			} label: {
+				Label {
+					Text(
+						(pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending)
+							? (pairingCore.localPairingCleanupPending ? "Retry Local Cleanup" : "Forget Local Pairing")
+							: (pairingCore.isRunning ? "Waiting for This iPhone…" : "Pair This iPhone")
+					)
+				} icon: {
+					if (pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending) {
+						ZStack(alignment: .bottomTrailing) {
+							ZagPairingIcon().frame(width: 25, height: 25)
+							Image(systemName: "minus.circle.fill")
+								.font(.system(size: 9, weight: .bold))
+								.background(Circle().fill(Color(uiColor: .systemBackground)).padding(1))
+								.offset(x: 4, y: 3)
+						}
+					} else {
+						ZagPairingIcon().frame(width: 25, height: 25)
+					}
+				}
+				.frame(maxWidth: .infinity, alignment: .leading)
+				.contentShape(Rectangle())
+			}
+			.buttonStyle(.plain)
+			.foregroundStyle((pairingCore.pairingFileExists || pairingCore.localPairingCleanupPending) ? Color.red : Color.accentColor)
+			.disabled(pairingCore.isRunning)
+            .sheet(isPresented: $showUnpairConfirmation, onDismiss: presentCleanupFeedback) {
+                ZagLocalPairingConfirmationPopup(
+                    confirm: confirmLocalCleanup,
+                    cancel: { showUnpairConfirmation = false }
+                )
+                .modifier(ZagRemovalSheetPresentation())
+            }
+
 			HStack {
 				Label("Pairing File", systemImage: "doc.badge.gearshape")
 				Spacer()
 				Text(pairingCore.pairingFileExists ? "Saved" : "Not Saved")
+                    .font(ZagInstallationStatusStyle.font)
 					.foregroundStyle(pairingCore.pairingFileExists ? .green : .secondary)
-				Image(systemName: pairingCore.pairingFileExists ? "checkmark.circle.fill" : "circle")
+				ZagInstallationStatusIndicator(systemName: pairingCore.pairingFileExists ? "checkmark.circle.fill" : "circle")
 					.foregroundStyle(pairingCore.pairingFileExists ? .green : .secondary)
 					.frame(width: 22, alignment: .center)
 			}
@@ -136,6 +171,17 @@ private struct RPPairingView: View {
 					Text(pin)
 						.font(.system(size: 32, weight: .semibold, design: .monospaced))
 						.textSelection(.enabled)
+                    Button {
+                        guard let code = ZagPairingCodeNotification.validCode(pin) else { return }
+                        UIPasteboard.general.setItems(
+                            [[UTType.utf8PlainText.identifier: code]],
+                            options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)]
+                        )
+                    } label: {
+                        Label("Copy Pairing Code", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityHint("Copies on this device for two minutes. Paste in Settings if the field supports it.")
 				}
 				.frame(maxWidth: .infinity)
 				.padding(.vertical, 8)
@@ -148,54 +194,11 @@ private struct RPPairingView: View {
 					.textSelection(.enabled)
 			}
 
-			Button(role: pairingCore.pairingFileExists ? .destructive : nil) {
-				if pairingCore.pairingFileExists {
-					showUnpairConfirmation = true
-				} else {
-					pairingCore.start()
-				}
-			} label: {
-				Label {
-					Text(
-						pairingCore.pairingFileExists
-							? "Unpair This iPhone"
-							: (pairingCore.isRunning ? "Waiting for This iPhone…" : "Pair This iPhone")
-					)
-				} icon: {
-					if pairingCore.pairingFileExists {
-						ZStack(alignment: .bottomTrailing) {
-							Image(systemName: "iphone")
-							Image(systemName: "minus.circle.fill")
-								.font(.system(size: 9, weight: .bold))
-								.background(Circle().fill(Color(uiColor: .systemBackground)).padding(1))
-								.offset(x: 4, y: 3)
-						}
-					} else {
-						Image(systemName: "iphone.radiowaves.left.and.right")
-					}
-				}
-				.frame(maxWidth: .infinity, alignment: .leading)
-				.contentShape(Rectangle())
-			}
-			.buttonStyle(.plain)
-			.foregroundStyle(pairingCore.pairingFileExists ? Color.red : Color.accentColor)
-			.disabled(pairingCore.isRunning)
-			.popover(isPresented: $showUnpairConfirmation, attachmentAnchor: .rect(.bounds), arrowEdge: .bottom) {
-				ZagUnpairConfirmationBubble(
-					confirm: {
-						showUnpairConfirmation = false
-						do { try pairingCore.forgetPairing() }
-						catch { unpairError = error.localizedDescription }
-					},
-					cancel: { showUnpairConfirmation = false }
-				)
-				.frame(width: 340)
-				.presentationCompactAdaptation(.popover)
-			}
 		} header: {
 			Text("Control")
 		} footer: {
-			Text("Pairing credentials are stored locally and reused for direct installation.")
+            Text(pairingFooter)
+                .fixedSize(horizontal: false, vertical: true)
 		}
 
 		Section {
@@ -229,7 +232,16 @@ private struct RPPairingView: View {
 			Text(pairingExportError ?? "")
 		}
 
-		.alert("Unable to Unpair", isPresented: Binding(
+        .alert("Local Pairing Removed", isPresented: Binding(
+            get: { localRemovalMessage != nil },
+            set: { if !$0 { localRemovalMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { localRemovalMessage = nil }
+        } message: {
+            Text((localRemovalMessage ?? "") + "\n\n" + ZagLocalPairingRemoval.systemRemovalInstructions)
+        }
+
+		.alert("Local Cleanup Incomplete", isPresented: Binding(
 			get: { unpairError != nil },
 			set: { if !$0 { unpairError = nil } }
 		)) {
@@ -240,7 +252,7 @@ private struct RPPairingView: View {
 
 
 		.onAppear {
-			if pairingCore.pairingFileExists &&
+			if pairingCore.pairingFileExists && !pairingCore.localPairingCleanupPending &&
 			   !pairingCore.isGate2Running &&
 			   pairingCore.gate2State == .idle {
 				pairingCore.startGate2Probe()
@@ -293,6 +305,25 @@ private struct RPPairingView: View {
 		}
 	}
 
+    private func confirmLocalCleanup() {
+        showUnpairConfirmation = false
+        do {
+            try pairingCore.forgetPairing()
+            cleanupFeedback = .removed
+        } catch { cleanupFeedback = .failed(error.localizedDescription) }
+    }
+
+    private func presentCleanupFeedback() {
+        guard let feedback = cleanupFeedback else { return }
+        cleanupFeedback = nil
+        // Keep the operation in the confirmed action, as before. Only its alert
+        // waits for the custom sheet to finish dismissing.
+        switch feedback {
+        case .removed: localRemovalMessage = ZagLocalPairingRemoval.localOnlyMessage
+        case .failed(let message): unpairError = message
+        }
+    }
+
 	private var tunnelVerified: Bool {
 		switch pairingCore.gate2State {
 		case .lockdown, .pairing, .pairRecord, .coreDevice, .rsd, .deviceInfo, .installationProxy, .installedApps, .afc, .stagingWrite, .stagingVerify, .complete:
@@ -324,6 +355,18 @@ private struct RPPairingView: View {
 		pairingCore.pairingFileExists && tunnelVerified ? "checkmark.circle.fill" : "circle"
 	}
 
+    private var pairingFooter: String {
+        let verified: Bool
+        if case .verified = pairingVerification.currentVerification {
+            verified = !pairingCore.localPairingCleanupPending && pairingCore.pairingFileExists
+        } else {
+            verified = false
+        }
+        return verified
+            ? "Settings App → Privacy & Security → Developer Mode → Zag Store"
+            : "Settings App → Privacy & Security → Developer Mode → Pair with Zag Store"
+    }
+
 	private var directInstallStatusColor: Color {
 		pairingCore.pairingFileExists && tunnelVerified ? .green : .secondary
 	}
@@ -332,17 +375,29 @@ private struct RPPairingView: View {
 	private func directStatusRow(
 		_ title: String,
 		titleSystemImage: String,
+        usesPairingIcon: Bool = false,
 		value: String,
 		systemImage: String,
 		color: Color
 	) -> some View {
 		HStack {
-			Label(title, systemImage: titleSystemImage)
-                .labelStyle(ZagInstallationTintedIconLabelStyle())
+			Label {
+                Text(title).foregroundStyle(.primary)
+            } icon: {
+                if usesPairingIcon {
+                    ZagPairingIcon().frame(width: 25, height: 25).foregroundStyle(.tint)
+                } else {
+                    Image(systemName: titleSystemImage)
+                        .frame(width: 25, height: 25, alignment: .center)
+                        .foregroundStyle(.tint)
+                }
+            }
+                .labelStyle(.titleAndIcon)
 			Spacer()
 			Text(value)
+                .font(ZagInstallationStatusStyle.font)
 				.foregroundStyle(color)
-			Image(systemName: systemImage)
+			ZagInstallationStatusIndicator(systemName: systemImage)
 				.foregroundStyle(color)
 				.frame(width: 22, alignment: .center)
 		}
@@ -393,64 +448,6 @@ private struct RPPairingView: View {
 }
 
 
-private struct ZagUnpairConfirmationBubble: View {
-	let confirm: () -> Void
-	let cancel: () -> Void
-
-	var body: some View {
-		VStack(spacing: 0) {
-			VStack(alignment: .leading, spacing: 10) {
-				Text("Unpair This iPhone?")
-					.font(.title3.weight(.semibold))
-				Text("This removes Zag Store's saved RPPairing credentials. You will need to pair again before direct installation can be used.")
-					.font(.body)
-					.foregroundStyle(.secondary)
-					.fixedSize(horizontal: false, vertical: true)
-			}
-			.frame(maxWidth: .infinity, alignment: .leading)
-			.padding(.horizontal, 20)
-			.padding(.top, 18)
-			.padding(.bottom, 14)
-
-			Divider()
-
-			Button(role: .destructive, action: confirm) {
-				Text("Unpair This iPhone")
-					.font(.body.weight(.semibold))
-					.frame(maxWidth: .infinity)
-					.frame(minHeight: 50)
-			}
-			.buttonStyle(.plain)
-			.foregroundStyle(.red)
-
-			Divider()
-
-			Button(action: cancel) {
-				Text("Cancel")
-					.font(.body.weight(.semibold))
-					.frame(maxWidth: .infinity)
-					.frame(minHeight: 50)
-			}
-			.buttonStyle(.plain)
-			.foregroundStyle(Color.accentColor)
-		}
-		.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
-		.overlay {
-			RoundedRectangle(cornerRadius: 28, style: .continuous)
-				.strokeBorder(.white.opacity(0.12), lineWidth: 0.5)
-		}
-		.overlay(alignment: .bottom) {
-			Image(systemName: "triangle.fill")
-				.font(.system(size: 24))
-				.foregroundStyle(.regularMaterial)
-				.rotationEffect(.degrees(180))
-				.offset(y: 15)
-		}
-		.shadow(color: .black.opacity(0.28), radius: 24, y: 10)
-		.frame(maxWidth: .infinity)
-		.padding(.horizontal, 2)
-	}
-}
 
 struct RPPairingDiagnosticsView: View {
 	@StateObject private var pairingCore = ZagRPPairingCore.shared

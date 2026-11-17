@@ -24,6 +24,7 @@ enum ZagPackageIntegrity {
 		defer { try? handle.close() }
 		var hasher = SHA256()
 		while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            try Task.checkCancellation()
 			hasher.update(data: chunk)
 		}
 		return hasher.finalize().map { String(format: "%02x", $0) }.joined()
@@ -35,6 +36,29 @@ enum ZagPackageIntegrity {
 		}
 	}
 
+    static func sha256InBackground(of url: URL) async throws -> String {
+        let worker = Task.detached(priority: .utility) { try sha256(of: url) }
+        return try await withTaskCancellationHandler {
+            let result = try await worker.value
+            try Task.checkCancellation()
+            return result
+        } onCancel: { worker.cancel() }
+    }
+
+    /// Cached packages can be large. Keep bounded-memory verification off the UI
+    /// actor and propagate parent cancellation to the hashing worker.
+    static func verifyInBackground(_ url: URL, expectedSHA256: String) async throws {
+        let worker = Task.detached(priority: .utility) {
+            try verify(url, expectedSHA256: expectedSHA256)
+        }
+        try await withTaskCancellationHandler {
+            try await worker.value
+            try Task.checkCancellation()
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
 	/// Streams `url` into `file`, which the caller creates and owns, hashing
 	/// each chunk as it is written, and throws unless the body matches
 	/// `expectedSHA256`. Memory use is bounded by URLSession's chunk size.
@@ -45,11 +69,12 @@ enum ZagPackageIntegrity {
 		_ url: URL,
 		expectedSHA256: String,
 		session: URLSession,
-		to file: URL
+		to file: URL,
+        progress: (@Sendable (ZagUpdateByteProgress) -> Void)? = nil
 	) async throws {
 		let handle = try FileHandle(forWritingTo: file)
 		defer { try? handle.close() }
-		let receiver = StreamingReceiver(handle: handle)
+		let receiver = StreamingReceiver(handle: handle, progress: progress)
 		let task = session.dataTask(with: url)
 		task.delegate = receiver
 		let digest = try await withTaskCancellationHandler {
@@ -73,10 +98,22 @@ enum ZagPackageIntegrity {
 		private var hasher = SHA256()
 		private var failure: Error?
 		var continuation: CheckedContinuation<String, Error>?
+        private let progress: (@Sendable (ZagUpdateByteProgress) -> Void)?
+        private var received: Int64 = 0
+        private var expected: Int64?
+        private var sampler = ZagUpdateProgressSampler()
 
-		init(handle: FileHandle) {
-			self.handle = handle
-		}
+        init(handle: FileHandle, progress: (@Sendable (ZagUpdateByteProgress) -> Void)?) {
+            self.handle = handle
+            self.progress = progress
+        }
+
+        private func publishProgress(finished: Bool = false) {
+            guard let value = sampler.receive(bytes: received, expected: expected,
+                                              now: ProcessInfo.processInfo.systemUptime,
+                                              finished: finished) else { return }
+            progress?(value)
+        }
 
 		func urlSession(
 			_ session: URLSession,
@@ -89,6 +126,8 @@ enum ZagPackageIntegrity {
 				completionHandler(.cancel)
 				return
 			}
+            expected = response.expectedContentLength > 0 ? response.expectedContentLength : nil
+            publishProgress()
 			completionHandler(.allow)
 		}
 
@@ -97,6 +136,8 @@ enum ZagPackageIntegrity {
 			do {
 				try handle.write(contentsOf: data)
 				hasher.update(data: data)
+                received += Int64(data.count)
+                publishProgress()
 			} catch {
 				failure = error
 				dataTask.cancel()
@@ -107,6 +148,7 @@ enum ZagPackageIntegrity {
 			if let error = failure ?? error {
 				continuation?.resume(throwing: error)
 			} else {
+                publishProgress(finished: true)
 				continuation?.resume(returning: hasher.finalize().map { String(format: "%02x", $0) }.joined())
 			}
 			continuation = nil
