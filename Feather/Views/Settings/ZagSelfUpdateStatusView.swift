@@ -1083,6 +1083,7 @@ private struct ZagStoreUpdateAutomaticPreferencesView: View {
         }
         .navigationTitle("Automatic Updates")
         .navigationBarTitleDisplayMode(.inline)
+        .zagAccountCloseButton()
     }
 }
 
@@ -1116,6 +1117,7 @@ private struct ZagStoreUpdateBetaPreferencesView: View {
         }
         .navigationTitle("Release Channel")
         .navigationBarTitleDisplayMode(.inline)
+        .zagAccountCloseButton()
     }
 }
 
