@@ -22,6 +22,16 @@ import Foundation
 	}
 
 	static func main() {
+        func allowed(_ original: String, _ destination: String) -> Bool {
+            NBFetchRedirectPolicy.allows(original: URL(string: original), destination: URL(string: destination))
+        }
+        expect(allowed("https://repo.example/a", "https://cdn.example/b"), "HTTPS CDN redirects supported")
+        expect(!allowed("https://repo.example/a", "http://repo.example/b"), "HTTPS downgrade rejected")
+        expect(!allowed("https://repo.example/a", "file:///private/data"), "local-file redirect rejected")
+        expect(!allowed("https://repo.example/a", "feather://install/https://example.com/a"), "custom-scheme redirect rejected")
+        expect(!allowed("https://repo.example/a", "https://user:pass@repo.example/b"), "credential-bearing redirect rejected")
+        expect(allowed("http://repo.example/a", "http://cdn.example/b"), "existing HTTP repository compatibility retained")
+
 		let legacyKey = "ZagStore.RepositoryFetchMetrics"
 		NBRepositoryFetchDiagnostics.clear()
 
@@ -52,6 +62,23 @@ import Foundation
 
 		NBRepositoryFetchDiagnostics.clear()
 		expect(NBRepositoryFetchDiagnostics.metrics.isEmpty, "clearing diagnostics removes them")
+
+		// A failed cache write must not discard the only copy of older metrics.
+		let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+			.appendingPathComponent("ZagStore-RepositoryFetchMetrics.json")
+		do {
+			try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+			UserDefaults.standard.set(legacy, forKey: legacyKey)
+			NBRepositoryFetchDiagnostics.record(metric("https://failed.example/repo.json", "network/200"))
+			expect(UserDefaults.standard.data(forKey: legacyKey) == legacy,
+				"failed file migration preserves the legacy metrics")
+			expect(NBRepositoryFetchDiagnostics.metrics.map(\.url) == ["https://old.example/repo.json"],
+				"legacy metrics remain readable after a failed migration")
+			try FileManager.default.removeItem(at: cache)
+		} catch {
+			expect(false, "could not prepare failed-migration fixture: \(error)")
+		}
+		NBRepositoryFetchDiagnostics.clear()
 
 		if failures > 0 { print("\(failures) fetch defaults test(s) failed"); exit(1) }
 		print("All fetch defaults tests passed")

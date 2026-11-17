@@ -61,6 +61,21 @@ enum ZagWideGamutTint {
 	}
 }
 
+/// The root needs only inventory changes. Observing the whole pairing core
+/// re-evaluated the tab hierarchy for every Gate4 publication; this empty
+/// view takes those invalidations instead.
+private struct ZagInstalledAppsStateObserver: View {
+	@ObservedObject private var pairingCore = ZagRPPairingCore.shared
+	let onChange: (ZagRPPairingCore.InstalledAppsState) -> Void
+
+	var body: some View {
+		Color.clear
+			.frame(width: 0, height: 0)
+			.accessibilityHidden(true)
+			.onChange(of: pairingCore.installedAppsState, perform: onChange)
+	}
+}
+
 struct VariedTabbarView: View {
 	@AppStorage("Feather.userTintColor") private var themeColorHex: String = "#0090FF"
 	@AppStorage(ZagWallpaperStore.enabledKey) private var wallpaperEnabled = false
@@ -69,8 +84,8 @@ struct VariedTabbarView: View {
 	// every repository that finished during a refresh.
 	private let sourcesViewModel = SourcesViewModel.shared
 	private let updateManager = UpdateManager.shared
-	@StateObject private var pairingCore = ZagRPPairingCore.shared
 	@State private var didStartInitialUpdateRefresh = false
+    @State private var linkedTab: TabEnum?
 
 	@FetchRequest(
 		entity: AltSource.entity(),
@@ -94,6 +109,29 @@ struct VariedTabbarView: View {
 				TabbarView()
 			}
 		}
+        .sheet(isPresented: Binding(get: { linkedTab != nil }, set: { if !$0 { linkedTab = nil } })) {
+            if let tab = linkedTab {
+                TabEnum.view(for: tab)
+                    .onAppear {
+                        if let route = ZagStoreRouter.pendingRoute, route.isTabRoot { ZagStoreRouter.consume(route) }
+                    }
+                    .safeAreaInset(edge: .top) {
+                        HStack {
+                            Spacer()
+                            Button("Done") { linkedTab = nil }
+                                .padding()
+                        }
+                    }
+                    .presentationDetents([.large])
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .zagStoreRouteRequested)) { note in
+            guard let route = note.object as? ZagStoreRoute else { return }
+            openHiddenDestination(route)
+        }
+        .onAppear {
+            if let route = ZagStoreRouter.pendingRoute { openHiddenDestination(route) }
+        }
 		.onAppear {
             // Migrate only the previous built-in blues; leave custom themes intact.
             let previous = themeColorHex.uppercased()
@@ -125,7 +163,7 @@ struct VariedTabbarView: View {
 				await updateManager.requestBadgePermission()
 			}
 		}
-		.onChange(of: pairingCore.installedAppsState) { state in
+		.background(ZagInstalledAppsStateObserver { state in
 			// An inventory query can complete after the startup refresh has
 			// timed out and published Signed fallback. Promote it to the
 			// authoritative update snapshot without opening the Apps tab.
@@ -144,8 +182,20 @@ struct VariedTabbarView: View {
 			)
 			guard configuredURLs == loadedURLs else { return }
 			updateManager.refresh(repositories: Array(activeSources.values))
-		}
+		})
 	}
+
+    private func openHiddenDestination(_ route: ZagStoreRoute) {
+        guard let tab = TabEnum(rawValue: route.tab) else { return }
+        if ZagDockConfiguration.tabs.contains(tab) {
+            linkedTab = nil
+        } else if linkedTab == tab, route == .activity {
+            // Reuse an already-presented hidden destination without another sheet.
+            ZagStoreRouter.consume(route)
+        } else {
+            linkedTab = tab
+        }
+    }
 
 	private func updateDockTint() {
 		let color = UIColor(ZagWideGamutTint.color(hex: themeColorHex))
@@ -400,6 +450,7 @@ private struct ZagCircularToolbarBorder: ViewModifier {
 struct ZagProfileToolbarButton: View {
 	@StateObject private var updateManager = UpdateManager.shared
 	@State private var isAccountPresenting = false
+    @State private var activityHandoff = ZagAccountActivityHandoff()
 	@State private var avatarRevision = UUID()
 	var body: some View {
 		Button {
@@ -420,14 +471,27 @@ struct ZagProfileToolbarButton: View {
 		.onReceive(NotificationCenter.default.publisher(for: .zagProfileAvatarDidChange)) { _ in
 			avatarRevision = UUID()
 		}
-		.sheet(isPresented: $isAccountPresenting) { ZagAccountPopup(onClose: { isAccountPresenting = false }) }
+        .sheet(isPresented: $isAccountPresenting, onDismiss: {
+            guard let route = activityHandoff.takeAfterDismissal() else { return }
+            #if DEBUG
+            ZagLogger.shared.info("Navigation", "Account dismissed; routing Activity")
+            #endif
+            _ = ZagStoreRouter.open(route.url)
+        }) {
+            ZagAccountPopup(onClose: { isAccountPresenting = false }, onOpenActivity: {
+                #if DEBUG
+                ZagLogger.shared.info("Navigation", "Account Activity requested")
+                #endif
+                activityHandoff.request()
+                isAccountPresenting = false
+            })
+        }
 	}
 }
 
 struct ZagGlobalProfileAvatar: View {
     let revision: UUID
     var animatedBorder: Bool = false
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var borderRotation = false
 
@@ -444,7 +508,7 @@ struct ZagGlobalProfileAvatar: View {
             if let image = ZagProfileAvatarStore.customImage() {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
-                Image(colorScheme == .dark ? "ZagProfileDark" : "ZagProfileLight")
+                Image("ZagProfileDark")
                     .resizable().scaledToFill()
             }
         }
@@ -470,6 +534,7 @@ struct ZagGlobalProfileAvatar: View {
 
 struct ZagAccountPopup: View {
     let onClose: () -> Void
+    let onOpenActivity: () -> Void
     @ObservedObject private var updateManager = UpdateManager.shared
     @ObservedObject private var selfUpdateCoordinator = ZagSelfUpdateCoordinator.shared
     @Environment(\.dismiss) private var dismiss
@@ -479,7 +544,7 @@ struct ZagAccountPopup: View {
     @State private var accountPath: [AccountDestination] = []
 
     private enum AccountDestination: Hashable {
-        case profile, updates, certificates, installation, signing, notifications, devices, activity, selfUpdate, settings
+        case profile, updates, certificates, installation, signing, notifications, devices, selfUpdate, settings
     }
 
     private var themeTint: Color { Color(hex: themeColorHex) }
@@ -493,7 +558,7 @@ struct ZagAccountPopup: View {
                             ZagGlobalProfileAvatar(revision: avatarRevision)
                                 .frame(width: 54, height: 54)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Petar Zagorski")
+                                Text("Guest User")
                                     .font(.system(size: 20, weight: .semibold))
                                     .foregroundStyle(.primary)
                                 Text("Account info and settings")
@@ -549,8 +614,8 @@ struct ZagAccountPopup: View {
                     NavigationLink(value: AccountDestination.devices) {
                         Text("Devices")
                     }
-                    NavigationLink(value: AccountDestination.activity) {
-                        Text("Activity")
+                    Button(action: onOpenActivity) {
+                        Text("Activity").foregroundStyle(.primary)
                     }
                     NavigationLink(value: AccountDestination.notifications) {
                         Text("Notifications")
@@ -608,7 +673,6 @@ struct ZagAccountPopup: View {
                     case .signing: ConfigurationView()
                     case .notifications: ZagAccountNotificationsView()
                     case .devices: ZagDevicesPage().tint(themeTint)
-                    case .activity: TabEnum.view(for: .activity).tint(themeTint)
                     case .selfUpdate: ZagSelfUpdateStatusView()
                     case .settings:
                         SettingsView(

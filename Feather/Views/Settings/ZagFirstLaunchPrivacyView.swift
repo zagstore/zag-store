@@ -1,8 +1,10 @@
 import SwiftUI
 
-/// Settings › Privacy: the first-launch report setting (on by default).
-/// Shown only in copies that have a report (ZagFirstLaunchReporter.hasReport).
+/// Settings › Privacy: usage statistics (every copy) and the first-launch
+/// report (on by default; only copies with a report can send one). The two
+/// settings are independent.
 struct ZagFirstLaunchPrivacyView: View {
+	@AppStorage(ZagActivityReporter.optOutKey) private var _activityOptedOut = false
 	@AppStorage(ZagFirstLaunchReporter.optOutKey) private var _optedOut = false
 	@AppStorage(ZagFirstLaunchReporter.jailbreakOptInKey) private var _sharesJailbreak = false
 	@State private var _status = ZagFirstLaunchReporter.status()
@@ -11,15 +13,40 @@ struct ZagFirstLaunchPrivacyView: View {
 		Form {
 			Section {
 				Toggle(isOn: Binding(
-					get: { !_optedOut },
-					set: { ZagFirstLaunchReporter.setSharing($0); _status = ZagFirstLaunchReporter.status() }
+					get: { !_activityOptedOut },
+					set: { ZagActivityReporter.setSharing($0) }
 				)) {
-					Text("Share First-Launch Report")
+					Text("Share Usage Statistics")
 				}
 				.toggleStyle(ZagThemeTintToggleStyle())
-				.disabled(_status == .notApplicable)
+			} header: {
+				Text("Usage Statistics")
 			} footer: {
-				Text(ZagFirstLaunchDisclosure.summary)
+				Text(ZagActivityDisclosure.summary)
+			}
+
+			Section {
+				ForEach(ZagActivityDisclosure.sent, id: \.self) { Label($0, systemImage: "arrow.up.circle") }
+			} header: {
+				Text("Sent While Zag Store Is Open")
+			} footer: {
+				Text(ZagActivityDisclosure.limits)
+			}
+
+			Section {
+				if _status == .notApplicable {
+					LabeledContent("Share First-Launch Report", value: "Unavailable")
+				} else {
+					Toggle(isOn: Binding(
+						get: { !_optedOut },
+						set: { ZagFirstLaunchReporter.setSharing($0); _status = ZagFirstLaunchReporter.status() }
+					)) {
+						Text("Share First-Launch Report")
+					}
+					.toggleStyle(ZagThemeTintToggleStyle())
+				}
+			} footer: {
+				Text(_status == .notApplicable ? ZagFirstLaunchDisclosure.unavailable : ZagFirstLaunchDisclosure.summary)
 			}
 
 			Section {
@@ -29,14 +56,18 @@ struct ZagFirstLaunchPrivacyView: View {
 			}
 
 			Section {
-				Toggle(isOn: Binding(
-					get: { _sharesJailbreak },
-					set: { ZagFirstLaunchReporter.setJailbreakSharing($0) }
-				)) {
-					Text("Share Jailbreak Status")
+				if _status == .notApplicable {
+					LabeledContent("Share Jailbreak Status", value: "Unavailable")
+				} else {
+					Toggle(isOn: Binding(
+						get: { _sharesJailbreak },
+						set: { ZagFirstLaunchReporter.setJailbreakSharing($0) }
+					)) {
+						Text("Share Jailbreak Status")
+					}
+					.toggleStyle(ZagThemeTintToggleStyle())
+					.disabled(_optedOut)
 				}
-				.toggleStyle(ZagThemeTintToggleStyle())
-				.disabled(_status == .notApplicable || _optedOut)
 			} footer: {
 				Text(ZagFirstLaunchDisclosure.jailbreak)
 			}
@@ -70,7 +101,7 @@ struct ZagFirstLaunchPrivacyView: View {
 
 	private var _statusText: String {
 		switch _status {
-		case .notApplicable: return "Nothing to Report"
+		case .notApplicable: return "Unavailable"
 		case .off: return "Off"
 		case .pending: return "Waiting to Send"
 		case .sent: return "Sent"
@@ -81,7 +112,7 @@ struct ZagFirstLaunchPrivacyView: View {
 	private var _statusFooter: String {
 		switch _status {
 		case .notApplicable:
-			return "This copy of Zag Store was not signed on the Zag Store website, so it has no report to send."
+			return ZagFirstLaunchDisclosure.unavailable
 		case .off:
 			return "Nothing is sent while this is off."
 		case .pending:
@@ -94,8 +125,21 @@ struct ZagFirstLaunchPrivacyView: View {
 	}
 }
 
+/// What the usage statistics contain, in plain words.
+enum ZagActivityDisclosure {
+	static let summary = "On by default. While Zag Store is open, it tells the Zag Store website that a session is active, about once a minute, so the website can estimate how many people are using the app. Nothing is sent in the background. Turn this off and nothing more is sent, starting immediately."
+	static let sent = [
+		"A random session code, new for each session and never reused or linked to other sessions or days",
+		"Whether the session started, is still open or ended",
+		"Zag Store version and build",
+		"iOS or iPadOS version, such as 26.1",
+	]
+	static let limits = "Sent over an encrypted connection. Nothing that identifies you or your device is sent: no Apple Account, certificates, device identifiers, location, or which apps or sources you use. The server does not store your IP address with these events. Session records are deleted after 30 days and hourly totals after 90 days."
+}
+
 /// What the first-launch report contains, in plain words.
 enum ZagFirstLaunchDisclosure {
+	static let unavailable = "This copy has no website installation attribution, so no first-launch report or jailbreak status is sent. Usage statistics are controlled separately."
 	static let summary = "Zag Store tells the website you downloaded it from, once, that the copy you installed from it has opened. It helps count how many website installations actually start. Turn this off and nothing is sent."
 	static let sent = [
 		"The installation code from your download (it identifies that download, not you or your device)",

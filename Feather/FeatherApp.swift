@@ -16,6 +16,7 @@ import NimbleJSON
 
 @main
 struct FeatherApp: App {
+    @StateObject private var launch = ZagPairingLaunchCoordinator()
 	@UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 	
 	let heartbeat = HeartbeatManager.shared
@@ -28,10 +29,15 @@ struct FeatherApp: App {
 			ZStack {
 				ZagWallpaperBackground()
 
-				VariedTabbarView()
+                if !launch.policy.canEnterMain {
+                    ZagWelcomeView(launch: launch)
+                        .allowsHitTesting(launch.policy.splashFinished)
+                        .accessibilityHidden(!launch.policy.splashFinished)
+                } else {
+                VariedTabbarView()
 					.environment(\.managedObjectContext, storage.context)
-					.onOpenURL(perform: _handleURL)
 					.modifier(ZagMobileDataInstallOverlay())
+					.zagPairingRepairPrompt()
 					.overlay(alignment: .top) {
 						// Manual transfers float above the app rather than
 						// resizing the tab/navigation hierarchy.
@@ -39,8 +45,32 @@ struct FeatherApp: App {
 							.padding(.top, 4)
 							.transition(.move(edge: .top).combined(with: .opacity))
 						}
+                }
 				ZagAnimatedLaunchOverlay()
 			}
+            .onOpenURL { url in
+                guard url.absoluteString.utf8.count <= 4 * 1024 * 1024 else { return }
+                if ZagMobileDataToggleController.shared.handle(url) { return }
+                launch.enqueue(url)
+                drainPendingURLs()
+            }
+            .task {
+                launch.startIfNeeded()
+                await ZagLaunchGate.shared.waitUntilSplashFinishes()
+                launch.finishSplash()
+                drainPendingURLs()
+            }
+            // Connection status refreshes on its own; a reconnect re-checks
+            // pairing once if the last check could not reach the device.
+            .onReceive(ZagLocalVPNMonitor.shared.$model.map(\.tunnel).removeDuplicates()) { tunnel in
+                if tunnel == .operational { launch.connectionAvailable() }
+            }
+            .onChange(of: launch.policy.canEnterMain) { _ in
+                Task { @MainActor in
+                    await Task.yield()
+                    drainPendingURLs()
+                }
+            }
 			.animation(.smooth, value: downloadManager.manualDownloads.description)
 			.onAppear { ZagInventorySnapshotRecorder.shared.start() }
             .onAppear {
@@ -76,96 +106,92 @@ struct FeatherApp: App {
 		}
 	}
 	
-	private func _handleURL(_ url: URL) {
-		// Consumes only zagstore://shortcut-callback/…; all other links route as before.
-		if ZagMobileDataToggleController.shared.handle(url) {
-			return
-		}
-		if ZagStoreRouter.open(url) {
-			return
-		}
-		if url.scheme == "feather" {
-			/// feather://import-certificate?p12=<base64>&mobileprovision=<base64>&password=<base64>
-			if url.host == "import-certificate" {
-				guard
-					let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-					let queryItems = components.queryItems
-				else {
-					return
-				}
-				
-				func queryValue(_ name: String) -> String? {
-					queryItems.first(where: { $0.name == name })?.value?.removingPercentEncoding
-				}
-				
-				guard
-					let p12Base64 = queryValue("p12"),
-					let provisionBase64 = queryValue("mobileprovision"),
-					let passwordBase64 = queryValue("password"),
-					let passwordData = Data(base64Encoded: passwordBase64),
-					let password = String(data: passwordData, encoding: .utf8)
-				else {
-					return
-				}
-				
-				let generator = UINotificationFeedbackGenerator()
-				generator.prepare()
-				
-				guard
-					let p12URL = FileManager.default.decodeAndWrite(base64: p12Base64, pathComponent: ".p12"),
-					let provisionURL = FileManager.default.decodeAndWrite(base64: provisionBase64, pathComponent: ".mobileprovision"),
-					FR.checkPasswordForCertificate(for: p12URL, with: password, using: provisionURL)
-				else {
-					generator.notificationOccurred(.error)
-					return
-				}
-				
-				FR.handleCertificateFiles(
-					p12URL: p12URL,
-					provisionURL: provisionURL,
-					p12Password: password
-				) { error in
-					if let error = error {
-						UIAlertController.showAlertWithOk(title: .localized("Error"), message: error.localizedDescription)
-					} else {
-						generator.notificationOccurred(.success)
-					}
-				}
-				
-				return
-			}
-			/// feather://export-certificate is intentionally disabled.
-			/// It sent the stored P12 and its password to a URL chosen by the
-			/// caller, which any web page or app could supply. Certificates can
-			/// still be exported deliberately from Settings → Certificates.
-			if url.host == "export-certificate" {
-				ZagLogger.shared.warning("DeepLink", "Ignored external certificate export request")
-				return
-			}
-			/// feather://source/<url>
-			if let fullPath = url.validatedScheme(after: "/source/") {
-				FR.handleSource(fullPath) { }
-			}
-			/// feather://install/<url.ipa>
-			if
-				let fullPath = url.validatedScheme(after: "/install/"),
-				let downloadURL = URL(string: fullPath)
-			{
-				_ = DownloadManager.shared.startDownload(from: downloadURL)
-			}
-		} else {
-			if url.pathExtension == "ipa" || url.pathExtension == "tipa" {
-				if FileManager.default.isFileFromFileProvider(at: url) {
-					guard url.startAccessingSecurityScopedResource() else { return }
-					FR.handlePackageFile(url) { _ in }
-				} else {
-					FR.handlePackageFile(url) { _ in }
-				}
-				
-				return
-			}
-		}
-	}
+    private func drainPendingURLs() {
+        for url in launch.takeURLs() { _handleURL(url) }
+    }
+
+    private func _handleURL(_ url: URL) {
+        if ZagMobileDataToggleController.shared.handle(url) { return }
+        guard let action = ZagDeepLink.parse(url) else {
+            showLinkError("This link is incomplete or is not supported by Zag Store.")
+            return
+        }
+        switch action {
+        case .navigate:
+            _ = ZagStoreRouter.open(url)
+        case .returnFromVPN:
+            break
+        case .disabledExport:
+            // "export-certificate" remains deliberately disabled for compatibility.
+            ZagLogger.shared.warning("DeepLink", "Ignored external certificate export request")
+        case .source(let remote):
+            confirmLink("Add Source?", message: "Add a repository from \(remote.host ?? "this website")?") {
+                FR.handleSource(remote.absoluteString) { }
+            }
+        case .download(let remote):
+            confirmLink("Download App?", message: "Download an app from \(remote.host ?? "this website")? You can review and sign it in Apps before installing.") {
+                _ = DownloadManager.shared.startDownload(from: remote)
+            }
+        case .certificate(let certificate):
+            confirmLink("Import Signing Certificate?", message: "This link contains a signing identity. Import it only if you trust where it came from.") {
+                importLinkedCertificate(certificate)
+            }
+        case .package(let file):
+            importLinkedPackage(file)
+        }
+    }
+
+    private func confirmLink(_ title: String, message: String, action: @escaping () -> Void) {
+        guard let presenter = UIApplication.topViewController(), !(presenter is UIAlertController) else { return }
+        UIAlertController.showAlertWithCancel(presenter, title: title, message: message, actions: [
+            UIAlertAction(title: "Continue", style: .default) { _ in action() }
+        ])
+    }
+
+    private func showLinkError(_ message: String) {
+        guard let presenter = UIApplication.topViewController(), !(presenter is UIAlertController) else { return }
+        UIAlertController.showAlertWithOk(presenter, title: "Unable to Open Link", message: message)
+    }
+
+    private func importLinkedCertificate(_ certificate: ZagDeepLink.Certificate) {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let p12 = folder.appendingPathComponent("identity.p12")
+        let provision = folder.appendingPathComponent("identity.mobileprovision")
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try certificate.p12.write(to: p12, options: .atomic)
+            try certificate.provision.write(to: provision, options: .atomic)
+            guard FR.checkPasswordForCertificate(for: p12, with: certificate.password, using: provision) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            FR.handleCertificateFiles(p12URL: p12, provisionURL: provision, p12Password: certificate.password) { error in
+                try? FileManager.default.removeItem(at: folder)
+                if let error { showLinkError(error.localizedDescription) }
+                else { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            showLinkError("The signing files could not be imported. Check the certificate and password.")
+        }
+    }
+
+    private func importLinkedPackage(_ file: URL) {
+        let scoped = file.startAccessingSecurityScopedResource()
+        // Files must be explicitly granted by the document provider, or delivered
+        // to the app's Inbox. An arbitrary sandbox path in a URL grants no access.
+        let inbox = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Inbox", isDirectory: true)
+        guard let resolved = ZagDeepLink.importLocation(file, grantedScope: scoped, inbox: inbox) else {
+            if scoped { file.stopAccessingSecurityScopedResource() }
+            showLinkError("Choose an IPA from Files using Import in Apps.")
+            return
+        }
+        FR.handlePackageFile(resolved) { error in
+            if scoped { file.stopAccessingSecurityScopedResource() }
+            if let error { showLinkError(error.localizedDescription) }
+        }
+    }
+
 }
 
 
@@ -203,6 +229,8 @@ final class ZagLaunchGate {
         )
         // After the interface is interactive; returns at once (website-signed copies only).
         ZagFirstLaunchReporter.launchBecameInteractive()
+        // Foreground usage activity; independent of the report above, returns at once.
+        ZagActivityReporter.launchBecameInteractive()
     }
 }
 
@@ -222,6 +250,7 @@ enum ZagSplashPreferences {
 /// colour-preserving still/native Core Animation path.
 private struct ZagAnimatedLaunchOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var updateCoordinator = ZagSelfUpdateCoordinator.shared
     @AppStorage(ZagSplashPreferences.enabledKey) private var enabled = true
     @AppStorage("ZagStore.splashSoundEnabled") private var soundEnabled = true
     @State private var opacity: Double = 1
@@ -245,7 +274,9 @@ private struct ZagAnimatedLaunchOverlay: View {
                             soundEnabled: soundEnabled,
                             skipRequested: skipVideoRequested,
                             onExitReady: beginVideoFade,
-                            onFinished: finishVideo
+                            onFinished: finishVideo,
+                            postUpdateMessage: { updateCoordinator.postUpdateMessage },
+                            onPostUpdateMessageDisplayed: acknowledgePostUpdateMessage
                         )
                         // A transparent full-screen gesture surface: no Skip
                         // affordance competes with the original Z artwork.
@@ -259,7 +290,9 @@ private struct ZagAnimatedLaunchOverlay: View {
                     } else {
                         ZagSplashAnimationStage(
                             reduceMotion: reduceMotion,
-                            exiting: exitRequested
+                            exiting: exitRequested,
+                            postUpdateMessage: { updateCoordinator.postUpdateMessage },
+                            onPostUpdateMessageDisplayed: acknowledgePostUpdateMessage
                         )
                     }
                 }
@@ -340,6 +373,11 @@ private struct ZagAnimatedLaunchOverlay: View {
             ))
             complete()
         }
+    }
+
+    private func acknowledgePostUpdateMessage(_ message: ZagPostUpdateMessage) {
+        guard opacity > 0.5, !dismissed, !exitRequested, !videoFadeStarted else { return }
+        updateCoordinator.acknowledgePostUpdateMessageDisplayed(message)
     }
 
     private func complete() {

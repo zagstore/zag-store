@@ -164,20 +164,23 @@ struct ExtendedTabbarView: View {
 		.tabViewStyle(.sidebarAdaptable)
 		.tabViewCustomization($customization)
 		.modifier(ZagDockShrinkOnScroll())
-		.onAppear { ZagPageSlide.attachToDock() }
+		.onAppear {
+            ZagPageSlide.attachToDock()
+            if let route = ZagStoreRouter.pendingRoute, let tab = TabEnum(rawValue: route.tab), ZagDockConfiguration.tabs.contains(tab) {
+                selectedTab.wrappedValue = tab.rawValue
+                if route.isTabRoot { ZagStoreRouter.consume(route) }
+            }
+        }
 		.onChange(of: dockTabs) { _ in
             if !ZagDockConfiguration.tabs.contains(TabEnum(rawValue: selectedTabRawValue) ?? .discover) {
                 selectedTabRawValue = ZagDockConfiguration.tabs.first?.rawValue ?? TabEnum.discover.rawValue
             }
         }
-		.onOpenURL { url in
-            if let tab = TabEnum.tab(for: url) {
-                selectedTab.wrappedValue = (ZagDockConfiguration.tabs.contains(tab) ? tab : (ZagDockConfiguration.tabs.first ?? .discover)).rawValue
-            }
-        }
 		.onReceive(NotificationCenter.default.publisher(for: .zagStoreRouteRequested)) { note in
-			guard let route = note.object as? ZagStoreRoute else { return }
-			selectedTab.wrappedValue = (ZagDockConfiguration.tabs.contains(TabEnum(rawValue: route.tab) ?? .discover) ? route.tab : (ZagDockConfiguration.tabs.first ?? .discover).rawValue)
+			guard let route = note.object as? ZagStoreRoute,
+                  let tab = TabEnum(rawValue: route.tab), ZagDockConfiguration.tabs.contains(tab) else { return }
+			selectedTab.wrappedValue = route.tab
+            if route.isTabRoot { ZagStoreRouter.consume(route) }
 		}
 		.sheet(isPresented: $_isAddingPresenting) {
 			SourcesAddView()

@@ -34,12 +34,20 @@ enum ZagSplashTimeline {
 struct ZagSplashAnimationStage: UIViewRepresentable {
     let reduceMotion: Bool
     let exiting: Bool
+    var postUpdateMessage: (() -> ZagPostUpdateMessage?)? = nil
+    var onPostUpdateMessageDisplayed: ((ZagPostUpdateMessage) -> Void)? = nil
 
     func makeUIView(context: Context) -> ZagSplashStageView {
-        ZagSplashStageView(reduceMotion: reduceMotion)
+        let view = ZagSplashStageView(reduceMotion: reduceMotion)
+        view.postUpdateMessage = postUpdateMessage
+        view.onPostUpdateMessageDisplayed = onPostUpdateMessageDisplayed
+        return view
     }
 
     func updateUIView(_ uiView: ZagSplashStageView, context: Context) {
+        uiView.postUpdateMessage = postUpdateMessage
+        uiView.onPostUpdateMessageDisplayed = onPostUpdateMessageDisplayed
+        uiView.refreshSignatureIfNeeded()
         if exiting {
             uiView.beginExit()
         }
@@ -48,6 +56,15 @@ struct ZagSplashAnimationStage: UIViewRepresentable {
 
 final class ZagSplashStageView: UIView {
     private let reduceMotion: Bool
+    var postUpdateMessage: (() -> ZagPostUpdateMessage?)?
+    var onPostUpdateMessageDisplayed: ((ZagPostUpdateMessage) -> Void)?
+    private var signatureMessage: ZagPostUpdateMessage?
+    private var signatureClock: CFTimeInterval?
+    private var signatureBaselineY: CGFloat = 0
+    private var signatureAcknowledged = false
+    private lazy var signatureCompletion = ZagSplashSignatureCompletion { [weak self] in
+        self?.acknowledgeSignatureIfDisplayed()
+    }
     private let backdrop = UIImageView(image: UIImage(named: "ZagSplashBackdrop"))
     private var assembled = false
     private var exitStarted = false
@@ -96,6 +113,7 @@ final class ZagSplashStageView: UIView {
         let canvas = CGRect(origin: .zero, size: rect.size)
         let scale = w / 692
         let clock = CACurrentMediaTime() + 0.05
+        signatureClock = clock
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -282,8 +300,10 @@ final class ZagSplashStageView: UIView {
         // The motto is editorial: three aligned words, separately animated,
         // with hierarchy in weight/tracking rather than large glowing labels.
         let captionSize = min(20, max(16.5, bounds.width * 0.0475))
-        let tokens = ["Sideloading", "and", "beyond."]
-        let weight: [UIFont.Weight] = [.light, .ultraLight, .semibold]
+        signatureMessage = postUpdateMessage?()
+        let tokens = signatureMessage?.tokens ?? ["Sideloading", "and", "beyond."]
+        // The motto ends semibold; an update's release group is bold.
+        let weight: [UIFont.Weight] = [.light, .ultraLight, signatureMessage == nil ? .semibold : .bold]
         let kern: [CGFloat] = [1.0, 1.1, 0.45]
         let gap: CGFloat = max(9, captionSize * 0.48)
         let measured: [CGFloat] = tokens.enumerated().map { i, word in
@@ -294,6 +314,7 @@ final class ZagSplashStageView: UIView {
         let textWidth = measured.reduce(0, +) + CGFloat(tokens.count - 1) * gap
         let fit = min(1, (bounds.width - 28) / textWidth)
         let baselineY = max(rect.maxY + mirrorHeight + 28, bounds.height * 0.675)
+        signatureBaselineY = baselineY
         var cursorX = (bounds.width - fit * textWidth) / 2
 
         for (index, word) in tokens.enumerated() {
@@ -351,6 +372,7 @@ final class ZagSplashStageView: UIView {
         }
 
         if reduceMotion {
+            CATransaction.setCompletionBlock { [weak self] in self?.acknowledgeSignatureIfDisplayed() }
             CATransaction.commit()
             return
         }
@@ -529,6 +551,7 @@ final class ZagSplashStageView: UIView {
             appear.timingFunction = CAMediaTimingFunction(name: .easeOut)
             appear.fillMode = .both
             appear.isRemovedOnCompletion = false
+            if index == 2 { appear.delegate = signatureCompletion }
             text.add(appear, forKey: "zag.wordAppear")
 
             let focus = CABasicAnimation(keyPath: "position.y")
@@ -562,6 +585,71 @@ final class ZagSplashStageView: UIView {
             )
         }
         CATransaction.commit()
+    }
+
+    /// Update only caption glyphs before their existing scheduled reveal. Logo
+    /// artwork, layer animations, audio and the original clock remain untouched.
+    func refreshSignatureIfNeeded() {
+        guard assembled, words.count == 3, !exitStarted,
+              let message = postUpdateMessage?(), message != signatureMessage,
+              let clock = signatureClock,
+              reduceMotion || CACurrentMediaTime() < clock + ZagSplashTimeline.firstWord else { return }
+        let tokens = message.tokens
+        let size = min(20, max(16.5, bounds.width * 0.0475))
+        let weights: [UIFont.Weight] = [.light, .ultraLight, .bold]
+        let kern: [CGFloat] = [1.0, 1.1, 0.45]
+        let gap = max(9, size * 0.48)
+        let widths = tokens.enumerated().map { index, token in
+            ceil((token as NSString).size(withAttributes: [.font: UIFont.systemFont(ofSize: size, weight: weights[index])]).width
+                 + CGFloat(token.count - 1) * kern[index])
+        }
+        let total = widths.reduce(0, +) + 2 * gap
+        let fit = min(1, (bounds.width - 28) / total)
+        var x = (bounds.width - fit * total) / 2
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for index in 0..<3 {
+            let text = words[index]
+            let width = widths[index] * fit
+            text.string = NSAttributedString(string: tokens[index], attributes: [
+                .font: UIFont.systemFont(ofSize: size * fit, weight: weights[index]),
+                .foregroundColor: UIColor.white.withAlphaComponent(index == 1 ? 0.70 : 0.95),
+                .kern: kern[index] * fit
+            ])
+            text.frame = CGRect(x: x, y: signatureBaselineY, width: width + 2, height: size * fit * 1.75)
+            if let focus = text.animation(forKey: "zag.wordFocus") as? CABasicAnimation {
+                focus.fromValue = text.position.y + 4
+                focus.toValue = text.position.y
+                text.add(focus, forKey: "zag.wordFocus")
+            }
+            let glint = wordLights[index]
+            if let sleeve = glint.superlayer, let mask = sleeve.mask as? CATextLayer {
+                sleeve.frame = text.frame
+                mask.frame = text.bounds
+                mask.string = text.string
+                glint.frame = CGRect(x: -width * 0.65, y: 0, width: width * 0.55, height: sleeve.bounds.height)
+                if let travel = glint.animation(forKey: "zag.wordSweep") as? CABasicAnimation {
+                    glint.position.x = text.bounds.width + glint.bounds.width
+                    travel.fromValue = -glint.bounds.width
+                    travel.toValue = glint.position.x
+                    glint.add(travel, forKey: "zag.wordSweep")
+                }
+            }
+            x += width + gap * fit
+        }
+        signatureMessage = message
+        if reduceMotion {
+            CATransaction.setCompletionBlock { [weak self] in self?.acknowledgeSignatureIfDisplayed() }
+        }
+        CATransaction.commit()
+    }
+
+    private func acknowledgeSignatureIfDisplayed() {
+        guard !signatureAcknowledged, !exitStarted, window != nil,
+              UIApplication.shared.applicationState == .active,
+              let message = signatureMessage else { return }
+        signatureAcknowledged = true
+        onPostUpdateMessageDisplayed?(message)
     }
 
     /// 5. EXIT — stagger the departure. Only the Z remains for the last

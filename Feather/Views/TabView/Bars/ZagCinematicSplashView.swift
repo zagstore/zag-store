@@ -14,12 +14,16 @@ struct ZagCinematicSplashView: UIViewRepresentable {
     let skipRequested: Bool
     let onExitReady: () -> Void
     let onFinished: () -> Void
+    var postUpdateMessage: (() -> ZagPostUpdateMessage?)? = nil
+    var onPostUpdateMessageDisplayed: ((ZagPostUpdateMessage) -> Void)? = nil
 
     func makeUIView(context: Context) -> ZagCinematicSplashStage {
         let view = ZagCinematicSplashStage()
         view.onFinished = onFinished
         view.onExitReady = onExitReady
         view.soundEnabled = soundEnabled
+        view.postUpdateMessage = postUpdateMessage
+        view.onPostUpdateMessageDisplayed = onPostUpdateMessageDisplayed
         if skipRequested { view.requestSkip() }
         return view
     }
@@ -28,6 +32,8 @@ struct ZagCinematicSplashView: UIViewRepresentable {
         uiView.onFinished = onFinished
         uiView.onExitReady = onExitReady
         uiView.soundEnabled = soundEnabled
+        uiView.postUpdateMessage = postUpdateMessage
+        uiView.onPostUpdateMessageDisplayed = onPostUpdateMessageDisplayed
         if skipRequested { uiView.requestSkip() }
     }
 
@@ -42,6 +48,13 @@ struct ZagCinematicSplashView: UIViewRepresentable {
 final class ZagCinematicSplashStage: UIView {
     var onFinished: (() -> Void)?
     var onExitReady: (() -> Void)?
+    var postUpdateMessage: (() -> ZagPostUpdateMessage?)?
+    var onPostUpdateMessageDisplayed: ((ZagPostUpdateMessage) -> Void)?
+    private var signatureMessage: ZagPostUpdateMessage?
+    private var signatureAcknowledged = false
+    private lazy var signatureCompletion = ZagSplashSignatureCompletion { [weak self] in
+        self?.acknowledgeSignatureIfDisplayed()
+    }
     var soundEnabled: Bool = true {
         didSet {
             player?.isMuted = !soundEnabled
@@ -195,9 +208,11 @@ final class ZagCinematicSplashStage: UIView {
     }
 
     private func buildSignature() {
-        let tokens = ["Sideloading", "and", "beyond."]
+        signatureMessage = postUpdateMessage?()
+        let tokens = signatureMessage?.tokens ?? ["Sideloading", "and", "beyond."]
         let size = min(23, max(16, bounds.width * 0.054))
-        let weights: [UIFont.Weight] = [.light, .ultraLight, .semibold]
+        // The motto ends semibold; an update's release group is bold.
+        let weights: [UIFont.Weight] = [.light, .ultraLight, signatureMessage == nil ? .semibold : .bold]
         let tracking: [CGFloat] = [1.1, 0.9, 0.35]
         let gap = size * 0.49
         let widths = tokens.enumerated().map { i, word -> CGFloat in
@@ -299,6 +314,16 @@ final class ZagCinematicSplashStage: UIView {
 
     private func update(at seconds: Double) {
         guard !skipStarted else { return }
+        // Reconciliation hashes off the UI thread. Adopt its result only before
+        // the existing reveal starts; a late result stays pending for next launch.
+        if !startedSweep, !revealed[0], let message = postUpdateMessage?(), message != signatureMessage {
+            wordLayers.forEach { $0.removeFromSuperlayer() }
+            wordGlints.forEach { $0.superlayer?.removeFromSuperlayer() }
+            sweep?.removeFromSuperlayer()
+            wordLayers.removeAll()
+            wordGlints.removeAll()
+            buildSignature()
+        }
         if !startedSweep && seconds >= arrivalTimes[0] - 0.08 {
             startedSweep = true
             animateSweep()
@@ -365,6 +390,7 @@ final class ZagCinematicSplashStage: UIView {
         group.duration = duration
         group.fillMode = .both
         group.isRemovedOnCompletion = false
+        if index == 2 { group.delegate = signatureCompletion }
         text.add(group, forKey: "zag.signatureReveal")
 
         let glint = wordGlints[index]
@@ -389,6 +415,14 @@ final class ZagCinematicSplashStage: UIView {
         glint.add(flash, forKey: "zag.signatureCatch")
 
         CATransaction.commit()
+    }
+
+    private func acknowledgeSignatureIfDisplayed() {
+        guard !signatureAcknowledged, !skipStarted, revealed.allSatisfy({ $0 }),
+              window != nil, UIApplication.shared.applicationState == .active,
+              let message = signatureMessage else { return }
+        signatureAcknowledged = true
+        onPostUpdateMessageDisplayed?(message)
     }
 
     private func animateSweep() {
