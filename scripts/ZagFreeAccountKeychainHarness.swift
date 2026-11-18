@@ -61,8 +61,69 @@ import SwiftUI
 		} catch {
 			lines.append("FAIL: unexpected error \(error)")
 		}
+		signingKeys(check)
 		lines.append("DONE")
 		try? lines.joined(separator: "\n").write(to: log, atomically: true, encoding: .utf8)
+	}
+
+	/// Signing keys as Keychain key items: made, used and removed without
+	/// the private key ever being exported.
+	func signingKeys(_ check: (Bool, String) -> Void) {
+		let keys = ZagKeychainSigningKeys(namespace: "ZagStore.test.\(UUID().uuidString)")
+		let a = UUID(), b = UUID()
+		do {
+			let made = try keys.create(account: a, team: "SIMTEAM001", commonName: "Zag Test")
+			_ = try keys.create(account: a, team: "SIMORG0001", commonName: "Zag Test")
+			_ = try keys.create(account: b, team: "SIMTEAM001", commonName: "Zag Test")
+			if case .success(let contents) = ZagCertificateSigningRequest.validate(made.request.data),
+			   let publicKey = SecKeyCopyPublicKey(made.key), contents.publicKey == SecKeyCopyExternalRepresentation(publicKey, nil) as Data? {
+				check(true, "the certificate request is made from the Keychain key, with its public key")
+			} else {
+				check(false, "the certificate request is made from the Keychain key, with its public key")
+			}
+			var duplicate = false
+			do { _ = try keys.create(account: a, team: "SIMTEAM001", commonName: "Zag Test") } catch ZagKeychainSigningKeys.Failure.exists { duplicate = true }
+			check(duplicate, "an existing key is never replaced silently")
+			guard let stored = try keys.key(account: a, team: "SIMTEAM001"), let other = try keys.key(account: b, team: "SIMTEAM001") else {
+				check(false, "the keys are found again"); return
+			}
+			// Platform fact, recorded in SIGNING-KEY-SECURITY.md: the simulator
+			// does not enforce kSecAttrIsExtractable for software RSA keys, so
+			// the owning app could still export it. Zag Store's code never does
+			// (checked by source in the signing suite). If this changes, the
+			// document must be updated.
+			check(SecKeyCopyExternalRepresentation(stored, nil) != nil,
+				  "platform fact as documented: the owning app can still export a software RSA key (not-extractable is not enforced)")
+			var attributes: CFTypeRef?
+			SecItemCopyMatching([kSecClass: kSecClassKey, kSecAttrApplicationTag: try keys.tag(account: a, team: "SIMTEAM001"),
+								 kSecReturnAttributes: true] as CFDictionary, &attributes)
+			let item = attributes as? [String: Any] ?? [:]
+			check(item[kSecAttrAccessible as String] as? String == (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
+				  && (item[kSecAttrSynchronizable as String] as? Bool ?? false) == false,
+				  "the key is after-first-unlock, this device only, never synchronised")
+
+			// A DigestInfo for SHA-256, as Zsign passes it to the signer.
+			let digest = Data((0..<32).map { UInt8($0) })
+			let digestInfo = Data([0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20]) + digest
+			let signature = ZagKeychainSigningKeys.signer(stored)(digestInfo)
+			let publicKey = SecKeyCopyPublicKey(stored)!
+			check(signature.map { SecKeyVerifySignature(publicKey, .rsaSignatureDigestPKCS1v15SHA256, digest as CFData, $0 as CFData, nil) } == true,
+				  "the Keychain key signs through the raw-signer callback; the signature verifies")
+			check(signature.map { SecKeyVerifySignature(SecKeyCopyPublicKey(other)!, .rsaSignatureDigestPKCS1v15SHA256, digest as CFData, $0 as CFData, nil) } == false,
+				  "another account's key is a different key")
+			var badTeam = false
+			do { _ = try keys.key(account: a, team: "bad.team*") } catch ZagKeychainSigningKeys.Failure.invalidTeam { badTeam = true }
+			check(badTeam, "a malformed team ID is refused")
+
+			try keys.deleteAll(account: a)
+			check(try keys.key(account: a, team: "SIMTEAM001") == nil && keys.key(account: a, team: "SIMORG0001") == nil,
+				  "removing an account deletes all of its keys")
+			check(try keys.key(account: b, team: "SIMTEAM001") != nil, "another account's key is untouched")
+			try keys.delete(account: b, team: "SIMTEAM001")
+			check(try keys.key(account: b, team: "SIMTEAM001") == nil, "a single key is deleted")
+		} catch {
+			check(false, "signing keys: unexpected error \(error)")
+		}
 	}
 
 	var body: some Scene { WindowGroup { Text("Keychain harness") } }

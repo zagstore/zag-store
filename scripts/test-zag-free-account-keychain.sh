@@ -23,8 +23,8 @@ cat > "$WORK/entitlements.plist" <<PLIST
 PLIST
 xcrun -sdk iphonesimulator swiftc -target "$(uname -m)-apple-ios16.4-simulator" -parse-as-library \
 	-module-cache-path "$WORK/module-cache" \
-	"$ROOT/Feather/Utilities/FreeAccount/ZagFreeAccountSecretStore.swift" \
-	"$ROOT/Feather/Utilities/FreeAccount/ZagFreeAccountState.swift" \
+	"$ROOT"/Feather/Utilities/FreeAccount/*.swift \
+	"$ROOT/Feather/Utilities/ZagEntitlementCompatibility.swift" "$ROOT/Feather/Utilities/CertificateReader/Models/CertificateModel.swift" "$ROOT/Feather/Utilities/AnyCodable.swift" \
 	"$ROOT/scripts/ZagFreeAccountKeychainHarness.swift" -o "$APP/Keychain" \
 	-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements -Xlinker "$WORK/entitlements.plist"
 cat > "$APP/Info.plist" <<PLIST

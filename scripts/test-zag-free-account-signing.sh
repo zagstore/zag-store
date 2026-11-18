@@ -35,6 +35,11 @@ assert not re.search(r"func\s+\w*[Rr]evoke", portal + provisioner)
 print("PASS: the portal interface has no revoke operation, so nothing can revoke a certificate automatically")
 assert "ZagSigningIdentity" in portal and '"[signing identity \\(serialNumber)]"' in portal
 print("PASS: a signing identity describes itself without its key")
+keychain_key = (root / "ZagKeychainSigningKey.swift").read_text()
+for forbidden in ["print(", "Logger", "NSLog", "os_log", "debugPrint", "dump(", "SecKeyCopyExternalRepresentation", "SecItemCopyMatching(query", "kSecReturnData"]:
+    assert forbidden not in keychain_key, ("keychain key", forbidden)
+assert "kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly" in keychain_key and "kSecAttrSynchronizable: false" in keychain_key
+print("PASS: Keychain-held signing keys are only referenced, never exported or logged; this device only, never synchronised")
 PY2
 
 bash "$ROOT/scripts/zag-build-zsign-macos.sh" "$WORK/zsign" >/dev/null
