@@ -14,6 +14,54 @@ enum ZagFreeAccountSimulation {
 	static let verificationCode = "123456"
 	static let keychainService = "app.zagstore.free-account.simulation"
 	static let sessionKey = "ZagStore.freeAccount.simulatedSession.v1"
+	/// Multi-account simulation data lives under its own namespace.
+	static let accountsNamespace = "ZagStore.accounts.simulated"
+
+	/// Synthetic accounts: each address has its own Apple-side identity and
+	/// teams. Any other reserved address behaves as `appleID`.
+	struct Account: Sendable {
+		let identifier: String
+		let teams: [ZagDeveloperTeam]
+	}
+
+	static let accounts: [String: Account] = [
+		appleID: Account(identifier: "SIMULATED0001", teams: [
+			ZagDeveloperTeam(identifier: "SIMTEAM001", name: "Personal Team (Simulated)", kind: .personalFree)
+		]),
+		"second\(accountDomain)": Account(identifier: "SIMULATED0002", teams: [
+			ZagDeveloperTeam(identifier: "SIMTEAM002", name: "Second Personal Team (Simulated)", kind: .personalFree)
+		]),
+		"paid\(accountDomain)": Account(identifier: "SIMULATED0003", teams: [
+			ZagDeveloperTeam(identifier: "SIMPAID001", name: "Paid Individual (Simulated)", kind: .individualPaid),
+			ZagDeveloperTeam(identifier: "SIMORG0001", name: "Organisation (Simulated)", kind: .organization)
+		])
+	]
+
+	static func account(for appleID: String) -> Account {
+		accounts[appleID.lowercased()] ?? accounts[Self.appleID]!
+	}
+
+	/// The multi-account directory wired to the simulation, under its own
+	/// Keychain service and preferences namespace (never the real ones).
+	static func makeDirectory(
+		service: ZagSimulatedAuthenticationService,
+		clock: ZagSimulationClock,
+		secrets: ZagFreeAccountSecretStore = ZagKeychainFreeAccountSecretStore(service: keychainService),
+		preferences: ZagPreferenceStore = ZagUserDefaultsPreferences(),
+		diagnostics: ZagFreeAccountDiagnostics = ZagFreeAccountDiagnostics(),
+		operationTimeout: TimeInterval = 8
+	) -> ZagAccountDirectory {
+		var configuration = ZagAccountDirectory.Configuration()
+		configuration.namespace = accountsNamespace
+		configuration.legacySessionKey = sessionKey
+		configuration.authenticator = .init(operationTimeout: operationTimeout, twoFactorWindow: 600, maximumCodeAttempts: 3)
+		return ZagAccountDirectory(
+			service: service,
+			anisette: ZagSimulatedAnisetteSource(service: service, clock: clock),
+			secrets: secrets, preferences: preferences, diagnostics: diagnostics,
+			configuration: configuration, now: { clock.now }
+		)
+	}
 
 	enum Scenario: String, CaseIterable, Identifiable, Sendable {
 		case signInSucceeds
@@ -93,6 +141,8 @@ actor ZagSimulatedAuthenticationService: ZagAppleAuthenticationService {
 	private(set) var scenario: ZagFreeAccountSimulation.Scenario
 	/// When true, the stored session is reported as no longer accepted.
 	private(set) var rejectsSessions = false
+	/// Apple-side identifiers whose sessions are no longer accepted.
+	private(set) var rejectedAccounts: Set<String> = []
 	private let latency: UInt64
 	private let clock: ZagSimulationClock
 
@@ -109,18 +159,25 @@ actor ZagSimulatedAuthenticationService: ZagAppleAuthenticationService {
 
 	func setRejectsSessions(_ value: Bool) { rejectsSessions = value }
 
+	/// Rejects one simulated account's sessions only.
+	func setRejectsSessions(_ value: Bool, forAppleID appleID: String) {
+		let identifier = ZagFreeAccountSimulation.account(for: appleID).identifier
+		if value { rejectedAccounts.insert(identifier) } else { rejectedAccounts.remove(identifier) }
+	}
+
 	private func pause() async throws {
 		if latency > 0 { try await Task.sleep(nanoseconds: latency) }
 	}
 
-	private func session() -> ZagAuthenticatedSession {
-		ZagAuthenticatedSession(
+	private func session(_ appleID: String) -> ZagAuthenticatedSession {
+		let account = ZagFreeAccountSimulation.account(for: appleID)
+		return ZagAuthenticatedSession(
 			credential: ZagSessionCredential(
-				accountIdentifier: "SIMULATED0001",
+				accountIdentifier: account.identifier,
 				token: "simulated-session-\(UUID().uuidString)",
 				expiresAt: clock.now + 30 * 86_400
 			),
-			teams: [ZagDeveloperTeam(identifier: "SIMTEAM001", name: "Personal Team (Simulated)", kind: .personalFree)]
+			teams: account.teams
 		)
 	}
 
@@ -134,7 +191,7 @@ actor ZagSimulatedAuthenticationService: ZagAppleAuthenticationService {
 			throw ZagAuthenticationServiceError.invalidCredentials
 		}
 		switch scenario {
-		case .signInSucceeds: return .authenticated(session())
+		case .signInSucceeds: return .authenticated(session(appleID))
 		case .trustedDeviceCode:
 			return .twoFactorRequired(ZagTwoFactorChallenge(method: .trustedDevice, codeLength: 6, maskedDestination: nil, canRequestSMS: true))
 		case .accountLocked: throw ZagAuthenticationServiceError.accountLocked
@@ -161,12 +218,12 @@ actor ZagSimulatedAuthenticationService: ZagAppleAuthenticationService {
 		try await pause()
 		guard passwordMatches(password) else { throw ZagAuthenticationServiceError.invalidCredentials }
 		guard code == ZagFreeAccountSimulation.verificationCode else { throw ZagAuthenticationServiceError.twoFactorRejected }
-		return .authenticated(session())
+		return .authenticated(session(appleID))
 	}
 
 	func isValid(_ credential: ZagSessionCredential, anisette: ZagAnisetteData) async throws -> Bool {
 		try await pause()
-		return !rejectsSessions
+		return !rejectsSessions && !rejectedAccounts.contains(credential.accountIdentifier)
 	}
 }
 #endif

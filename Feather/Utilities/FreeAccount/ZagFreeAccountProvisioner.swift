@@ -63,6 +63,9 @@ struct ZagProvisioningFailure: Error, Equatable, Sendable {
 
 	enum Kind: Equatable, Sendable {
 		case invalidRequest
+		/// The request is not for the authorised account and team, the
+		/// authorisation has lapsed, or this provisioner belongs to another account.
+		case notAuthorized
 		/// Three apps from this team are already on the device.
 		case installSlotsFull(installed: [String])
 		case deviceLimitReached
@@ -88,6 +91,7 @@ struct ZagProvisioningFailure: Error, Equatable, Sendable {
 	var message: String {
 		switch kind {
 		case .invalidRequest: return "This app cannot be signed with a free Apple Account."
+		case .notAuthorized: return "This Apple Account is not signed in. Sign in to it to sign or refresh its apps."
 		case .installSlotsFull: return "Three apps signed with this Apple Account are already installed. Remove one first."
 		case .deviceLimitReached: return "This Apple Account already has three registered devices."
 		case .appIDCapacityExhausted: return "This Apple Account has used its 10 App IDs for this week."
@@ -116,8 +120,13 @@ struct ZagProvisioningFailure: Error, Equatable, Sendable {
 ///   never revoked automatically.
 /// - Every profile is checked against the team, bundle ID, device and
 ///   certificate before it is returned.
+/// - Every call needs a `ZagSigningAuthorization` for the request's own
+///   account and team; a provisioner bound to an account (its portal session)
+///   refuses any other. Limits follow the team kind.
 actor ZagFreeAccountProvisioner {
 	private let portal: ZagDeveloperPortalService
+	/// The account whose portal session this provisioner uses, if bound.
+	let account: UUID?
 	private let keys: ZagSigningKeyFactory
 	private let secrets: ZagFreeAccountSecretStore
 	private let diagnostics: ZagFreeAccountDiagnostics
@@ -131,8 +140,10 @@ actor ZagFreeAccountProvisioner {
 		secrets: ZagFreeAccountSecretStore,
 		diagnostics: ZagFreeAccountDiagnostics = ZagFreeAccountDiagnostics(),
 		operationTimeout: TimeInterval = 30,
+		account: UUID? = nil,
 		now: @escaping @Sendable () -> Date = { Date() }
 	) {
+		self.account = account
 		self.portal = portal
 		self.keys = keys
 		self.secrets = secrets
@@ -141,10 +152,16 @@ actor ZagFreeAccountProvisioner {
 		self.now = now
 	}
 
-	func provision(_ request: ZagProvisioningRequest) async -> Result<ZagProvisioningResult, ZagProvisioningFailure> {
+	func provision(_ request: ZagProvisioningRequest, authorization: ZagSigningAuthorization) async -> Result<ZagProvisioningResult, ZagProvisioningFailure> {
 		defer { currentStep = nil }
+		guard authorization.isValid(at: now()),
+			  authorization.scope == ZagSigningScope(accountID: request.accountID, teamID: request.team),
+			  account == nil || account == request.accountID else {
+			diagnostics.record("Provisioning refused: not authorised for this account", at: now())
+			return .failure(ZagProvisioningFailure(kind: .notAuthorized, step: .request))
+		}
 		do {
-			let result = try await run(request)
+			let result = try await run(request, limits: authorization.limits)
 			diagnostics.record("Provisioned \(result.app.bundleIdentifier); profiles expire \(ISO8601DateFormatter().string(from: result.expiresAt))", at: now())
 			return .success(result)
 		} catch let failure as ZagProvisioningFailure {
@@ -159,7 +176,7 @@ actor ZagFreeAccountProvisioner {
 
 	// MARK: Steps
 
-	private func run(_ request: ZagProvisioningRequest) async throws -> ZagProvisioningResult {
+	private func run(_ request: ZagProvisioningRequest, limits: ZagTeamLimits) async throws -> ZagProvisioningResult {
 		let team = request.team
 		let portal = self.portal
 		var changes = ZagProvisioningResult.Changes()
@@ -183,14 +200,16 @@ actor ZagFreeAccountProvisioner {
 
 		// 1. Install slots (local, no request).
 		currentStep = .installSlots
-		if case .full(let installed) = ZagInstallSlotPlan.make(installing: appBundle, installedFreeAccountApps: request.installedFreeAccountApps) {
+		// iOS's 3-app limit applies to free teams' apps only (device-wide).
+		if limits.countsTowardsFreeAppLimit,
+		   case .full(let installed) = ZagInstallSlotPlan.make(installing: appBundle, installedFreeAccountApps: request.installedFreeAccountApps) {
 			throw ZagProvisioningFailure(kind: .installSlotsFull(installed: installed), step: .installSlots)
 		}
 
 		// 2. Device.
 		currentStep = .device
 		let devices = try await call { try await portal.devices(team: team) }
-		switch ZagDeviceRegistrationPlan.make(udid: request.deviceUDID, registeredUDIDs: devices.map(\.udid)) {
+		switch ZagDeviceRegistrationPlan.make(udid: request.deviceUDID, registeredUDIDs: devices.map(\.udid), limit: limits.devicesPerPlatform) {
 		case .alreadyRegistered:
 			break
 		case .register:
@@ -205,7 +224,7 @@ actor ZagFreeAccountProvisioner {
 		// 3. App ID capacity, before anything else is created.
 		currentStep = .appIDs
 		let registered = try await call { try await portal.appIDs(team: team) }
-		let plan = ZagAppIDPlan.make(bundleIdentifiers: components.map(\.bundle), registered: registered, now: now())
+		let plan = ZagAppIDPlan.make(bundleIdentifiers: components.map(\.bundle), registered: registered, limit: limits.appIDs ?? Int.max, now: now())
 		if case .capacityExhausted(let needed, let available, let freesAt) = plan.outcome {
 			throw ZagProvisioningFailure(kind: .appIDCapacityExhausted(needed: needed, available: available, nextSlotFreesAt: freesAt), step: .appIDs)
 		}
@@ -295,7 +314,8 @@ actor ZagFreeAccountProvisioner {
 	/// for a certificate. Never revokes one.
 	private func signingIdentity(for request: ZagProvisioningRequest, team: String, changes: inout ZagProvisioningResult.Changes) async throws -> ZagSigningIdentity {
 		let portal = self.portal
-		let stored = (try? secrets.load(.signingPrivateKey, account: request.accountID))
+		// Each account and team has its own identity.
+		let stored = (try? secrets.load(.signingPrivateKey, account: request.accountID, team: team))
 			.flatMap { $0 }
 			.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
 		let remote = try await call { try await portal.certificates(team: team) }
@@ -347,7 +367,7 @@ actor ZagFreeAccountProvisioner {
 				expiresAt: expiresAt
 			)
 			do {
-				try secrets.save(try JSONEncoder().encode(identity), kind: .signingPrivateKey, account: request.accountID)
+				try secrets.save(try JSONEncoder().encode(identity), kind: .signingPrivateKey, account: request.accountID, team: team)
 			} catch {
 				throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
 			}

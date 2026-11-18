@@ -15,13 +15,17 @@ final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	private let lock = NSLock()
 	var items: [String: Data] = [:]
 	var failDeletes = false
-	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID) throws {
-		lock.withLock { items["\(account).\(kind)"] = secret }
+	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws {
+		lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = secret }
 	}
-	func load(_ kind: ZagFreeAccountSecretKind, account: UUID) throws -> Data? { lock.withLock { items["\(account).\(kind)"] } }
-	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID) throws {
+	func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] } }
+	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws {
 		if failDeletes { throw ZagKeychainFreeAccountSecretStore.StoreError.keychain(-25300) }
-		lock.withLock { items["\(account).\(kind)"] = nil }
+		lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = nil }
+	}
+	func deleteAll(account: UUID) throws {
+		if failDeletes { throw ZagKeychainFreeAccountSecretStore.StoreError.keychain(-25300) }
+		lock.withLock { items = items.filter { !$0.key.hasPrefix("\(account).") } }
 	}
 	var all: String { lock.withLock { items.values.map { String(decoding: $0, as: UTF8.self) }.joined(separator: "\n") } }
 }

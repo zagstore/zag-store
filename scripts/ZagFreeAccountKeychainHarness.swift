@@ -32,9 +32,28 @@ import SwiftUI
 			var refusedEmpty = false
 			do { try store.save(Data(), kind: .session, account: a) } catch { refusedEmpty = true }
 			check(refusedEmpty, "an empty secret is refused")
+			try store.save(Data("team-1".utf8), kind: .signingPrivateKey, account: a, team: "SIMTEAM001")
+			try store.save(Data("team-2".utf8), kind: .signingPrivateKey, account: a, team: "SIMORG0001")
+			try store.save(Data("b-team".utf8), kind: .signingPrivateKey, account: b, team: "SIMTEAM001")
+			let teamItems = [
+				try store.load(.signingPrivateKey, account: a, team: "SIMTEAM001"),
+				try store.load(.signingPrivateKey, account: a, team: "SIMORG0001"),
+				try store.load(.signingPrivateKey, account: b, team: "SIMTEAM001"),
+				try store.load(.signingPrivateKey, account: a)
+			]
+			check(teamItems == ["team-1", "team-2", "b-team", "key"].map { Data($0.utf8) },
+				  "each account and team has its own signing item")
+			check(store.accessibility(.signingPrivateKey, account: a, team: "SIMTEAM001") == (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String),
+				  "team signing items are this-device-only too")
+			var refusedTeam = false
+			do { try store.save(Data("x".utf8), kind: .signingPrivateKey, account: a, team: "bad.team*") } catch { refusedTeam = true }
+			check(refusedTeam, "a malformed team ID is refused")
 			try store.deleteAll(account: a)
-			check(try store.load(.session, account: a) == nil && store.accessibility(.signingPrivateKey, account: a) == nil,
-				  "signing out removes every secret of the account")
+			check(try store.load(.session, account: a) == nil && store.accessibility(.signingPrivateKey, account: a) == nil
+				  && store.accessibility(.signingPrivateKey, account: a, team: "SIMTEAM001") == nil
+				  && store.accessibility(.signingPrivateKey, account: a, team: "SIMORG0001") == nil,
+				  "removing an account deletes every secret of it, all teams included")
+			check(try store.load(.signingPrivateKey, account: b, team: "SIMTEAM001") == Data("b-team".utf8), "another account's team item is untouched")
 			check(try store.load(.session, account: b) == Data("other".utf8), "another account's secrets are untouched")
 			try store.deleteAll(account: b)
 			query[kSecAttrSynchronizable as String] = kSecAttrSynchronizableAny

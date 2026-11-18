@@ -14,17 +14,17 @@ final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	private let lock = NSLock()
 	var items: [String: Data] = [:]
 	var failSaves = false
-	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID) throws {
+	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws {
 		if failSaves { throw ZagKeychainFreeAccountSecretStore.StoreError.keychain(-34018) }
-		lock.withLock { items["\(account).\(kind)"] = secret }
+		lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = secret }
 	}
-	func load(_ kind: ZagFreeAccountSecretKind, account: UUID) throws -> Data? { lock.withLock { items["\(account).\(kind)"] } }
-	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID) throws { lock.withLock { items["\(account).\(kind)"] = nil } }
+	func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] } }
+	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = nil } }
+	func deleteAll(account: UUID) throws { lock.withLock { items = items.filter { !$0.key.hasPrefix("\(account).") } } }
 }
 
 let team = "SIMTEAM001"
 let udid = "00000000-SIMULATED000000"
-let account = UUID()
 
 func entitlements(_ values: [String: Any] = [:]) -> ZagEntitlementSet { try! ZagEntitlementSet(values) }
 
@@ -35,7 +35,7 @@ func request(
 	installed: Set<String> = []
 ) -> ZagProvisioningRequest {
 	ZagProvisioningRequest(
-		accountID: account,
+		accountID: UUID(), // replaced with the harness's signed-in account
 		team: team,
 		deviceUDID: udid,
 		deviceName: "Test iPhone",
@@ -46,23 +46,55 @@ func request(
 }
 
 struct Harness {
-	let clock = TestClock()
-	let secrets = MemorySecrets()
+	let clock: TestClock
+	let secrets: MemorySecrets
 	let diagnostics = ZagFreeAccountDiagnostics()
 	let portal: ZagSimulatedDeveloperPortal
 	let provisioner: ZagFreeAccountProvisioner
+	let directory: ZagAccountDirectory
+	/// The simulated tester account, signed in to the directory.
+	let account: UUID
 
-	init(timeout: TimeInterval = 30) {
-		let clock = self.clock
+	static func make(timeout: TimeInterval = 30) async -> Harness {
+		let clock = TestClock(), secrets = MemorySecrets()
+		let directory = SimulatedAccounts.directory(now: { clock.now }, secrets: secrets).directory
+		let account = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: directory)!
+		return Harness(clock: clock, secrets: secrets, directory: directory, account: account, timeout: timeout)
+	}
+
+	private init(clock: TestClock, secrets: MemorySecrets, directory: ZagAccountDirectory, account: UUID, timeout: TimeInterval) {
+		self.clock = clock
+		self.secrets = secrets
+		self.directory = directory
+		self.account = account
 		portal = ZagSimulatedDeveloperPortal(team: team, clock: { clock.now })
 		provisioner = ZagFreeAccountProvisioner(
 			portal: portal, keys: ZagSimulatedSigningKeyFactory(), secrets: secrets,
-			diagnostics: diagnostics, operationTimeout: timeout, now: { clock.now }
+			diagnostics: diagnostics, operationTimeout: timeout, account: account, now: { clock.now }
 		)
 	}
 
-	func run(_ request: ZagProvisioningRequest) async -> Result<ZagProvisioningResult, ZagProvisioningFailure> {
-		await provisioner.provision(request)
+	var scope: ZagSigningScope { ZagSigningScope(accountID: account, teamID: team) }
+
+	/// Authorised for this account (signing in again if the simulated session has lapsed).
+	func authorization() async -> ZagSigningAuthorization {
+		if let granted = try? await directory.authorize(scope) { return granted }
+		let authenticator = await directory.authenticator(for: account)!
+		_ = await authenticator.restore()
+		_ = await authenticator.signIn(appleID: SimulatedAccounts.tester, password: ZagEphemeralSecret(ZagFreeAccountSimulation.password))
+		return try! await directory.authorize(scope)
+	}
+
+	func run(_ r: ZagProvisioningRequest) async -> Result<ZagProvisioningResult, ZagProvisioningFailure> {
+		let request = ZagProvisioningRequest(
+			accountID: account, team: r.team, deviceUDID: r.deviceUDID, deviceName: r.deviceName,
+			app: r.app, extensions: r.extensions, installedFreeAccountApps: r.installedFreeAccountApps
+		)
+		return await provisioner.provision(request, authorization: await authorization())
+	}
+
+	var storedIdentity: ZagSigningIdentity? {
+		secrets.items["\(account).signingPrivateKey.\(team)"].flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
 	}
 }
 
@@ -91,7 +123,7 @@ extension Result where Failure == ZagProvisioningFailure {
 	}
 
 	static func firstProvisioning() async {
-		let h = Harness()
+		let h = await Harness.make()
 		let result = await h.run(request(
 			extensions: ["com.example.notes.widget"],
 			appEntitlements: [
@@ -115,16 +147,16 @@ extension Result where Failure == ZagProvisioningFailure {
 		check(rejected == ["aps-environment", "com.apple.developer.networking.networkextension"],
 			  "capabilities free teams lack are reported, not granted")
 		check(value.expiresAt == h.clock.now + 7 * 86_400, "the profiles last 7 days")
-		let stored = h.secrets.items["\(account).signingPrivateKey"].flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
+		let stored = h.storedIdentity
 		check(stored?.serialNumber == value.certificateSerial && stored?.privateKey.count == 32, "the signing key is kept in the Keychain store with its certificate")
-		check(h.secrets.items.count == 1, "nothing else is stored")
+		check(Set(h.secrets.items.keys) == ["\(h.account).session", "\(h.account).signingPrivateKey.\(team)"], "besides the session, only the team's signing identity is stored")
 		let log = h.diagnostics.entries.map(\.message).joined(separator: "\n")
 		check(!log.contains(udid) && !log.contains("SIMULATED-CERTIFICATE") && !log.contains(stored?.privateKey.base64EncodedString() ?? "-"),
 			  "diagnostics hold no device ID, certificate or key")
 	}
 
 	static func reuseAndRefresh() async {
-		let h = Harness()
+		let h = await Harness.make()
 		let first = await h.run(request()).value
 		let before = await h.portal.mutations.count
 		let second = await h.run(request()).value
@@ -140,7 +172,7 @@ extension Result where Failure == ZagProvisioningFailure {
 	}
 
 	static func limitsCheckedBeforeChanges() async {
-		let full = Harness()
+		let full = await Harness.make()
 		let slots = await full.run(request(installed: ["a.\(team)", "b.\(team)", "c.\(team)"]))
 		let slotCalls = await full.portal.calls
 		check(slots.failure?.kind == .installSlotsFull(installed: ["a.\(team)", "b.\(team)", "c.\(team)"]) && slotCalls.isEmpty,
@@ -148,33 +180,33 @@ extension Result where Failure == ZagProvisioningFailure {
 		let refresh = await full.run(request(installed: ["com.example.notes.\(team)", "b.\(team)", "c.\(team)"]))
 		check(refresh.value != nil, "refreshing an installed app needs no free slot")
 
-		let devices = Harness()
+		let devices = await Harness.make()
 		for index in 0..<3 { await devices.portal.seedDevice("OTHER-\(index)") }
 		let deviceResult = await devices.run(request())
 		let deviceMutations = await devices.portal.mutations
 		check(deviceResult.failure?.kind == .deviceLimitReached && deviceMutations.isEmpty, "a fourth device is refused and nothing is created")
 
-		let appIDs = Harness()
+		let appIDs = await Harness.make()
 		for index in 0..<9 { await appIDs.portal.seedAppID("com.other.app\(index).\(team)", expiresAt: appIDs.clock.now + Double(index + 1) * 3_600) }
 		let appIDResult = await appIDs.run(request(extensions: ["com.example.notes.widget"]))
 		let appIDMutations = await appIDs.portal.mutations
 		check(appIDResult.failure?.kind == .appIDCapacityExhausted(needed: 2, available: 1, nextSlotFreesAt: appIDs.clock.now + 3_600),
 			  "App ID capacity is reported with when the next slot frees")
 		check(appIDMutations == [.registerDevice], "no certificate or App ID is created when App IDs would run out")
-		check(appIDs.secrets.items.isEmpty, "no signing key is created either")
+		check(appIDs.storedIdentity == nil, "no signing key is created either")
 
-		let taken = Harness()
+		let taken = await Harness.make()
 		await taken.portal.setForeignIdentifiers(["com.example.notes.\(team)"])
 		let takenResult = await taken.run(request())
 		check(takenResult.failure?.kind == .identifierUnavailable("com.example.notes.\(team)"), "an identifier owned by another team is reported")
 
-		let invalid = Harness()
+		let invalid = await Harness.make()
 		let bad = await invalid.run(request(app: "not a bundle id"))
 		check(bad.failure?.kind == .invalidRequest && bad.failure?.step == .request, "an invalid bundle ID is refused locally")
 	}
 
 	static func certificates() async {
-		let limit = Harness()
+		let limit = await Harness.make()
 		await limit.portal.seedCertificate(serial: "AAAA", expiresAt: limit.clock.now + 200 * 86_400)
 		await limit.portal.seedCertificate(serial: "BBBB", expiresAt: limit.clock.now + 100 * 86_400)
 		let result = await limit.run(request())
@@ -183,13 +215,13 @@ extension Result where Failure == ZagProvisioningFailure {
 		let issued = await limit.portal.issuedCertificates.count
 		check(issued == 2, "no certificate is revoked automatically")
 
-		let expiring = Harness()
+		let expiring = await Harness.make()
 		_ = await expiring.run(request())
 		expiring.clock.advance(360 * 86_400)
 		let renewed = await expiring.run(request())
 		check(renewed.value?.changes.createdCertificate == true, "a certificate with under 7 days left is replaced, not reused")
 
-		let storage = Harness()
+		let storage = await Harness.make()
 		storage.secrets.failSaves = true
 		let stored = await storage.run(request())
 		check(stored.failure?.kind == .keyStorage, "if the Keychain refuses the key, provisioning stops")
@@ -204,7 +236,7 @@ extension Result where Failure == ZagProvisioningFailure {
 			(.expired, .expired),
 			(.wrongApplicationIdentifier, .wrongApplicationIdentifier)
 		] {
-			let h = Harness()
+			let h = await Harness.make()
 			await h.portal.tamperProfiles(tamper)
 			let result = await h.run(request())
 			check(result.failure?.kind == .invalidProfile(problem) && result.failure?.step == .profiles, "a profile with \(problem.rawValue) is refused")
@@ -218,18 +250,18 @@ extension Result where Failure == ZagProvisioningFailure {
 			(.rateLimited, .rateLimited, "rate limiting is reported"),
 			(.malformed, .unexpectedResponse, "a malformed response is reported")
 		] {
-			let h = Harness()
+			let h = await Harness.make()
 			await h.portal.fail(.appIDs, with: failure)
 			let result = await h.run(request())
 			check(result.failure?.kind == kind && result.failure?.step == .appIDs, label)
 		}
 
-		let slow = Harness(timeout: 0.3)
+		let slow = await Harness.make(timeout: 0.3)
 		await slow.portal.fail(.profile, with: .noResponse)
 		let timedOut = await slow.run(request())
 		check(timedOut.failure?.kind == .timedOut && timedOut.failure?.step == .profiles, "a portal call that does not answer times out")
 
-		let cancelled = Harness()
+		let cancelled = await Harness.make()
 		await cancelled.portal.fail(.certificates, with: .noResponse)
 		let task = Task { await cancelled.run(request()) }
 		try? await Task.sleep(nanoseconds: 200_000_000)
@@ -241,10 +273,14 @@ extension Result where Failure == ZagProvisioningFailure {
 	}
 
 	static func liveDisabled() async {
-		let secrets = MemorySecrets()
-		let provisioner = ZagFreeAccountProvisioner(secrets: secrets)
-		let result = await provisioner.provision(request())
-		check(result.failure?.kind == .unavailable && secrets.items.isEmpty, "the default build cannot provision and says it is unavailable")
+		let h = await Harness.make()
+		let clock = h.clock
+		let provisioner = ZagFreeAccountProvisioner(secrets: h.secrets, now: { clock.now })
+		let request = ZagProvisioningRequest(accountID: h.account, team: team, deviceUDID: udid, deviceName: "Test iPhone",
+											 app: .init(originalBundleIdentifier: "com.example.notes", name: "Notes", entitlements: entitlements()),
+											 extensions: [], installedFreeAccountApps: [])
+		let result = await provisioner.provision(request, authorization: await h.authorization())
+		check(result.failure?.kind == .unavailable && h.storedIdentity == nil, "the default build cannot provision and says it is unavailable")
 		check(ZagLivePortal.isEnabled == false && ZagLiveAuthentication.isEnabled == false && ZagAnisetteLive.isEnabled == false,
 			  "live portal, sign-in and anisette are all disabled")
 	}

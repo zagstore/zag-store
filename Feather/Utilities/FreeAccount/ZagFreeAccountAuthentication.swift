@@ -198,17 +198,34 @@ struct ZagFreeAccountSessionStore {
 	static let key = "ZagStore.freeAccount.session.v1"
 	let preferences: ZagPreferenceStore
 	/// Simulated sessions use their own key so they never mix with real ones.
+	/// With `accountKeyPrefix` this is only the single-account (v1) key.
 	var key: String = ZagFreeAccountSessionStore.key
+	/// Multi-account: each account's summary is stored under
+	/// `<prefix><account ID>`, so accounts never share an entry.
+	var accountKeyPrefix: String? = nil
 
-	func load() -> ZagFreeAccountSession? {
-		preferences.data(forKey: key).flatMap { try? JSONDecoder().decode(ZagFreeAccountSession.self, from: $0) }
+	private func storageKey(_ account: UUID?) -> String? {
+		guard let accountKeyPrefix else { return key }
+		return account.map { accountKeyPrefix + $0.uuidString }
+	}
+
+	func load(account: UUID? = nil) -> ZagFreeAccountSession? {
+		guard let storageKey = storageKey(account) else { return nil }
+		guard let session = preferences.data(forKey: storageKey).flatMap({ try? JSONDecoder().decode(ZagFreeAccountSession.self, from: $0) }) else { return nil }
+		// An entry filed under another account's key is never returned.
+		if accountKeyPrefix != nil, session.accountID != account { return nil }
+		return session
 	}
 
 	func save(_ session: ZagFreeAccountSession) throws {
-		preferences.set(try JSONEncoder().encode(session), forKey: key)
+		guard let storageKey = storageKey(session.accountID) else { return }
+		preferences.set(try JSONEncoder().encode(session), forKey: storageKey)
 	}
 
-	func remove() { preferences.set(nil, forKey: key) }
+	func remove(account: UUID? = nil) {
+		guard let storageKey = storageKey(account) else { return }
+		preferences.set(nil, forKey: storageKey)
+	}
 }
 
 /// The last 50 free-account events for Settings › Diagnostics. Every entry is
@@ -274,6 +291,12 @@ actor ZagFreeAccountAuthenticator {
 	private var pending: PendingSignIn?
 	private var cancelInFlight: (@Sendable () -> Void)?
 	private var busy = false
+	/// The account this authenticator belongs to (multi-account), if any.
+	/// Once bound it never signs in, stores or removes another account.
+	private(set) var boundAccountID: UUID?
+	/// Maps Apple's account identifier to Zag Store's stable account ID, so
+	/// the same Apple Account signing in again keeps its ID (and its assets).
+	private let identify: (@Sendable (String) -> UUID)?
 
 	init(
 		service: ZagAppleAuthenticationService = ZagDisabledAuthenticationService(),
@@ -282,8 +305,12 @@ actor ZagFreeAccountAuthenticator {
 		sessions: ZagFreeAccountSessionStore,
 		diagnostics: ZagFreeAccountDiagnostics = ZagFreeAccountDiagnostics(),
 		configuration: Configuration = Configuration(),
+		account: UUID? = nil,
+		identify: (@Sendable (String) -> UUID)? = nil,
 		now: @escaping @Sendable () -> Date = { Date() }
 	) {
+		self.boundAccountID = account
+		self.identify = identify
 		self.service = service
 		self.anisette = anisette
 		self.secrets = secrets
@@ -298,14 +325,14 @@ actor ZagFreeAccountAuthenticator {
 	/// At launch: signed in only with both a summary and its Keychain
 	/// credential; expired when either has passed its expiry. No network.
 	func restore() -> ZagFreeAccountState {
-		guard let summary = sessions.load() else {
+		guard let summary = sessions.load(account: boundAccountID) else {
 			state = .signedOut
 			return state
 		}
 		guard let data = try? secrets.load(.session, account: summary.accountID),
 			  let credential = try? JSONDecoder().decode(ZagSessionCredential.self, from: data) else {
 			// A summary without its credential is useless: clear it.
-			sessions.remove()
+			sessions.remove(account: summary.accountID)
 			diagnostics.record("Stored session incomplete; signed out", at: now())
 			state = .signedOut
 			return state
@@ -314,15 +341,18 @@ actor ZagFreeAccountAuthenticator {
 		return state
 	}
 
-	/// Removes the session from the Keychain and preferences. If the Keychain
+	/// Removes this account's session from the Keychain and preferences. Its
+	/// signing identities and refresh records stay (removing the account
+	/// removes those), and no other account is touched. If the Keychain
 	/// refuses, the error is thrown and the state is unchanged, so the user is
 	/// never told they are signed out while a credential remains.
 	func signOut() throws {
 		cancelPending(reason: nil)
-		if let accountID = state.session?.accountID ?? sessions.load()?.accountID {
-			try secrets.deleteAll(account: accountID)
+		let accountID = state.session?.accountID ?? sessions.load(account: boundAccountID)?.accountID ?? boundAccountID
+		if let accountID {
+			try secrets.delete(.session, account: accountID)
 		}
-		sessions.remove()
+		sessions.remove(account: accountID)
 		state = state.applying(.signOut) ?? .signedOut
 		twoFactorPrompt = nil
 		diagnostics.record("Signed out", at: now())
@@ -338,7 +368,7 @@ actor ZagFreeAccountAuthenticator {
 			password.wipe()
 			return state
 		}
-		let accountID = state.session?.accountID ?? UUID()
+		let accountID = state.session?.accountID ?? boundAccountID ?? UUID()
 		state = next
 		busy = true
 		defer { busy = false }
@@ -512,13 +542,22 @@ actor ZagFreeAccountAuthenticator {
 			fail(.unexpectedResponse, "Sign-in response rejected: \(error)")
 			return
 		}
+		// The stable ID for this Apple Account. An authenticator bound to one
+		// account refuses to become another.
+		let resolvedID = identify?(validated.credential.accountIdentifier) ?? accountID
+		if let boundAccountID, resolvedID != boundAccountID {
+			fail(.differentAccount, "Sign-in was for a different Apple Account; nothing stored")
+			return
+		}
 		let summary = ZagFreeAccountSession(
-			accountID: accountID,
+			accountID: resolvedID,
 			maskedAppleID: ZagFreeAccountSession.mask(appleID: appleID),
 			team: validated.preferredTeam,
 			authenticatedAt: now(),
-			expiresAt: validated.credential.expiresAt
+			expiresAt: validated.credential.expiresAt,
+			otherTeams: validated.teams.filter { $0.identifier != validated.preferredTeam.identifier }
 		)
+		let accountID = resolvedID
 		do {
 			try secrets.save(try JSONEncoder().encode(validated.credential), kind: .session, account: accountID)
 			do {
@@ -532,6 +571,7 @@ actor ZagFreeAccountAuthenticator {
 			return
 		}
 		state = state.applying(.authenticated(summary)) ?? state
+		boundAccountID = accountID
 		diagnostics.record("Signed in; team \(validated.preferredTeam.kind.rawValue)", at: now())
 	}
 

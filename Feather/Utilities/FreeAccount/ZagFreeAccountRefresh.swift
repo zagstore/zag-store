@@ -39,6 +39,15 @@ struct ZagRefreshThresholds: Equatable, Sendable {
 	}
 }
 
+/// Who signed an installed app, and with what: the only account and team
+/// allowed to refresh it.
+struct ZagAppOwnership: Codable, Equatable, Sendable {
+	let scope: ZagSigningScope
+	let teamKind: ZagDeveloperTeam.Kind
+	var certificateSerial: String
+	var profileUUID: String
+}
+
 /// What Zag Store knows about one app it signed with a free account. Stored
 /// as JSON in Application Support; it contains no secrets.
 struct ZagSignedAppRecord: Codable, Equatable, Sendable {
@@ -56,6 +65,16 @@ struct ZagSignedAppRecord: Codable, Equatable, Sendable {
 	var lastSuccessfulRefresh: Date?
 	var lastFailure: Failure?
 	var consecutiveFailures: Int = 0
+	/// The signing account and team (absent in records made before
+	/// multi-account support, which therefore never refresh automatically).
+	var owner: ZagAppOwnership? = nil
+	/// Whether the expiry was read back from the device (nil: not known).
+	var expiryVerified: Bool? = nil
+	/// Set when the owning account was removed: the app keeps its owner, is
+	/// never given to another account, and stops refreshing.
+	var ownerRemovedAt: Date? = nil
+
+	var countsTowardsFreeAppLimit: Bool { owner.map { ZagTeamLimits.forTeam($0.teamKind).countsTowardsFreeAppLimit } ?? true }
 
 	var expiresAt: Date { min(profileExpiresAt, certificateExpiresAt) }
 
@@ -105,11 +124,17 @@ enum ZagRefreshFailureReason: String, Codable, Sendable {
 	case cancelled
 	/// Zag Store was closed while the refresh ran.
 	case interrupted
+	/// The record has no signing account (made before multi-account support).
+	case noOwner
+	/// The account that signed the app was removed.
+	case accountRemoved
+	/// The account no longer belongs to the team that signed the app.
+	case teamUnavailable
 
 	/// Retrying cannot help until the user acts.
 	var needsUser: Bool {
 		switch self {
-		case .signedOut, .appIDCapacity, .installSlots, .cancelled: return true
+		case .signedOut, .appIDCapacity, .installSlots, .cancelled, .noOwner, .accountRemoved, .teamUnavailable: return true
 		default: return false
 		}
 	}
@@ -129,6 +154,8 @@ struct ZagRefreshLedger: Codable, Equatable, Sendable {
 		case unknownApp
 		/// Too soon after a failure; try again after the date.
 		case backingOff(until: Date)
+		/// Its account was removed: it is never refreshed by another one.
+		case ownerRemoved
 	}
 
 	enum FinishError: Error, Equatable {
@@ -149,6 +176,7 @@ struct ZagRefreshLedger: Codable, Equatable, Sendable {
 	/// `userInitiated` skips the backoff: a person asking is always tried.
 	mutating func begin(_ bundleIdentifier: String, at now: Date, userInitiated: Bool) -> BeginResult {
 		guard let app = records[bundleIdentifier] else { return .unknownApp }
+		guard app.ownerRemovedAt == nil else { return .ownerRemoved }
 		guard running[bundleIdentifier] == nil else { return .alreadyRunning }
 		if !userInitiated, let failure = app.lastFailure {
 			if failure.reason.needsUser { return .backingOff(until: .distantFuture) }
@@ -191,9 +219,11 @@ struct ZagRefreshLedger: Codable, Equatable, Sendable {
 	}
 
 	/// The user fixed the cause (signed in again, freed a slot): automatic
-	/// refreshes held back by it may run again.
-	mutating func resolve(_ reason: ZagRefreshFailureReason) {
-		for (bundleIdentifier, app) in records where app.lastFailure?.reason == reason {
+	/// refreshes held back by it may run again. With `account`, only that
+	/// account's apps: one account signing in never releases another's.
+	mutating func resolve(_ reason: ZagRefreshFailureReason, account: UUID? = nil) {
+		for (bundleIdentifier, app) in records where app.lastFailure?.reason == reason
+			&& (account == nil || app.owner?.scope.accountID == account) {
 			records[bundleIdentifier]?.lastFailure = nil
 			records[bundleIdentifier]?.consecutiveFailures = 0
 		}
@@ -210,9 +240,10 @@ struct ZagRefreshLedger: Codable, Equatable, Sendable {
 	/// Apps for Refresh All: everything at or past `minimum`, most urgent (then
 	/// soonest to expire) first. Expired apps are included: refreshing is how
 	/// they come back.
-	func refreshAllOrder(at now: Date, minimum: ZagRefreshUrgency = .eligible) -> [String] {
+	func refreshAllOrder(at now: Date, minimum: ZagRefreshUrgency = .eligible, account: UUID? = nil) -> [String] {
 		records.values
-			.filter { $0.urgency(at: now) >= minimum }
+			.filter { $0.urgency(at: now) >= minimum && $0.ownerRemovedAt == nil }
+			.filter { account == nil || $0.owner?.scope.accountID == account }
 			.sorted {
 				let lhs = $0.urgency(at: now), rhs = $1.urgency(at: now)
 				return lhs != rhs ? lhs > rhs : ($0.expiresAt, $0.bundleIdentifier) < ($1.expiresAt, $1.bundleIdentifier)
@@ -220,9 +251,146 @@ struct ZagRefreshLedger: Codable, Equatable, Sendable {
 			.map(\.bundleIdentifier)
 	}
 
+	/// Installed apps signed by the account, by bundle ID.
+	func apps(ownedBy account: UUID) -> [String] {
+		records.values.filter { $0.owner?.scope.accountID == account }.map(\.bundleIdentifier).sorted()
+	}
+
+	/// Apps that count towards iOS's 3-app limit for free development
+	/// profiles: every free team's, across all accounts (device-wide).
+	var freeAppLimitApps: Set<String> {
+		Set(records.values.filter { $0.countsTowardsFreeAppLimit && $0.ownerRemovedAt == nil }.map(\.bundleIdentifier))
+	}
+
+	/// A refresh that could not be routed (owner signed out, removed, …):
+	/// recorded as a failure without starting.
+	mutating func markBlocked(_ bundleIdentifier: String, reason: ZagRefreshFailureReason, at now: Date) {
+		guard var app = records[bundleIdentifier] else { return }
+		app.lastFailure = .init(at: now, reason: reason)
+		app.consecutiveFailures += 1
+		records[bundleIdentifier] = app
+	}
+
+	/// After a verified refresh: the certificate and profile now in use.
+	mutating func updateOwnership(_ bundleIdentifier: String, certificateSerial: String?, profileUUID: String?) {
+		guard var owner = records[bundleIdentifier]?.owner else { return }
+		if let certificateSerial { owner.certificateSerial = certificateSerial }
+		if let profileUUID { owner.profileUUID = profileUUID }
+		records[bundleIdentifier]?.owner = owner
+		records[bundleIdentifier]?.expiryVerified = true
+	}
+
+	/// The account was removed: its apps keep their owner but never refresh.
+	mutating func detach(account: UUID, at now: Date = Date()) {
+		for (bundleIdentifier, app) in records where app.owner?.scope.accountID == account {
+			records[bundleIdentifier]?.ownerRemovedAt = now
+			running[bundleIdentifier] = nil
+		}
+	}
+
+	/// When each app should next be refreshed and reminded about, for apps
+	/// that can refresh, earliest first.
+	func schedule(at now: Date, thresholds: ZagRefreshThresholds = .standard) -> [ZagRefreshScheduleEntry] {
+		records.values
+			.filter { $0.ownerRemovedAt == nil }
+			.map { app in
+				var refreshAt = max(now, app.recommendedRefreshDate(thresholds: thresholds))
+				if let failure = app.lastFailure, !failure.reason.needsUser {
+					refreshAt = max(refreshAt, failure.at.addingTimeInterval(Self.backoff(afterFailures: app.consecutiveFailures)))
+				}
+				return ZagRefreshScheduleEntry(
+					bundleIdentifier: app.bundleIdentifier,
+					owner: app.owner?.scope,
+					refreshAt: refreshAt,
+					reminders: app.reminderDates(after: now, thresholds: thresholds),
+					needsUser: app.lastFailure?.reason.needsUser == true || app.owner == nil
+				)
+			}
+			.sorted { ($0.refreshAt, $0.bundleIdentifier) < ($1.refreshAt, $1.bundleIdentifier) }
+	}
+
 	/// 1, 2, 4, 8 … minutes, capped at 6 hours.
 	static func backoff(afterFailures failures: Int) -> TimeInterval {
 		guard failures > 0 else { return 0 }
 		return min(60 * pow(2, Double(min(failures, 20) - 1)), 6 * 3_600)
+	}
+}
+
+struct ZagRefreshScheduleEntry: Equatable, Sendable {
+	let bundleIdentifier: String
+	let owner: ZagSigningScope?
+	/// The start of the recommended window, or after the backoff.
+	let refreshAt: Date
+	let reminders: [Date]
+	/// Waiting for the user (signed out, no owner, slots): not tried automatically.
+	let needsUser: Bool
+}
+
+/// Where a refresh goes: to the app's own account and team, or nowhere.
+enum ZagRefreshRoute: Equatable, Sendable {
+	case refresh(ZagSigningAuthorization)
+	case blocked(ZagRefreshFailureReason)
+}
+
+extension ZagAccountDirectory {
+	/// Routes a refresh to the account and team that signed the app. Blocked,
+	/// never redirected, when that account is removed, signed out, expired or
+	/// no longer in the team.
+	func route(_ bundleIdentifier: String, ledger: ZagRefreshLedger) async -> ZagRefreshRoute {
+		guard let app = ledger.records[bundleIdentifier] else { return .blocked(.noOwner) }
+		guard let owner = app.owner else { return .blocked(.noOwner) }
+		guard app.ownerRemovedAt == nil, registry.account(owner.scope.accountID) != nil else { return .blocked(.accountRemoved) }
+		guard registry.team(owner.scope) != nil else { return .blocked(.teamUnavailable) }
+		do {
+			return .refresh(try await authorize(owner.scope))
+		} catch {
+			return .blocked(.signedOut)
+		}
+	}
+}
+
+/// The refresh records on disk: one JSON file in Application Support,
+/// replaced atomically and excluded from backups (the apps and profiles it
+/// describes belong to this device). A file that cannot be read is kept
+/// aside, never overwritten, and the ledger starts empty: apps then show as
+/// unknown until refreshed, which never signs with a guessed account.
+struct ZagRefreshLedgerStore: Sendable {
+	enum LoadResult: Equatable, Sendable {
+		case loaded(ZagRefreshLedger)
+		case empty
+		/// The file was unreadable; it was moved to `preservedAt`.
+		case recovered(preservedAt: URL)
+	}
+
+	let file: URL
+
+	static var standard: ZagRefreshLedgerStore {
+		let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+		return ZagRefreshLedgerStore(file: support.appendingPathComponent("ZagStore/FreeAccount/refresh-ledger.v2.json"))
+	}
+
+	/// Loads the ledger and marks refreshes that were running when Zag Store
+	/// last closed as interrupted.
+	func load(at now: Date) -> (ZagRefreshLedger, LoadResult) {
+		guard let data = try? Data(contentsOf: file) else { return (ZagRefreshLedger(), .empty) }
+		guard var ledger = try? JSONDecoder().decode(ZagRefreshLedger.self, from: data) else {
+			let aside = file.deletingPathExtension().appendingPathExtension("unreadable-\(Int(now.timeIntervalSince1970)).json")
+			try? FileManager.default.moveItem(at: file, to: aside)
+			return (ZagRefreshLedger(), .recovered(preservedAt: aside))
+		}
+		ledger.recoverAfterLaunch(at: now)
+		return (ledger, .loaded(ledger))
+	}
+
+	func save(_ ledger: ZagRefreshLedger) throws {
+		let folder = file.deletingLastPathComponent()
+		try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+		let encoder = JSONEncoder()
+		encoder.outputFormatting = [.sortedKeys]
+		try encoder.encode(ledger).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		var values = URLResourceValues()
+		values.isExcludedFromBackup = true
+		var url = file
+		try? url.setResourceValues(values)
 	}
 }

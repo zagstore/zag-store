@@ -20,12 +20,17 @@ found=0
 for marker in "${DEBUG_ONLY[@]}"; do
 	if grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); [ "$MODE" = release ] && echo "FOUND: $marker"; fi
 done
-# Phase 3 simulation and signing adapter (not in builds made before they existed, so release mode only).
+# Phase 3 portal simulation, the open (simulation-only) signing gate and the
+# synthetic accounts (not in builds made before they existed, so release mode
+# only). The signing adapter and lifecycle are production code behind the
+# closed gate (`ZagFreeAccountSigning.isEnabled`), checked in the source below.
 for marker in ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
-	ZagFreeAccountSigningAdapter ZagFreeAccountLifecycle ZagZsignCodeSigner zag-free-account-signing-; do
+	simulationOnly SIMULATED0002 SIMPAID001 ZagSimulatedAnisetteSource; do
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
 done
 if [ "$MODE" = release ]; then
+	grep -qE '^\s*static let isEnabled = false$' "$ROOT/Feather/Utilities/FreeAccount/ZagFreeAccountSigningAdapter.swift" \
+		|| { echo "FAIL: the free-account signing gate is not closed in the source"; exit 1; }
 	[ "$found" -eq 0 ] || { echo "FAIL: $found debug-only marker(s) in $EXE"; exit 1; }
 	echo "SUCCESS: no simulation UI or test credentials in $EXE"
 else

@@ -61,7 +61,7 @@ swiftc -parse-as-library -D DEBUG -D ZAG_ZSIGN_TESTS -target "$(uname -m)-apple-
 	"$ROOT/Feather/Utilities/CertificateReader/Models/CertificateModel.swift" \
 	"$ROOT/Feather/Utilities/AnyCodable.swift" \
 	"$ROOT/Zsign/Sources/zsign.swift" \
-	"$ROOT/scripts/ZagFreeAccountSigningTests.swift" \
+	"$ROOT/scripts/ZagFreeAccountTestSupport.swift" "$ROOT/scripts/ZagFreeAccountSigningTests.swift" \
 	-Xlinker "$WORK/zsign/libzsign.a" -lc++ -framework Security -o "$WORK/tests"
 
 cd "$WORK" # Zsign writes its cache to the current directory

@@ -31,14 +31,22 @@ struct ZagDeveloperTeam: Codable, Equatable, Sendable {
 /// It holds nothing that can be used to sign in: the session token is in
 /// `ZagFreeAccountSecretStore` under `accountID`.
 struct ZagFreeAccountSession: Codable, Equatable, Sendable {
-	/// Local identifier for the Keychain items; not Apple's account ID.
+	/// Zag Store's stable identifier for the account (`ZagAppleAccountRecord.id`);
+	/// not Apple's account ID and not the email address.
 	let accountID: UUID
 	/// For display only, e.g. "p•••@gmail.com".
 	let maskedAppleID: String
+	/// The preferred team: the free Personal Team when there is one.
 	let team: ZagDeveloperTeam
 	let authenticatedAt: Date
 	/// When Apple said the session token expires, if it said.
 	let expiresAt: Date?
+	/// The account's other teams (paid memberships). Absent in summaries
+	/// written before multi-account support.
+	var otherTeams: [ZagDeveloperTeam]? = nil
+
+	/// Every team of the account, the preferred one first.
+	var teams: [ZagDeveloperTeam] { [team] + (otherTeams ?? []).filter { $0.identifier != team.identifier } }
 
 	func isExpired(at now: Date) -> Bool {
 		guard let expiresAt else { return false }
@@ -75,6 +83,8 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		/// retried automatically: the protocol may have changed.
 		case unexpectedResponse
 		case cancelled
+		/// Re-authenticating an account signed in to a different Apple Account.
+		case differentAccount
 		/// Sign-in is turned off in this build (live authentication not enabled).
 		case unavailable
 	}
@@ -92,6 +102,7 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		case .anisetteUnavailable: return "Sign-in data from the anisette service is unavailable."
 		case .unexpectedResponse: return "Apple returned a response Zag Store does not recognise."
 		case .cancelled: return "Sign-in was cancelled."
+		case .differentAccount: return "You signed in with a different Apple Account. This account was not changed."
 		case .unavailable: return "Apple Account sign-in is not available in this version of Zag Store."
 		}
 	}
@@ -103,6 +114,7 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		case .rateLimited: return "Try again later"
 		case .network, .anisetteUnavailable: return "Check your connection and try again"
 		case .unexpectedResponse: return "Update Zag Store"
+		case .differentAccount: return "Sign in with this account's Apple ID, or add the other account separately"
 		case .unavailable: return "Use an imported certificate for now"
 		}
 	}

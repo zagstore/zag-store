@@ -1,14 +1,33 @@
-#if DEBUG
 import Foundation
 #if canImport(ZsignSwift)
 import ZsignSwift
 #endif
 
-// Debug builds only: the test adapter between `ZagFreeAccountProvisioner`
-// and the existing Zsign signer, and the sign-install-refresh lifecycle
-// around it. Nothing calls it in the app; tests drive it with the real Zsign
-// sources, a local test authority and a stand-in device. The AppTesters
-// signing path (`ZsignHandler`) and the RPPairing installer are unchanged.
+// Free-account signing in production code, behind a gate that is closed in
+// this version (`ZagFreeAccountSigning.isEnabled`): from a provisioning
+// result to a signed app, its installation through the existing RPPairing
+// installer, a verified record, and refreshes routed to the app's own
+// account and team. The AppTesters signing path (`ZsignHandler`) and the
+// RPPairing installer are unchanged.
+
+enum ZagFreeAccountSigning {
+	/// Signing with Apple Account certificates is not enabled in this version.
+	static let isEnabled = false
+}
+
+/// Whether free-account signing may run. Release builds can only make the
+/// production gate, which is closed; the open gate exists in Debug builds,
+/// for simulated accounts and local test authorities.
+struct ZagFreeAccountSigningGate: Equatable, Sendable {
+	let isOpen: Bool
+
+	private init(isOpen: Bool) { self.isOpen = isOpen }
+
+	static let production = ZagFreeAccountSigningGate(isOpen: ZagFreeAccountSigning.isEnabled)
+	#if DEBUG
+	static let simulationOnly = ZagFreeAccountSigningGate(isOpen: true)
+	#endif
+}
 
 /// Signs a bundle in place.
 protocol ZagCodeSigner: Sendable {
@@ -21,7 +40,8 @@ struct ZagSignerFailure: Error, Equatable { let message: String }
 #if canImport(ZsignSwift) || ZAG_ZSIGN_TESTS
 /// The existing Zsign signer, called as `ZsignHandler` calls it. Zsign reads
 /// the private key file directly (no PKCS #12) and takes the matching
-/// certificate from the profile.
+/// certificate from the profile. It signs every nested bundle with the main
+/// app's entitlements, so apps with extensions are refused before it runs.
 struct ZagZsignCodeSigner: ZagCodeSigner {
 	typealias Failure = ZagSignerFailure
 
@@ -44,11 +64,15 @@ struct ZagZsignCodeSigner: ZagCodeSigner {
 #endif
 
 enum ZagFreeAccountSigningError: Error, Equatable {
+	/// Free-account signing is not enabled in this build.
+	case disabled
+	/// No valid authorisation for the result's account and team.
+	case notAuthorized
 	/// The stored identity is not the certificate the profiles were issued for.
 	case identityMismatch
 	case bundleMismatch(expected: String, found: String?)
-	/// Zsign signs nested bundles with the main app's entitlements and profile;
-	/// a free team needs each extension signed for its own App ID.
+	/// The pinned Zsign signs nested bundles with the main app's entitlements
+	/// and profile; a free team needs each extension signed for its own App ID.
 	case extensionsNeedPerBundleSigning([String])
 	case staging
 	case signer(String)
@@ -57,12 +81,24 @@ enum ZagFreeAccountSigningError: Error, Equatable {
 
 /// Signs one provisioned app with Zsign. The private key is written for the
 /// signer only, readable by this user alone, in a private folder that is
-/// removed (after overwriting the key) whether signing succeeds or not.
+/// removed (after overwriting the key) whether signing succeeds or not; see
+/// SIGNING-KEY-SECURITY.md for what deletion does and does not guarantee.
 struct ZagFreeAccountSigningAdapter: Sendable {
 	let signer: ZagCodeSigner
 	var workRoot = FileManager.default.temporaryDirectory
+	var gate = ZagFreeAccountSigningGate.production
 
-	func sign(appAt app: URL, with result: ZagProvisioningResult, identity: ZagSigningIdentity, now: Date) throws -> ZagSignedAppRecord {
+	func sign(
+		appAt app: URL,
+		with result: ZagProvisioningResult,
+		identity: ZagSigningIdentity,
+		authorization: ZagSigningAuthorization,
+		now: Date
+	) throws -> ZagSignedAppRecord {
+		guard gate.isOpen else { throw ZagFreeAccountSigningError.disabled }
+		guard authorization.isValid(at: now), authorization.scope.teamID == result.team else {
+			throw ZagFreeAccountSigningError.notAuthorized
+		}
 		guard identity.serialNumber == result.certificateSerial else { throw ZagFreeAccountSigningError.identityMismatch }
 
 		let found = Self.bundleIdentifier(of: app)
@@ -78,7 +114,10 @@ struct ZagFreeAccountSigningAdapter: Sendable {
 		let staging = workRoot.appendingPathComponent("zag-free-account-signing-\(UUID().uuidString)", isDirectory: true)
 		let keyFile = staging.appendingPathComponent("signing.key")
 		do {
-			try fileManager.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+			try fileManager.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [
+				.posixPermissions: 0o700,
+				.protectionKey: FileProtectionType.completeUnlessOpen
+			])
 		} catch {
 			throw ZagFreeAccountSigningError.staging
 		}
@@ -93,7 +132,10 @@ struct ZagFreeAccountSigningAdapter: Sendable {
 
 		let profileFile = staging.appendingPathComponent("embedded.mobileprovision")
 		let entitlementsFile = staging.appendingPathComponent("entitlements.plist")
-		guard fileManager.createFile(atPath: keyFile.path, contents: identity.privateKey, attributes: [.posixPermissions: 0o600]),
+		guard fileManager.createFile(atPath: keyFile.path, contents: identity.privateKey, attributes: [
+				.posixPermissions: 0o600,
+				.protectionKey: FileProtectionType.completeUnlessOpen
+			  ]),
 			  let entitlements = try? PropertyListSerialization.data(fromPropertyList: result.app.entitlements.dictionary, format: .xml, options: 0),
 			  (try? result.app.profile.data.write(to: profileFile)) != nil,
 			  (try? entitlements.write(to: entitlementsFile)) != nil else {
@@ -112,8 +154,8 @@ struct ZagFreeAccountSigningAdapter: Sendable {
 		guard Self.bundleIdentifier(of: app) == result.app.bundleIdentifier else {
 			throw ZagFreeAccountSigningError.verification("bundle identifier")
 		}
-		// Zsign reports success even when it could not make the CMS signature
-		// (for a certificate it does not recognise), so look for it.
+		// The pinned Zsign reports success even when it could not make the CMS
+		// signature (for a certificate it does not recognise), so look for it.
 		guard let executable = Self.executableName(of: app),
 			  let binary = try? Data(contentsOf: app.appendingPathComponent(executable)),
 			  ZagCodeSignatureInspection.hasCMSSignature(binary) else {
@@ -130,7 +172,13 @@ struct ZagFreeAccountSigningAdapter: Sendable {
 			originalBundleIdentifier: result.app.originalBundleIdentifier,
 			signedAt: now,
 			profileExpiresAt: result.app.profile.expiresAt,
-			certificateExpiresAt: identity.expiresAt
+			certificateExpiresAt: identity.expiresAt,
+			owner: ZagAppOwnership(
+				scope: authorization.scope,
+				teamKind: authorization.teamKind,
+				certificateSerial: identity.serialNumber,
+				profileUUID: result.app.profile.uuid
+			)
 		)
 	}
 
@@ -213,89 +261,190 @@ enum ZagCodeSignatureInspection {
 	}
 }
 
-// MARK: - Lifecycle
+// MARK: - Installation
 
-/// Installs a signed app and reads back, from the device, the expiry iOS
-/// will enforce. The real one will wrap the existing RPPairing installer.
-protocol ZagFreeAccountInstaller: Sendable {
-	func install(signedApp: URL, bundleIdentifier: String) async throws -> (profileExpiresAt: Date, certificateExpiresAt: Date)
+/// What a verified installation must show.
+struct ZagInstallExpectation: Equatable, Sendable {
+	let bundleIdentifier: String
+	let profileUUID: String
+	let profileExpiresAt: Date
+	let certificateExpiresAt: Date
+	/// The signing certificate's common name, as installation_proxy reports it.
+	let signerCommonName: String?
 }
 
-/// Provision, sign, install and record; and the same again as a refresh,
-/// which succeeds only when the device reports a later expiry.
+/// What the device reported after an installation.
+enum ZagInstallVerification: Equatable, Sendable {
+	/// The device itself reported this app's profile and its expiry.
+	case verified(profileExpiresAt: Date, certificateExpiresAt: Date)
+	/// The app is installed, but the device's expiry cannot be read back with
+	/// the current RPPairing core; success is not claimed.
+	case unverifiable(String)
+	/// The device reports something else (another signer, an older profile).
+	case mismatch(String)
+	case notInstalled
+}
+
+/// Installs through the existing installer, then asks the device what it
+/// installed. Only `.verified` counts as a successful install or refresh.
+protocol ZagFreeAccountInstaller: Sendable {
+	func install(signedApp: URL, bundleIdentifier: String) async throws
+	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification
+}
+
+// MARK: - Lifecycle
+
+struct ZagTargetDevice: Equatable, Sendable {
+	let udid: String
+	let name: String
+}
+
+/// Provision, sign, install, verify and record; and the same again as a
+/// refresh, routed to the app's own account and team and successful only
+/// when the device reports a later expiry. An account that is signed out or
+/// expired never signs, and another account is never used instead.
 struct ZagFreeAccountLifecycle: Sendable {
 	enum Outcome: Equatable, Sendable {
+		/// Installed and verified from the device.
 		case installed(ZagSignedAppRecord)
+		/// Installed, but the device's expiry could not be confirmed: recorded,
+		/// never counted as a successful refresh.
+		case installedUnverified(ZagSignedAppRecord)
 		case failed(ZagRefreshFailureReason)
 		case notStarted(ZagRefreshLedger.BeginResult)
 	}
 
+	let directory: ZagAccountDirectory
 	let provisioner: ZagFreeAccountProvisioner
 	let adapter: ZagFreeAccountSigningAdapter
 	let installer: ZagFreeAccountInstaller
 	let secrets: ZagFreeAccountSecretStore
 
-	func install(_ request: ZagProvisioningRequest, appAt app: URL, ledger: inout ZagRefreshLedger, now: Date) async -> Outcome {
-		switch await signAndInstall(request, appAt: app, now: now) {
-		case .installed(var verified, let profileExpiresAt, let certificateExpiresAt):
-			verified.profileExpiresAt = profileExpiresAt
-			verified.certificateExpiresAt = certificateExpiresAt
-			ledger.record(verified)
-			return .installed(verified)
+	/// A first installation, for the chosen (or default) account and team.
+	func install(
+		app component: ZagProvisioningRequest.Component,
+		scope explicit: ZagSigningScope?,
+		device: ZagTargetDevice,
+		appAt app: URL,
+		ledger: inout ZagRefreshLedger,
+		now: Date
+	) async -> Outcome {
+		let authorization: ZagSigningAuthorization
+		do {
+			authorization = try await directory.authorize(try await directory.signingScope(explicit: explicit))
+		} catch {
+			return .failed(.signedOut)
+		}
+		let request = Self.request(component, authorization: authorization, device: device, ledger: ledger)
+		switch await signAndInstall(request, authorization: authorization, appAt: app, now: now) {
+		case .verified(var record, let profileExpiresAt, let certificateExpiresAt):
+			record.profileExpiresAt = profileExpiresAt
+			record.certificateExpiresAt = certificateExpiresAt
+			record.expiryVerified = true
+			ledger.record(record)
+			return .installed(record)
+		case .unverified(var record):
+			record.expiryVerified = false
+			ledger.record(record)
+			return .installedUnverified(record)
 		case .failed(let reason):
 			return .failed(reason)
 		}
 	}
 
-	/// `request` is the original app again; the app already holds its install
-	/// slot, so it is listed as installed.
-	func refresh(_ bundleIdentifier: String, request: ZagProvisioningRequest, appAt app: URL, ledger: inout ZagRefreshLedger, now: Date, userInitiated: Bool) async -> Outcome {
+	/// Refreshes an installed app with the account and team that signed it.
+	func refresh(
+		_ bundleIdentifier: String,
+		app component: ZagProvisioningRequest.Component,
+		device: ZagTargetDevice,
+		appAt app: URL,
+		ledger: inout ZagRefreshLedger,
+		now: Date,
+		userInitiated: Bool
+	) async -> Outcome {
+		let authorization: ZagSigningAuthorization
+		switch await directory.route(bundleIdentifier, ledger: ledger) {
+		case .blocked(let reason):
+			ledger.markBlocked(bundleIdentifier, reason: reason, at: now)
+			return .failed(reason)
+		case .refresh(let granted):
+			authorization = granted
+		}
 		let begin = ledger.begin(bundleIdentifier, at: now, userInitiated: userInitiated)
 		guard begin == .started else { return .notStarted(begin) }
-		let refreshing = ZagProvisioningRequest(
-			accountID: request.accountID, team: request.team, deviceUDID: request.deviceUDID, deviceName: request.deviceName,
-			app: request.app, extensions: request.extensions,
-			installedFreeAccountApps: request.installedFreeAccountApps.union([bundleIdentifier])
-		)
-		switch await signAndInstall(refreshing, appAt: app, now: now) {
-		case .installed(_, let profileExpiresAt, let certificateExpiresAt):
+		let request = Self.request(component, authorization: authorization, device: device, ledger: ledger)
+		switch await signAndInstall(request, authorization: authorization, appAt: app, now: now) {
+		case .verified(let record, let profileExpiresAt, let certificateExpiresAt):
 			do {
 				try ledger.finishSucceeded(bundleIdentifier, installedProfileExpiresAt: profileExpiresAt, installedCertificateExpiresAt: certificateExpiresAt, at: now)
 			} catch {
 				return .failed(.notVerified)
 			}
+			ledger.updateOwnership(bundleIdentifier, certificateSerial: record.owner?.certificateSerial, profileUUID: record.owner?.profileUUID)
 			return ledger.records[bundleIdentifier].map(Outcome.installed) ?? .failed(.notVerified)
+		case .unverified:
+			ledger.finishFailed(bundleIdentifier, reason: .notVerified, at: now)
+			return .failed(.notVerified)
 		case .failed(let reason):
 			ledger.finishFailed(bundleIdentifier, reason: reason, at: now)
 			return .failed(reason)
 		}
 	}
 
+	/// The request for the authorised scope. iOS's 3-app limit for free
+	/// development profiles is counted across every account's free-team apps.
+	static func request(_ component: ZagProvisioningRequest.Component, authorization: ZagSigningAuthorization, device: ZagTargetDevice, ledger: ZagRefreshLedger) -> ZagProvisioningRequest {
+		ZagProvisioningRequest(
+			accountID: authorization.scope.accountID,
+			team: authorization.scope.teamID,
+			deviceUDID: device.udid,
+			deviceName: device.name,
+			app: component,
+			extensions: [],
+			installedFreeAccountApps: ledger.freeAppLimitApps
+		)
+	}
+
 	private enum Attempt {
-		case installed(ZagSignedAppRecord, profileExpiresAt: Date, certificateExpiresAt: Date)
+		case verified(ZagSignedAppRecord, profileExpiresAt: Date, certificateExpiresAt: Date)
+		case unverified(ZagSignedAppRecord)
 		case failed(ZagRefreshFailureReason)
 	}
 
-	private func signAndInstall(_ request: ZagProvisioningRequest, appAt app: URL, now: Date) async -> Attempt {
+	private func signAndInstall(_ request: ZagProvisioningRequest, authorization: ZagSigningAuthorization, appAt app: URL, now: Date) async -> Attempt {
 		let result: ZagProvisioningResult
-		switch await provisioner.provision(request) {
+		switch await provisioner.provision(request, authorization: authorization) {
 		case .success(let value): result = value
 		case .failure(let failure): return .failed(Self.reason(for: failure.kind))
 		}
-		guard let stored = try? secrets.load(.signingPrivateKey, account: request.accountID),
+		guard let stored = try? secrets.load(.signingPrivateKey, account: authorization.scope.accountID, team: authorization.scope.teamID),
 			  let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: stored) else {
 			return .failed(.signingFailed)
 		}
 		let record: ZagSignedAppRecord
 		do {
-			record = try adapter.sign(appAt: app, with: result, identity: identity, now: now)
+			record = try adapter.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: now)
 		} catch {
 			return .failed(.signingFailed)
 		}
 		do {
-			let installed = try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier)
-			return .installed(record, profileExpiresAt: installed.profileExpiresAt, certificateExpiresAt: installed.certificateExpiresAt)
+			try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier)
 		} catch {
+			return .failed(.installFailed)
+		}
+		let expectation = ZagInstallExpectation(
+			bundleIdentifier: record.bundleIdentifier,
+			profileUUID: result.app.profile.uuid,
+			profileExpiresAt: record.profileExpiresAt,
+			certificateExpiresAt: record.certificateExpiresAt,
+			signerCommonName: ZagCertificateInspection(der: identity.certificate)?.commonName
+		)
+		switch await installer.verify(expectation) {
+		case .verified(let profileExpiresAt, let certificateExpiresAt):
+			return .verified(record, profileExpiresAt: profileExpiresAt, certificateExpiresAt: certificateExpiresAt)
+		case .unverifiable:
+			return .unverified(record)
+		case .mismatch, .notInstalled:
 			return .failed(.installFailed)
 		}
 	}
@@ -303,7 +452,7 @@ struct ZagFreeAccountLifecycle: Sendable {
 	static func reason(for kind: ZagProvisioningFailure.Kind) -> ZagRefreshFailureReason {
 		switch kind {
 		// Retrying cannot help until the user signs in (or a build that can).
-		case .sessionRejected, .unavailable: return .signedOut
+		case .sessionRejected, .unavailable, .notAuthorized: return .signedOut
 		case .network, .rateLimited, .timedOut, .unexpectedResponse: return .network
 		case .appIDCapacityExhausted: return .appIDCapacity
 		case .installSlotsFull: return .installSlots
@@ -313,4 +462,3 @@ struct ZagFreeAccountLifecycle: Sendable {
 		}
 	}
 }
-#endif

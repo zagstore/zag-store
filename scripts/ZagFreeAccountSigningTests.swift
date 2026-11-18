@@ -82,10 +82,13 @@ final class TestClock: @unchecked Sendable {
 final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	private let lock = NSLock()
 	var items: [String: Data] = [:]
-	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID) throws { lock.withLock { items["\(account).\(kind)"] = secret } }
-	func load(_ kind: ZagFreeAccountSecretKind, account: UUID) throws -> Data? { lock.withLock { items["\(account).\(kind)"] } }
-	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID) throws { lock.withLock { items["\(account).\(kind)"] = nil } }
-	var identity: ZagSigningIdentity? { items["\(account).signingPrivateKey"].flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) } }
+	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = secret } }
+	func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] } }
+	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = nil } }
+	func deleteAll(account: UUID) throws { lock.withLock { items = items.filter { !$0.key.hasPrefix("\(account).") } } }
+	func identity(_ account: UUID, _ team: String) -> ZagSigningIdentity? {
+		lock.withLock { items["\(account).signingPrivateKey.\(team)"] }.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
+	}
 }
 
 final class RecordingSigner: ZagCodeSigner, @unchecked Sendable {
@@ -101,29 +104,42 @@ final class RecordingSigner: ZagCodeSigner, @unchecked Sendable {
 	}
 }
 
-/// Stands in for the RPPairing installer: "installs" by copying, then reads
-/// the expiry back from the installed app, as the real check will.
+/// Stands in for the RPPairing installer and a device-side read-back: it
+/// "installs" by copying, then reports the installed profile, as a verifier
+/// that can read the device's profiles would. `unverifiable` stands for the
+/// current RPPairing core, which cannot read the expiry back.
 actor TestDevice: ZagFreeAccountInstaller {
 	enum Failure: Error { case installFailed }
+	let root = work.appendingPathComponent("device-\(UUID().uuidString)")
 	private(set) var installs = 0
 	var failNext = false
 	var reportOldExpiryNext: Date?
+	var unverifiable = false
 	func setFailNext() { failNext = true }
 	func setReportOldExpiryNext(_ date: Date) { reportOldExpiryNext = date }
+	func setUnverifiable(_ value: Bool) { unverifiable = value }
 
-	func install(signedApp: URL, bundleIdentifier: String) async throws -> (profileExpiresAt: Date, certificateExpiresAt: Date) {
+	func install(signedApp: URL, bundleIdentifier: String) async throws {
 		if failNext { failNext = false; throw Failure.installFailed }
-		let destination = work.appendingPathComponent("device/\(bundleIdentifier).app")
+		let destination = root.appendingPathComponent("\(bundleIdentifier).app")
 		try? FileManager.default.removeItem(at: destination)
-		try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+		try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 		try FileManager.default.copyItem(at: signedApp, to: destination)
 		installs += 1
-		let profile = try Certificate.decode(profileData: Data(contentsOf: destination.appendingPathComponent("embedded.mobileprovision")))!
+	}
+
+	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification {
+		if unverifiable { return .unverifiable("expiry read-back is not available") }
+		let installed = root.appendingPathComponent("\(expectation.bundleIdentifier).app/embedded.mobileprovision")
+		guard let data = try? Data(contentsOf: installed), let profile = try? Certificate.decode(profileData: data) else { return .notInstalled }
+		guard profile.UUID == expectation.profileUUID else { return .mismatch("profile") }
 		let certificate = (profile.DeveloperCertificates ?? []).compactMap { ZagCertificateInspection(der: $0)?.expiresAt }.min()!
-		if let old = reportOldExpiryNext { reportOldExpiryNext = nil; return (old, certificate) }
-		return (profile.ExpirationDate, certificate)
+		if let old = reportOldExpiryNext { reportOldExpiryNext = nil; return .verified(profileExpiresAt: old, certificateExpiresAt: certificate) }
+		return .verified(profileExpiresAt: profile.ExpirationDate, certificateExpiresAt: certificate)
 	}
 }
+
+let device = ZagTargetDevice(udid: udid, name: "Test iPhone")
 
 func makeApp(bundleIdentifier: String = "com.example.notes", extensions: [String] = []) -> URL {
 	let app = work.appendingPathComponent("apps/\(UUID().uuidString)/Notes.app")
@@ -166,33 +182,85 @@ func request(installed: Set<String> = [], app: String = "com.example.notes") -> 
 	)
 }
 
+func component(_ app: String = "com.example.notes") -> ZagProvisioningRequest.Component {
+	request(app: app).app
+}
+
+/// One simulated account (and team) signed in to a real account directory,
+/// with its own portal, provisioner and lifecycle. Several can share a
+/// directory, Keychain store and device.
 struct Harness {
-	let clock = TestClock()
-	let secrets = MemorySecrets()
+	let clock: TestClock
+	let secrets: MemorySecrets
+	let directory: ZagAccountDirectory
+	let service: ZagSimulatedAuthenticationService
+	let appleID: String
+	let account: UUID
+	let team: String
 	let diagnostics = ZagFreeAccountDiagnostics()
-	let signer = RecordingSigner()
-	let device = TestDevice()
+	let signer: RecordingSigner
+	let device: TestDevice
 	let staging: URL
 	let portal: ZagSimulatedDeveloperPortal
 	let provisioner: ZagFreeAccountProvisioner
 	let lifecycle: ZagFreeAccountLifecycle
 	var adapter: ZagFreeAccountSigningAdapter { lifecycle.adapter }
 
-	init(issuer: OpenSSLIssuer = OpenSSLIssuer()) {
-		let clock = self.clock
-		staging = work.appendingPathComponent("staging-\(UUID().uuidString)")
+	static func make(issuer: OpenSSLIssuer = OpenSSLIssuer()) async -> Harness {
+		let clock = TestClock(), secrets = MemorySecrets()
+		let (directory, service) = SimulatedAccounts.directory(now: { clock.now }, secrets: secrets)
+		return await make(SimulatedAccounts.tester, team: "SIMTEAM001", clock: clock, secrets: secrets, directory: directory, service: service,
+						  signer: RecordingSigner(), device: TestDevice(), issuer: issuer)
+	}
+
+	/// Another account (or team) on the same directory, Keychain and device.
+	func adding(_ appleID: String, team: String, issuer: OpenSSLIssuer = OpenSSLIssuer()) async -> Harness {
+		await Harness.make(appleID, team: team, clock: clock, secrets: secrets, directory: directory, service: service, signer: signer, device: device, issuer: issuer)
+	}
+
+	static func make(
+		_ appleID: String, team: String, clock: TestClock, secrets: MemorySecrets, directory: ZagAccountDirectory,
+		service: ZagSimulatedAuthenticationService, signer: RecordingSigner, device: TestDevice, issuer: OpenSSLIssuer
+	) async -> Harness {
+		let account: UUID
+		if let known = await directory.registry.accounts.first(where: { $0.teams.contains { $0.identifier == team } })?.id {
+			account = known
+		} else {
+			account = await SimulatedAccounts.signIn(appleID, to: directory)!
+		}
+		let staging = work.appendingPathComponent("staging-\(UUID().uuidString)")
 		try! FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-		portal = ZagSimulatedDeveloperPortal(team: team, clock: { clock.now }, issuer: issuer)
-		provisioner = ZagFreeAccountProvisioner(
+		let portal = ZagSimulatedDeveloperPortal(team: team, clock: { clock.now }, issuer: issuer)
+		let provisioner = ZagFreeAccountProvisioner(
 			portal: portal, keys: ZagSecuritySigningKeyFactory(), secrets: secrets,
-			diagnostics: diagnostics, now: { clock.now }
+			account: account, now: { clock.now }
 		)
-		lifecycle = ZagFreeAccountLifecycle(
+		let lifecycle = ZagFreeAccountLifecycle(
+			directory: directory,
 			provisioner: provisioner,
-			adapter: ZagFreeAccountSigningAdapter(signer: signer, workRoot: staging),
+			adapter: ZagFreeAccountSigningAdapter(signer: signer, workRoot: staging, gate: .simulationOnly),
 			installer: device,
 			secrets: secrets
 		)
+		return Harness(clock: clock, secrets: secrets, directory: directory, service: service, appleID: appleID, account: account, team: team,
+					   signer: signer, device: device, staging: staging, portal: portal, provisioner: provisioner, lifecycle: lifecycle)
+	}
+
+	var scope: ZagSigningScope { ZagSigningScope(accountID: account, teamID: team) }
+	var identity: ZagSigningIdentity? { secrets.identity(account, team) }
+	var bundle: String { "com.example.notes.\(team)" }
+	func authorization() async -> ZagSigningAuthorization { try! await directory.authorize(scope) }
+
+	func provision(_ r: ZagProvisioningRequest) async -> Result<ZagProvisioningResult, ZagProvisioningFailure> {
+		let mine = ZagProvisioningRequest(accountID: account, team: team, deviceUDID: r.deviceUDID, deviceName: r.deviceName,
+										  app: r.app, extensions: r.extensions, installedFreeAccountApps: r.installedFreeAccountApps)
+		return await provisioner.provision(mine, authorization: await authorization())
+	}
+
+	/// Signs in to this account again (after its session expired or was rejected).
+	func signInAgain() async {
+		let authenticator = await directory.authenticator(for: account)!
+		_ = await authenticator.signIn(appleID: appleID, password: ZagEphemeralSecret(ZagFreeAccountSimulation.password))
 	}
 
 	var stagingIsEmpty: Bool { ((try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? ["?"]).isEmpty }
@@ -214,6 +282,7 @@ struct Harness {
 		await extensionsAndGuards()
 		await lifecycle()
 		await lifecycleFailures()
+		await multipleAccounts()
 		print("SUCCESS: \(passed) free-account signing and lifecycle checks passed")
 	}
 
@@ -293,9 +362,10 @@ struct Harness {
 	// MARK: Signing with Zsign
 
 	static func signing() async {
-		let h = Harness()
-		guard let result = await h.provisioner.provision(request()).value else { return check(false, "provisioning with real keys") }
-		guard let identity = h.secrets.identity else { return check(false, "identity stored") }
+		let h = await Harness.make()
+		guard let result = await h.provision(request()).value else { return check(false, "provisioning with real keys") }
+		guard let identity = h.identity else { return check(false, "identity stored") }
+		let auth = await h.authorization()
 		check(identity.serialNumber == result.certificateSerial && result.changes.createdCertificate,
 			  "provisioning makes a key, gets a certificate for it and stores the identity")
 		let issued = await h.portal.issuedCertificates.count
@@ -303,7 +373,7 @@ struct Harness {
 
 		let app = makeApp()
 		let record: ZagSignedAppRecord
-		do { record = try h.adapter.sign(appAt: app, with: result, identity: identity, now: h.clock.now) } catch {
+		do { record = try h.adapter.sign(appAt: app, with: result, identity: identity, authorization: auth, now: h.clock.now) } catch {
 			return check(false, "signing failed: \(error)")
 		}
 		check(h.signer.calls == 1, "the app is signed once, by Zsign")
@@ -338,12 +408,13 @@ struct Harness {
 	// MARK: Extensions and adapter guards
 
 	static func extensionsAndGuards() async {
-		let h = Harness()
-		guard let result = await h.provisioner.provision(request()).value, let identity = h.secrets.identity else { return check(false, "provision") }
+		let h = await Harness.make()
+		guard let result = await h.provision(request()).value, let identity = h.identity else { return check(false, "provision") }
+		let auth = await h.authorization()
 
 		let withExtension = makeApp(extensions: ["Widget"])
 		do {
-			_ = try h.adapter.sign(appAt: withExtension, with: result, identity: identity, now: h.clock.now)
+			_ = try h.adapter.sign(appAt: withExtension, with: result, identity: identity, authorization: auth, now: h.clock.now)
 			check(false, "apps with extensions are refused")
 		} catch {
 			check(error as? ZagFreeAccountSigningError == .extensionsNeedPerBundleSigning(["PlugIns/Widget.appex"]) && h.signer.calls == 0,
@@ -366,13 +437,13 @@ struct Harness {
 
 		let other = ZagSigningIdentity(serialNumber: "DEADBEEF", certificate: identity.certificate, privateKey: identity.privateKey, expiresAt: identity.expiresAt)
 		do {
-			_ = try h.adapter.sign(appAt: makeApp(), with: result, identity: other, now: h.clock.now)
+			_ = try h.adapter.sign(appAt: makeApp(), with: result, identity: other, authorization: auth, now: h.clock.now)
 			check(false, "identity mismatch")
 		} catch {
 			check(error as? ZagFreeAccountSigningError == .identityMismatch && h.signer.calls == 0, "an identity that is not the profiles' certificate is refused")
 		}
 		do {
-			_ = try h.adapter.sign(appAt: makeApp(bundleIdentifier: "com.example.other"), with: result, identity: identity, now: h.clock.now)
+			_ = try h.adapter.sign(appAt: makeApp(bundleIdentifier: "com.example.other"), with: result, identity: identity, authorization: auth, now: h.clock.now)
 			check(false, "bundle mismatch")
 		} catch {
 			check(error as? ZagFreeAccountSigningError == .bundleMismatch(expected: "com.example.notes", found: "com.example.other") && h.signer.calls == 0,
@@ -382,7 +453,7 @@ struct Harness {
 		let broken = makeApp()
 		try! Data("not a Mach-O".utf8).write(to: broken.appendingPathComponent("Notes"))
 		do {
-			_ = try h.adapter.sign(appAt: broken, with: result, identity: identity, now: h.clock.now)
+			_ = try h.adapter.sign(appAt: broken, with: result, identity: identity, authorization: auth, now: h.clock.now)
 			check(false, "broken executable")
 		} catch {
 			if case .signer? = error as? ZagFreeAccountSigningError { check(true, "a signing failure from Zsign is reported") } else { check(false, "signer error: \(error)") }
@@ -391,12 +462,12 @@ struct Harness {
 
 		// Zsign says "Signed OK" for a certificate whose issuer it does not
 		// recognise, but makes no CMS signature; the adapter must catch that.
-		let unrecognised = Harness(issuer: OpenSSLIssuer(authority: otherAuthority))
-		guard let otherResult = await unrecognised.provisioner.provision(request()).value, let otherIdentity = unrecognised.secrets.identity else {
+		let unrecognised = await Harness.make(issuer: OpenSSLIssuer(authority: otherAuthority))
+		guard let otherResult = await unrecognised.provision(request()).value, let otherIdentity = unrecognised.identity else {
 			return check(false, "provision with the other authority")
 		}
 		do {
-			_ = try unrecognised.adapter.sign(appAt: makeApp(), with: otherResult, identity: otherIdentity, now: unrecognised.clock.now)
+			_ = try unrecognised.adapter.sign(appAt: makeApp(), with: otherResult, identity: otherIdentity, authorization: await unrecognised.authorization(), now: unrecognised.clock.now)
 			check(false, "unsigned result accepted")
 		} catch {
 			check(error as? ZagFreeAccountSigningError == .verification("no signature") && unrecognised.stagingIsEmpty,
@@ -407,12 +478,12 @@ struct Harness {
 	// MARK: Lifecycle
 
 	static func lifecycle() async {
-		let h = Harness()
+		let h = await Harness.make()
 		var ledger = ZagRefreshLedger()
 		let bundle = "com.example.notes.\(team)"
 		let start = h.clock.now
 
-		guard case .installed(let first) = await h.lifecycle.install(request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now) else {
+		guard case .installed(let first) = await h.lifecycle.install(app: component(), scope: nil, device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now) else {
 			return check(false, "first install")
 		}
 		let installs = await h.device.installs
@@ -427,7 +498,7 @@ struct Harness {
 
 		let certificatesBefore = await h.portal.issuedCertificates.count
 		let mutationsBefore = await h.portal.mutations.count
-		guard case .installed(let refreshed) = await h.lifecycle.refresh(bundle, request: request(installed: []), appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: false) else {
+		guard case .installed(let refreshed) = await h.lifecycle.refresh(bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: false) else {
 			return check(false, "refresh")
 		}
 		let certificatesAfter = await h.portal.issuedCertificates.count
@@ -441,7 +512,7 @@ struct Harness {
 		h.clock.advance(days: 8)
 		check(ledger.records[bundle]?.urgency(at: h.clock.now) == .expired && ledger.refreshAllOrder(at: h.clock.now) == [bundle],
 			  "8 days later the app has expired and is first in Refresh All")
-		guard case .installed(let revived) = await h.lifecycle.refresh(bundle, request: request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true) else {
+		guard case .installed(let revived) = await h.lifecycle.refresh(bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true) else {
 			return check(false, "refresh after expiry")
 		}
 		let calls = await h.portal.calls
@@ -451,59 +522,195 @@ struct Harness {
 	}
 
 	static func lifecycleFailures() async {
-		let h = Harness()
+		let h = await Harness.make()
 		var ledger = ZagRefreshLedger()
 		let bundle = "com.example.notes.\(team)"
-		guard case .installed = await h.lifecycle.install(request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now) else { return check(false, "install") }
+		guard case .installed = await h.lifecycle.install(app: component(), scope: nil, device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now) else { return check(false, "install") }
 
 		h.clock.advance(days: 4.5)
 		let old = ledger.records[bundle]!.profileExpiresAt
 		await h.device.setReportOldExpiryNext(old)
-		let stale = await h.lifecycle.refresh(bundle, request: request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
+		let stale = await h.lifecycle.refresh(bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
 		check(stale == .failed(.notVerified) && ledger.records[bundle]?.lastFailure?.reason == .notVerified && ledger.records[bundle]?.profileExpiresAt == old,
 			  "a refresh the device does not confirm is recorded as not verified, not as done")
 
 		await h.device.setFailNext()
-		let failed = await h.lifecycle.refresh(bundle, request: request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
+		let failed = await h.lifecycle.refresh(bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
 		check(failed == .failed(.installFailed), "an installation failure is recorded")
-		let automatic = await h.lifecycle.refresh(bundle, request: request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: false)
+		let automatic = await h.lifecycle.refresh(bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: false)
 		if case .notStarted(.backingOff) = automatic { check(true, "automatic refreshes back off after failures") } else { check(false, "backoff: \(automatic)") }
 
 		await h.portal.fail(.appIDs, with: .sessionRejected)
-		let signedOut = await h.lifecycle.refresh(bundle, request: request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
+		let signedOut = await h.lifecycle.refresh(bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
 		let held = ledger.begin(bundle, at: h.clock.now + 86_400, userInitiated: false)
 		check(signedOut == .failed(.signedOut) && held == .backingOff(until: .distantFuture), "an expired session stops automatic refreshes until the user signs in")
-		ledger.finishFailed(bundle, reason: .cancelled, at: h.clock.now)
-		ledger.resolve(.cancelled)
+		ledger.resolve(.signedOut, account: h.account)
 		await h.portal.fail(.appIDs, with: nil)
 
 		let signings = h.signer.calls
 		await h.portal.tamperProfiles(.missingDevice)
-		let tampered = await h.lifecycle.refresh(bundle, request: request(), appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
+		let tampered = await h.lifecycle.refresh(bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: h.clock.now, userInitiated: true)
 		check(tampered == .failed(.signingFailed) && h.signer.calls == signings, "a profile without this device is never used to sign")
 		await h.portal.tamperProfiles(nil)
 
-		let full = await h.lifecycle.install(request(installed: ["a.\(team)", "b.\(team)", bundle], app: "com.example.fourth"), appAt: makeApp(bundleIdentifier: "com.example.fourth"), ledger: &ledger, now: h.clock.now)
+		for other in ["a.\(team)", "b.\(team)"] {
+			ledger.record(ZagSignedAppRecord(bundleIdentifier: other, originalBundleIdentifier: other, signedAt: h.clock.now,
+											 profileExpiresAt: h.clock.now + 86_400, certificateExpiresAt: h.clock.now + 86_400))
+		}
+		let full = await h.lifecycle.install(app: component("com.example.fourth"), scope: nil, device: device, appAt: makeApp(bundleIdentifier: "com.example.fourth"), ledger: &ledger, now: h.clock.now)
 		check(full == .failed(.installSlots) && h.signer.calls == signings, "a fourth app is refused before anything is signed")
 
-		let limited = Harness()
+		let limited = await Harness.make()
 		await limited.portal.seedCertificate(serial: "AAAA", expiresAt: limited.clock.now + 100 * 86_400)
 		await limited.portal.seedCertificate(serial: "BBBB", expiresAt: limited.clock.now + 200 * 86_400)
 		var other = ZagRefreshLedger()
-		let refused = await limited.lifecycle.install(request(), appAt: makeApp(), ledger: &other, now: limited.clock.now)
+		let refused = await limited.lifecycle.install(app: component(), scope: nil, device: device, appAt: makeApp(), ledger: &other, now: limited.clock.now)
 		let remaining = await limited.portal.issuedCertificates.map(\.serialNumber)
 		check(refused == .failed(.signingFailed) && remaining == ["AAAA", "BBBB"] && limited.signer.calls == 0,
 			  "at the certificate limit nothing is revoked and nothing is signed")
 
 		let disabled = ZagFreeAccountLifecycle(
-			provisioner: ZagFreeAccountProvisioner(secrets: MemorySecrets()),
+			directory: limited.directory,
+			provisioner: ZagFreeAccountProvisioner(secrets: MemorySecrets(), now: { limited.clock.now }),
 			adapter: ZagFreeAccountSigningAdapter(signer: limited.signer, workRoot: limited.staging),
 			installer: limited.device, secrets: MemorySecrets()
 		)
 		var none = ZagRefreshLedger()
-		let unavailable = await disabled.install(request(), appAt: makeApp(), ledger: &none, now: Date())
+		let unavailable = await disabled.install(app: component(), scope: nil, device: device, appAt: makeApp(), ledger: &none, now: limited.clock.now)
 		check(unavailable == .failed(.signedOut) && limited.signer.calls == 0 && ZagLivePortal.isEnabled == false && ZagLiveAuthentication.isEnabled == false && ZagAnisetteLive.isEnabled == false,
 			  "the default build cannot provision or sign: live portal, sign-in and anisette are off")
+		check(ZagFreeAccountSigning.isEnabled == false && ZagFreeAccountSigningGate.production.isOpen == false, "the production signing gate is closed")
+		let gated = await Harness.make()
+		guard let result = await gated.provision(request()).value, let identity = gated.identity else { return check(false, "provision for the gate") }
+		let closed = ZagFreeAccountSigningAdapter(signer: gated.signer, workRoot: gated.staging)
+		do {
+			_ = try closed.sign(appAt: makeApp(), with: result, identity: identity, authorization: await gated.authorization(), now: gated.clock.now)
+			check(false, "closed gate signed")
+		} catch {
+			check(error as? ZagFreeAccountSigningError == .disabled && gated.signer.calls == 0, "the production adapter refuses to sign while the gate is closed")
+		}
+	}
+
+	// MARK: Several accounts on one device
+
+	static func multipleAccounts() async {
+		let free1 = await Harness.make()
+		let free2 = await free1.adding(SimulatedAccounts.second, team: "SIMTEAM002")
+		let paid = await free1.adding(SimulatedAccounts.paid, team: "SIMPAID001")
+		let org = await free1.adding(SimulatedAccounts.paid, team: "SIMORG0001")
+		let accounts = await free1.directory.registry.accounts
+		check(accounts.count == 3 && Set([free1.account, free2.account, paid.account]).count == 3 && org.account == paid.account,
+			  "three accounts are signed in at once; the paid account's two teams share one account")
+		check(accounts.first { $0.id == paid.account }?.teams.map(\.kind) == [.individualPaid, .organization], "a paid account lists all its teams")
+		var ledger = ZagRefreshLedger()
+		let now = free1.clock.now
+
+		// Each account and team signs with its own certificate and key.
+		guard case .installed(let a) = await free1.lifecycle.install(app: component(), scope: nil, device: device, appAt: makeApp(), ledger: &ledger, now: now),
+			  case .installed(let b) = await free2.lifecycle.install(app: component(), scope: free2.scope, device: device, appAt: makeApp(), ledger: &ledger, now: now),
+			  case .installed(let c) = await paid.lifecycle.install(app: component(), scope: paid.scope, device: device, appAt: makeApp(), ledger: &ledger, now: now),
+			  case .installed(let d) = await org.lifecycle.install(app: component(), scope: org.scope, device: device, appAt: makeApp(), ledger: &ledger, now: now) else {
+			return check(false, "install with each account")
+		}
+		check(a.owner?.scope == free1.scope && b.owner?.scope == free2.scope && c.owner?.scope == paid.scope && d.owner?.scope == org.scope,
+			  "each installed app records the account and team that signed it (the default for the first)")
+		let serials = [a, b, c, d].compactMap { $0.owner?.certificateSerial }
+		check(Set(serials).count == 4 && serials == [free1, free2, paid, org].compactMap { $0.identity?.serialNumber },
+			  "each account and team has its own certificate, stored under its own Keychain item")
+		check(a.expiryVerified == true && c.owner?.teamKind == .individualPaid, "installs are verified from the device and keep the team kind")
+		check(ledger.freeAppLimitApps == [free1.bundle, free2.bundle], "only free teams' apps count towards the 3-app limit, across accounts")
+
+		// iOS's limit is per device: a third free app from either account fits, a fourth does not.
+		guard case .installed = await free1.lifecycle.install(app: component("com.example.third"), scope: nil, device: device, appAt: makeApp(bundleIdentifier: "com.example.third"), ledger: &ledger, now: now) else {
+			return check(false, "third free app")
+		}
+		let signings = free1.signer.calls
+		let fourth = await free2.lifecycle.install(app: component("com.example.fourth"), scope: free2.scope, device: device, appAt: makeApp(bundleIdentifier: "com.example.fourth"), ledger: &ledger, now: now)
+		check(fourth == .failed(.installSlots) && free1.signer.calls == signings, "a second account cannot get round the device's 3 free-app limit")
+		guard case .installed = await paid.lifecycle.install(app: component("com.example.fifth"), scope: paid.scope, device: device, appAt: makeApp(bundleIdentifier: "com.example.fifth"), ledger: &ledger, now: now) else {
+			return check(false, "paid app beyond 3")
+		}
+		check(true, "a paid team's app is not held to the free 3-app limit")
+
+		// A provisioner works only for its own account.
+		let crossed = await free1.lifecycle.install(app: component("com.example.cross"), scope: free2.scope, device: device, appAt: makeApp(bundleIdentifier: "com.example.cross"), ledger: &ledger, now: now)
+		check(crossed == .failed(.signedOut) && free1.signer.calls == signings + 1, "one account's provisioner refuses to provision for another")
+
+		// Refreshes go to the app's own account and team.
+		free1.clock.advance(days: 4.5)
+		let later = free1.clock.now
+		let route = await free1.directory.route(free2.bundle, ledger: ledger)
+		check(route == .refresh(try! await free1.directory.authorize(free2.scope)), "an app's refresh is routed to the account and team that signed it")
+		guard case .installed(let refreshedB) = await free2.lifecycle.refresh(free2.bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: later, userInitiated: true) else {
+			return check(false, "refresh second account")
+		}
+		check(refreshedB.owner?.scope == free2.scope && refreshedB.owner?.certificateSerial == b.owner?.certificateSerial,
+			  "a refresh keeps the owner and reuses its certificate")
+
+		// Signing out one account leaves the others signed in and its assets kept.
+		try! await free1.directory.signOut(free2.account)
+		let blocked = await free1.directory.route(free2.bundle, ledger: ledger)
+		let free1Route = await free1.directory.route(free1.bundle, ledger: ledger)
+		if case .refresh(let granted) = free1Route { check(granted.scope == free1.scope && blocked == .blocked(.signedOut), "signing out one account blocks only its own refreshes") }
+		else { check(false, "first account still routes") }
+		let afterSignOut = await free2.lifecycle.refresh(free2.bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: later, userInitiated: true)
+		check(afterSignOut == .failed(.signedOut) && ledger.records[free2.bundle]?.owner?.scope == free2.scope,
+			  "a signed-out account's app is not refreshed and is never given to another account")
+		check(free2.identity != nil && free1.identity != nil, "signing out keeps every account's signing identity")
+		let calls = free1.signer.calls
+		let explicit = await free2.lifecycle.install(app: component("com.example.notes"), scope: free2.scope, device: device, appAt: makeApp(), ledger: &ledger, now: later)
+		check(explicit == .failed(.signedOut) && free1.signer.calls == calls, "a signed-out account cannot sign, even when chosen explicitly")
+		try! await free1.directory.setDefault(free2.scope)
+		let viaDefault = await free1.lifecycle.install(app: component("com.example.default"), scope: nil, device: device, appAt: makeApp(bundleIdentifier: "com.example.default"), ledger: &ledger, now: later)
+		check(viaDefault == .failed(.signedOut) && free1.signer.calls == calls, "a signed-out default account is not replaced by another one")
+		try! await free1.directory.setDefault(free1.scope)
+
+		ledger.resolve(.signedOut, account: free1.account)
+		check(ledger.records[free2.bundle]?.lastFailure?.reason == .signedOut, "resolving one account's sign-in leaves another's failures")
+		await free2.signInAgain()
+		ledger.resolve(.signedOut, account: free2.account)
+		free1.clock.advance(days: 1)
+		let again = await free2.lifecycle.refresh(free2.bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: free1.clock.now, userInitiated: false)
+		guard case .installed = again else { return check(false, "refresh after signing in again: \(again)") }
+		check(true, "after signing in again the account's apps refresh automatically")
+
+		// A failure in one account does not affect another.
+		await free2.portal.fail(.appIDs, with: .network)
+		free1.clock.advance(days: 1)
+		let failing = await free2.lifecycle.refresh(free2.bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: free1.clock.now, userInitiated: true)
+		let fine = await free1.lifecycle.refresh(free1.bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: free1.clock.now, userInitiated: true)
+		if case .installed = fine { check(failing == .failed(.network), "one account's portal failure leaves the others working") } else { check(false, "isolation: \(fine)") }
+		await free2.portal.fail(.appIDs, with: nil)
+
+		// The device cannot report the expiry: installed, but never a successful refresh.
+		await free1.device.setUnverifiable(true)
+		free1.clock.advance(days: 1)
+		let unverified = await free1.lifecycle.refresh(free1.bundle, app: component(), device: device, appAt: makeApp(), ledger: &ledger, now: free1.clock.now, userInitiated: true)
+		check(unverified == .failed(.notVerified) && ledger.records[free1.bundle]?.lastFailure?.reason == .notVerified,
+			  "a refresh whose expiry cannot be read back is recorded as not verified")
+		await free1.device.setUnverifiable(false)
+
+		// Removing an account: confirmation, its secrets gone, its apps kept but never refreshed.
+		let plan = try! await free1.directory.removalPlan(for: paid.account, ledger: ledger)
+		check(plan.dependentApps == [paid.bundle, "com.example.fifth.SIMPAID001", org.bundle].sorted(), "removal lists every app the account signed, across its teams")
+		let stale = ZagAccountRemovalPlan(accountID: paid.account, maskedAppleID: plan.maskedAppleID, teams: plan.teams, dependentApps: [paid.bundle])
+		do { try await free1.directory.remove(stale.confirm(.keepUntilExpiry), ledger: &ledger); check(false, "stale removal") }
+		catch { check(error as? ZagAccountError == .removalNotConfirmed && paid.identity != nil, "a confirmation that does not list the current apps is refused") }
+		try! await free1.directory.remove(plan.confirm(.keepUntilExpiry), ledger: &ledger)
+		let left = free1.secrets.items.keys
+		check(!left.contains { $0.hasPrefix("\(paid.account).") } && left.contains { $0.hasPrefix("\(free1.account).") } && left.contains { $0.hasPrefix("\(free2.account).") },
+			  "removal deletes every Keychain item of that account (both teams) and none of the others'")
+		let removedRoute = await free1.directory.route(paid.bundle, ledger: ledger)
+		check(removedRoute == .blocked(.accountRemoved) && ledger.records[org.bundle]?.owner?.scope == org.scope
+			  && ledger.begin(paid.bundle, at: free1.clock.now, userInitiated: true) == .ownerRemoved
+			  && !ledger.refreshAllOrder(at: free1.clock.now + 30 * 86_400, minimum: .normal).contains(paid.bundle),
+			  "its apps stay installed with their owner, and never refresh or move to another account")
+		let remaining = await free1.directory.registry.accounts.map(\.id)
+		let second = try? await free1.directory.authorize(free2.scope)
+		let first = try? await free1.directory.authorize(free1.scope)
+		let stillSignedIn = second != nil && first != nil
+		check(Set(remaining) == [free1.account, free2.account] && stillSignedIn, "the other accounts stay signed in")
+		check(free1.stagingIsEmpty && free2.stagingIsEmpty && paid.stagingIsEmpty, "no key file is left behind by any account")
 	}
 }
 
