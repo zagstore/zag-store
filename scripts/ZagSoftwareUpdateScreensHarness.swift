@@ -46,5 +46,7 @@ private struct HarnessRoot: View {
             .navigationTitle("Zag Store Update")
             .navigationBarTitleDisplayMode(.inline)
         }
+        // As in the account sheet: its close action shows the X on More Details.
+        .environment(\.zagAccountClose, {})
     }
 }

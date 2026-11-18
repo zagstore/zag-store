@@ -200,7 +200,7 @@ struct ZagSelfUpdateIntegrityTests {
 			"the installation time is persisted, inside the update's window")
 		check(stored?.whatsNew == "Harness What's New", "the installed release keeps its own What's New")
 		let installed = coordinator.installedRelease
-		check(installed.title == "Zag Store 1.0.0 Beta 2" && installed.whatsNew == "Harness What's New"
+		check(installed.versionText == "1.0.0 Beta (Build 2)" && installed.whatsNew == "Harness What's New"
 			&& installed.installedAt == stored?.installedAt, "More Details reads the verified record")
 		let authenticSHA = sha256(authentic)
 		var replacement = authentic

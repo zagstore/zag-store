@@ -176,7 +176,9 @@ plistPath='Feather/Resources/Info.plist'
 oldPlist=plistlib.loads(subprocess.check_output(['git','show','ea191fff:'+plistPath],cwd=root))
 newPlist=plistlib.loads((root/plistPath).read_bytes())
 assert newPlist.pop('CADisableMinimumFrameDurationOnPhone') is True
-assert newPlist == oldPlist, 'only documented ProMotion opt-in may change in Info.plist'
+# The build's release channel, from the ZAG_RELEASE_CHANNEL build setting.
+assert newPlist.pop('ZagReleaseChannel') == '$(ZAG_RELEASE_CHANNEL)'
+assert newPlist == oldPlist, 'only documented ProMotion opt-in and release channel may change in Info.plist'
 # FeatherApp may differ only by the pairing launch fix (docs/validation/pairing-launch-offline.md).
 oldApp=subprocess.check_output(['git','show','ea191fff:Feather/FeatherApp.swift'],cwd=root,text=True)
 newApp=(root/'Feather/FeatherApp.swift').read_text()

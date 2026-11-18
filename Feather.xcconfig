@@ -7,6 +7,9 @@
 
 FEATHER_PROJECT_VERSION=1.0.0
 FEATHER_PRODUCT_BUNDLE_IDENTIFIER=app.zagstore.ios
+// The channel this build is released on (stable, beta or nightly), written to
+// Info.plist as ZagReleaseChannel and shown in Settings and More Details.
+ZAG_RELEASE_CHANNEL=beta
 FEATHER_DISAMBIGUATOR=${DEVELOPMENT_TEAM}
 
 AD_HOC_CODE_SIGNING_ALLOWED = YES

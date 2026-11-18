@@ -22,6 +22,7 @@ xcrun -sdk iphonesimulator swiftc -target "$(uname -m)-apple-ios17.0-simulator" 
 	"$ROOT/Feather/Utilities/ZagUpdateReleaseNotes.swift" \
 	"$ROOT/Feather/Utilities/ZagInstalledRelease.swift" \
 	"$ROOT/Feather/Views/Settings/ZagSoftwareUpToDateView.swift" \
+	"$ROOT/scripts/ZagAccountCloseEnvironmentStub.swift" \
 	"$ROOT/scripts/ZagSoftwareUpdateScreensHarness.swift" -o "$APP/Screens"
 cat > "$APP/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

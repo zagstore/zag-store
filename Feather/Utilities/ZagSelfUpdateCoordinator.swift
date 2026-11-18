@@ -446,7 +446,10 @@ final class ZagSelfUpdateCoordinator: ObservableObject {
         return ZagInstalledRelease(
             version: currentVersion,
             build: currentBuild,
-            channel: verified?.releaseChannel ?? UpdateChannel.selected.rawValue,
+            // The build's own channel first; the selected update channel only
+            // for a build that does not record one.
+            channel: ZagInstalledRelease.bundleChannel(info: Bundle.main.infoDictionary ?? [:])
+                ?? verified?.releaseChannel ?? UpdateChannel.selected.rawValue,
             installedAt: verified.flatMap {
                 $0.installedAt ?? ZagInstalledRelease.installationDate(
                     startedAt: $0.startedAt, bundleCreated: Self.bundleCreationDate, latest: Date())

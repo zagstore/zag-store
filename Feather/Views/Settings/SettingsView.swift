@@ -127,6 +127,14 @@ struct ZagThemeTintToggleStyle: ToggleStyle {
 struct SettingsView: View {
 	@Environment(\.dismiss) private var dismiss
 	@Environment(\.zagAccountClose) private var closeAccount
+	/// The running OS build (e.g. "24B156"), from the kernel; nil if unavailable.
+	private static let _osBuild: String? = {
+		var size = 0
+		guard sysctlbyname("kern.osversion", nil, &size, nil, 0) == 0, size > 1 else { return nil }
+		var buffer = [CChar](repeating: 0, count: size)
+		guard sysctlbyname("kern.osversion", &buffer, &size, nil, 0) == 0 else { return nil }
+		return String(cString: buffer)
+	}()
 	var embeddedInAccountNavigation = false
 	var onAccountBack: (() -> Void)? = nil
 	@AppStorage("Feather.userTintColor") private var userTintColor = "#0090FF"
@@ -246,11 +254,15 @@ struct SettingsView: View {
 						VStack(spacing: 5) {
 							Text("Zag Store")
 								.font(.footnote.weight(.semibold))
-							Text(
-								"Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown") (Build \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"))"
-							)
+							Text(ZagInstalledRelease.settingsVersion(info: Bundle.main.infoDictionary ?? [:]))
 							.font(.caption)
 							.monospacedDigit()
+							Text(ZagInstalledRelease.systemText(name: UIDevice.current.systemName,
+							                                    version: UIDevice.current.systemVersion,
+							                                    build: Self._osBuild))
+							.font(.caption2)
+							.monospacedDigit()
+							.foregroundStyle(.tertiary)
 						}
 						.frame(maxWidth: .infinity)
 						.foregroundStyle(.secondary)

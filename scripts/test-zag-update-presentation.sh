@@ -89,7 +89,10 @@ assert 'Text("Build \\(release.build)")\n                                       
 # The local header/notes/layout behavior is preserved by the assertions above.
 # Automatic-download and channel controls remain byte-identical to the approved UI.
 approved = subprocess.check_output(['git', 'show', '30741eaf:' + path], cwd=root, text=True)
-assert view.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1] == approved.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1]
+# The only change: Software Update's close button on both pages, beside Back.
+preferences = view.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1]
+assert preferences.count('        .navigationBarTitleDisplayMode(.inline)\n        .zagAccountCloseButton()\n') == 2
+assert preferences.replace('        .zagAccountCloseButton()\n', '') == approved.split('private struct ZagStoreUpdateAutomaticPreferencesView:', 1)[1]
 control = (root / 'Feather/Views/Settings/ZagSelfUpdateActionControl.swift').read_text()
 assert control.count('            Button {') == 1
 assert control.count('ZagUpdateSpectrumSurface(') == 1
