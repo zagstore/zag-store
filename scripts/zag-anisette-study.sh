@@ -61,18 +61,24 @@ probe_once() {
 		launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 		exit 0
 	fi
-	local dns=fail tls=fail fingerprint="" expiry="" http status latency outcome
+	local dns=fail tls=fail fingerprint="" expiry="" http status latency outcome rc=0
 	if [ -n "$(dig +short +time=5 +tries=1 "$HOST" A 2>/dev/null | head -1)" ]; then dns=ok; fi
 	if [ "$dns" = ok ]; then
 		local chain
 		# LibreSSL's s_client exits non-zero when its input closes, even after
 		# a verified handshake, so the verification result is read instead.
 		chain=$(perl -e 'alarm shift; exec @ARGV' 20 openssl s_client -connect "$HOST:443" -servername "$HOST" \
-			-CAfile /etc/ssl/cert.pem -verify_return_error </dev/null 2>/dev/null || true)
+			-CAfile /etc/ssl/cert.pem -verify_return_error </dev/null 2>/dev/null) || rc=$?
 		if printf '%s\n' "$chain" | grep -q 'Verify return code: 0 (ok)'; then
 			tls=ok
 			fingerprint=$(printf '%s\n' "$chain" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//; s/://g')
 			expiry=$(printf '%s\n' "$chain" | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+		elif [ "$rc" -eq 142 ]; then
+			tls=inspection-timeout
+		elif printf '%s\n' "$chain" | grep -q 'Verify return code: [1-9]'; then
+			tls="verify-$(printf '%s\n' "$chain" | sed -n 's/.*Verify return code: \([0-9]*\).*/\1/p' | head -1)"
+		else
+			tls="inspection-failed-$rc"
 		fi
 	fi
 	http=$("$STUDY/bin/probe" "$HOST" 2>/dev/null || true)
@@ -80,7 +86,7 @@ probe_once() {
 	if [ "$status" = error ]; then status="error:$latency"; latency=${extra:-0}; fi
 	case "$status" in
 		error:offline) outcome=local-offline ;;
-		[1-4][0-9][0-9]) [ "$tls" = ok ] && outcome=up || outcome=down ;;
+		[1-4][0-9][0-9]) outcome=up ;;
 		*) outcome=down ;;
 	esac
 	printf '{"t":%s,"host":"%s","outcome":"%s","dns":"%s","tls":"%s","http":"%s","ms":%s,"cert":"%s","notAfter":"%s"}\n' \
@@ -102,6 +108,13 @@ start, end = int(config["START"]), int(config["END"])
 path = study / "probes.jsonl"
 probes = [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
 now = time.time()
+# Up = a reply below 500 to the request made through the app's transport,
+# which rejects invalid certificates. Recomputed here for every record, so
+# records written before 18 Nov 13:3x (when a failed separate certificate
+# inspection was wrongly counted as down) are judged the same way.
+for p in probes:
+    if p["outcome"] != "local-offline":
+        p["outcome"] = "up" if p["http"][:1] in "1234" and p["http"].isdigit() else "down"
 counted = [p for p in probes if p["outcome"] != "local-offline"]
 up = [p for p in counted if p["outcome"] == "up"]
 expected = int((min(now, end) - start) // 1800) + 1
@@ -123,7 +136,12 @@ if counted:
         p95 = ms[min(len(ms) - 1, int(round(0.95 * (len(ms) - 1))))]
         print(f"Latency:      median {statistics.median(ms) / 1000:.2f} s, p95 {p95 / 1000:.2f} s   thresholds < 1.5 s, < 5 s")
     certs = sorted({p["cert"] for p in counted if p["cert"]})
-    print(f"Certificates: {len(certs)} distinct leaf fingerprint(s); TLS failures: {sum(p['tls'] != 'ok' for p in counted)}")
+    inspections = {}
+    for p in counted:
+        if p["tls"] != "ok": inspections[p["tls"]] = inspections.get(p["tls"], 0) + 1
+    print(f"Certificates: {len(certs)} distinct leaf fingerprint(s); separate inspection problems: {inspections or 'none'}")
+    if any(p["tls"].startswith("verify-") for p in counted):
+        print("WARNING:      a certificate failed verification in the separate inspection; review before any verdict")
     expiries = sorted({p["notAfter"] for p in counted if p["notAfter"]})
     if expiries: print(f"Cert expiry:  {', '.join(expiries)}")
     failures = {}
