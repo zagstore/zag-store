@@ -614,6 +614,11 @@ extension SettingsView {
             NavigationLink(destination: ZagExperimentalSigningView().zagSettingsDestinationAvatar()) {
 				Label("Signing", systemImage: "signature")
 			}
+			#if DEBUG
+			NavigationLink(destination: ZagFreeAccountDebugSignInView().zagSettingsDestinationAvatar()) {
+				Label("Apple Account (Simulated)", systemImage: "person.badge.key")
+			}
+			#endif
 		} header: {
 			Text("Experimental Features")
 		}
