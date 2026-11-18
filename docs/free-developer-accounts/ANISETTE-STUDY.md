@@ -38,3 +38,13 @@ Purpose: decide whether the candidate recommended provider (`ZagAnisetteProvider
 1. Approve stages 1–2 (passive and availability probes from your Mac).
 2. Separately decide on stage 3 (bounded live anisette requests with a disposable identity).
 3. Confirm the proposed criteria, or set your own.
+
+## Running (stages 1–2, approved 18 November 2026)
+
+Stage 3 is **not** approved and nothing in the tooling requests anisette data.
+
+- Tooling: `scripts/zag-anisette-study.sh` (install, report, uninstall) and `scripts/ZagAnisetteStudyProbe.swift` (one HTTPS request through the app's `ZagURLSessionTransport`).
+- Each probe: a DNS lookup; a TLS handshake verified against the system's trusted roots (`Verify return code: 0`), recording the leaf fingerprint and expiry; and one request for `/robots.txt`, a path that is not an anisette endpoint. Any HTTP reply below 500 over a verified connection counts as up. A probe made while this Mac is offline is skipped, not counted as an outage.
+- Schedule: a launchd agent (`app.zagstore.anisette-study`) every 30 minutes for 7 days, then it stops itself. It also stops after two rate-limit (HTTP 429) replies in a row. Data: `~/Library/Application Support/ZagStore Anisette Study/probes.jsonl`. Probes missed while the Mac sleeps show as reduced coverage in the report.
+- Period: 18 November 11:54 to 25 November 11:54 GMT, provider `ani.sidestore.io`. The first attempt at 11:53 recorded a false TLS failure: LibreSSL's `s_client` exits non-zero even after a verified handshake. That record was discarded, the check now reads the verification result, and it was confirmed to reject an expired certificate. The period then restarted.
+- `scripts/zag-anisette-study.sh report` prints the figures against the thresholds and gives no verdict before the period ends. A certificate renewal during the week is expected (the current leaf expires 4 December) and is not by itself a failure.
