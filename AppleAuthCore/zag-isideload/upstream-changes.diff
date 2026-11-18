@@ -1,0 +1,982 @@
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/Cargo.toml zag-isideload/Cargo.toml
+--- upstream/Cargo.toml	2026-10-28 14:42:44
++++ zag-isideload/Cargo.toml	2026-11-18 17:25:32
+@@ -1,81 +1,53 @@
++# Zag Store fork of nab138/isideload, pinned to upstream commit
++# 326e56229d0790d5d3ac9ec0f8cb1d47f8bc1bc5 (crate 0.5.2). Only sign-in,
++# developer portal and anisette are kept; see PROVENANCE.md for every change.
+ [package]
+-name = "isideload"
+-description = "Sideload iOS/iPadOS applications"
+-license = "MIT"
+-authors = ["Nicholas Sharp <nab@nabdev.me>"]
+-version = "0.5.2"
++name = "zag-isideload"
++description = "Zag Store's trimmed fork of isideload: Apple Account sign-in, developer portal and anisette only"
++license = "MIT AND MPL-2.0"
++version = "0.5.2+zag.1"
+ edition = "2024"
+-repository = "https://github.com/nab138/isideload"
+-documentation = "https://docs.rs/isideload"
+-keywords = ["ios", "sideload"]
+-readme = "../README.md"
++publish = false
+ 
++[lib]
++name = "isideload"
++
+ [features]
+-default = ["install", "keyring-storage", "tokio-mt"]
+-# default = ["wasm"]
+-tokio-mt = ["tokio/rt-multi-thread", "dep:tokio-tungstenite"]
+-install = ["dep:idevice"]
+-keyring-storage = ["dep:keyring"]
+-wasm = ["idevice/wasm", "dep:getrandom_02", "dep:getrandom_04", "uuid/js", "dep:ws_stream_wasm"]
+-fs-storage = []
++# Nothing reaches the network unless this is enabled. Off by default and not
++# enabled by Zag Store without the owner's separate approval.
++default = []
++live-network = []
+ 
+-# Unfortunately, dependencies are kinda a mess rn, since this requires a beta version of the srp crate.
+-# Once that becomes stable, hopefuly duplicate dependencies should clean up.\
+-# Until then, I will wince in pain every time I see how long the output of cargo tree -d is.
+ [dependencies]
+-idevice = { version = "0.1.61", optional = true, default-features = false, features = ["ring", "afc", "installation_proxy", "remote_pairing", "rsd"]}
+ plist = "1.8"
+ plist-macro = "0.1.4"
+-reqwest = { version = "0.13.2", default-features = false, features = ["json", "gzip", "rustls-no-provider", "http2", "charset", "system-proxy"] }
++reqwest = { version = "0.13.2", default-features = false, features = ["json", "gzip", "rustls-no-provider", "http2", "charset"] }
+ thiserror = "2.0.17"
+ async-trait = "0.1.89"
+-serde = "1.0.228"
++serde = { version = "1.0.228", features = ["derive"] }
+ rand = "0.8.5"
+-uuid = {version = "1.20.0", features = ["v4"] }
+-tracing = "0.1.44"
+-tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"], optional = true }
++uuid = { version = "1.20.0", features = ["v4"] }
++tokio = { version = "1.49", features = ["time"] }
++tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+ rootcause = "0.12.0"
+ futures-util = "0.3.31"
+ serde_json = "1.0.149"
+ base64 = "0.22.1"
+ hex = "0.4.3"
+ sha2 = "0.11.0"
+-srp = "0.7.0-rc.3"
++srp = "=0.7.0-rc.3"
+ pbkdf2 = "0.13.0"
+ hmac = "0.13.0"
+ cbc = { version = "0.2.0", features = ["alloc"] }
+ aes = "0.9.0"
+ aes-gcm = "0.11.1"
+-rsa = { version = "0.9.10" }
+-tokio = { version = "1.49" }
+-keyring = { version = "3.6.3", features = ["apple-native", "linux-native-sync-persistent", "windows-native"], optional = true }
+-rcgen = { version = "0.14.7", default-features = false, features = ["ring", "pem"] }
+-p12-keystore = { version = "0.3.0-rc4", package = "isideload-p12-keystore" }
+-zip = { version = "8.3", default-features = false, features = ["deflate"] }
+-isideload-vfs = { version = "0.0.1" } #, path = "../../isideload-apple-platform-rs/isideload-vfs" }
+-sha1 = "0.11.0"
+-rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+ reqwest-middleware = "0.5.1"
+ http = "1.4.0"
+ urlencoding = { version = "2.1.3" }
+ futures = "0.3.32"
+-ws_stream_wasm = { version = "0.7.5", optional = true}
+ web-time = "1"
+-x509-cert = "0.2.5"
+-apple-codesign-quick = "0.1.0"
++zeroize = "1.8"
+ 
+-
+-# There is a bug in rustls-platform-verifier that causes an invalid certificate error with apple's root cert.
+-# It has been fixed already but I am waiting for a new release before I can update the dependency.
+-# Using native-tls avoids the issue.
+-[target.'cfg(windows)'.dependencies]
+-reqwest = { version = "0.13.2", default-features = false, features = ["json", "gzip", "native-tls", "http2", "charset", "system-proxy"] }
+-
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
+-getrandom_02 = { package = "getrandom", version = "0.2", default-features = false, features = [
+-  "js",
+-], optional = true }
+-getrandom_04 = { package = "getrandom", version = "0.4", default-features = false, features = [
+-  "wasm_js",
+-], optional = true }
+-ring = { version = "0.17.14", features = ["wasm32_unknown_unknown_js"] }
++[dev-dependencies]
++tokio = { version = "1.49", features = ["macros", "rt"] }
++rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/mod.rs zag-isideload/src/anisette/mod.rs
+--- upstream/src/anisette/mod.rs	2026-10-28 14:42:44
++++ zag-isideload/src/anisette/mod.rs	2026-11-18 17:20:23
+@@ -8,7 +8,6 @@
+ use serde::Deserialize;
+ use std::{collections::HashMap, sync::Arc};
+ use tokio::sync::RwLock;
+-use tracing::warn;
+ use web_time::SystemTime;
+ 
+ #[derive(Deserialize, Debug, Clone)]
+@@ -108,8 +107,7 @@
+     IncorrectlyProvisioned,
+ }
+ 
+-#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+-#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
++#[async_trait::async_trait]
+ pub trait AnisetteProvider {
+     async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report>;
+ 
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/remote_v3/mod.rs zag-isideload/src/anisette/remote_v3/mod.rs
+--- upstream/src/anisette/remote_v3/mod.rs	2026-10-28 14:42:44
++++ zag-isideload/src/anisette/remote_v3/mod.rs	2026-11-18 17:57:10
+@@ -1,3 +1,12 @@
++// Provenance note (Zag Store fork): parts of this file closely match code in
++// SideStore/apple-private-apis (omnisette/src/remote_anisette_v3.rs), which is licensed under the
++// Mozilla Public License 2.0. Until an independent licence review decides,
++// this file is treated as MPL-2.0 (see PROVENANCE.md and LICENSE-MPL-2.0):
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
+ mod state;
+ mod websocket;
+ 
+@@ -10,11 +19,9 @@
+     ClientBuilder,
+     header::{CONTENT_TYPE, HeaderMap, HeaderValue},
+ };
+-use reqwest_middleware::ClientBuilder as MwClientBuilder;
+ use rootcause::option_ext::OptionExt;
+ use rootcause::prelude::*;
+ use serde::Deserialize;
+-use tracing::{debug, info, warn};
+ 
+ use crate::anisette::remote_v3::websocket::AppWebSocket;
+ use crate::anisette::{AnisetteClientInfo, AnisetteData, AnisetteProvider};
+@@ -24,9 +31,8 @@
+ };
+ use crate::auth::grandslam::GrandSlam;
+ use crate::util::plist::PlistDataExtract;
+-use crate::util::storage::{SideloadingStorage, new_storage};
++use crate::util::storage::SideloadingStorage;
+ 
+-pub const DEFAULT_ANISETTE_V3_URL: &str = "https://ani.iloader.app";
+ pub const ANISETTE_STATE_KEY: &str = "anisette_state";
+ 
+ pub struct RemoteV3AnisetteProvider {
+@@ -35,7 +41,6 @@
+     storage: Box<dyn SideloadingStorage>,
+     serial_number: String,
+     client: reqwest_middleware::ClientWithMiddleware,
+-    websocket_proxy: Option<String>,
+     client_info_override: Option<AnisetteClientInfo>,
+ }
+ 
+@@ -56,49 +61,18 @@
+             url: url.to_string(),
+             storage,
+             serial_number,
+-            client: Self::build_reqwest_client(None)?,
+-            websocket_proxy: None,
++            client: Self::build_reqwest_client(url)?,
+             client_info_override: None,
+         })
+     }
+ 
+-    pub fn set_websocket_proxy(mut self, websocket_proxy: Option<String>) -> Result<Self, Report> {
+-        self.websocket_proxy = websocket_proxy;
+-        self.client = Self::build_reqwest_client(self.websocket_proxy.clone())?;
+-        Ok(self)
++    /// Zag Store fork: the provider's own HTTP client may reach only the
++    /// anisette server it was created for (https, verified certificates,
++    /// no redirects). There is no default server, and requests are never relayed.
++    fn build_reqwest_client(url: &str) -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
++        crate::net_policy::guarded_client(ClientBuilder::new(), vec![crate::net_policy::host_of(url)?])
+     }
+ 
+-    fn build_reqwest_client(
+-        websocket_proxy: Option<String>,
+-    ) -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
+-        if let Some(websocket_proxy) = websocket_proxy {
+-            use crate::auth::middleware::WasmProxyMiddleware;
+-
+-            let client = ClientBuilder::new().build()?;
+-
+-            Ok(MwClientBuilder::new(client)
+-                .with(WasmProxyMiddleware::new(websocket_proxy))
+-                .build())
+-        } else {
+-            let client = ClientBuilder::new().build()?;
+-
+-            Ok(MwClientBuilder::new(client).build())
+-        }
+-    }
+-
+-    pub fn default() -> Result<Self, Report> {
+-        Self::new(
+-            DEFAULT_ANISETTE_V3_URL,
+-            Box::new(new_storage()),
+-            "0".to_string(),
+-        )
+-    }
+-
+-    pub fn set_url(mut self, url: &str) -> RemoteV3AnisetteProvider {
+-        self.url = url.to_string();
+-        self
+-    }
+-
+     pub fn set_storage(mut self, storage: Box<dyn SideloadingStorage>) -> RemoteV3AnisetteProvider {
+         self.storage = storage;
+         self
+@@ -118,8 +92,7 @@
+     }
+ }
+ 
+-#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+-#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
++#[async_trait::async_trait]
+ impl AnisetteProvider for RemoteV3AnisetteProvider {
+     async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
+         self.fetch_headers(None).await
+@@ -237,7 +210,7 @@
+         let state = self.state.as_mut().ok_or_report()?;
+         if !state.is_provisioned() {
+             info!("Provisioning required...");
+-            Self::provision(state, gs, &self.url, self.websocket_proxy.as_deref())
++            Self::provision(state, gs, &self.url)
+                 .await
+                 .context("Failed to provision")?;
+         }
+@@ -279,14 +252,12 @@
+         state: &mut AnisetteState,
+         gs: &Arc<GrandSlam>,
+         url: &str,
+-        proxy_url: Option<&str>,
+     ) -> Result<(), Report> {
+         let start_provisioning = gs.get_url("midStartProvisioning")?;
+         let end_provisioning = gs.get_url("midFinishProvisioning")?;
+ 
+         let websocket_url = format!("{}/v3/provisioning_session", url)
+-            .replace("https://", "wss://")
+-            .replace("http://", "ws://");
++            .replacen("https://", "wss://", 1);
+ 
+         debug!("Starting provisioning at {}", websocket_url);
+         // let (mut ws_stream, _) = timeout(
+@@ -300,7 +271,7 @@
+         // .context("Failed to connect to provisioning socket")?
+         // .context("Failed to connect to provisioning socket")?;
+ 
+-        let mut ws = AppWebSocket::connect(&websocket_url, proxy_url.as_deref())
++        let mut ws = AppWebSocket::connect(&websocket_url, url)
+             .await
+             .context("Failed to connect to provisioning socket")?;
+ 
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/remote_v3/state.rs zag-isideload/src/anisette/remote_v3/state.rs
+--- upstream/src/anisette/remote_v3/state.rs	2026-10-28 14:42:44
++++ zag-isideload/src/anisette/remote_v3/state.rs	2026-11-18 17:57:10
+@@ -1,3 +1,12 @@
++// Provenance note (Zag Store fork): parts of this file closely match code in
++// SideStore/apple-private-apis (omnisette/src/remote_anisette_v3.rs), which is licensed under the
++// Mozilla Public License 2.0. Until an independent licence review decides,
++// this file is treated as MPL-2.0 (see PROVENANCE.md and LICENSE-MPL-2.0):
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
+ // Serialization/Desieralization borrowed from https://github.com/SideStore/apple-private-apis/blob/master/omnisette/src/remote_anisette_v3.rs
+ 
+ use plist::Data;
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/remote_v3/websocket.rs zag-isideload/src/anisette/remote_v3/websocket.rs
+--- upstream/src/anisette/remote_v3/websocket.rs	2026-10-28 14:42:44
++++ zag-isideload/src/anisette/remote_v3/websocket.rs	2026-11-18 17:20:59
+@@ -1,103 +1,59 @@
+ use futures::{SinkExt, StreamExt};
++use reqwest::Url;
+ use rootcause::prelude::*;
+ 
++use crate::net_policy;
++
+ pub enum WsMessage {
+     Text(String),
+     Close,
+ }
+ 
+ pub struct AppWebSocket {
+-    #[cfg(not(feature = "wasm"))]
+     inner: tokio_tungstenite::WebSocketStream<
+         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+     >,
+-    #[cfg(feature = "wasm")]
+-    inner: ws_stream_wasm::WsStream,
+-    #[cfg(feature = "wasm")]
+-    meta: ws_stream_wasm::WsMeta,
+ }
+ 
+ impl AppWebSocket {
+-    pub async fn connect(url: &str, proxy_url: Option<&str>) -> Result<Self, Report> {
+-        let target_url = if proxy_url.is_some() {
+-            let proxied = format!(
+-                "{}{}",
+-                proxy_url.unwrap(),
+-                urlencoding::encode(url)
+-            )
+-            .replace("https://", "wss://");
+-            proxied
+-        } else {
+-            url.to_string()
+-        };
++    /// Zag Store fork: connects only over wss, only to the anisette server
++    /// the provider was created for, and only in a live-network build.
++    /// Upstream's relay option is removed.
++    pub async fn connect(url: &str, anisette_url: &str) -> Result<Self, Report> {
++        let target = Url::parse(url).map_err(|_| report!(net_policy::PolicyError::InvalidUrl))?;
++        net_policy::permit(&target, &[net_policy::host_of(anisette_url)?], "wss")?;
+ 
+-        #[cfg(not(feature = "wasm"))]
+-        {
+-            use tokio::time::{Duration, timeout};
++        use tokio::time::{Duration, timeout};
+ 
+-            let (stream, _) = timeout(
+-                Duration::from_secs(30),
+-                tokio_tungstenite::connect_async(&target_url),
+-            )
+-            .await?
+-            .context(
+-                "Timed out connecting to provisioning socket. Try a different anisette server.",
+-            )?;
+-            Ok(Self { inner: stream })
+-        }
+-        #[cfg(feature = "wasm")]
+-        {
+-            let (meta, stream) = ws_stream_wasm::WsMeta::connect(&target_url, None)
+-                .await
+-                .map_err(|e| report!("WS connect failed: {e:?}"))?;
+-            Ok(Self {
+-                meta,
+-                inner: stream,
+-            })
+-        }
++        let (stream, _) = timeout(
++            Duration::from_secs(30),
++            tokio_tungstenite::connect_async(target.as_str()),
++        )
++        .await?
++        .context(
++            "Timed out connecting to provisioning socket. Try a different anisette server.",
++        )?;
++        Ok(Self { inner: stream })
+     }
+ 
+     pub async fn send_text(&mut self, text: String) -> Result<(), Report> {
+-        #[cfg(not(feature = "wasm"))]
+         self.inner
+             .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+             .await?;
+-        #[cfg(feature = "wasm")]
+-        self.inner
+-            .send(ws_stream_wasm::WsMessage::Text(text))
+-            .await
+-            .map_err(|e| report!("WS send failed: {e:?}"))?;
+         Ok(())
+     }
+ 
+     pub async fn next(&mut self) -> Option<Result<WsMessage, Report>> {
+-        #[cfg(not(feature = "wasm"))]
+-        {
+-            let msg = self.inner.next().await?;
+-            Some(msg.map_err(Into::into).map(|m| match m {
+-                tokio_tungstenite::tungstenite::Message::Text(t) => WsMessage::Text(t.to_string()),
+-                tokio_tungstenite::tungstenite::Message::Close(_) => WsMessage::Close,
+-                _ => WsMessage::Close,
+-            }))
+-        }
+-        #[cfg(feature = "wasm")]
+-        {
+-            let msg = self.inner.next().await?;
+-            Some(Ok(match msg {
+-                ws_stream_wasm::WsMessage::Text(t) => WsMessage::Text(t),
+-                ws_stream_wasm::WsMessage::Binary(_) => WsMessage::Close,
+-            }))
+-        }
++        let msg = self.inner.next().await?;
++        Some(msg.map_err(Into::into).map(|m| match m {
++            tokio_tungstenite::tungstenite::Message::Text(t) => WsMessage::Text(t.to_string()),
++            tokio_tungstenite::tungstenite::Message::Close(_) => WsMessage::Close,
++            _ => WsMessage::Close,
++        }))
+     }
+ 
+     pub async fn close(&mut self) -> Result<(), Report> {
+-        #[cfg(not(feature = "wasm"))]
+         self.inner.close(None).await?;
+-        #[cfg(feature = "wasm")]
+-        self.meta
+-            .close()
+-            .await
+-            .map_err(|e| report!("WS close failed: {e:?}"))?;
+         Ok(())
+     }
+ }
+Only in upstream/src/assets: AppleWWDRCAG3.cer
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/apple_account.rs zag-isideload/src/auth/apple_account.rs
+--- upstream/src/auth/apple_account.rs	2026-10-28 14:42:44
++++ zag-isideload/src/auth/apple_account.rs	2026-11-18 17:57:10
+@@ -1,4 +1,14 @@
++// Provenance note (Zag Store fork): parts of this file closely match code in
++// SideStore/apple-private-apis (icloud-auth/src/client.rs), which is licensed under the
++// Mozilla Public License 2.0. Until an independent licence review decides,
++// this file is treated as MPL-2.0 (see PROVENANCE.md and LICENSE-MPL-2.0):
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
+ use std::sync::Arc;
++use zeroize::Zeroizing;
+ 
+ use crate::util::callbacks::TwoFactorCallback;
+ use crate::{
+@@ -25,7 +35,6 @@
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+ use srp::{ClientVerifier, groups::G2048};
+-use tracing::{debug, error, info, warn};
+ 
+ pub struct AppleAccount {
+     pub email: String,
+@@ -34,7 +43,6 @@
+     pub grandslam_client: Arc<GrandSlam>,
+     pub trusted_phone_numbers: Option<Vec<TrustedNumber>>,
+     login_state: LoginState,
+-    debug: bool,
+     last_error: Option<String>,
+     err_429_retries: Option<u32>,
+ }
+@@ -146,31 +154,23 @@
+     /// # Arguments
+     /// - `email`: The Apple ID email address
+     /// - `anisette_provider`: The anisette provider to use
+-    /// - `debug`: DANGER, If true, accept invalid certificates and enable verbose connection
+     pub async fn new(
+         email: &str,
+         anisette_generator: AnisetteDataGenerator,
+-        debug: bool,
+-        proxy_url: Option<String>,
+         err_429_retries: Option<u32>,
+     ) -> Result<Self, Report> {
+-        if debug {
+-            warn!("Debug mode enabled: this is a security risk!");
+-        }
+-
+         let client_info = anisette_generator
+             .get_client_info()
+             .await
+             .context("Failed to get anisette client info")?;
+ 
+-        let grandslam_client = GrandSlam::new(client_info, debug, proxy_url.clone()).await?;
++        let grandslam_client = GrandSlam::new(client_info).await?;
+ 
+         Ok(AppleAccount {
+             email: email.to_string(),
+             spd: None,
+             anisette_generator,
+             grandslam_client: Arc::new(grandslam_client),
+-            debug,
+             login_state: LoginState::NeedsLogin,
+             trusted_phone_numbers: None,
+             last_error: None,
+@@ -196,9 +196,6 @@
+         C: TwoFactorCallback,
+     {
+         info!("Logging in to Apple ID: {}", censor_email(&self.email));
+-        if self.debug {
+-            warn!("Debug mode enabled: this is a security risk!");
+-        }
+ 
+         self.login_state = self
+             .login_inner(password)
+@@ -812,20 +809,22 @@
+             bail!("Unsupported SRP protocol selected: {}", selected_protocol);
+         }
+ 
+-        let hashed_password = Sha256::digest(password.as_bytes());
++        // Zag Store fork: password-derived buffers are wiped when dropped, on
++        // every path, including errors.
++        let hashed_password = Zeroizing::new(Sha256::digest(password.as_bytes()).to_vec());
+ 
+-        let password_hash = if selected_protocol == "s2k_fo" {
+-            hex::encode(hashed_password).into_bytes()
++        let password_hash = Zeroizing::new(if selected_protocol == "s2k_fo" {
++            hex::encode(&*hashed_password).into_bytes()
+         } else {
+             hashed_password.to_vec()
+-        };
++        });
+ 
+-        let mut password_buf = [0u8; 32];
+-        pbkdf2::pbkdf2::<hmac::Hmac<Sha256>>(&password_hash, salt, iters as u32, &mut password_buf)
++        let mut password_buf = Zeroizing::new([0u8; 32]);
++        pbkdf2::pbkdf2::<hmac::Hmac<Sha256>>(&password_hash, salt, iters as u32, &mut *password_buf)
+             .context("Failed to derive password using PBKDF2")?;
+ 
+         let verifier = srp_client
+-            .process_reply(&a, self.email.as_bytes(), &password_buf, salt, b_pub)
++            .process_reply(&a, self.email.as_bytes(), &*password_buf, salt, b_pub)
+             .context("Failed to compute SRP proof")?;
+ 
+         let req2 = plist!(dict {
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/builder.rs zag-isideload/src/auth/builder.rs
+--- upstream/src/auth/builder.rs	2026-10-28 14:42:44
++++ zag-isideload/src/auth/builder.rs	2026-11-18 17:20:23
+@@ -5,15 +5,13 @@
+ 
+ use crate::util::callbacks::TwoFactorCallback;
+ use crate::{
+-    anisette::{AnisetteDataGenerator, AnisetteProvider, remote_v3::RemoteV3AnisetteProvider},
++    anisette::{AnisetteDataGenerator, AnisetteProvider},
+     auth::apple_account::AppleAccount,
+ };
+ 
+ pub struct AppleAccountBuilder {
+     email: String,
+-    debug: Option<bool>,
+     anisette_generator: Option<AnisetteDataGenerator>,
+-    proxy_url: Option<String>,
+     err_429_retries: Option<u32>,
+ }
+ 
+@@ -25,35 +23,15 @@
+     pub fn new(email: &str) -> Self {
+         Self {
+             email: email.to_string(),
+-            debug: None,
+             anisette_generator: None,
+-            proxy_url: None,
+-            err_429_retries: Some(10),
++            // Zag Store fork: no automatic retries; the app decides.
++            err_429_retries: None,
+         }
+     }
+ 
+-    /// DANGER Set whether to enable debug mode
++    /// Set the anisette provider. Required: Zag Store's fork has no default server.
+     ///
+     /// # Arguments
+-    /// - `debug`: If true, accept invalid certificates and enable verbose connection logging
+-    pub fn danger_debug(mut self, debug: bool) -> Self {
+-        self.debug = Some(debug);
+-        self
+-    }
+-
+-    /// Set a proxy URL to use for all network requests, useful for running in a browser with WASM
+-    ///
+-    /// # Arguments
+-    /// - `proxy_url`: The proxy URL to use for all network requests
+-    pub fn proxy_url(mut self, proxy_url: Option<String>) -> Self {
+-        self.proxy_url = proxy_url;
+-        self
+-    }
+-
+-    /// Set an anisette provider to use. RemoteV3AnisetteProvider is used by default if none is provided.
+-    /// You should create your own instance of RemoteV3AnisetteProvider if you want to use a different anisette server.
+-    ///
+-    /// # Arguments
+     /// - `anisette_provider`: The anisette provider to use
+     pub fn anisette_provider(
+         mut self,
+@@ -65,8 +43,7 @@
+         self
+     }
+ 
+-    /// Sets the number of retries to attempt when receiving a 429 Too Many Requests response from Apple servers, default is 10.
+-    /// Set to None to disable retries.
++    /// Sets the number of retries after a 429 Too Many Requests response. Default: none.
+     ///
+     /// # Errors
+     /// Returns an error if the reqwest client cannot be built
+@@ -80,20 +57,13 @@
+     /// # Errors
+     /// Returns an error if the reqwest client cannot be built
+     pub async fn build(self) -> Result<AppleAccount, Report> {
+-        let debug = self.debug.unwrap_or(false);
+-        let anisette_generator = match self.anisette_generator {
+-            Some(generator) => generator,
+-            None => {
+-                let provider = RemoteV3AnisetteProvider::default()?;
+-                AnisetteDataGenerator::new(Arc::new(RwLock::new(provider)))
+-            }
++        let Some(anisette_generator) = self.anisette_generator else {
++            bail!("An anisette provider is required");
+         };
+ 
+         AppleAccount::new(
+             &self.email,
+             anisette_generator,
+-            debug,
+-            self.proxy_url,
+             self.err_429_retries,
+         )
+         .await
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/grandslam.rs zag-isideload/src/auth/grandslam.rs
+--- upstream/src/auth/grandslam.rs	2026-10-28 14:42:44
++++ zag-isideload/src/auth/grandslam.rs	2026-11-18 17:57:10
+@@ -1,22 +1,25 @@
+-use super::middleware::WasmProxyMiddleware;
++// Provenance note (Zag Store fork): parts of this file closely match code in
++// SideStore/apple-private-apis (icloud-auth/src/client.rs), which is licensed under the
++// Mozilla Public License 2.0. Until an independent licence review decides,
++// this file is treated as MPL-2.0 (see PROVENANCE.md and LICENSE-MPL-2.0):
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
+ use plist::Dictionary;
+ use plist_macro::plist_to_xml_string;
+ use plist_macro::pretty_print_dictionary;
+-#[cfg(not(feature = "wasm"))]
+-use reqwest::Certificate;
+ use reqwest::{
+     ClientBuilder,
+     header::{HeaderMap, HeaderValue},
+ };
+-use reqwest_middleware::ClientBuilder as MwClientBuilder;
+ use rootcause::prelude::*;
+-use tracing::debug;
+-use tracing::warn;
+ 
+-#[cfg(not(feature = "wasm"))]
+-use crate::sideload::cert_identity::APPLE_ROOT;
+ use crate::{SideloadError, anisette::AnisetteClientInfo, util::plist::PlistDataExtract};
+ 
++const APPLE_ROOT: &[u8] = include_bytes!("../assets/apple_root.cer");
++
+ const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
+ 
+ pub struct GrandSlam {
+@@ -32,11 +35,8 @@
+     /// - `client`: The reqwest client to use for requests
+     pub async fn new(
+         client_info: AnisetteClientInfo,
+-        debug: bool,
+-        proxy_url: Option<String>,
+     ) -> Result<Self, Report> {
+-        let client =
+-            Self::build_reqwest_client(debug, proxy_url).context("Failed to build HTTP client")?;
++        let client = Self::build_reqwest_client().context("Failed to build HTTP client")?;
+         let base_headers = Self::base_headers(&client_info, false)?;
+         let url_bag = Self::fetch_url_bag(&client, base_headers).await?;
+         Ok(Self {
+@@ -233,37 +233,17 @@
+         Ok(headers)
+     }
+ 
+-    /// Build a reqwest client with the Apple root certificate
++    /// Build the HTTP client for Apple's services: the system roots plus
++    /// Apple's root, certificates always verified, https only, no redirects,
++    /// and only Apple's allowlisted hosts (`net_policy`).
+     ///
+-    /// # Arguments
+-    /// - `debug`: DANGER, If true, accept invalid certificates and enable verbose connection logging
+-    /// # Errors
+-    /// Returns an error if the reqwest client cannot be built
+-    pub fn build_reqwest_client(
+-        #[cfg(not(feature = "wasm"))] debug: bool,
+-        #[cfg(feature = "wasm")] _debug: bool,
+-        proxy_url: Option<String>,
+-    ) -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
+-        #[cfg(not(feature = "wasm"))]
+-        let cert = Certificate::from_der(APPLE_ROOT)?;
+-        #[cfg(not(feature = "wasm"))]
+-        let client = ClientBuilder::new()
+-            .add_root_certificate(cert)
+-            .http1_title_case_headers()
+-            .danger_accept_invalid_certs(debug)
+-            .connection_verbose(debug)
+-            // .pool_max_idle_per_host(0)
+-            .build()?;
+-        #[cfg(feature = "wasm")]
+-        let client = ClientBuilder::new().build()?;
+-
+-        let builder = MwClientBuilder::new(client);
+-        let builder = if let Some(proxy_url) = proxy_url {
+-            builder.with(WasmProxyMiddleware::new(proxy_url))
+-        } else {
+-            builder
+-        };
+-        Ok(builder.build())
++    /// Zag Store fork: upstream's `debug` switch, which disabled certificate
++    /// verification, and its request proxy are removed.
++    pub fn build_reqwest_client() -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
++        let builder = ClientBuilder::new()
++            .add_root_certificate(reqwest::Certificate::from_der(APPLE_ROOT)?)
++            .http1_title_case_headers();
++        crate::net_policy::guarded_client(builder, crate::net_policy::apple_hosts())
+     }
+ }
+ 
+Only in upstream/src/auth: middleware.rs
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/mod.rs zag-isideload/src/auth/mod.rs
+--- upstream/src/auth/mod.rs	2026-10-28 14:42:44
++++ zag-isideload/src/auth/mod.rs	2026-11-18 17:20:23
+@@ -1,4 +1,3 @@
+ pub mod apple_account;
+ pub mod builder;
+ pub mod grandslam;
+-pub mod middleware;
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/app_groups.rs zag-isideload/src/dev/app_groups.rs
+--- upstream/src/dev/app_groups.rs	2026-10-28 14:42:44
++++ zag-isideload/src/dev/app_groups.rs	2026-11-18 17:20:23
+@@ -8,7 +8,6 @@
+ use plist_macro::plist;
+ use rootcause::prelude::*;
+ use serde::Deserialize;
+-use tracing::info;
+ 
+ #[derive(Debug, Clone, Deserialize)]
+ #[serde(rename_all = "camelCase")]
+@@ -18,8 +17,7 @@
+     pub application_group: String,
+ }
+ 
+-#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+-#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
++#[async_trait::async_trait]
+ pub trait AppGroupsApi {
+     fn developer_session(&mut self) -> &mut DeveloperSession;
+ 
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/app_ids.rs zag-isideload/src/dev/app_ids.rs
+--- upstream/src/dev/app_ids.rs	2026-10-28 14:42:44
++++ zag-isideload/src/dev/app_ids.rs	2026-11-18 17:20:23
+@@ -52,8 +52,7 @@
+     pub is_free_provisioning_profile: Option<bool>,
+ }
+ 
+-#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+-#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
++#[async_trait::async_trait]
+ pub trait AppIdsApi {
+     fn developer_session(&mut self) -> &mut DeveloperSession;
+ 
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/certificates.rs zag-isideload/src/dev/certificates.rs
+--- upstream/src/dev/certificates.rs	2026-10-28 14:42:44
++++ zag-isideload/src/dev/certificates.rs	2026-11-18 17:20:23
+@@ -71,8 +71,7 @@
+     }
+ }
+ 
+-#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+-#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
++#[async_trait::async_trait]
+ pub trait CertificatesApi {
+     fn developer_session(&mut self) -> &mut DeveloperSession;
+ 
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/developer_session.rs zag-isideload/src/dev/developer_session.rs
+--- upstream/src/dev/developer_session.rs	2026-10-28 14:42:44
++++ zag-isideload/src/dev/developer_session.rs	2026-11-18 17:20:23
+@@ -5,7 +5,6 @@
+ use reqwest::header::{HeaderMap, HeaderValue};
+ use rootcause::prelude::*;
+ use serde::de::DeserializeOwned;
+-use tracing::{error, warn};
+ use uuid::Uuid;
+ 
+ use crate::{
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/devices.rs zag-isideload/src/dev/devices.rs
+--- upstream/src/dev/devices.rs	2026-10-28 14:42:44
++++ zag-isideload/src/dev/devices.rs	2026-11-18 17:20:23
+@@ -9,7 +9,6 @@
+ use plist_macro::plist;
+ use rootcause::prelude::*;
+ use serde::Deserialize;
+-use tracing::info;
+ 
+ #[derive(Deserialize, Debug, Clone)]
+ #[serde(rename_all = "camelCase")]
+@@ -20,8 +19,7 @@
+     pub status: Option<String>,
+ }
+ 
+-#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+-#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
++#[async_trait::async_trait]
+ pub trait DevicesApi {
+     fn developer_session(&mut self) -> &mut DeveloperSession;
+ 
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/teams.rs zag-isideload/src/dev/teams.rs
+--- upstream/src/dev/teams.rs	2026-10-28 14:42:44
++++ zag-isideload/src/dev/teams.rs	2026-11-18 17:20:23
+@@ -14,8 +14,7 @@
+     pub status: Option<String>,
+ }
+ 
+-#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+-#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
++#[async_trait::async_trait]
+ pub trait TeamsApi {
+     fn developer_session(&mut self) -> &mut DeveloperSession;
+ 
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/lib.rs zag-isideload/src/lib.rs
+--- upstream/src/lib.rs	2026-10-28 14:42:44
++++ zag-isideload/src/lib.rs	2026-11-18 17:20:23
+@@ -1,13 +1,15 @@
+-use idevice::IdeviceError;
+ use rootcause::{
+     hooks::{Hooks, context_formatter::ContextFormatterHook},
+     prelude::*,
+ };
+ 
++// Zag Store fork: macros first, so every module below uses them.
++#[macro_use]
++mod quiet;
+ pub mod anisette;
+ pub mod auth;
+ pub mod dev;
+-pub mod sideload;
++pub mod net_policy;
+ pub mod util;
+ 
+ #[derive(Debug, thiserror::Error)]
+@@ -24,8 +26,6 @@
+     #[error("Invalid bundle: {0}")]
+     InvalidBundle(String),
+ 
+-    #[error("{0}")]
+-    IdeviceError(#[from] IdeviceError),
+ }
+ 
+ // The default reqwest error formatter sucks and provides no info
+Only in zag-isideload/src: net_policy.rs
+Only in zag-isideload/src: quiet.rs
+Only in upstream/src: sideload
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/callbacks.rs zag-isideload/src/util/callbacks.rs
+--- upstream/src/util/callbacks.rs	2026-10-28 14:42:44
++++ zag-isideload/src/util/callbacks.rs	2026-11-18 17:20:23
+@@ -1,10 +1,4 @@
+-use std::pin::Pin;
+-
+-use crate::{
+-    auth::apple_account::{TwoFactorCallbackParams, TwoFactorCallbackResponse},
+-    dev::certificates::DevelopmentCertificate,
+-    sideload::{builder::ExtensionsBehavior, bundle::Bundle},
+-};
++use crate::auth::apple_account::{TwoFactorCallbackParams, TwoFactorCallbackResponse};
+ use rootcause::prelude::*;
+ 
+ // don't care if anything's send in the very single threaded wasm
+@@ -31,52 +25,3 @@
+ {
+     type Future = Fut;
+ }
+-
+-pub trait MaxCertsCallback: Fn(Vec<DevelopmentCertificate>) -> Self::Future + Send + Sync {
+-    type Future: Future<Output = Result<Option<Vec<String>>, Report>> + MaybeSend;
+-}
+-
+-impl<C, Fut> MaxCertsCallback for C
+-where
+-    C: Fn(Vec<DevelopmentCertificate>) -> Fut + Send + Sync,
+-    Fut: Future<Output = Result<Option<Vec<String>>, Report>> + MaybeSend,
+-{
+-    type Future = Fut;
+-}
+-
+-pub trait ExtensionsBehaviorCallback: Fn(&[Bundle]) -> Self::Future + Send + Sync {
+-    type Future: Future<Output = Result<ExtensionsBehavior, Report>> + MaybeSend;
+-}
+-
+-impl<C, Fut> ExtensionsBehaviorCallback for C
+-where
+-    C: Fn(&[Bundle]) -> Fut + Send + Sync,
+-    Fut: Future<Output = Result<ExtensionsBehavior, Report>> + MaybeSend,
+-{
+-    type Future = Fut;
+-}
+-
+-// annoyingly, we can't use MaybeSend here because it isn't an auto trait, so we have to do it manually
+-#[cfg(not(target_arch = "wasm32"))]
+-pub type MaxCertsCallbackFuture =
+-    Pin<Box<dyn Future<Output = Result<Option<Vec<String>>, Report>> + Send + 'static>>;
+-
+-#[cfg(target_arch = "wasm32")]
+-pub type MaxCertsCallbackFuture =
+-    Pin<Box<dyn Future<Output = Result<Option<Vec<String>>, Report>> + 'static>>;
+-
+-// annoyingly, we can't use MaybeSend here because it isn't an auto trait, so we have to do it manually
+-#[cfg(not(target_arch = "wasm32"))]
+-pub type ExtensionsBehaviorCallbackFuture =
+-    Pin<Box<dyn Future<Output = Result<ExtensionsBehavior, Report>> + Send + 'static>>;
+-
+-#[cfg(target_arch = "wasm32")]
+-pub type ExtensionsBehaviorCallbackFuture =
+-    Pin<Box<dyn Future<Output = Result<ExtensionsBehavior, Report>> + 'static>>;
+-
+-// Helper types for when it makes more sense to use a concrete boxed callback instead of a generic type parameter
+-pub type MaxCertsCallbackBox =
+-    Box<dyn Fn(Vec<DevelopmentCertificate>) -> MaxCertsCallbackFuture + Send + Sync + 'static>;
+-
+-pub type ExtensionsBehaviorCallbackBox =
+-    Box<dyn Fn(&[Bundle]) -> ExtensionsBehaviorCallbackFuture + Send + Sync + 'static>;
+Only in upstream/src/util: device.rs
+Only in upstream/src/util: fs_storage.rs
+Only in upstream/src/util: keyring_storage.rs
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/mod.rs zag-isideload/src/util/mod.rs
+--- upstream/src/util/mod.rs	2026-10-28 14:42:44
++++ zag-isideload/src/util/mod.rs	2026-11-18 17:20:23
+@@ -1,8 +1,3 @@
+ pub mod callbacks;
+-pub mod device;
+-#[cfg(feature = "fs-storage")]
+-pub mod fs_storage;
+-#[cfg(feature = "keyring-storage")]
+-pub mod keyring_storage;
+ pub mod plist;
+ pub mod storage;
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/plist.rs zag-isideload/src/util/plist.rs
+--- upstream/src/util/plist.rs	2026-10-28 14:42:44
++++ zag-isideload/src/util/plist.rs	2026-11-18 17:20:23
+@@ -2,7 +2,6 @@
+ use plist_macro::pretty_print_dictionary;
+ use rootcause::prelude::*;
+ use serde::de::DeserializeOwned;
+-use tracing::error;
+ 
+ pub struct SensitivePlistAttachment {
+     pub plist: Dictionary,
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/storage.rs zag-isideload/src/util/storage.rs
+--- upstream/src/util/storage.rs	2026-10-28 14:42:44
++++ zag-isideload/src/util/storage.rs	2026-11-18 17:20:23
+@@ -25,24 +25,8 @@
+     }
+ }
+ 
+-/// Factory function to create a new storage instance based on enabled features. The priority is `keyring-storage`, then `fs-storage`, and finally an in-memory storage if neither of those features are enabled.
+-pub fn new_storage() -> impl SideloadingStorage {
+-    #[cfg(feature = "keyring-storage")]
+-    {
+-        return crate::util::keyring_storage::KeyringStorage::default();
+-    }
+-    #[cfg(all(feature = "fs-storage", not(feature = "keyring-storage")))]
+-    {
+-        return crate::util::fs_storage::FsStorage::default();
+-    }
+-    #[cfg(not(any(feature = "keyring-storage", feature = "fs-storage")))]
+-    {
+-        tracing::warn!(
+-            "Keyring and fs storage not enabled, falling back to in-memory storage. This means that the anisette state and certificates will not be saved across runs. Enable the 'keyring-storage' or 'fs-storage' feature for persistance."
+-        );
+-        return InMemoryStorage::new();
+-    }
+-}
++// Zag Store fork: no default storage. The caller supplies one (Zag Store:
++// its this-device-only Keychain), so nothing is written anywhere else.
+ 
+ pub struct InMemoryStorage {
+     storage: Mutex<HashMap<String, String>>,
