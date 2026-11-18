@@ -33,11 +33,11 @@ Purpose: decide whether the candidate recommended provider (`ZagAnisetteProvider
 - If approved, a one-line change of `evaluation` from `pending` to `approved`, in its own commit.
 - If rejected, an alternative: another public provider (same study), or the documented path to a first-party provider.
 
-## Remaining decisions for you
+## Decisions (18 November 2026)
 
-1. Approve stages 1–2 (passive and availability probes from your Mac).
-2. Separately decide on stage 3 (bounded live anisette requests with a disposable identity).
-3. Confirm the proposed criteria, or set your own.
+1. Stages 1–2: **approved**, with the privacy and rate limits above.
+2. Stage 3: **not approved**.
+3. Criteria: the proposed availability and latency thresholds are confirmed.
 
 ## Running (stages 1–2, approved 18 November 2026)
 
