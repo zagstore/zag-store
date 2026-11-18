@@ -43,6 +43,29 @@ for path in (root / "Feather").rglob("*.swift"):
         before = text[:match.start()]
         assert before.rfind("#if DEBUG") > before.rfind("#endif"), f"{path.name}: {match.group()} outside #if DEBUG"
 print("PASS: entry points (Settings link, launch hook) exist only in Debug builds")
+# The screen's only entry point is the Settings link in the Advanced
+# settings section; nothing else (routes, deep links, launch hooks) opens it.
+uses = [(path.name, m.start()) for path in (root / "Feather").rglob("*.swift")
+        if path.name != "ZagFreeAccountDebugSignInView.swift"
+        for m in re.finditer(r"ZagFreeAccountDebug(SignInView|LaunchHook|Demo|Lab)", path.read_text())]
+assert [name for name, _ in uses] == ["SettingsView.swift"], uses
+settings = (root / "Feather/Views/Settings/SettingsView.swift").read_text()
+section = settings[settings.index("private var _advancedSettingsSections"):settings.index("// Search covers")]
+assert "ZagFreeAccountDebugSignInView()" in section
+print("PASS: the only entry point is Settings > Advanced > Experimental Features")
+# The simulation and the debug screen have no path to the network: no
+# transport, no URLs, no anisette broker, no live service.
+for path in ["Feather/Utilities/FreeAccount/ZagFreeAccountSimulation.swift",
+             "Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift"]:
+    text = (root / path).read_text()
+    for forbidden in ["URLSession", "ZagHTTPTransport", "ZagURLSessionTransport", "URL(string", "URLRequest",
+                      "ZagAnisetteBroker", "ZagDisabledAuthenticationService", "http://", "https://", "NWConnection"]:
+        assert forbidden not in text, (path, forbidden)
+simulation = (root / "Feather/Utilities/FreeAccount/ZagFreeAccountSimulation.swift").read_text()
+assert "anisette: ZagSimulatedAnisetteSource(" in simulation and "service: service," in simulation
+screen = (root / "Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift").read_text()
+assert "ZagFreeAccountAuthenticator(" not in screen and "ZagFreeAccountSimulation.makeAuthenticator(" in screen
+print("PASS: the simulation and the screen cannot reach the network or a live service")
 model = (root / "Feather/Utilities/FreeAccount/ZagFreeAccountSignInModel.swift").read_text()
 for forbidden in ["UserDefaults", "AppStorage", "SecItem", "write(", "Keychain"]:
     assert forbidden not in model, forbidden
