@@ -94,3 +94,11 @@ The launch on the device is the remaining evidence.
 ## Not testable with this certificate
 
 **Extension test with per-component profiles:** blocked. The AppTesters profile covers the single explicit App ID `com.cwd43.gu29`, so there is no second profile for an extension. It needs either a wildcard or per-extension profiles from the certificate supplier, or the first free-account experiment, where Zag Store creates the App IDs itself. The multi-component strict path is covered by the Zsign branch's 86 local checks with a test authority only.
+
+## Follow-up: device test D (integration build)
+
+**PASS, 18 November 2026.** The integrated build has Zsign `f34e51a` inside the app and the #25 core.
+- Install, launch, pairing and Installed Profiles all worked.
+- In-app AppTesters signing and installation succeeded for a small IPA and for an IPA with frameworks.
+
+See `PHASE7-INTEGRATION.md`.

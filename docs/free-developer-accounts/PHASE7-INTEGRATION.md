@@ -1,6 +1,6 @@
 # Phase 7 integration: RPPairing PR #25 and Zsign-Zag PR #1
 
-Status 18 November 2026: **integrated and validated on branch `claude-phase7-integration`. Nothing has been merged, deployed or published.** The canonical IPA is unchanged (`67d1a79b…`).
+Status 18 November 2026: **integrated and validated on branch `claude-phase7-integration`. Device tests A–D passed. Merges approved by the owner with safeguards; nothing deployed or published.** The canonical IPA is unchanged (`67d1a79b…`).
 
 ## What the branch contains
 
@@ -31,7 +31,18 @@ Status 18 November 2026: **integrated and validated on branch `claude-phase7-int
 - Zsign's strict path refuses Watch apps, App Clips, XPC services, nested apps and extensions without a profile.
 - No per-component profile test has been possible yet.
 
-## Device test D (prepared; the owner runs it)
+## Device test D: PASS (owner, iPhone 15 Pro Max, 18 November 2026)
+
+All five checks passed:
+- Zag Store installed and launched.
+- The existing RPPairing connection stayed functional.
+- Installed Profiles (Read Only) worked correctly.
+- **A small IPA signed and installed with the AppTesters certificate through the integrated in-app Zsign.**
+- **A second IPA containing frameworks also signed and installed.**
+
+This confirms Zsign `f34e51a` inside Zag Store on physical hardware, including an app with frameworks.
+
+## Device test D: the procedure as run
 
 The integrated build has Zsign `f34e51a` *inside* the app and the rebuilt #25 core.
 - In B and C only the outer signature came from the new Zsign. The in-app AppTesters signing still used the old pinned Zsign.
@@ -79,8 +90,8 @@ The integrated build has Zsign `f34e51a` *inside* the app and the rebuilt #25 co
    Release and canonical IPA replacement stay separate decisions.
 
 **Preconditions:**
-- device test D passes;
-- the owner approves.
+- device test D passes (**done**, 18 Nov);
+- the owner approves (**approved**, 18 Nov, with safeguards).
 
 **Not included:**
 - the isideload fork (PR #26, awaiting the independent licence review);
