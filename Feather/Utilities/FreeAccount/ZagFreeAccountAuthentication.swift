@@ -197,16 +197,18 @@ struct ZagDisabledAuthenticationService: ZagAppleAuthenticationService {
 struct ZagFreeAccountSessionStore {
 	static let key = "ZagStore.freeAccount.session.v1"
 	let preferences: ZagPreferenceStore
+	/// Simulated sessions use their own key so they never mix with real ones.
+	var key: String = ZagFreeAccountSessionStore.key
 
 	func load() -> ZagFreeAccountSession? {
-		preferences.data(forKey: Self.key).flatMap { try? JSONDecoder().decode(ZagFreeAccountSession.self, from: $0) }
+		preferences.data(forKey: key).flatMap { try? JSONDecoder().decode(ZagFreeAccountSession.self, from: $0) }
 	}
 
 	func save(_ session: ZagFreeAccountSession) throws {
-		preferences.set(try JSONEncoder().encode(session), forKey: Self.key)
+		preferences.set(try JSONEncoder().encode(session), forKey: key)
 	}
 
-	func remove() { preferences.set(nil, forKey: Self.key) }
+	func remove() { preferences.set(nil, forKey: key) }
 }
 
 /// The last 50 free-account events for Settings › Diagnostics. Every entry is
