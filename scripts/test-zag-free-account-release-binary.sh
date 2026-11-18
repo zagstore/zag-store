@@ -20,8 +20,9 @@ found=0
 for marker in "${DEBUG_ONLY[@]}"; do
 	if grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); [ "$MODE" = release ] && echo "FOUND: $marker"; fi
 done
-# Phase 3 simulation (not in builds made before it existed, so release mode only).
-for marker in ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE; do
+# Phase 3 simulation and signing adapter (not in builds made before they existed, so release mode only).
+for marker in ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
+	ZagFreeAccountSigningAdapter ZagFreeAccountLifecycle ZagZsignCodeSigner zag-free-account-signing-; do
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
 done
 if [ "$MODE" = release ]; then

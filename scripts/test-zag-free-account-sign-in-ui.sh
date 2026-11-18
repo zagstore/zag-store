@@ -37,7 +37,7 @@ PY2
 xcrun -sdk iphonesimulator swiftc -target "$(uname -m)-apple-ios16.4-simulator" -parse-as-library -D DEBUG \
 	-module-cache-path "$WORK/module-cache" \
 	"$ROOT"/Feather/Utilities/FreeAccount/*.swift \
-	"$ROOT/Feather/Utilities/ZagEntitlementCompatibility.swift" \
+	"$ROOT/Feather/Utilities/ZagEntitlementCompatibility.swift" "$ROOT/Feather/Utilities/CertificateReader/Models/CertificateModel.swift" "$ROOT/Feather/Utilities/AnyCodable.swift" \
 	"$ROOT/Feather/Views/Settings/Appearance/ZagWallpaper.swift" \
 	"$ROOT/Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift" \
 	"$WORK/ZagWideGamutTint.swift" "$ROOT/scripts/ZagFreeAccountSignInUIHarness.swift" -o "$APP/SignIn" \
