@@ -5,7 +5,7 @@ These are recommendations on `LIVE-AUTH-REVIEW-PROPOSAL.md`. Nothing is enabled.
 | Gate | Recommendation |
 |---|---|
 | **G1 Proposal** | Approve with two amendments. (a) The experiment build must use the multi-account directory, so the session is filed under its own account ID and stays separate from the simulation. (b) The experiment includes sign-out and a Keychain inventory, so we can confirm nothing but that account's own session remains. |
-| **G2 Protocol source** | See below. Choose one source, pin it by commit, and review it before any code depends on it. |
+| **G2 Protocol source** | Evaluated (18 Nov): `isideload` at `326e56229d07`, trimmed to sign-in, portal and anisette, is acceptable **after** a fork removes its signing code (an LGPL-2.1 dependency, and files that cite a GPL-3.0 project as their reference) and a licence reviewer confirms the provenance notes. See `ISIDELOAD-EVALUATION.md` and `SUPERVISED-SIGN-IN-PLAN.md`. |
 | **G3 Anisette** | Let the study finish on 25 Nov without resetting it. Decide on stage 3 from its results and the stage 4 privacy review. If the provider fails either, prefer an on-device approach whose source passes G2's criteria. |
 | **G4 Code review** | A reviewer independent of the implementation, using a checklist: no credential persistence, the redactor covers every log path, the host allowlist, rate limits and the kill switch. The release-binary scan is extended to the live service's markers. |
 | **G5 Test build** | A separately named Debug IPA. The canonical IPA is not replaced. Analytics are compiled out rather than "proven silent". |
@@ -19,7 +19,7 @@ Criteria:
 - it can be reviewed independently, by someone other than its implementer;
 - it is used only as a reference or dependency, with nothing reconstructed from withheld details.
 
-Licences as declared in GitHub's repository metadata on 18 Nov 2026. Confirm each against the LICENSE file before relying on it.
+Licences as declared in GitHub's repository metadata on 18 Nov 2026. For isideload and apple-private-apis, the LICENSE files and isideload's 416 locked dependencies have since been checked (`ISIDELOAD-EVALUATION.md`).
 
 | Source | Declared licence | Notes |
 |---|---|---|

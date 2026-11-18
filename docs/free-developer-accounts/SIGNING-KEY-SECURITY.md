@@ -35,6 +35,10 @@ The Zsign feature branch (`zag-free-account-signing`, draft PR zagorskey/Zsign-Z
    - Tested with a Security framework key: the signatures verify, a refusing or malformed signer fails, and a wrong key is caught by the output check.
 2. **Key from memory.** Key data passed as bytes and wiped from Zsign's copy afterwards. No file.
 
+**Implemented (not yet used by the production path):** `ZagKeychainSigningKeys` creates one Keychain key item per account and team, makes the certificate request from the key reference, and signs through Zsign's callback. This is tested on the simulator's real Keychain, and with the Zsign branch in `scripts/test-zag-zsign-branch.sh`.
+
+**Platform finding.** iOS does not enforce `kSecAttrIsExtractable: false` for software RSA keys: the owning app can still export one (checked on the simulator). "No export" therefore means Zag Store's code never exports the private key, which is enforced by a source check. It does not mean export is impossible.
+
 To get full benefit, the key should also be stored as a **Keychain key item** (`kSecClassKey`, this-device-only) rather than as bytes inside `ZagSigningIdentity`. Then the app only ever holds a reference. RSA keys cannot live in the Secure Enclave, and iOS performs software-key operations within the app's process, so this removes export rather than making the key hardware-bound.
 
 That migration, and switching the adapter to `Zsign.signComponents`, waits for the Zsign branch to be approved and the submodule pointer to be updated.

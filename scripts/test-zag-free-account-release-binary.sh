@@ -25,7 +25,8 @@ done
 # only). The signing adapter and lifecycle are production code behind the
 # closed gate (`ZagFreeAccountSigning.isEnabled`), checked in the source below.
 for marker in ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
-	simulationOnly SIMULATED0002 SIMPAID001 ZagSimulatedAnisetteSource; do
+	simulationOnly SIMULATED0002 SIMPAID001 ZagSimulatedAnisetteSource ZagAppleAccountsDebugView ZagAppleAccountsLab \
+	"Apple Accounts (Simulated)" ZagStrictComponentSigning signComponents; do
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
 done
 if [ "$MODE" = release ]; then

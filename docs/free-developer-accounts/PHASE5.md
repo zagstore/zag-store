@@ -85,3 +85,40 @@ Frameworks and libraries are signed with the app's identity and no entitlements.
 5. The Zsign branch: review, approval and the pointer update. This is needed for extensions, no key export and verified output. Ordinary apps already work with the pinned Zsign through the temporary key file.
 6. Account UI (Liquid Glass) on top of the directory, and wiring a gated entry point.
 7. One supervised experiment with the dedicated test account, after explicit approval.
+
+## Update, 18 November 2026 (owner decisions 1 to 5)
+
+**Zsign (zagorskey/Zsign-Zag#1, head `59020d3`; not merged; pointer still `ab57916`)**
+- Each entitlement value is checked against the component's own profile:
+  - App ID and team;
+  - keychain groups within the team;
+  - app groups listed and named `group.*`;
+  - push environment, iCloud containers and associated domains;
+  - booleans such as `get-task-allow`;
+  - unsupported value kinds are refused.
+- Profiles must have entitlements, an App ID and an expiry.
+- The certificate's issuer must be a valid certificate authority.
+- 83 synthetic checks.
+
+**Behaviour changes for AppTesters, if the pointer is moved:**
+1. A certificate not cryptographically issued by Apple WWDR now fails with a clear error, before the app is changed. It used to produce an unsigned app reported as signed.
+2. An unsignable library fails the signing.
+
+Unchanged and tested:
+- PKCS #12 files, modern and legacy RC2, still load.
+- Certificate import's revocation check answers exactly as before.
+- The canonical IPA's real certificate is accepted.
+
+A positive end-to-end AppTesters signature needs a real certificate with its key, which was not used.
+
+**Integration (isolated):** `signComponents` signs an app with an extension through a Security framework key. It is compiled only with `ZAG_ZSIGN_STRICT`, and covered by 14 checks run against the branch.
+
+**RPPairing read-back (PR #25, draft, separate branch):**
+- `zag_installed_profiles` reads the device's installed profiles through misagent. It is read only.
+- `ZagInstalledProfileCheck` (on this branch, 8 checks) verifies only an exact match: the embedded profile's UUID, team, App ID and expiry, plus each extension's profile.
+- Until #25 is approved, installs remain "not verified".
+- Not yet run on a device. Whether misagent lists free-account profiles on current iOS must be confirmed on the owner's device.
+
+**Accounts UI (Debug only):** Settings > Experimental Features > Apple Accounts (Simulated). `test-zag-apple-accounts-ui.sh` runs 11 in-app checks.
+
+**G2:** see `ISIDELOAD-EVALUATION.md` and `SUPERVISED-SIGN-IN-PLAN.md`.
