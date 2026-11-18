@@ -48,6 +48,13 @@ bool zag_installed_app_icons(
     ZagRPPairingCallback callback
 );
 
+bool zag_installed_profiles(
+    const char *device_ip,
+    const char *pairing_path,
+    const char *output_dir,
+    ZagRPPairingCallback callback
+);
+
 bool zag_gate4_install(
     const char *device_ip,
     const char *pairing_path,

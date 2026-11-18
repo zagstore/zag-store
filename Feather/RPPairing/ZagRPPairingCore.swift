@@ -34,6 +34,13 @@ private func zagInstalledAppIconsCallback(_ code: Int32, _ message: UnsafePointe
 	}
 }
 
+private func zagInstalledProfilesCallback(_ code: Int32, _ message: UnsafePointer<CChar>?) {
+	let text = message.map { String(cString: $0) } ?? ""
+	DispatchQueue.main.async {
+		ZagRPPairingCore.shared.receiveInstalledProfiles(code: code, message: text)
+	}
+}
+
 private func zagInstalledAppsCallback(_ code: Int32, _ message: UnsafePointer<CChar>?) {
 	let text = message.map { String(cString: $0) } ?? ""
 	DispatchQueue.main.async {
@@ -103,6 +110,8 @@ final class ZagRPPairingCore: ObservableObject {
 	@Published private(set) var installedAppsState: InstalledAppsState = .idle
 	@Published private(set) var installedAppIconURLs: [String: URL] = [:]
 	@Published private(set) var installedAppIconsRefreshing = false
+	private var installedProfilesDirectory: URL?
+	private var installedProfilesCompletion: ((Result<[Data], Error>) -> Void)?
 	@Published private(set) var houseArrestRunning = false
 	@Published private(set) var houseArrestBundleID: String?
 	@Published private(set) var houseArrestDocuments: [String] = []
@@ -746,6 +755,59 @@ final class ZagRPPairingCore: ObservableObject {
 		default:
 			break
 		}
+	}
+
+	/// The provisioning profiles installed on the device, exactly as it
+	/// returns them (misagent, read only). Used to confirm which profile, and
+	/// so which expiry, an app signed by Zag Store was installed with.
+	func readInstalledProfiles(
+		deviceIP: String = "10.7.0.1",
+		completion: @escaping (Result<[Data], Error>) -> Void
+	) {
+		guard installedProfilesCompletion == nil else { return completion(.failure(InstalledAppsError.alreadyRunning)) }
+		guard pairingFileExists else { return completion(.failure(InstalledAppsError.notPaired)) }
+		guard acquireTransport("Installed profiles") else { return completion(.failure(InstalledAppsError.alreadyRunning)) }
+
+		let directory = FileManager.default.temporaryDirectory
+			.appendingPathComponent("ZagStore-InstalledProfiles-\(UUID().uuidString)", isDirectory: true)
+		installedProfilesDirectory = directory
+		installedProfilesCompletion = completion
+		let started = deviceIP.withCString { ip in
+			Self.pairingFileURL.path.withCString { pairingPath in
+				directory.path.withCString { outputDirectory in
+					zag_installed_profiles(ip, pairingPath, outputDirectory, zagInstalledProfilesCallback)
+				}
+			}
+		}
+		if !started {
+			finishInstalledProfiles(.failure(InstalledAppsError.couldNotStart))
+		}
+	}
+
+	fileprivate func receiveInstalledProfiles(code: Int32, message: String) {
+		switch code {
+		case 603:
+			// Read every file the core wrote, in order, then remove the folder.
+			let count = Int(message) ?? 0
+			let profiles = (0..<count).compactMap { index in
+				installedProfilesDirectory.flatMap { try? Data(contentsOf: $0.appendingPathComponent("\(index).mobileprovision")) }
+			}
+			finishInstalledProfiles(profiles.count == count ? .success(profiles) : .failure(InstalledAppsError.refreshFailed("An installed profile could not be read.")))
+		case -8:
+			ZagLogger.shared.error("RPPairing", "Installed-profile listing failed: \(message)")
+			finishInstalledProfiles(.failure(InstalledAppsError.refreshFailed(message)))
+		default:
+			break
+		}
+	}
+
+	private func finishInstalledProfiles(_ result: Result<[Data], Error>) {
+		releaseTransport("Installed profiles")
+		if let directory = installedProfilesDirectory { try? FileManager.default.removeItem(at: directory) }
+		installedProfilesDirectory = nil
+		let completion = installedProfilesCompletion
+		installedProfilesCompletion = nil
+		completion?(result)
 	}
 
 	func isInstalled(bundleID: String) -> Bool {
