@@ -30,9 +30,14 @@ for flag in ["static let freeAccountEnabled = false", "enum ZagLiveAuthenticatio
              "static let isEnabled = false\n}\n\n/// Stands in for every configured provider"]:
     assert flag in sources, flag
 print("PASS: live sign-in, live anisette and free-account UI are disabled")
-views = "\n".join(p.read_text() for p in (root / "Feather/Views").rglob("*.swift"))
-assert "freeAppleAccount" not in views and "ZagFreeAccount" not in views
-print("PASS: no free-account UI is exposed yet")
+# Release builds have no free-account UI; the simulated screen is Debug-only
+# (checked in detail by test-zag-free-account-sign-in.sh).
+debug_screen = root / "Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift"
+views = "\n".join(p.read_text() for p in (root / "Feather/Views").rglob("*.swift") if p != debug_screen)
+assert "freeAppleAccount" not in views
+assert re.sub(r"#if DEBUG.*?#endif", "", views, flags=re.S).count("ZagFreeAccount") == 0
+assert debug_screen.read_text().startswith("#if DEBUG")
+print("PASS: no free-account UI in release builds")
 # The entitlement matcher was moved, not copied.
 assert len(re.findall(r"enum ZagEntitlementCompatibility\b", sources + views + (root / "Feather/Utilities/ZagEntitlementCompatibility.swift").read_text())) == 1
 print("PASS: one shared entitlement matcher")
