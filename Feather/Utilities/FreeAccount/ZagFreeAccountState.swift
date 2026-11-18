@@ -75,6 +75,8 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		/// retried automatically: the protocol may have changed.
 		case unexpectedResponse
 		case cancelled
+		/// Sign-in is turned off in this build (live authentication not enabled).
+		case unavailable
 	}
 
 	let kind: Kind
@@ -90,6 +92,7 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		case .anisetteUnavailable: return "Sign-in data from the anisette service is unavailable."
 		case .unexpectedResponse: return "Apple returned a response Zag Store does not recognise."
 		case .cancelled: return "Sign-in was cancelled."
+		case .unavailable: return "Apple Account sign-in is not available in this version of Zag Store."
 		}
 	}
 
@@ -100,6 +103,7 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		case .rateLimited: return "Try again later"
 		case .network, .anisetteUnavailable: return "Check your connection and try again"
 		case .unexpectedResponse: return "Update Zag Store"
+		case .unavailable: return "Use an imported certificate for now"
 		}
 	}
 
