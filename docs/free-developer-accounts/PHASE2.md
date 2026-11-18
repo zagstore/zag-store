@@ -51,6 +51,18 @@ Phase 1 is unchanged otherwise, and so are BYOC, certificate signing and RPPairi
 
 **OpenSSL isn't used in this phase.** Nothing here needs it. It stays reserved for the authentication cryptography, once that's specified and verified under the supervised plan.
 
+## 2a. Debug-only sign-in screen (simulated)
+
+`Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift` is the Apple Account sign-in screen, driven by the real `ZagFreeAccountAuthenticator` through `ZagFreeAccountSignInModel`.
+
+- **Debug builds only.** The screen, the simulation (`ZagFreeAccountSimulation.swift`), the Settings entry (Advanced › Experimental Features › Apple Account (Simulated)) and the launch hook are all inside `#if DEBUG`. Release builds compile none of it; the tests check both the source and the compiled symbols.
+- **Simulated Apple and anisette.** `ZagSimulatedAuthenticationService` accepts only `@example.invalid` addresses with the test password and code. A picker chooses what Apple does: sign in directly, ask for a code, account locked, too many attempts, network failure, no response (timeout), malformed response, or anisette unavailable. Session revocation and a relaunch 31 days later show expiry.
+- **Real storage paths.** The simulated session goes into the device Keychain (separate service `app.zagstore.free-account.simulation`) and a separate preferences key, so it never mixes with a real session later.
+- **Passwords and codes.** The fields are cleared the moment they are submitted; the password moves into `ZagEphemeralSecret`. Nothing writes them anywhere. iOS may still offer to save a typed password to the user's Passwords app. Whether the live screen supports password autofill is a decision for later.
+- **Reuse.** The model holds no authentication logic of its own. State, validation, storage, cancellation and timeouts are the Phase 2 authenticator's.
+
+`ZagFreeAccountSignInModel` is not debug-only: it has no UI or storage of its own, so the eventual live screen can reuse it.
+
 ## 3. Anisette provider evaluation (before any live use)
 
 | Criterion | How it will be checked |
@@ -61,7 +73,7 @@ Phase 1 is unchanged otherwise, and so are BYOC, certificate signing and RPPairi
 | Compatibility | Responses accepted by `ZagAnisetteData(validating:)`; behaviour on errors |
 | Failure handling | Clear "provider unavailable" in the app; no silent switch to another provider |
 
-`ZagAnisetteProviderCatalogue.recommended` (SideStore's public server) stays `pending` until this evaluation is done and you approve it.
+`ZagAnisetteProviderCatalogue.recommended` (SideStore's public server) stays `pending` until this evaluation is done and you approve it. The study plan is in `ANISETTE-STUDY.md`.
 
 ## 4. Supervised real-account test plan (not started)
 
@@ -80,7 +92,7 @@ Phase 1 is unchanged otherwise, and so are BYOC, certificate signing and RPPairi
 2. **Live authentication service.** Implement `ZagAppleAuthenticationService` for Apple's services, behind `ZagLiveAuthentication.isEnabled`, using OpenSSL primitives with published test vectors.
    - It must have its own security review.
    - The protocol behaviour it relies on must be documented and independently confirmed before it's enabled.
-3. **Test build.** A sign-in screen in a debug-only test build. It isn't shown in release builds until Phase 4.
+3. **Test build.** Done with simulated services (section 2a). For the supervised test, the same screen runs against the live service in a test-only build.
 
 **Test cases (run by you, observed through redacted diagnostics):**
 1. Sign in with the correct password and a trusted-device code: expect signed in with the Personal Team, the session in the Keychain, and the password wiped.
@@ -112,4 +124,6 @@ Phase 1 is unchanged otherwise, and so are BYOC, certificate signing and RPPairi
   - live switches off;
   - no free-account UI.
 - `scripts/test-zag-free-account-keychain.sh`: 9 checks against the iOS Simulator's real Keychain.
+- `scripts/test-zag-free-account-sign-in.sh`: **43 state checks** of the sign-in screen's model against the simulation (success, wrong password, code retries, attempt limit, cancellation during sign-in and at the prompt, timeout, revocation, expiry on relaunch, sign-out and failed sign-out, every failure scenario), plus checks that the simulation and the screen exist only in Debug builds.
+- `scripts/test-zag-free-account-sign-in-ui.sh`: the real screen on the iOS Simulator. A scripted walkthrough with 14 screenshots, a video and 10 in-app checks. It runs in a throwaway host app, because the full app cannot link for the simulator: its RPPairing core library is a device-only build.
 - Release iOS build of the app (`CODE_SIGNING_ALLOWED=NO`).
