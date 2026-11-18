@@ -283,7 +283,46 @@ struct Harness {
 		await lifecycle()
 		await lifecycleFailures()
 		await multipleAccounts()
+		await profileReadBack()
 		print("SUCCESS: \(passed) free-account signing and lifecycle checks passed")
+	}
+
+	// MARK: Installed-profile read-back
+
+	/// What the device reports (its installed profiles) against what was
+	/// installed. Only an exact match is verified.
+	static func profileReadBack() async {
+		let h = await Harness.make()
+		guard let result = await h.provision(request()).value else { return check(false, "provision for read-back") }
+		guard let other = await h.provision(request(app: "com.example.other")).value else { return check(false, "second provision") }
+		let profile = result.app.profile
+		let expectation = ZagInstallExpectation(bundleIdentifier: result.app.bundleIdentifier, profileUUID: profile.uuid, profileExpiresAt: profile.expiresAt,
+												certificateExpiresAt: profile.expiresAt.addingTimeInterval(86_400 * 300), signerCommonName: nil, teamIdentifier: team)
+		let verdict = ZagInstalledProfileCheck.verify(expectation, installedProfiles: [other.app.profile.data, profile.data])
+		check(verdict == .verified(profileExpiresAt: profile.expiresAt, certificateExpiresAt: expectation.certificateExpiresAt),
+			  "the app's own profile on the device, with the expected team, App ID and expiry, is verified")
+		check(ZagInstalledProfileCheck.verify(expectation, installedProfiles: [other.app.profile.data]) == .unverifiable("the app's profile is not among the device's installed profiles"),
+			  "without the app's own profile on the device, nothing is verified (another app's profile does not count)")
+		check(ZagInstalledProfileCheck.verify(expectation, installedProfiles: []) != .verified(profileExpiresAt: profile.expiresAt, certificateExpiresAt: expectation.certificateExpiresAt)
+			  && ZagInstalledProfileCheck.verify(expectation, installedProfiles: [Data("junk".utf8)]) == .unverifiable("the app's profile is not among the device's installed profiles"),
+			  "an empty or unreadable profile list is never success")
+		var later = expectation
+		later = ZagInstallExpectation(bundleIdentifier: later.bundleIdentifier, profileUUID: later.profileUUID, profileExpiresAt: later.profileExpiresAt.addingTimeInterval(86_400),
+									  certificateExpiresAt: later.certificateExpiresAt, signerCommonName: nil, teamIdentifier: team)
+		check(ZagInstalledProfileCheck.verify(later, installedProfiles: [profile.data]) == .mismatch("profile expiry"), "a different expiry on the device is a mismatch")
+		let wrongTeam = ZagInstallExpectation(bundleIdentifier: expectation.bundleIdentifier, profileUUID: profile.uuid, profileExpiresAt: profile.expiresAt,
+											  certificateExpiresAt: expectation.certificateExpiresAt, signerCommonName: nil, teamIdentifier: "OTHERTEAM1")
+		check(ZagInstalledProfileCheck.verify(wrongTeam, installedProfiles: [profile.data]) == .mismatch("profile team"), "a profile for another team is a mismatch")
+		let wrongApp = ZagInstallExpectation(bundleIdentifier: "com.example.elsewhere", profileUUID: profile.uuid, profileExpiresAt: profile.expiresAt,
+											 certificateExpiresAt: expectation.certificateExpiresAt, signerCommonName: nil, teamIdentifier: team)
+		check(ZagInstalledProfileCheck.verify(wrongApp, installedProfiles: [profile.data]) == .mismatch("profile App ID"), "a profile for another App ID is a mismatch")
+		var withExtension = expectation
+		withExtension.extensionProfileUUIDs = ["00000000-0000-0000-0000-000000000000"]
+		check(ZagInstalledProfileCheck.verify(withExtension, installedProfiles: [profile.data]) == .unverifiable("an extension's profile is not among the device's installed profiles"),
+			  "a missing extension profile is never success")
+		withExtension.extensionProfileUUIDs = [other.app.profile.uuid]
+		check(ZagInstalledProfileCheck.verify(withExtension, installedProfiles: [profile.data, other.app.profile.data]) != .mismatch("extension profile team"),
+			  "extension profiles of the same team are accepted")
 	}
 
 	// MARK: Keys and certificate requests

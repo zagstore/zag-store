@@ -20,6 +20,10 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 
 	var gate = ZagFreeAccountSigningGate.production
 	var workRoot = FileManager.default.temporaryDirectory
+	/// The device's installed provisioning profiles. Nil until the RPPairing
+	/// misagent reader (draft PR #25) is approved; then `verify` can confirm
+	/// the installed profile and its expiry instead of reporting unverifiable.
+	var installedProfiles: (@Sendable () async -> Result<[Data], Error>)?
 
 	func install(signedApp: URL, bundleIdentifier: String) async throws {
 		guard gate.isOpen else { throw Failure.disabled }
@@ -61,9 +65,14 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 			if let expected = expectation.signerCommonName, !app.signerIdentity.isEmpty, app.signerIdentity != expected {
 				return .mismatch("signer")
 			}
-			// Present and signed by this certificate; the profile's expiry on
-			// the device cannot be read with the current RPPairing core.
-			return .unverifiable("installed; profile expiry cannot be read back")
+			// Present and signed by this certificate. The profile and its
+			// expiry can be confirmed only by reading the device's installed
+			// profiles (RPPairing misagent, draft PR #25, not merged).
+			guard let installedProfiles else { return .unverifiable("installed; profile expiry cannot be read back") }
+			switch await installedProfiles() {
+			case .success(let profiles): return ZagInstalledProfileCheck.verify(expectation, installedProfiles: profiles)
+			case .failure: return .unverifiable("installed; the device's profiles could not be read")
+			}
 		}
 	}
 

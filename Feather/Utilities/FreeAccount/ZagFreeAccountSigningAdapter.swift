@@ -271,6 +271,40 @@ struct ZagInstallExpectation: Equatable, Sendable {
 	let certificateExpiresAt: Date
 	/// The signing certificate's common name, as installation_proxy reports it.
 	let signerCommonName: String?
+	var teamIdentifier: String?
+	/// Each extension's profile, which the device installs alongside the app's.
+	var extensionProfileUUIDs: [String] = []
+}
+
+/// Compares the provisioning profiles the device reports as installed
+/// (RPPairing misagent, draft PR #25) with what Zag Store installed. The
+/// device does not say which app uses which profile, so profiles are
+/// matched by the UUID of the exact profile Zag Store embedded; its team,
+/// App ID and expiry must then be the expected ones. Anything less is not
+/// success.
+enum ZagInstalledProfileCheck {
+	static func verify(_ expectation: ZagInstallExpectation, installedProfiles: [Data]) -> ZagInstallVerification {
+		var byUUID: [String: Certificate] = [:]
+		for data in installedProfiles {
+			if let profile = try? Certificate.decode(profileData: data) { byUUID[profile.UUID] = profile }
+		}
+		guard let app = byUUID[expectation.profileUUID] else {
+			return .unverifiable("the app's profile is not among the device's installed profiles")
+		}
+		let team = expectation.teamIdentifier ?? app.TeamIdentifier.first ?? ""
+		guard app.TeamIdentifier.first == team else { return .mismatch("profile team") }
+		guard app.Entitlements?["application-identifier"]?.value as? String == "\(team).\(expectation.bundleIdentifier)" else {
+			return .mismatch("profile App ID")
+		}
+		guard abs(app.ExpirationDate.timeIntervalSince(expectation.profileExpiresAt)) < 1 else { return .mismatch("profile expiry") }
+		var earliest = app.ExpirationDate
+		for uuid in expectation.extensionProfileUUIDs {
+			guard let profile = byUUID[uuid] else { return .unverifiable("an extension's profile is not among the device's installed profiles") }
+			guard profile.TeamIdentifier.first == team else { return .mismatch("extension profile team") }
+			earliest = min(earliest, profile.ExpirationDate)
+		}
+		return .verified(profileExpiresAt: earliest, certificateExpiresAt: expectation.certificateExpiresAt)
+	}
 }
 
 /// What the device reported after an installation.
@@ -437,7 +471,9 @@ struct ZagFreeAccountLifecycle: Sendable {
 			profileUUID: result.app.profile.uuid,
 			profileExpiresAt: record.profileExpiresAt,
 			certificateExpiresAt: record.certificateExpiresAt,
-			signerCommonName: ZagCertificateInspection(der: identity.certificate)?.commonName
+			signerCommonName: ZagCertificateInspection(der: identity.certificate)?.commonName,
+			teamIdentifier: result.team,
+			extensionProfileUUIDs: result.extensions.map(\.profile.uuid)
 		)
 		switch await installer.verify(expectation) {
 		case .verified(let profileExpiresAt, let certificateExpiresAt):
