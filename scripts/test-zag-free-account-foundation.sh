@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK=$(mktemp -d "${TMPDIR:-/tmp/}zag-free-account.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
-swiftc -warnings-as-errors -parse-as-library \
+swiftc -warnings-as-errors -parse-as-library -target "$(uname -m)-apple-macos13" \
 	"$ROOT"/Feather/Utilities/FreeAccount/*.swift \
 	"$ROOT/Feather/Utilities/ZagEntitlementCompatibility.swift" \
 	"$ROOT/scripts/ZagFreeAccountFoundationTests.swift" -o "$WORK/tests"
@@ -17,12 +17,19 @@ from pathlib import Path
 import re, sys
 root = Path(sys.argv[1])
 sources = "\n".join(p.read_text() for p in (root / "Feather/Utilities/FreeAccount").glob("*.swift"))
-# Phase 1 talks to nothing: no Apple endpoints, no anisette service, no logging of values.
-for forbidden in ["URLSession", "gsa.apple.com", "developerservices", "anisette.", "print(", "Logger"]:
+files = {p.name: p.read_text() for p in (root / "Feather/Utilities/FreeAccount").glob("*.swift")}
+# No Apple endpoint exists in the code, nothing is logged, and only the
+# transport may open network connections (with the system's TLS validation).
+assert not re.search(r'"https?://[^"]*apple\.com', sources), "Apple service URL in code"
+for forbidden in ["print(", "Logger", "NSLog", "os_log", "serverTrust", "didReceive challenge", "allowsArbitraryLoads"]:
     assert forbidden not in sources, forbidden
-print("PASS: phase 1 makes no network requests and logs nothing")
-# Free-account UI stays hidden until it works end to end.
-assert "static let freeAccountEnabled = false" in sources
+assert [name for name, text in files.items() if "URLSession" in text] == ["ZagFreeAccountTransport.swift"]
+print("PASS: no Apple endpoints, no logging; only the transport touches the network")
+# Live sign-in, live anisette and the free-account UI all stay off.
+for flag in ["static let freeAccountEnabled = false", "enum ZagLiveAuthentication {\n\t/// Live Apple Account authentication is not implemented or enabled.\n\tstatic let isEnabled = false",
+             "static let isEnabled = false\n}\n\n/// Stands in for every configured provider"]:
+    assert flag in sources, flag
+print("PASS: live sign-in, live anisette and free-account UI are disabled")
 views = "\n".join(p.read_text() for p in (root / "Feather/Views").rglob("*.swift"))
 assert "freeAppleAccount" not in views and "ZagFreeAccount" not in views
 print("PASS: no free-account UI is exposed yet")
