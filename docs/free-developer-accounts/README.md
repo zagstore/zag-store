@@ -271,3 +271,9 @@ It must be validated against Apple's real responses; mocks alone don't count.
 - Anisette server availability.
 - A free account's 3-app limit: Zag Store itself uses one slot if it's signed with the same account.
 - iOS 16 transport support in the RPPairing core.
+
+**Phase 7 working documents (18 Nov 2026).**
+- `FIRST-LIVE-EXPERIMENT.md`: the smallest path to the first supervised free-account installation, and the G1–G6 evidence.
+- `DEVICE-TEST-PHASE7.md`: the installed-profiles (PR #25) and Zsign branch device tests.
+- `WEBSITE-INSTALL-FEASIBILITY.md`: installing from zagstore.app with a visitor's free account.
+- The trimmed isideload fork and its provenance evidence: PR #26, `AppleAuthCore/zag-isideload/PROVENANCE.md`.
