@@ -1,6 +1,6 @@
 # Device tests, phase 7: installed profiles (PR #25) and Zsign branch signing (Zsign-Zag #1)
 
-Status: **prepared 18 November 2026; owner to run on the iPhone 15 Pro Max.** No results yet.
+Status: **PASS. Owner-run on a physical iPhone 15 Pro Max, 18 November 2026; all three tests passed.** Results below.
 
 The canonical IPA (`~/Documents/ZagStore-v1.0.0-build1-iOS-AppTesters.ipa`, `67d1a79b…`) is not replaced. Every test IPA below:
 - is Zag Store 1.0.0 (Build 1), bundle `com.cwd43.gu29`, signed for the existing AppTesters certificate;
@@ -14,6 +14,29 @@ The canonical IPA (`~/Documents/ZagStore-v1.0.0-build1-iOS-AppTesters.ipa`, `67d
 | **C** `packages/private-test/ZSIGN-TEST-f34e51a/ZagStore-ZSIGN-BRANCH-STRICT-TEST.ipa` | Zsign branch `f34e51a`, strict path: the private key is a non-extractable key in a throwaway keychain, used only through `SecKeyCreateSignature` | 60,418,528 | `eee600c2a95ddcad6fd24be0c21cd081f93df91c6ad64ed7ebffdc6ee88a86e8` |
 
 The folders are under `~/Documents/ZagStore-claude/`.
+
+## Results (owner-reported, 18 November 2026)
+
+**A: installed profiles, read only (PR #25): pass**
+- Four installed profiles were returned, and all four were readable.
+- UUID, team, App ID and expiry were available for all four.
+- This app's embedded profile was found and matched: **VERIFIED**.
+- Control, altered expiry: **MISMATCH**, as expected.
+- Control, absent profile: **NOT VERIFIED**, as expected.
+
+**B: Zsign branch, ordinary path (Zsign-Zag #1): pass**
+- iOS accepted the installation.
+- Zag Store launched and stayed stable; Library, Settings and Sources worked.
+- Pairing stayed connected, and the installed-profiles read-back worked.
+- AppTesters signing and installation from inside the app succeeded.
+
+**C: Zsign branch, strict path with the Security framework key (Zsign-Zag #1): pass**
+- iOS accepted the installation.
+- Zag Store launched and stayed stable; Library, Settings and Sources worked.
+- Pairing stayed connected, and the installed-profiles read-back worked.
+- AppTesters signing and installation from inside the app succeeded.
+
+**Still not tested:** the extension test with per-component profiles. It is blocked (see the end of this document).
 
 ## Install by AirDrop (each IPA, one at a time)
 
