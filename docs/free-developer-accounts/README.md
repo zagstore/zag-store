@@ -1,6 +1,6 @@
 # Free Apple Developer Accounts: research, architecture and plan
 
-Status: Phase 0 (research) and Phase 1 (foundation) done on branch
+Status: Phase 0 (research), Phase 1 (foundation) and the Phase 2 groundwork (see `PHASE2.md`) done on branch
 `claude-free-developer-accounts`, 18 November 2026. Nothing user-visible ships
 yet. The free-account method stays hidden (`ZagSigningMethodAvailability.freeAccountEnabled = false`)
 until it can sign and install end to end.
@@ -145,7 +145,7 @@ The Apple Account password goes only to Apple, through the SRP exchange, and is 
 
 - **Apple Account password.**
   - It's used once, for SRP, and never written to disk or the Keychain (`ZagFreeAccountSecretKind` has no password kind; this is tested).
-  - The cost is that an expired session needs the user to sign in again. Storing the password for unattended re-login would be an opt-in decision for you.
+  - The cost is that an expired session needs the user to sign in again. **Owner decision (18 November): the password is never persisted, not even as an option.**
 - **Session token and DSID.**
   - Kept in the Keychain as `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, not synchronised, under service `app.zagstore.free-account.v1`.
   - "After first unlock" is needed so a background or Shortcut refresh can read it.
