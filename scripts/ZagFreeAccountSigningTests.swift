@@ -11,8 +11,10 @@ import Security
 let environment = ProcessInfo.processInfo.environment
 let openssl = environment["ZAG_TEST_OPENSSL"]!
 /// Self-generated and trusted by nothing. Its subject name matches Apple's
-/// WWDR G3 intermediate only so that Zsign's issuer check takes its normal
-/// signing path; `otherAuthority` has a plainly different name.
+/// WWDR G3 intermediate; Zsign checks the chain cryptographically, so the
+/// name alone is not enough: the tests supply it to Zsign explicitly as an
+/// intermediate (`testSign`), and check that the ordinary path refuses it.
+/// `otherAuthority` has a plainly different name and is never supplied.
 let recognisedAuthority = URL(fileURLWithPath: environment["ZAG_TEST_AUTHORITY"]!)
 let otherAuthority = URL(fileURLWithPath: environment["ZAG_TEST_OTHER_AUTHORITY"]!)
 let executable = URL(fileURLWithPath: environment["ZAG_TEST_EXECUTABLE"]!)
@@ -100,7 +102,27 @@ final class RecordingSigner: ZagCodeSigner, @unchecked Sendable {
 		let mode = (try? FileManager.default.attributesOfItem(atPath: privateKey.path)[.posixPermissions] as? Int) ?? -1
 		let folder = (try? FileManager.default.attributesOfItem(atPath: privateKey.deletingLastPathComponent().path)[.posixPermissions] as? Int) ?? -1
 		guard mode == 0o600, folder == 0o700 else { throw ZagSignerFailure(message: "key file permissions \(String(mode, radix: 8)) / \(String(folder, radix: 8))") }
-		try ZagZsignCodeSigner().sign(app: app, profile: profile, privateKey: privateKey, entitlements: entitlements, bundleIdentifier: bundleIdentifier)
+		try testSign(app: app, profile: profile, privateKey: privateKey, entitlements: entitlements, bundleIdentifier: bundleIdentifier)
+	}
+}
+
+/// The same Zsign library and signature format as the app, through its
+/// strict entry point, which accepts a test intermediate explicitly: Zsign's
+/// ordinary path accepts only certificates cryptographically issued by
+/// Apple's WWDR intermediates, which no test can have. The ordinary path is
+/// covered with a real certificate by test-zag-zsign-real-certificate.sh.
+func testSign(app: URL, profile: URL, privateKey: URL, entitlements: URL, bundleIdentifier: String) throws {
+	let profileData = try Data(contentsOf: profile)
+	guard let certificate = (try? Certificate.decode(profileData: profileData))??.DeveloperCertificates?.first else {
+		throw ZagSignerFailure(message: "no certificate in the profile")
+	}
+	let authority = run(openssl, ["x509", "-in", recognisedAuthority.appendingPathComponent("ca.pem").path, "-outform", "DER"]).output
+	if let failure = Zsign.signComponents(
+		appPath: app.path, certificate: certificate, keyData: try Data(contentsOf: privateKey),
+		components: ["": (profileData, try Data(contentsOf: entitlements))],
+		bundleIdentifier: bundleIdentifier, extraIntermediates: [authority]
+	) {
+		throw ZagSignerFailure(message: failure)
 	}
 }
 
@@ -460,19 +482,24 @@ struct Harness {
 				  "an app with an extension is refused before signing (Zsign cannot sign it per App ID)")
 		}
 
-		// The evidence for that refusal: Zsign, as the app calls it, signs the
-		// extension with the main app's entitlements and embeds no profile in it.
+		// Zsign's ordinary path (ZagZsignCodeSigner, as the app calls it)
+		// refuses a certificate that only carries Apple's WWDR name: the chain
+		// is checked cryptographically, and nothing is signed.
 		let evidence = makeApp(extensions: ["Widget"])
 		let profile = temporaryFile(result.app.profile.data, "main.mobileprovision")
 		let keyFile = temporaryFile(identity.privateKey, "key")
 		let entitlements = temporaryFile(try! PropertyListSerialization.data(fromPropertyList: result.app.entitlements.dictionary, format: .xml, options: 0), "e.plist")
-		try? ZagZsignCodeSigner().sign(app: evidence, profile: profile, privateKey: keyFile, entitlements: entitlements, bundleIdentifier: result.app.bundleIdentifier)
+		var ordinaryRefused = false
+		do {
+			try ZagZsignCodeSigner().sign(app: evidence, profile: profile, privateKey: keyFile, entitlements: entitlements, bundleIdentifier: result.app.bundleIdentifier)
+		} catch {
+			ordinaryRefused = true
+		}
 		try? FileManager.default.removeItem(at: keyFile)
 		let appex = evidence.appendingPathComponent("PlugIns/Widget.appex")
-		let appexEntitlements = signedEntitlements(appex.appendingPathComponent("Widget"))
-		check(appexEntitlements["application-identifier"] as? String == "\(team).com.example.notes.\(team)"
+		check(ordinaryRefused && !ZagCodeSignatureInspection.hasCMSSignature(try! Data(contentsOf: evidence.appendingPathComponent("Notes")))
 			  && !FileManager.default.fileExists(atPath: appex.appendingPathComponent("embedded.mobileprovision").path),
-			  "evidence: Zsign gives an extension the main app's App ID and no profile of its own")
+			  "Zsign's ordinary path refuses a certificate that only carries Apple's WWDR name, and signs nothing")
 
 		let other = ZagSigningIdentity(serialNumber: "DEADBEEF", certificate: identity.certificate, privateKey: identity.privateKey, expiresAt: identity.expiresAt)
 		do {
@@ -499,8 +526,9 @@ struct Harness {
 		}
 		check(h.stagingIsEmpty, "the key file is removed after a failed signing too")
 
-		// Zsign says "Signed OK" for a certificate whose issuer it does not
-		// recognise, but makes no CMS signature; the adapter must catch that.
+		// A certificate from an authority Zsign is not given: Zsign refuses it
+		// (the pinned Zsign used to report "Signed OK" without a CMS
+		// signature, which the adapter's own check still guards against).
 		let unrecognised = await Harness.make(issuer: OpenSSLIssuer(authority: otherAuthority))
 		guard let otherResult = await unrecognised.provision(request()).value, let otherIdentity = unrecognised.identity else {
 			return check(false, "provision with the other authority")
@@ -509,8 +537,13 @@ struct Harness {
 			_ = try unrecognised.adapter.sign(appAt: makeApp(), with: otherResult, identity: otherIdentity, authorization: await unrecognised.authorization(), now: unrecognised.clock.now)
 			check(false, "unsigned result accepted")
 		} catch {
-			check(error as? ZagFreeAccountSigningError == .verification("no signature") && unrecognised.stagingIsEmpty,
-				  "a result Zsign reports as signed but that has no CMS signature is refused")
+			let refused: Bool
+			switch error as? ZagFreeAccountSigningError {
+			case .signer?, .verification("no signature")?: refused = true
+			default: refused = false
+			}
+			check(refused && unrecognised.stagingIsEmpty,
+				  "a certificate from an authority Zsign is not given is refused, with no false success")
 		}
 	}
 

@@ -14,8 +14,18 @@ SSL="${ZAG_OPENSSL_PREFIX:-$(brew --prefix openssl@3 2>/dev/null || true)}"
 
 # The existing signing and installation paths are not part of this change.
 BASE=$(git -C "$ROOT" merge-base HEAD "${ZAG_BASE_REF:-public/main}")
-git -C "$ROOT" diff --quiet "$BASE" -- Zsign RPPairingCore Feather/Utilities/Handlers \
-	|| { echo "FAIL: Zsign, RPPairing or the signing handlers differ from the base branch" >&2; exit 1; }
+# The signing handlers (the AppTesters path) never change here. The Zsign
+# pointer may move only to the reviewed, device-tested commit of Zsign-Zag #1,
+# and RPPairingCore may differ only by PR #25, exactly as reviewed.
+ZSIGN_REVIEWED=f34e51a06e803b4aeb2df2c5763c5f1ddfe46cb1
+RPPAIRING_REVIEWED=25cdc49a
+git -C "$ROOT" diff --quiet "$BASE" -- Feather/Utilities/Handlers \
+	|| { echo "FAIL: the signing handlers differ from the base branch" >&2; exit 1; }
+ZSIGN_NOW=$(git -C "$ROOT" ls-tree HEAD Zsign | awk '{print $3}')
+git -C "$ROOT" diff --quiet "$BASE" -- Zsign || [ "$ZSIGN_NOW" = "$ZSIGN_REVIEWED" ] \
+	|| { echo "FAIL: the Zsign pointer differs from the base branch and is not the reviewed commit" >&2; exit 1; }
+git -C "$ROOT" diff --quiet "$BASE" -- RPPairingCore || git -C "$ROOT" diff --quiet "$RPPAIRING_REVIEWED" HEAD -- RPPairingCore \
+	|| { echo "FAIL: RPPairingCore differs from both the base branch and the reviewed PR #25" >&2; exit 1; }
 echo "PASS: Zsign, RPPairing and the AppTesters signing handlers are unchanged from the base branch"
 
 python3 - "$ROOT" <<'PY2'
