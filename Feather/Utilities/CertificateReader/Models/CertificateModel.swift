@@ -49,4 +49,18 @@ struct Certificate: Codable {
 		     Version
 		case derEncodedProfile = "DER-Encoded-Profile"
 	}
+
+	/// Decodes a .mobileprovision file: the property list inside its signed
+	/// envelope. Nil when the file holds no property list. The envelope's
+	/// signature is not checked here.
+	static func decode(profileData: Data) throws -> Certificate? {
+		guard let xmlRange = profileData.range(of: Data("<?xml".utf8)) else {
+			return nil
+		}
+		
+		let xmlData = profileData.subdata(in: xmlRange.lowerBound..<profileData.endIndex)
+		
+		let decoder = PropertyListDecoder()
+		return try decoder.decode(Certificate.self, from: xmlData)
+	}
 }
