@@ -340,7 +340,7 @@ private struct ZagFreeAccountStatusCard: View {
 	}
 }
 
-private struct ZagFreeAccountPrimaryButton: View {
+struct ZagFreeAccountPrimaryButton: View {
 	let title: String
 	let enabled: Bool
 	let action: () -> Void
@@ -362,7 +362,7 @@ private struct ZagFreeAccountPrimaryButton: View {
 	}
 }
 
-private struct ZagFreeAccountCodeSheet: View {
+struct ZagFreeAccountCodeSheet: View {
 	@ObservedObject var model: ZagFreeAccountSignInModel
 	let tint: Color
 	@FocusState private var focused: Bool
@@ -427,7 +427,7 @@ private struct ZagFreeAccountCodeSheet: View {
 	}
 }
 
-private extension View {
+extension View {
 	@ViewBuilder
 	func zagFreeAccountGlass<S: Shape>(in shape: S) -> some View {
 		if #available(iOS 26.0, *) {
