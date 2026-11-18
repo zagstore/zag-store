@@ -1,27 +1,47 @@
 # Device test: debug-only Apple Account sign-in screen
 
-Status: **ready for the owner to run. Not yet validated on a device.**
+Status: **PASS. Owner-run on a physical iPhone 15 Pro Max, 18 November 2026; results below.**
 
 ## The build
 
 - Source: branch `claude-free-developer-accounts` at `09516af4`. The Release configuration is compiled with the `DEBUG` flag added, the same pattern as `scripts/build-zag-first-launch-test.sh`. That flag is what the screen and its Settings entry depend on. Otherwise it enables only some navigation logging.
   - The Xcode Debug configuration cannot go through the existing packager: it produces version `1.0.0-debug` and a different bundle ID.
 - Packaged with the existing `~/Documents/ZagStore-Package.zsh`: AppTesters signature, profile, entitlements and the first-launch guard all passed.
-- **Canonical IPA, now this test build:** `~/Documents/ZagStore-v1.0.0-build1-iOS-AppTesters.ipa`
+- **Test IPA, kept for future testing:** `packages/private-test/DEBUG-SIGNIN-9e73d8b0/ZagStore-DEBUG-SIGNIN-TEST-AppTesters-09516af4.ipa`
   - SHA-256 `2cf357087cfe46a2f37934ea5e34636576d8736192943f3fd0c2b67c3cf2e7b1`
   - Zag Store 1.0.0 (Build 1), bundle `com.cwd43.gu29`.
-- **Previous canonical IPA (private Nightly build 1, `67d1a79b…`):** preserved, byte-identical, at `packages/private-test/FINAL-1299f1e9/ZagStore-Nightly-build1-INSTALL-THIS-AppTesters-1299f1e9.ipa`.
+  - It was the canonical IPA during the test.
+- **Canonical IPA:** restored after the test to the private Nightly build 1 (`67d1a79b…`), from its byte-identical copy at `packages/private-test/FINAL-1299f1e9/ZagStore-Nightly-build1-INSTALL-THIS-AppTesters-1299f1e9.ipa`.
 - Staging, logs and hashes: `packages/private-test/DEBUG-SIGNIN-9e73d8b0/`. RPPairing and its build configuration were not modified.
+
+## Results (owner-reported, 18 November 2026)
+
+Run by the owner on an iPhone 15 Pro Max with the test IPA above. **All scenarios exercised passed; no failures observed.**
+
+| Area (checklist items) | Result |
+|---|---|
+| Simulated sign-in and 2FA, including an invalid then a valid code (3–6) | Pass |
+| Keychain session persists across app restarts (7) | Pass |
+| Session revocation (8) and sign-in cancellation (9) | Pass |
+| Network timeout and cancellation while signing in (10) | Pass |
+| Invalid credentials rejected (11) | Pass |
+| Simulated authentication works in Airplane Mode (12) | Pass |
+| All four error scenarios show their messages (13) | Pass |
+| Sign-out persists after restarting the app (14) | Pass |
+| Diagnostics expose no sensitive credentials (15) | Pass |
+| Existing AppTesters certificate signing, pairing and IPA installation work normally (16) | Pass |
+
+The owner's report does not separately mention items 1–2 (screen hidden while Advanced settings is locked, reachable only from its Settings entry). The source checks above enforce both.
 
 ## Install (you run this; the iPhone must be connected and trusted)
 
 ```bash
 xcrun devicectl list devices
-W=$(mktemp -d) && unzip -q ~/Documents/ZagStore-v1.0.0-build1-iOS-AppTesters.ipa -d "$W" \
+W=$(mktemp -d) && unzip -q packages/private-test/DEBUG-SIGNIN-9e73d8b0/ZagStore-DEBUG-SIGNIN-TEST-AppTesters-09516af4.ipa -d "$W" \
   && xcrun devicectl device install app --device "<identifier of your iPhone from the list above>" "$W/Payload/Feather.app"
 ```
 
-Or install the canonical IPA the way you normally do. It replaces the installed Zag Store (`com.cwd43.gu29`) and keeps its data. The build number is 1, so Zag Store may offer a software update; **don't update during the test**.
+Run it from `~/Documents/ZagStore-claude`, or install the test IPA the way you normally do. It replaces the installed Zag Store (`com.cwd43.gu29`) and keeps its data. The build number is 1, so Zag Store may offer a software update; **don't update during the test**.
 
 ## Checklist
 
@@ -48,7 +68,7 @@ Use only the test account the screen offers: `tester@example.invalid`, `zag-simu
 
 Report each number as pass or fail. For a failure, add a screenshot.
 
-## After the test: restore the previous canonical IPA
+## After a test: restore the canonical IPA (done on 18 November)
 
 ```bash
 cd ~/Documents/ZagStore-claude
@@ -57,7 +77,7 @@ cp packages/private-test/FINAL-1299f1e9/ZagStore-Nightly-build1-INSTALL-THIS-App
 shasum -a 256 ~/Documents/ZagStore-v1.0.0-build1-iOS-AppTesters.ipa   # expect 67d1a79b…
 ```
 
-Then reinstall your usual Zag Store build on the iPhone. The simulated session uses its own Keychain service (`app.zagstore.free-account.simulation`) and preferences key. Sign out in the screen before reinstalling to leave nothing behind.
+The test IPA is never the canonical IPA now, so this applies only if it is copied there again. Afterwards, reinstall your usual Zag Store build on the iPhone. The simulated session uses its own Keychain service (`app.zagstore.free-account.simulation`) and preferences key. Sign out in the screen before reinstalling to leave nothing behind.
 
 ## Already verified without the device
 
