@@ -59,6 +59,33 @@ struct ZagIssuedProfile: Sendable, Equatable {
 	let data: Data
 }
 
+extension ZagIssuedProfile {
+	/// Reads a signed .mobileprovision with Zag Store's profile parser
+	/// (`Certificate.decode`). Certificate serials come from the profile's own
+	/// developer certificates, in `ZagCertificateInspection`'s format.
+	init(profileData: Data) throws {
+		guard let profile = try? Certificate.decode(profileData: profileData),
+			  let team = profile.TeamIdentifier.first,
+			  let entitlements = profile.Entitlements?.mapValues(\.value),
+			  let applicationIdentifier = entitlements[ZagFreeAccountEntitlements.applicationIdentifierKey] as? String,
+			  let dot = applicationIdentifier.firstIndex(of: "."),
+			  let entitlementSet = try? ZagEntitlementSet(entitlements) else {
+			throw ZagPortalError.malformedResponse
+		}
+		self.init(
+			uuid: profile.UUID,
+			teamIdentifier: team,
+			bundleIdentifier: String(applicationIdentifier[applicationIdentifier.index(after: dot)...]),
+			certificateSerials: (profile.DeveloperCertificates ?? []).compactMap { ZagCertificateInspection(der: $0)?.serialNumber },
+			deviceUDIDs: profile.ProvisionedDevices ?? [],
+			entitlements: entitlementSet,
+			createdAt: profile.CreationDate,
+			expiresAt: profile.ExpirationDate,
+			data: profileData
+		)
+	}
+}
+
 enum ZagPortalError: Error, Equatable, Sendable {
 	/// Apple no longer accepts the session; the user must sign in again.
 	case sessionRejected
@@ -111,11 +138,14 @@ struct ZagDisabledDeveloperPortal: ZagDeveloperPortalService {
 /// on the device. Only a simulation implements it in this phase.
 protocol ZagSigningKeyFactory: Sendable {
 	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest)
+	/// Whether an issued certificate is for `privateKey`, with its serial and expiry.
+	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck
 }
 
 struct ZagDisabledSigningKeyFactory: ZagSigningKeyFactory {
 	enum Failure: Error { case unavailable }
 	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest) { throw Failure.unavailable }
+	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck { .mismatch }
 }
 
 /// The development signing identity kept in the Keychain

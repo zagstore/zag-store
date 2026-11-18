@@ -326,14 +326,25 @@ actor ZagFreeAccountProvisioner {
 				let valid = remote.filter { $0.expiresAt > now() }.sorted { $0.expiresAt < $1.expiresAt }
 				throw ZagProvisioningFailure(kind: .certificateMustBeRevoked(candidates: valid), step: .certificate)
 			}
-			guard !issued.data.isEmpty, issued.certificate.expiresAt > now() else {
+			// The certificate must be for the key just made.
+			var serial = issued.certificate.serialNumber, expiresAt = issued.certificate.expiresAt
+			switch keys.check(certificate: issued.data, privateKey: key.privateKey) {
+			case .matches(let inspectedSerial, let inspectedExpiry):
+				serial = inspectedSerial
+				expiresAt = inspectedExpiry
+			case .notInspected:
+				break
+			case .mismatch:
+				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
+			}
+			guard !issued.data.isEmpty, expiresAt > now() else {
 				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
 			}
 			let identity = ZagSigningIdentity(
-				serialNumber: issued.certificate.serialNumber,
+				serialNumber: serial,
 				certificate: issued.data,
 				privateKey: key.privateKey,
-				expiresAt: issued.certificate.expiresAt
+				expiresAt: expiresAt
 			)
 			do {
 				try secrets.save(try JSONEncoder().encode(identity), kind: .signingPrivateKey, account: request.accountID)

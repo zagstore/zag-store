@@ -4,7 +4,17 @@ import Foundation
 // Debug builds only. An in-memory developer team for exercising
 // `ZagFreeAccountProvisioner`: free-account limits, 7-day App IDs and
 // profiles, failures and tampered profiles on request. Nothing here contacts
-// Apple or any server; certificates, keys and profiles are synthetic bytes.
+// Apple or any server. Certificates and profiles are synthetic bytes unless
+// a test supplies a `ZagSimulatedIssuer` (a throwaway local test authority).
+
+/// Issues real, locally signed certificates and profiles for the simulation.
+/// Only test code implements it; the issuing authority is never Apple's.
+protocol ZagSimulatedIssuer: Sendable {
+	/// A DER certificate for the request's public key.
+	func certificate(for request: ZagCertificateRequest, serialNumber: String) throws -> Data
+	/// A signed .mobileprovision holding `plist`.
+	func profile(signing plist: Data) throws -> Data
+}
 
 actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 	enum Failure: Sendable, Equatable {
@@ -40,11 +50,15 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 	private var failures: [Operation: Failure] = [:]
 	private var tamper: ProfileTamper?
 	private(set) var calls: [Operation] = []
+	/// Issued certificate files by serial (real issuer only).
+	private var certificateFiles: [String: Data] = [:]
 	private let clock: @Sendable () -> Date
+	private let issuer: ZagSimulatedIssuer?
 
-	init(team: String = "SIMTEAM001", clock: @escaping @Sendable () -> Date = { Date() }) {
+	init(team: String = "SIMTEAM001", clock: @escaping @Sendable () -> Date = { Date() }, issuer: ZagSimulatedIssuer? = nil) {
 		self.team = team
 		self.clock = clock
+		self.issuer = issuer
 	}
 
 	// MARK: Set-up for tests and the debug screen
@@ -144,6 +158,14 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		guard !request.data.isEmpty else { throw ZagPortalError.malformedResponse }
 		guard validCertificates.count < certificateLimit else { throw ZagPortalError.certificateLimitReached }
 		let serial = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16))
+		if let issuer {
+			let data = try issuer.certificate(for: request, serialNumber: serial)
+			guard let inspection = ZagCertificateInspection(der: data) else { throw ZagPortalError.malformedResponse }
+			let certificate = ZagDevelopmentCertificate(serialNumber: inspection.serialNumber, name: "Zag Store", machineName: "Zag Store", expiresAt: inspection.expiresAt)
+			issuedCertificates.append(certificate)
+			certificateFiles[inspection.serialNumber] = data
+			return ZagIssuedCertificate(certificate: certificate, data: data)
+		}
 		let certificate = ZagDevelopmentCertificate(serialNumber: serial, name: "Zag Store", machineName: "Zag Store", expiresAt: clock() + 365 * 86_400)
 		issuedCertificates.append(certificate)
 		return ZagIssuedCertificate(certificate: certificate, data: Data("SIMULATED-CERTIFICATE-\(serial)".utf8))
@@ -159,7 +181,9 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		var applicationIdentifier = "\(team).\(appID.bundleIdentifier)"
 		switch tamper {
 		case .wrongTeam: profileTeam = "OTHERTEAM1"
-		case .wrongBundle: bundle += ".other"
+		case .wrongBundle:
+			bundle += ".other"
+			applicationIdentifier = "\(team).\(bundle)"
 		case .missingDevice: udids = []
 		case .missingCertificate: serials = []
 		case .expired: expiresAt = now - 60
@@ -174,6 +198,29 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		]
 		if let assigned = assignments[appID.bundleIdentifier] {
 			entitlements[ZagFreeAccountEntitlements.appGroupsKey] = assigned
+		}
+		if let issuer {
+			// A real profile file, read back with Zag Store's profile parser.
+			let plist: [String: Any] = [
+				"AppIDName": "Zag Store \(bundle)",
+				"ApplicationIdentifierPrefix": [profileTeam],
+				"CreationDate": now,
+				"Platform": ["iOS"],
+				"IsXcodeManaged": false,
+				"DeveloperCertificates": serials.compactMap { certificateFiles[$0] },
+				"DER-Encoded-Profile": Data([0x30, 0x00]),
+				"Entitlements": entitlements,
+				"ExpirationDate": expiresAt,
+				"Name": "Zag Store \(bundle)",
+				"ProvisionedDevices": udids,
+				"TeamIdentifier": [profileTeam],
+				"TeamName": "Simulated Team",
+				"TimeToLive": 7,
+				"UUID": UUID().uuidString,
+				"Version": 1
+			]
+			let xml = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+			return try ZagIssuedProfile(profileData: try issuer.profile(signing: xml))
 		}
 		return ZagIssuedProfile(
 			uuid: UUID().uuidString,
@@ -196,5 +243,7 @@ struct ZagSimulatedSigningKeyFactory: ZagSigningKeyFactory {
 		let key = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
 		return (key, ZagCertificateRequest(data: Data("SIMULATED-CSR \(commonName)".utf8)))
 	}
+
+	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck { .notInspected }
 }
 #endif
