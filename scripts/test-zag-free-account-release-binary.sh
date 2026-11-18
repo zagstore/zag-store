@@ -20,6 +20,10 @@ found=0
 for marker in "${DEBUG_ONLY[@]}"; do
 	if grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); [ "$MODE" = release ] && echo "FOUND: $marker"; fi
 done
+# Phase 3 simulation (not in builds made before it existed, so release mode only).
+for marker in ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE; do
+	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
+done
 if [ "$MODE" = release ]; then
 	[ "$found" -eq 0 ] || { echo "FAIL: $found debug-only marker(s) in $EXE"; exit 1; }
 	echo "SUCCESS: no simulation UI or test credentials in $EXE"

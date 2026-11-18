@@ -29,7 +29,8 @@ print("PASS: no Apple endpoints, no logging; only the transport touches the netw
 for flag in ["static let freeAccountEnabled = false", "enum ZagLiveAuthentication {\n\t/// Live Apple Account authentication is not implemented or enabled.\n\tstatic let isEnabled = false",
              "static let isEnabled = false\n}\n\n/// Stands in for every configured provider"]:
     assert flag in sources, flag
-print("PASS: live sign-in, live anisette and free-account UI are disabled")
+assert "enum ZagLivePortal {\n\t/// The live developer-portal service is not implemented or enabled.\n\tstatic let isEnabled = false" in sources
+print("PASS: live sign-in, live anisette, live portal and free-account UI are disabled")
 # Release builds have no free-account UI; the simulated screen is Debug-only
 # (checked in detail by test-zag-free-account-sign-in.sh).
 debug_screen = root / "Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift"

@@ -18,7 +18,7 @@ swiftc -parse-as-library -emit-library -target "$(uname -m)-apple-macos13" -modu
 	"${SOURCES[@]}" -o "$WORK/librelease.dylib" 2>/dev/null
 nm "$WORK/librelease.dylib" > "$WORK/symbols.txt"
 grep -q ZagFreeAccountAuthenticator "$WORK/symbols.txt" || { echo "FAIL: release library is empty"; exit 1; }
-if grep -q -E 'ZagSimulatedAuthentication|ZagFreeAccountSimulation|ZagSimulationClock' "$WORK/symbols.txt"; then
+if grep -q -E 'ZagSimulatedAuthentication|ZagFreeAccountSimulation|ZagSimulationClock|ZagSimulatedDeveloperPortal|ZagSimulatedSigningKeyFactory' "$WORK/symbols.txt"; then
 	echo "FAIL: simulation compiled without DEBUG"; exit 1
 fi
 echo "PASS: the simulation is absent from non-Debug builds"
@@ -31,15 +31,16 @@ def debug_only(path):
     text = (root / path).read_text().strip()
     return text.startswith("#if DEBUG") and text.endswith("#endif") and text.count("#if DEBUG") == 1
 for path in ["Feather/Utilities/FreeAccount/ZagFreeAccountSimulation.swift",
+             "Feather/Utilities/FreeAccount/ZagDeveloperPortalSimulation.swift",
              "Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift"]:
     assert debug_only(path), path
 print("PASS: the debug screen and the simulation are wrapped in #if DEBUG")
 # Every other mention of the screen is inside an #if DEBUG block.
 for path in (root / "Feather").rglob("*.swift"):
-    if path.name in {"ZagFreeAccountDebugSignInView.swift", "ZagFreeAccountSimulation.swift"}:
+    if path.name in {"ZagFreeAccountDebugSignInView.swift", "ZagFreeAccountSimulation.swift", "ZagDeveloperPortalSimulation.swift"}:
         continue
     text = path.read_text()
-    for match in re.finditer(r"ZagFreeAccountDebug|ZagFreeAccountSimulation|ZagSimulatedAuthentication", text):
+    for match in re.finditer(r"ZagFreeAccountDebug|ZagFreeAccountSimulation|ZagSimulatedAuthentication|ZagSimulatedDeveloperPortal|ZagSimulatedSigningKeyFactory", text):
         before = text[:match.start()]
         assert before.rfind("#if DEBUG") > before.rfind("#endif"), f"{path.name}: {match.group()} outside #if DEBUG"
 print("PASS: entry points (Settings link, launch hook) exist only in Debug builds")
@@ -56,6 +57,7 @@ print("PASS: the only entry point is Settings > Advanced > Experimental Features
 # The simulation and the debug screen have no path to the network: no
 # transport, no URLs, no anisette broker, no live service.
 for path in ["Feather/Utilities/FreeAccount/ZagFreeAccountSimulation.swift",
+             "Feather/Utilities/FreeAccount/ZagDeveloperPortalSimulation.swift",
              "Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift"]:
     text = (root / path).read_text()
     for forbidden in ["URLSession", "ZagHTTPTransport", "ZagURLSessionTransport", "URL(string", "URLRequest",
