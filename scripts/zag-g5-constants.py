@@ -66,6 +66,11 @@ def authorised():
         refuse("the provider is not an https URL")
     if row["Serial policy"] not in ("g3Fixed", "g3PerAccount"):
         refuse("the serial policy is not g3Fixed or g3PerAccount")
+    if row["Serial policy"] != "g3Fixed":
+        # The bridge's live backend requires one valid device serial
+        # (zag-apple-bridge live.rs, valid_serial); a per-account serial is
+        # not implemented, so such a build could never sign in.
+        refuse("the bridge supports only g3Fixed (a fixed device serial)")
     if row["Serial policy"] == "g3Fixed" and not os.environ.get("ZAG_G5_DEVICE_SERIAL"):
         refuse("g3Fixed needs ZAG_G5_DEVICE_SERIAL (never stored in the ledger)")
     if not re.fullmatch(r"[A-Z]", row["Account label"]):

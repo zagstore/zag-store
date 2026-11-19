@@ -37,14 +37,17 @@ for marker in ZagSecuritySigningKeyFactory ZagIsideloadAuthenticationService Zag
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
 done
 # The G5 live experiment (compiled only with ZAG_LIVE_EXPERIMENT): its
-# campaign, budget, logger, report, screen and stores, and the experiment
-# event names the production provisioner passes to its no-op hook (logging
-# spec L7). None may be in a production build.
-for marker in ZagLiveExperimentCampaign ZagCertificateBudget ZagExperimentLogger ZagExperimentReport ZagExperimentReadback \
-	ZagExperimentInstaller ZagLiveExperimentView ZagLiveExperimentHooks ZagCampaignRegistry ZagStore.live-test.registry \
-	ZagStore.accounts.live-test campaign-marker.json zag-g5-report "LIVE TEST" "Live Test" G5-C0 zag_bridge_take_policy_decisions \
-	cert.journal cert.limit cert.recovery cert.submit cert.swap cert.verify pendingCreated submissionUnconfirmedSet \
-	submissionUnconfirmedCleared issuedRecorded pendingDiscarded portal.certificateLimit cert.possessionMismatch cert.unresolved; do
+# campaign, logger, screen, stores and bridge calls. None may be in a
+# production build. Only strings longer than 15 bytes are listed: shorter
+# Swift strings are stored inline and are invisible to `strings`, so the
+# experiment event names the production provisioner passes to its hooks
+# (logging spec L7) are checked in the source instead, by
+# test-zag-g5-experiment.sh (the hooks' bodies are empty outside the
+# experiment).
+for marker in ZagLiveExperimentCampaign ZagExperimentLogger ZagExperimentReport ZagExperimentReadback ZagExperimentInstaller \
+	ZagLiveExperimentView ZagCampaignRegistry ZagStore.live-test.registry ZagStore.accounts.live-test campaign-marker.json \
+	zag_bridge_take_policy_decisions zag_bridge_configure_time_window zag_bridge_time_gate_status "Stop the Campaign" \
+	"Provision, Sign and Install" submissionUnconfirmedSet submissionUnconfirmedCleared portal.certificateLimit cert.possessionMismatch; do
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
 done
 if [ "$MODE" = release ]; then

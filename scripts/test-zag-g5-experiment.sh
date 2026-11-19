@@ -38,6 +38,22 @@ callers = sorted({p.name for p, t in swift.items() if re.search(r"\.submitCertif
 assert callers == ["ZagFreeAccountProvisioner.swift"], callers
 print("PASS: T11 one submission path: the op string once, consume once and before the send, the budget only in ZagCertificateBudget")
 
+# L7: outside the experiment the provisioner's hooks do nothing, so the
+# event names passed to them are inert in production (and, as Swift small
+# strings, not scannable in the binary).
+prov = (fa / "ZagFreeAccountProvisioner.swift").read_text()
+for name in ["experimentStop", "experimentFailure", "experimentEvent"]:
+    start = prov.index(f"private func {name}(")
+    body = prov[prov.index("{", prov.index(")", start)) + 1:]
+    depth, i = 1, 0
+    while depth:
+        depth += {"{": 1, "}": -1}.get(body[i], 0); i += 1
+    body = body[:i - 1].strip()
+    assert body.startswith("#if ZAG_LIVE_EXPERIMENT\n") and body.endswith("#endif"), name
+    rest = body[body.rfind("#else"):] if "#else" in body else ""
+    assert rest in ("", "#else\n\t\treturn nil\n\t\t#endif"), (name, rest)
+print("PASS: L7 the provisioner's experiment hooks are empty outside the experiment")
+
 # Revocation is not implemented anywhere.
 assert not re.search(r"revoke[A-Za-z]*Cert[a-zA-Z]*\s*\(", "\n".join(code(t) for t in swift.values()))
 print("PASS: no certificate revocation call exists")
@@ -104,23 +120,27 @@ now = datetime.datetime.now(datetime.timezone.utc)
 fmt = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
 text = open(source).read()
 rule = next(line for line in text.splitlines() if line.startswith("|----"))
-def row(n, start, end, state):
-    return f"| G5-C{n} | {n} | \"test\" | {fmt(start)} | {fmt(end)} | A | https://anisette.example.org | g3PerAccount | | | | {state} |"
+def row(n, start, end, state, policy="g3Fixed"):
+    return f"| G5-C{n} | {n} | \"test\" | {fmt(start)} | {fmt(end)} | A | https://anisette.example.org | {policy} | | | | {state} |"
 rows = {"ok": [row(1, now, now + datetime.timedelta(days=2), "authorised")],
         "expired": [row(1, now - datetime.timedelta(days=3), now - datetime.timedelta(days=1), "authorised")],
         "long": [row(1, now, now + datetime.timedelta(days=8), "authorised")],
+        "perAccount": [row(1, now, now + datetime.timedelta(days=2), "authorised", "g3PerAccount")],
         "reused": [row(2, now - datetime.timedelta(days=9), now - datetime.timedelta(days=8), "closed: SAFE STOP"), row(2, now, now + datetime.timedelta(days=1), "authorised")]}
 for name, lines in rows.items():
     open(out.replace(".md", f"-{name}.md"), "w").write(text.replace(rule, rule + "\n" + "\n".join(lines), 1))
 PY
+export ZAG_G5_DEVICE_SERIAL=TESTSERIAL01
 ZAG_G5_LEDGER="$WORK/ledger-ok.md" bash "$ROOT/scripts/zag-g5-build-check.sh" constants --out "$WORK/constants.swift" >/dev/null
 python3 -I "$ROOT/scripts/zag-g5-constants.py" verify < "$WORK/constants.swift"
 grep -q 'static let campaignID = "G5-C1"' "$WORK/constants.swift" && ! grep -q '"00000000000000000000000000000000"' "$WORK/constants.swift"
-for bad in expired long reused; do
+for bad in expired long reused perAccount; do
 	! ZAG_G5_LEDGER="$WORK/ledger-$bad.md" bash "$ROOT/scripts/zag-g5-build-check.sh" check 2>/dev/null || { echo "FAIL: S1 accepts a $bad campaign" >&2; exit 1; }
 done
+unset ZAG_G5_DEVICE_SERIAL
+! ZAG_G5_LEDGER="$WORK/ledger-ok.md" bash "$ROOT/scripts/zag-g5-build-check.sh" check 2>/dev/null || { echo "FAIL: S1 accepts g3Fixed without a device serial" >&2; exit 1; }
 grep -q 'static let campaignID = "G5-C0"' "$ROOT/Feather/Utilities/FreeAccount/ZagLiveExperimentCampaignConstants.swift" || { echo "FAIL: the committed constants are not the placeholder" >&2; exit 1; }
-echo "PASS: S1 refuses no authorisation, DEBUG/test/missing conditions, an expired, over-long or reused campaign; writes constants in the generated form; the committed constants stay the placeholder"
+echo "PASS: S1 refuses no authorisation, DEBUG/test/missing conditions, an expired, over-long or reused campaign, g3PerAccount (unsupported by the bridge) and g3Fixed without a serial; writes constants in the generated form; the committed constants stay the placeholder"
 
 # Libraries: the bridge with its mock backend; the strict Zsign branch.
 (cd "$BRIDGE" && cargo build --quiet --release --features mock 2>/dev/null)
@@ -159,7 +179,7 @@ import sys
 p = sys.argv[1]; s = open(p).read()
 start = s.index("\t\ttry await ZagCertificateBudget.consume(")
 end = s.index("\t\t)\n", start) + 4
-open(p, "w").write(s[:start] + "\t\t// MUTANT: consume removed\n" + s[end:])
+open(p, "w").write(s[:start] + "\t\t_ = accountKey // MUTANT: consume removed\n" + s[end:])
 PY
 build "$WORK/mutant" "$WORK/mutant-g5"
 if run "$WORK/mutant-g5" "$WORK/mutant.log" budget; then

@@ -26,7 +26,7 @@ placeholder constants, which can never arm.
 - **Window:** ISO 8601 UTC, `notAfter` at most 7 days after `notBefore`.
 - **Account label:** a letter (`A`, `B`, …), never the account's address.
 - **Provider:** the G3 anisette provider's `https` URL. **Serial policy:**
-  `g3Fixed` (with the serial in the build's private input, not here) or
-  `g3PerAccount`.
+  `g3Fixed`, with the serial given to the build check privately, never
+  here. (`g3PerAccount` is refused: the bridge supports one fixed serial.)
 - **State:** `authorised`, `built`, `running`, or `closed: <class>`, where
   the class is the report's verdict, or `INCOMPLETE: durability not proven`.

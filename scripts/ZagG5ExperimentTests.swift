@@ -226,6 +226,7 @@ struct Rig {
 	let adapter: ZagIsideloadDeveloperPortal
 	let provisioner: ZagFreeAccountProvisioner
 	let keys: ZagKeychainSigningKeys
+	let diagnostics: ZagFreeAccountDiagnostics
 
 	static func make(_ campaign: ZagLiveExperimentCampaign, appleID: String = SimulatedAccounts.tester,
 					 secrets: MemorySecrets = MemorySecrets(), directory: ZagAccountDirectory? = nil,
@@ -237,18 +238,20 @@ struct Rig {
 		let counter = RequestCounter()
 		let adapter = ZagIsideloadDeveloperPortal(account: account, secrets: secrets, campaign: campaign, transport: scriptedTransport(portal, counter: counter))
 		let keys = keys ?? ZagKeychainSigningKeys(namespace: "ZagStore.test.g5.\(UUID().uuidString)")
-		let provisioner = ZagFreeAccountProvisioner(portal: adapter, keys: ZagKeychainSigningKeyFactory(keys: keys), secrets: secrets, account: account)
+		let diagnostics = ZagFreeAccountDiagnostics()
+		let provisioner = ZagFreeAccountProvisioner(portal: adapter, keys: ZagKeychainSigningKeyFactory(keys: keys), secrets: secrets, diagnostics: diagnostics, account: account)
 		return Rig(secrets: secrets, directory: directory, account: account, team: team, portal: portal, counter: counter,
-				   adapter: adapter, provisioner: provisioner, keys: keys)
+				   adapter: adapter, provisioner: provisioner, keys: keys, diagnostics: diagnostics)
 	}
 
 	/// The same account after a relaunch: new adapter and provisioner over
 	/// the same Keychain items, with `campaign` (a new campaign object).
 	func relaunched(_ campaign: ZagLiveExperimentCampaign) -> Rig {
 		let adapter = ZagIsideloadDeveloperPortal(account: account, secrets: secrets, campaign: campaign, transport: scriptedTransport(portal, counter: counter))
-		let provisioner = ZagFreeAccountProvisioner(portal: adapter, keys: ZagKeychainSigningKeyFactory(keys: keys), secrets: secrets, account: account)
+		let diagnostics = ZagFreeAccountDiagnostics()
+		let provisioner = ZagFreeAccountProvisioner(portal: adapter, keys: ZagKeychainSigningKeyFactory(keys: keys), secrets: secrets, diagnostics: diagnostics, account: account)
 		return Rig(secrets: secrets, directory: directory, account: account, team: team, portal: portal, counter: counter,
-				   adapter: adapter, provisioner: provisioner, keys: keys)
+				   adapter: adapter, provisioner: provisioner, keys: keys, diagnostics: diagnostics)
 	}
 
 	var accountKey: String {
@@ -294,6 +297,16 @@ func field(_ event: ZagLogEvent, _ name: String) -> String? {
 	case .int(let value)?: String(value)
 	default: nil
 	}
+}
+
+/// Each concurrent result, with its step and the provisioner's diagnostics.
+func describe(_ results: [Result<ZagProvisioningResult, ZagProvisioningFailure>], _ rigs: [Rig]) -> String {
+	zip(results, rigs).map { result, rig in
+		switch result {
+		case .success: "success"
+		case .failure(let failure): "\(failure.kind)@\(failure.step) \(rig.diagnostics.entries.map(\.message))"
+		}
+	}.joined(separator: " | ")
 }
 
 func budgetDecisions(_ logger: ZagExperimentLogger) -> [String] { events(logger, "cert.budget").compactMap { field($0, "decision") } }
@@ -491,6 +504,8 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 			let second = await Rig.make(campaign, appleID: SimulatedAccounts.second, secrets: rig.secrets, directory: rig.directory)
 			_ = await second.provision()
 			check(rig.counter.value == 1 && second.counter.value == 0, "T10: the second account sends nothing; one request in total")
+			let secondMutations = await second.portal.calls.filter { [.registerDevice, .registerAppID, .registerAppGroup, .assignAppGroups].contains($0) }
+			check(secondMutations.isEmpty, "T10: the second account registers no device or App ID (C6 before every mutation) \(secondMutations)")
 			check(budgetDecisions(device.logger).last == "accountMismatch" || events(device.logger, "campaign.accountPin").contains { field($0, "result") == "mismatch" },
 				  "T10: refused as experimentAccountMismatch")
 			check(halted(device), "T10: the halt is set")
@@ -499,6 +514,8 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 
 		// T12: concurrent provisions: two accounts, and two independent
 		// provisioners on one account (no shared exclusivity between them).
+		// Safety: at most one certificate request, ever; the other account
+		// never mutates anything (C6 at its E4 check, before any mutation).
 		do {
 			let device = Device(), campaign = device.armed()
 			let first = await Rig.make(campaign)
@@ -506,17 +523,13 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 			async let a = first.provision()
 			async let b = second.provision()
 			let results = await [a, b]
+			let calls = [await first.portal.calls, await second.portal.calls]
+			let mutating: Set<ZagSimulatedDeveloperPortal.Operation> = [.registerDevice, .registerAppID, .registerAppGroup, .assignAppGroups, .submitCertificateRequest]
+			let mutators = calls.filter { !$0.filter(mutating.contains).isEmpty }.count
 			check(first.counter.value + second.counter.value <= 1, "T12: two accounts at once: at most one request (\(first.counter.value + second.counter.value))")
-			let firstCalls = await first.portal.calls, secondCalls = await second.portal.calls
-			let kinds = results.map { result -> String in
-				switch result { case .success: "success"; case .failure(let failure): "\(failure.kind)" }
-			}
-			// When the loser reaches the budget, its account-pin refusal halts
-			// the campaign, so the winner's later steps may be refused too (E2).
-			// Never more than one success.
-			let reachedBudget = budgetDecisions(device.logger).count
-			check(results.filter { (try? $0.get()) != nil }.count <= 1 && (reachedBudget < 2 || halted(device)),
-				  "T12: two accounts at once: at most one succeeds; a second budget attempt halts \(kinds) (budget attempts \(reachedBudget); portal calls \(firstCalls.count)/\(secondCalls.count))")
+			check(mutators <= 1, "T12: two accounts at once: only one account mutates anything (\(describe(results, [first, second])))")
+			check(halted(device) && events(device.logger, "campaign.accountPin").contains { field($0, "result") == "mismatch" },
+				  "T12: two accounts at once: the second account is refused as a mismatch and the campaign halts")
 			first.cleanUp(); second.cleanUp()
 		}
 		do {
@@ -525,11 +538,33 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 			let twin = first.relaunched(campaign)
 			async let a = first.provision()
 			async let b = twin.provision("com.example.twin")
-			_ = await [a, b]
-			// Safety only: under load both may stop before sending (fail-closed);
-			// T1 covers the single request going through.
-			check(first.counter.value <= 1, "T12: two provisioners on one account at once: at most one request (\(first.counter.value))")
+			let results = await [a, b]
+			check(first.counter.value <= 1, "T12: two provisioners on one account at once: at most one request (\(first.counter.value)) \(describe(results, [first, twin]))")
+			// Both saw an empty certificate list, so both plan a request; the
+			// second reaches a spent budget, which is a stop: the campaign halts
+			// (and may refuse the first one's later steps). Explained, not hidden.
+			let decisions = budgetDecisions(device.logger)
+			check(results.filter { (try? $0.get()) != nil }.count <= 1 && (decisions.count < 2 || (decisions.contains("budgetSpent") && halted(device))),
+				  "T12: two provisioners on one account at once: a second request attempt is refused as budgetSpent and halts (\(decisions))")
 			first.cleanUp()
+		}
+		// T12 success path: the app's one provisioner per account serialises
+		// its operations, so concurrent provisionings of two apps both
+		// complete, with one certificate request and no halt.
+		for round in 0..<5 {
+			let device = Device(), campaign = device.armed()
+			let rig = await Rig.make(campaign)
+			async let a = rig.provision("com.example.notes")
+			async let b = rig.provision("com.example.second")
+			let results = await [a, b]
+			let ok = results.allSatisfy { (try? $0.get()) != nil } && rig.counter.value == 1 && !halted(device)
+				&& device.registryValue?.campaigns["G5-C1"]?.state == .spent
+			rig.cleanUp()
+			if !ok {
+				check(false, "T12 success path: two concurrent provisionings on one provisioner both complete, one request, no halt (round \(round): \(describe(results, [rig, rig])), requests \(rig.counter.value))")
+				break
+			}
+			if round == 4 { check(true, "T12 success path: two concurrent provisionings on one provisioner both complete, one request, no halt (5 rounds)") }
 		}
 
 		// T13: a new campaign in the same Keychain; the account already has a certificate.
@@ -713,8 +748,8 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 		// C2: single use.
 		do {
 			let device = Device(), campaign = device.armed()
-			try? campaign.verifyAccountState(certificates: 0, appIDs: 0, devices: 0)
-			try? await ZagCertificateBudget.consume(campaign: campaign, accountKey: "k", recheckCertificates: { 0 })
+			try? campaign.verifyAccountState(accountKey: "k", team: "T", certificates: 0, appIDs: 0, devices: 0)
+			try? await ZagCertificateBudget.consume(campaign: campaign, accountKey: "k", team: "T", recheckCertificates: { 0 })
 			let (_, result) = device.launch()
 			check(result == .refused && checkRefused(device.logger, "C2") && haltFollows(device, "C2"), "C2: a spent campaign never runs again (L11)")
 			let (_, closedAgain) = device.launch()
@@ -766,9 +801,11 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 		do {
 			let device = Device(), campaign = device.armed()
 			try? campaign.checkAccount("first")
-			check(!halted(device), "C6: nothing is pinned before the first submission")
-			try? campaign.verifyAccountState(certificates: 0, appIDs: 0, devices: 0)
-			try? await ZagCertificateBudget.consume(campaign: campaign, accountKey: "first", recheckCertificates: { 0 })
+			check(!halted(device) && device.registryValue?.campaigns["G5-C1"]?.accountKey == nil, "C6: nothing is pinned before the E4 check")
+			try? campaign.verifyAccountState(accountKey: "first", team: "T", certificates: 0, appIDs: 0, devices: 0)
+			check(device.registryValue?.campaigns["G5-C1"]?.accountKey == "first" && device.registryValue?.campaigns["G5-C1"]?.state == .armed,
+				  "C6: E4 pins the account in the registry, before any mutation or submission")
+			try? await ZagCertificateBudget.consume(campaign: campaign, accountKey: "first", team: "T", recheckCertificates: { 0 })
 			check((try? campaign.checkAccount("first")) != nil, "C6: the pinned account matches")
 			var refused: ZagLiveExperimentRefusal?
 			do { try campaign.checkAccount("second") } catch { refused = error as? ZagLiveExperimentRefusal }
@@ -795,19 +832,77 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 		do {
 			let device = Device(), campaign = device.armed()
 			var refused = false
-			do { try campaign.verifyAccountState(certificates: 0, appIDs: 0, devices: 1) } catch { refused = true }
+			do { try campaign.verifyAccountState(accountKey: "k", team: "T", certificates: 0, appIDs: 0, devices: 1) } catch { refused = true }
 			check(refused && checkRefused(device.logger, "C8") && haltFollows(device, "C8"), "C8: a device already on the account refuses and halts (L11)")
 		}
 		do {
 			let device = Device(), campaign = device.armed()
-			try? campaign.verifyAccountState(certificates: 0, appIDs: 0, devices: 0)
+			try? campaign.verifyAccountState(accountKey: "k", team: "T", certificates: 0, appIDs: 0, devices: 0)
 			var refused = false
-			do { try await ZagCertificateBudget.consume(campaign: campaign, accountKey: "k", recheckCertificates: { 1 }) } catch { refused = true }
+			do { try await ZagCertificateBudget.consume(campaign: campaign, accountKey: "k", team: "T", recheckCertificates: { 1 }) } catch { refused = true }
 			check(refused && device.registryValue?.campaigns["G5-C1"]?.submissions == 0 && halted(device), "C8: a certificate appearing before consume refuses it")
 		}
 		do {
 			let device = Device(), campaign = device.armed()
-			check((try? campaign.authorize(.portalMutate)) == nil, "C8: a mutating call before the E4 check is refused")
+			check((try? campaign.authorizeMutation(accountKey: "k", team: "T")) == nil && halted(device), "C8: a mutating call before the E4 check is refused and halts")
+		}
+		do {
+			let device = Device(), campaign = device.armed()
+			check((try? campaign.authorize(.portalMutate)) == nil, "C8: a mutating call without its account is refused")
+		}
+		// C8 is bound to the account and the team, and C6 is checked before
+		// every mutation.
+		do {
+			let device = Device(), campaign = device.armed()
+			try? campaign.verifyAccountState(accountKey: "A", team: "T1", certificates: 0, appIDs: 0, devices: 0)
+			check((try? campaign.authorizeMutation(accountKey: "A", team: "T1")) != nil, "C8: the verified account may mutate on its verified team")
+			check((try? campaign.authorizeMutation(accountKey: "A", team: "T2")) == nil, "C8: the same account on another (unverified) team is refused")
+			check(halted(device), "C8: and that halts")
+		}
+		do {
+			let device = Device(), campaign = device.armed()
+			try? campaign.verifyAccountState(accountKey: "A", team: "T1", certificates: 0, appIDs: 0, devices: 0)
+			var refused: Error?
+			do { try campaign.authorizeMutation(accountKey: "B", team: "T1") } catch { refused = error }
+			check(refused as? ZagLiveExperimentRefusal == .accountMismatch && halted(device), "C6: another account's mutation is refused as a mismatch, even on the verified team, and halts")
+		}
+		do {
+			let device = Device(), campaign = device.armed()
+			try? campaign.verifyAccountState(accountKey: "A", team: "T1", certificates: 0, appIDs: 0, devices: 0)
+			var refused: Error?
+			do { try campaign.verifyAccountState(accountKey: "B", team: "T9", certificates: 0, appIDs: 0, devices: 0) } catch { refused = error }
+			check(refused as? ZagLiveExperimentRefusal == .accountMismatch && device.registryValue?.campaigns["G5-C1"]?.accountKey == "A",
+				  "C6: a second account's E4 check is refused; the pin stays on the first")
+		}
+		// Concurrent E4 checks for two accounts: exactly one is pinned.
+		for round in 0..<20 {
+			let device = Device(), campaign = device.armed()
+			let outcomes = await withTaskGroup(of: Bool.self) { group in
+				for key in ["A", "B"] {
+					group.addTask { (try? campaign.verifyAccountState(accountKey: key, team: "T", certificates: 0, appIDs: 0, devices: 0)) != nil }
+				}
+				return await group.reduce(into: [Bool]()) { $0.append($1) }
+			}
+			let pin = device.registryValue?.campaigns["G5-C1"]?.accountKey
+			if outcomes.filter({ $0 }).count != 1 || pin == nil || !halted(device) {
+				check(false, "C6/C8: concurrent E4 checks for two accounts pin exactly one and halt (round \(round): \(outcomes), pin \(pin ?? "none"))")
+				break
+			}
+			if round == 19 { check(true, "C6/C8: concurrent E4 checks for two accounts pin exactly one and halt (20 rounds)") }
+		}
+		// C5 in the bridge: each refusal status halts as C5; the others do nothing.
+		for status: Int32 in 0...8 {
+			let device = Device(), campaign = device.armed()
+			let refused = (try? campaign.checkTimeGate(status)) == nil
+			let expected = (3...8).contains(status)
+			check(refused == expected && halted(device) == expected && checkRefused(device.logger, "C5") == expected,
+				  "C5: bridge time-gate status \(status) \(expected ? "refuses and halts" : "passes")")
+		}
+		for status: Int32 in 0...8 {
+			let device = Device(), campaign = device.armed()
+			let refused = (try? campaign.checkTimeGate(status, signedIn: true)) == nil
+			check(refused == (status != 1) && halted(device) == (status != 1),
+				  "C5: signed in with time-gate status \(status): \(status == 1 ? "passes (verified)" : "refuses and halts")")
 		}
 	}
 
@@ -960,8 +1055,45 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 			] {
 				check(ZagExperimentReport.contentRule(value) == rule, "L4: \(rule) blocks \(rule == "R6" ? "a UDID shape" : "its pattern")")
 			}
-			for keyName in ZagLogSchema.events.values.flatMap(\.keys) {
-				check(ZagExperimentReport.contentRule(keyName) == nil, "L4: the declared key name \(keyName) passes R1–R7")
+			for keyName in Set(ZagLogSchema.events.values.flatMap(\.keys)).sorted() {
+				check(ZagExperimentReport.contentRule(keyName, declaredKey: true) == nil, "L4: the declared key name \(keyName) passes R1–R7")
+			}
+			// R5 false negatives (the revision-3 relaxation): every value that
+			// is not a declared key name gets the spec's R5, letters-only runs
+			// included; the exemption is for declared names only.
+			for (label, value) in [
+				("a letters-only base64 token", "qwertyuiopASDFGHJKLzxcvbn"),
+				("a 24-letter run", String(repeating: "z", count: 24)),
+				("base64 with digits", "QUJDREVGR0hJSktMTU5PUFFS"),
+				("base64 with + and /", "ab+cd/efghijklmnopqrstuvw"),
+				("padded base64", "YWJjZGVmZ2hpamtsbW5vcHFy=="),
+				("a token inside other text", "x qwertyuiopasdfghjklzxcvbnm y"),
+				("a long letters-only host label", "qwertyuiopasdfghjklzxcvbnm.apple.com"),
+				("a declared name, unless declared here", "extractableAttributeRequested"),
+			] {
+				check(ZagExperimentReport.contentRule(value) == "R5", "R5: \(label) is blocked")
+			}
+			check(ZagExperimentReport.contentRule(String(repeating: "z", count: 23)) == nil, "R5: a 23-character run is below the threshold")
+			check(ZagExperimentReport.contentRule("qwertyuiopasdfghjklzxcvbnm", declaredKey: true) == "R5" || !Set(ZagLogSchema.events.values.flatMap(\.keys)).contains("qwertyuiopasdfghjklzxcvbnm"),
+				  "R5: the exemption depends on the caller, which grants it only for a declared name")
+			do {
+				// End to end: a blocked request's verbatim host holding a
+				// letters-only token, and an undeclared long key, both block
+				// the export without showing the value.
+				let logger = Device.newLogger()
+				logger.record("campaign.check", fields: ["check": .string("C1"), "result": .string("pass")])
+				var hostEvent = logger.events[0]
+				hostEvent.phase = "net"; hostEvent.event = "request"
+				hostEvent.fields = ["host": .string("qwertyuiopasdfghjklzxcvbnm.apple.com"), "pathTemplate": .string("unlisted"), "method": .string("GET"), "decision": .string("blocked")]
+				var keyEvent = logger.events[0]
+				keyEvent.fields = ["check": .string("C1"), "result": .string("pass"), "qwertyuiopasdfghjklzxcvbnm": .string("x")]
+				for (label, event) in [("host", hostEvent), ("key", keyEvent)] {
+					if case .blocked(let rule) = ZagExperimentReport.validate([event], provider: provider) {
+						check(!rule.contains("qwertyuiop"), "R5 end to end: a letters-only token in a \(label) blocks the export (\(rule)), value not shown")
+					} else {
+						check(false, "R5 end to end: a letters-only token in a \(label) blocks the export")
+					}
+				}
 			}
 			let blockedHost = ZagLogSchema.recordedHost("deadbeefdeadbeef01.apple.com", provider: provider)
 			check(blockedHost == "appleUnusual", "L4/§4.4: a blocked .apple.com host with a 16+ hex label is classed, not kept")
@@ -1056,8 +1188,8 @@ func halted(_ device: Device, _ id: String = "G5-C1") -> Bool { device.registryV
 		// carries nonces, account keys or times other than the start hour.
 		do {
 			let device = Device(), campaign = device.armed()
-			try? campaign.verifyAccountState(certificates: 0, appIDs: 0, devices: 0)
-			try? await ZagCertificateBudget.consume(campaign: campaign, accountKey: "ACCOUNTKEYVALUE0123456789abcdef", recheckCertificates: { 0 })
+			try? campaign.verifyAccountState(accountKey: "ACCOUNTKEYVALUE0123456789abcdef", team: "T", certificates: 0, appIDs: 0, devices: 0)
+			try? await ZagCertificateBudget.consume(campaign: campaign, accountKey: "ACCOUNTKEYVALUE0123456789abcdef", team: "T", recheckCertificates: { 0 })
 			_ = device.launch(Device.constants(1, nonce: "ffffffffffffffffffffffffffffffff"))
 			let report = ZagExperimentReport(header: header(device.logger), events: device.logger.events, privateKeyExportCalls: 0)
 			if case .success(let files) = report.export(provider: provider) {

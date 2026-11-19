@@ -309,6 +309,11 @@ enum ZagIsideloadBridge {
 		let constants = campaign.constants
 		guard campaign.state == .armed, let host = constants.providerHost, let url = URL(string: constants.anisetteURL),
 			  !constants.deviceSerial.isEmpty else { return false }
+		// C5 in the bridge, before anything live: until a verified Apple Date
+		// inside the window, only the credential-free URL-bag lookup may
+		// reach Apple.
+		guard zag_bridge_configure_time_window(Int64(constants.notBefore.timeIntervalSince1970), Int64(constants.notAfter.timeIntervalSince1970),
+												 Int64(ZagCampaignConstants.maximumSkew)) == 0 else { return false }
 		let configured = configureLive(anisetteURL: url, deviceSerial: constants.deviceSerial)
 		ZagLiveExperiment.logger?.record("build.configureLive", outcome: configured ? "ok" : "failed",
 										  fields: ["providerHost": .string(host), "serialPolicy": .string(constants.deviceSerialPolicy)])
@@ -614,22 +619,32 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 	#if ZAG_LIVE_EXPERIMENT
 	private typealias Operation = ZagLiveOperation
 
-	/// The campaign's gate before every operation (plan §5.2, §5.5). A
-	/// mutating call first needs the E4 account-state check (C8).
+	/// The campaign's gate before every operation (plan §5.2, §5.5). Every
+	/// mutating call is checked for this adapter's signed-in account and the
+	/// team: E4 (C8) once per account and team, then C6 and C8 each time.
 	private func gate(_ operation: Operation, team: String) async throws {
-		if operation == .portalMutate { try await checkAccountStateIfNeeded(team: team) }
-		try campaign.authorize(operation)
+		guard operation == .portalMutate else { return try campaign.authorize(operation) }
+		let accountKey = try self.accountKey()
+		try await checkAccountStateIfNeeded(accountKey: accountKey, team: team)
+		try campaign.authorizeMutation(accountKey: accountKey, team: team)
 	}
 
-	/// E4 (C8), once per process before the first mutating call: the
-	/// dedicated account has no certificate, App ID or device.
-	private func checkAccountStateIfNeeded(team: String) async throws {
-		guard campaign.needsAccountStateCheck else { return }
+	private func accountKey() throws -> String {
+		ZagAppleAccountRecord.accountKey(for: try credential().accountIdentifier)
+	}
+
+	/// E4 (C8) before this account's first mutating call on this team: it is
+	/// the campaign's account (or becomes it) and has no certificate, App ID
+	/// or device.
+	private func checkAccountStateIfNeeded(accountKey: String, team: String) async throws {
+		guard campaign.needsAccountStateCheck(accountKey: accountKey, team: team) else { return }
+		// C6 before reading anything: another account stops here.
+		try campaign.checkAccount(accountKey)
 		try campaign.authorize(.portalRead)
 		let certificates = try await call(["op": "certificates", "team": team], as: [Certificate].self)
 		let appIDs = try await call(["op": "appIds", "team": team], as: [AppID].self)
 		let devices = try await call(["op": "devices", "team": team], as: [Device].self)
-		try campaign.verifyAccountState(certificates: certificates.count, appIDs: appIDs.count, devices: devices.count)
+		try campaign.verifyAccountState(accountKey: accountKey, team: team, certificates: certificates.count, appIDs: appIDs.count, devices: devices.count)
 	}
 	#else
 	private enum Operation { case portalRead, portalMutate, certificateList }
@@ -681,11 +696,13 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		#if ZAG_LIVE_EXPERIMENT
 		// E1 (G5 plan §5.2): the one choke point. Nothing below runs unless the
 		// campaign's single submission is recorded first.
+		let accountKey = try self.accountKey()
 		try await ZagCertificateBudget.consume(
 			campaign: campaign,
-			accountKey: ZagAppleAccountRecord.accountKey(for: try credential().accountIdentifier),
+			accountKey: accountKey,
+			team: team,
 			recheckCertificates: {
-				try await checkAccountStateIfNeeded(team: team)
+				try await checkAccountStateIfNeeded(accountKey: accountKey, team: team)
 				return try await call(["op": "certificates", "team": team], as: [Certificate].self).count
 			}
 		)
@@ -871,6 +888,7 @@ enum ZagLiveExperimentHooks {
 	static func signInStep(_ event: ZagBridgeEvent?, afterCode: Bool) throws {
 		let campaign = ZagLiveExperiment.campaign, logger = ZagLiveExperiment.logger
 		drainPolicyDecisions(campaign: campaign)
+		try campaign.checkTimeGate(zag_bridge_time_gate_status())
 		switch event {
 		case .codeRequired(let challenge, let retry)?:
 			if afterCode && retry {
@@ -881,6 +899,7 @@ enum ZagLiveExperimentHooks {
 			logger?.record("auth.twoFactor.challenge", fields: ["kind": .string(kind), "smsNumberCount": .int(challenge.maskedDestination == nil ? 0 : 1)])
 			logger?.record("auth.state", fields: ["from": .string("signingIn"), "to": .string("awaitingTwoFactor")])
 		case .signedIn(let session)?:
+			try campaign.checkTimeGate(zag_bridge_time_gate_status(), signedIn: true)
 			lock.withLock { consecutiveFailures = 0 }
 			if afterCode { logger?.record("auth.twoFactor.submit", fields: ["result": .string("accepted")]) }
 			try campaign.authorize(.portalRead)

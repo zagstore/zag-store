@@ -89,19 +89,20 @@ struct ZagExperimentReport: Equatable, Sendable {
 	}
 
 	/// §7.2 content rules for one free-form value (a verbatim host or a key name).
-	static func contentRule(_ value: String) -> String? {
+	/// R1–R7 (logging spec §7.2) for a free-form value. `declaredKey` is true
+	/// only for a field name the schema declares for that event; such a name
+	/// is exempt from R5 alone (camelCase names such as
+	/// `extractableAttributeRequested` are long letter runs). Every other
+	/// value gets the spec's R5 unchanged: any run of 24 or more base64
+	/// characters, letters only included.
+	static func contentRule(_ value: String, declaredKey: Bool = false) -> String? {
 		let lowered = value.lowercased()
 		if value.contains("@") { return "R1" }
 		if value.contains("-----BEGIN") { return "R2" }
 		if lowered.contains("x-apple-") || lowered.contains("x-mme-") { return "R3" }
 		if value.range(of: "^([0-9A-Fa-f]{40}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16})$", options: .regularExpression) != nil { return "R6" }
 		if value.range(of: "[0-9A-Fa-f]{16,}", options: .regularExpression) != nil { return "R4" }
-		// R5: a base64 run of 24 or more characters. A run of letters only is a
-		// camelCase key name (the schema's own `extractableAttributeRequested`
-		// is 29), so the run must also hold a digit, "+", "/" or "=".
-		if value.range(of: "[A-Za-z0-9+/=]{24,}", options: .regularExpression).map({ value[$0].contains { $0.isNumber || "+/=".contains($0) } }) == true {
-			return "R5"
-		}
+		if !declaredKey, value.range(of: "[A-Za-z0-9+/=]{24,}", options: .regularExpression) != nil { return "R5" }
 		let prohibited = ["password", "dsid", "token", "adi", "udid", "serial", "ecid", "imei", "cookie", "authorization", "spim", "cpim", "ptm", "tk", "salt"]
 		if prohibited.contains(lowered) || prohibited.contains(where: { lowered == $0 + "s" }) { return "R7" }
 		return nil
@@ -113,8 +114,9 @@ struct ZagExperimentReport: Equatable, Sendable {
 		for (index, event) in events.enumerated() {
 			if let field = ZagLogSchema.violation(event, provider: provider) { return .blocked("schema:\(index).\(field)") }
 			guard contentRules else { continue }
+			let declared = ZagLogSchema.events["\(event.phase).\(event.event)"] ?? [:]
 			for (key, value) in event.fields ?? [:] {
-				if let rule = contentRule(key) { return .blocked(rule) }
+				if let rule = contentRule(key, declaredKey: declared[key] != nil) { return .blocked(rule) }
 				if key == "host" || key == "providerHost", case .string(let host) = value, !ZagLogSchema.allowedHosts(provider: provider).contains(host),
 				   host != "nonApple", host != "appleUnusual", let rule = contentRule(host) {
 					return .blocked(rule)

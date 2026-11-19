@@ -45,6 +45,8 @@ struct ZagCampaignConstants: Equatable, Sendable {
 
 	/// The longest window the plan allows (§5.5).
 	static let maximumWindow: TimeInterval = 7 * 86_400
+	/// Apple's time may differ from the device clock by at most this (C5).
+	static let maximumSkew: TimeInterval = 600
 
 	/// The G3 provider's host, or nil when none is configured.
 	var providerHost: String? {
@@ -254,7 +256,9 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 	/// A later launch that finds the record spent refuses (C2).
 	private var consumedInThisProcess = false
 	/// The E4 account-state check passed in this process (C8).
-	private var accountStateVerified = false
+	/// C8 / E4: the accounts and teams found empty in this process, each
+	/// `accountKey + "\n" + team`. Only the pinned account can be in it.
+	private var verifiedAccounts = Set<String>()
 	/// A halt was attempted in this process: even if it could not be
 	/// stored, nothing more runs here.
 	private var haltedInProcess = false
@@ -538,7 +542,7 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 			}
 			return
 		}
-		let skewOK = abs(apple.timeIntervalSince(now())) <= 600
+		let skewOK = abs(apple.timeIntervalSince(now())) <= ZagCampaignConstants.maximumSkew
 		logger?.campaignWindow(device: window(now()), authenticated: window(apple), skewOK: skewOK)
 		guard window(apple) == "inside", skewOK else {
 			logger?.campaignCheck("C5", pass: false)
@@ -550,11 +554,20 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 
 	/// Refuses `operation` unless this campaign may run it now. Refusals that
 	/// come from a check halt the campaign (E2).
+	/// Every operation except a portal mutation, which needs its account and
+	/// team (`authorizeMutation`).
 	func authorize(_ operation: ZagLiveOperation) throws {
-		try lock.withLock { try authorizeLocked(operation) }
+		try lock.withLock { try authorizeLocked(operation, account: nil) }
 	}
 
-	private func authorizeLocked(_ operation: ZagLiveOperation) throws {
+	/// A mutating portal call (device, App ID, group, profile): the campaign
+	/// checks, then C6 (the pinned account, set when E4 found it empty) and
+	/// C8 (E4 ran for this account and team in this process).
+	func authorizeMutation(accountKey: String, team: String) throws {
+		try lock.withLock { try authorizeLocked(.portalMutate, account: (accountKey, team)) }
+	}
+
+	private func authorizeLocked(_ operation: ZagLiveOperation, account: (key: String, team: String)?) throws {
 		if [.certificateList, .signOut, .inventory].contains(operation) { return }
 		if haltedInProcess { throw ZagLiveExperimentRefusal.halted }
 		guard constants.isAuthorisable else { throw ZagLiveExperimentRefusal.notArmed }
@@ -594,7 +607,13 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 		}
 		try authenticatedWindowLocked(required: operation != .signIn)
 		if operation == .portalMutate {
-			guard accountStateVerified else {
+			guard let account else {
+				logger?.campaignCheck("C8", pass: false)
+				_ = haltLocked(.accountNotEmpty)
+				throw ZagLiveExperimentRefusal.check("C8")
+			}
+			try checkPinLocked(account.key)
+			guard verifiedAccounts.contains(Self.verificationKey(account.key, account.team)) else {
 				logger?.campaignCheck("C8", pass: false)
 				_ = haltLocked(.accountNotEmpty)
 				throw ZagLiveExperimentRefusal.check("C8")
@@ -604,28 +623,52 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 
 	// MARK: C6 and C8
 
-	/// C6 at sign-in: a pinned campaign accepts only its own account.
-	func checkAccount(_ accountKey: String) throws {
-		try lock.withLock {
-			guard case .some(let stored) = load(), let record = stored?.campaigns[constants.campaignID] else { return }
-			guard let pinned = record.accountKey else { return }
-			if pinned == accountKey {
-				logger?.campaignAccountPin("matches")
-				logger?.campaignCheck("C6", pass: true)
-				return
-			}
-			logger?.campaignAccountPin("mismatch")
-			logger?.campaignCheck("C6", pass: false)
-			_ = haltLocked(.accountMismatch)
-			throw ZagLiveExperimentRefusal.accountMismatch
+	/// C5 as the bridge enforced it (`zag_bridge_time_gate_status`): 3–8
+	/// mean a response's Date was missing, malformed, outside the window or
+	/// too far from the device clock, and nothing after it reached Apple.
+	/// That is recorded as C5 refused, and halts.
+	/// When signed in, the gate must also have verified a Date (status 1):
+	/// unconfigured or still pending means the window was never enforced.
+	func checkTimeGate(_ status: Int32, signedIn: Bool = false) throws {
+		guard (3...8).contains(status) || (signedIn && status != 1) else { return }
+		lock.withLock {
+			let authenticated = status == 5 ? "before" : status == 6 ? "after" : nil
+			logger?.campaignWindow(device: window(now()), authenticated: authenticated, skewOK: status == 7 ? false : nil)
+			logger?.campaignCheck("C5", pass: false)
+			_ = haltLocked(.campaignCheck)
 		}
+		throw ZagLiveExperimentRefusal.check("C5")
 	}
 
-	/// C8 / E4 before the first mutating portal call: the dedicated account
-	/// has no certificate, no App ID and no device. Run once per process; a
-	/// relaunch checks again (and then finds this run's own device: a stop).
-	func verifyAccountState(certificates: Int, appIDs: Int, devices: Int) throws {
+	/// C6 at sign-in: a pinned campaign accepts only its own account.
+	func checkAccount(_ accountKey: String) throws {
+		try lock.withLock { try checkPinLocked(accountKey) }
+	}
+
+	/// C6: once an account is pinned, only that account may act.
+	private func checkPinLocked(_ accountKey: String) throws {
+		guard case .some(let stored) = load(), let record = stored?.campaigns[constants.campaignID] else { return }
+		guard let pinned = record.accountKey else { return }
+		if pinned == accountKey {
+			logger?.campaignAccountPin("matches")
+			logger?.campaignCheck("C6", pass: true)
+			return
+		}
+		logger?.campaignAccountPin("mismatch")
+		logger?.campaignCheck("C6", pass: false)
+		_ = haltLocked(.accountMismatch)
+		throw ZagLiveExperimentRefusal.accountMismatch
+	}
+
+
+	/// C8 / E4 before an account's first mutating portal call: the account
+	/// is the pinned one (C6), or becomes it (the pin is written and read
+	/// back here, before any mutation), and its team has no certificate, no
+	/// App ID and no device. A relaunch checks again (and then finds this
+	/// run's own device: a stop).
+	func verifyAccountState(accountKey: String, team: String, certificates: Int, appIDs: Int, devices: Int) throws {
 		try lock.withLock {
+			try checkPinLocked(accountKey)
 			let empty = certificates == 0 && appIDs == 0 && devices == 0
 			logger?.certPreflight(certificates: certificates, appIDs: appIDs, devices: devices, ok: empty)
 			guard empty else {
@@ -633,19 +676,38 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 				_ = haltLocked(.accountNotEmpty)
 				throw ZagLiveExperimentRefusal.check("C8")
 			}
+			let id = constants.campaignID
+			guard case .some(let stored) = load(), let record = stored?.campaigns[id], record.state == .armed || record.accountKey == accountKey else {
+				logger?.campaignCheck("C8", pass: false)
+				_ = haltLocked(.accountNotEmpty)
+				throw ZagLiveExperimentRefusal.check("C8")
+			}
+			if record.accountKey == nil {
+				do {
+					try commit { registry in registry.campaigns[id]?.accountKey = accountKey }
+				} catch {
+					_ = haltLocked(.ledgerWriteFailed)
+					throw ZagLiveExperimentRefusal.ledgerWriteFailed
+				}
+				logger?.campaignAccountPin("pinnedNow")
+			}
 			logger?.campaignCheck("C8", pass: true)
-			accountStateVerified = true
+			verifiedAccounts.insert(Self.verificationKey(accountKey, team))
 		}
 	}
 
-	var needsAccountStateCheck: Bool { lock.withLock { !accountStateVerified } }
+	func needsAccountStateCheck(accountKey: String, team: String) -> Bool {
+		lock.withLock { !verifiedAccounts.contains(Self.verificationKey(accountKey, team)) }
+	}
+
+	private static func verificationKey(_ accountKey: String, _ team: String) -> String { accountKey + "\n" + team }
 
 	// MARK: The budget (E1), through ZagCertificateBudget only
 
 	/// Lets exactly one certificate request through for this campaign, and
 	/// records it (and the account pin) before returning. Called only by
 	/// `ZagCertificateBudget.consume` (a static test checks this).
-	func recordSubmission(accountKey: String, certificatesNow: Int) throws {
+	func recordSubmission(accountKey: String, team: String, certificatesNow: Int) throws {
 		try lock.withLock {
 			let id = constants.campaignID
 			guard case .some(let stored) = load(), let record = stored?.campaigns[id] else {
@@ -668,7 +730,7 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 				_ = haltLocked(.accountMismatch)
 				throw ZagLiveExperimentRefusal.accountMismatch
 			}
-			guard accountStateVerified, certificatesNow == 0 else {
+			guard verifiedAccounts.contains(Self.verificationKey(accountKey, team)), certificatesNow == 0 else {
 				logger?.campaignCheck("C8", pass: false)
 				logger?.certBudget(before: record.submissions, state: record.state, pin: pin, decision: "halted")
 				_ = haltLocked(.accountNotEmpty)
@@ -695,7 +757,7 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 	/// C1–C5 and C8 again immediately before consuming (plan §5.5). Called
 	/// only by `ZagCertificateBudget.consume`.
 	func authorizeSubmission() throws {
-		try lock.withLock { try authorizeLocked(.submitCertificate) }
+		try lock.withLock { try authorizeLocked(.submitCertificate, account: nil) }
 	}
 
 	// MARK: E3

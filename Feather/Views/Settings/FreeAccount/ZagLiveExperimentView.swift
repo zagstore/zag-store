@@ -10,6 +10,37 @@ import Zip
 // provisioned, signed and installed, and the report export. Every live step
 // still goes through the campaign's checks; this screen adds none of its own.
 
+/// The campaign's launch checks, once per process: called by `FeatherApp`
+/// when the interface becomes interactive (and by the Live Test screen, which
+/// gets the same result). Configures the bridge (C5's window, then the live
+/// backend) only when the campaign is armed.
+@MainActor
+enum ZagLiveExperimentLaunch {
+	private static var result: ZagLiveExperimentCampaign.Durability?
+
+	@discardableResult
+	static func run() -> ZagLiveExperimentCampaign.Durability {
+		if let result { return result }
+		let durability = ZagLiveExperiment.campaign.launch()
+		result = durability
+		recordIdentity(.compiled)
+		if durability == .armed { _ = ZagIsideloadBridge.configureFromCampaign() }
+		return durability
+	}
+
+	private static func recordIdentity(_ constants: ZagCampaignConstants) {
+		ZagLiveExperiment.logger?.record("build.identity", fields: [
+			"campaignID": .string(constants.campaignID),
+			"branchSHA8": .string(String(ZagLiveExperimentCampaignConstants.branchSHA.prefix(8))),
+			"bridgeLibSHA8": .string(String(ZagLiveExperimentCampaignConstants.bridgeLibSHA.prefix(8))),
+			"zsignSHA8": .string(String(ZagLiveExperimentCampaignConstants.zsignSHA.prefix(8))),
+			"installID8": .string(ZagLiveExperiment.logger?.installID8 ?? "00000000"),
+			"conditions": .list(["ZAG_APPLE_BRIDGE", "ZAG_LIVE_EXPERIMENT", "ZAG_ZSIGN_STRICT"]),
+			"debugCompiled": .string("false"),
+		])
+	}
+}
+
 @MainActor
 final class ZagLiveExperimentModel: ObservableObject {
 	@Published private(set) var durability: ZagLiveExperimentCampaign.Durability?
@@ -27,7 +58,6 @@ final class ZagLiveExperimentModel: ObservableObject {
 	private let directory: ZagAccountDirectory
 	private let secrets = ZagKeychainFreeAccountSecretStore(service: ZagLiveExperiment.accountNamespace)
 	private var configuration: ZagAccountDirectory.Configuration
-	private static var launched: ZagLiveExperimentCampaign.Durability?
 
 	static let confirmationsRequired: [(String, String)] = [
 		("A1", "Created for this experiment; never the personal account; never used to sign apps"),
@@ -57,32 +87,15 @@ final class ZagLiveExperimentModel: ObservableObject {
 	var allConfirmed: Bool { Set(Self.confirmationsRequired.map(\.0)).isSubset(of: confirmations) }
 	var canRun: Bool { durability == .armed && state == .armed && allConfirmed && !isBusy }
 
-	/// The launch checks run once per process, when this screen first opens
-	/// (`FeatherApp.swift` is not changed by the experiment).
 	func appear() async {
-		if Self.launched == nil {
-			Self.launched = campaign.launch()
-			_ = ZagIsideloadBridge.configureFromCampaign()
-			recordIdentity()
-		}
-		durability = Self.launched
+		durability = ZagLiveExperimentLaunch.run()
 		state = campaign.state
 		if signIn == nil {
 			signIn = ZagFreeAccountSignInModel(authenticator: await directory.newSignIn(), diagnostics: ZagFreeAccountDiagnostics())
 		}
 	}
 
-	private func recordIdentity() {
-		ZagLiveExperiment.logger?.record("build.identity", fields: [
-			"campaignID": .string(constants.campaignID),
-			"branchSHA8": .string(String(ZagLiveExperimentCampaignConstants.branchSHA.prefix(8))),
-			"bridgeLibSHA8": .string(String(ZagLiveExperimentCampaignConstants.bridgeLibSHA.prefix(8))),
-			"zsignSHA8": .string(String(ZagLiveExperimentCampaignConstants.zsignSHA.prefix(8))),
-			"installID8": .string(ZagLiveExperiment.logger?.installID8 ?? "00000000"),
-			"conditions": .list(["ZAG_APPLE_BRIDGE", "ZAG_LIVE_EXPERIMENT", "ZAG_ZSIGN_STRICT"]),
-			"debugCompiled": .string("false"),
-		])
-	}
+
 
 	/// P3: the device's profiles must be readable before anything live.
 	func readPreflight() async {

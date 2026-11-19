@@ -231,6 +231,10 @@ final class ZagLaunchGate {
         ZagFirstLaunchReporter.launchBecameInteractive()
         // Foreground usage activity; independent of the report above, returns at once.
         ZagActivityReporter.launchBecameInteractive()
+        #if ZAG_LIVE_EXPERIMENT
+        // G5 experiment builds only: the campaign's launch checks (E5, C1–C4, C7).
+        ZagLiveExperimentLaunch.run()
+        #endif
     }
 }
 
