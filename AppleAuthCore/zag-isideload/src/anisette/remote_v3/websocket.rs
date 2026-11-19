@@ -21,7 +21,7 @@ impl AppWebSocket {
     /// Upstream's relay option is removed.
     pub async fn connect(url: &str, anisette_url: &str) -> Result<Self, Report> {
         let target = Url::parse(url).map_err(|_| report!(net_policy::PolicyError::InvalidUrl))?;
-        net_policy::permit(&target, &[net_policy::host_of(anisette_url)?], "wss")?;
+        net_policy::permit_observed(&target, &[net_policy::host_of(anisette_url)?], "wss", "GET")?;
 
         use tokio::time::{Duration, timeout};
 

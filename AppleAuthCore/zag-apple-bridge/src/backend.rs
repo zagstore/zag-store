@@ -218,4 +218,26 @@ mod request_tests {
         let listing = serde_json::from_str::<PortalRequest>(r#"{"op":"certificates","team":"T"}"#);
         assert!(matches!(listing, Ok(PortalRequest::Certificates { .. })));
     }
+
+    /// G5 (R3): exactly one request can ask Apple for a certificate, so the
+    /// Swift budget in front of `submitCertificateRequest` covers them all.
+    #[test]
+    fn exactly_one_request_submits_a_certificate_request() {
+        let source = include_str!("backend.rs");
+        let start = source.find("pub enum PortalRequest {").unwrap();
+        let body = &source[start..start + source[start..].find("\n}").unwrap()];
+        let variants: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+            .collect();
+        let issuing: Vec<&&str> = variants
+            .iter()
+            .filter(|v| { let l = v.to_ascii_lowercase(); l.contains("certificate") && !l.starts_with("certificates") })
+            .collect();
+        assert_eq!(issuing.len(), 1, "{issuing:?}");
+        assert!(issuing[0].starts_with("SubmitCertificateRequest"));
+        assert!(variants.iter().all(|v| !v.to_ascii_lowercase().contains("revoke")));
+        assert_eq!(variants.len(), 11, "a new portal request must be reviewed against the G5 budget");
+    }
 }

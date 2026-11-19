@@ -243,3 +243,30 @@ pub unsafe extern "C" fn zag_bridge_portal(
         _ => emit(br#"{"event":"failed","kind":"invalidInput"}"#),
     }
 }
+
+/// G5 (observation only): seconds since 1970 of the `Date` header of the
+/// latest response from an Apple host, received over verified TLS; 0 if
+/// none yet. The experiment checks its authorisation window against it.
+#[unsafe(no_mangle)]
+pub extern "C" fn zag_bridge_last_apple_date() -> i64 {
+    isideload::net_policy::observe::last_apple_date()
+}
+
+/// G5 (observation only): delivers every network-policy decision recorded
+/// since the last call, as one JSON array, synchronously through `callback`
+/// (the bytes are valid only during the call). Entries carry the host, the
+/// path without its query, the method, whether it was allowed and why not.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zag_bridge_take_policy_decisions(context: *mut c_void, callback: EventCallback) {
+    let decisions: Vec<serde_json::Value> = isideload::net_policy::observe::take()
+        .into_iter()
+        .map(|d| {
+            serde_json::json!({
+                "host": d.host, "path": d.path, "method": d.method, "scheme": d.scheme,
+                "allowed": d.allowed, "reason": d.reason,
+            })
+        })
+        .collect();
+    let bytes = Zeroizing::new(serde_json::to_vec(&decisions).unwrap_or_else(|_| b"[]".to_vec()));
+    callback(context, bytes.as_ptr(), bytes.len());
+}

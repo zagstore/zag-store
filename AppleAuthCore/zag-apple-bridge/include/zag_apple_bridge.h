@@ -48,4 +48,10 @@ void zag_bridge_portal(uint64_t slot, const uint8_t *credential, size_t credenti
 					   const uint8_t *request, size_t request_length,
 					   void *context, zag_bridge_event_callback callback);
 
+// G5, observation only: the latest Apple `Date` header (seconds since 1970,
+// 0 if none), and the network-policy decisions recorded since the last call
+// (one JSON array, delivered synchronously through the callback).
+int64_t zag_bridge_last_apple_date(void);
+void zag_bridge_take_policy_decisions(void *context, zag_bridge_event_callback callback);
+
 #endif

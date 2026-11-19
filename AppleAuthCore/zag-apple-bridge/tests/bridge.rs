@@ -337,3 +337,13 @@ fn live_build_refuses_insecure_configuration_and_runs_nothing_unconfigured() {
     assert_eq!(events.next(), json!({ "event": "failed", "kind": "notConfigured" }));
     zag_bridge_close_slot(slot);
 }
+
+/// G5: the observation exports answer without any network activity: no
+/// Apple date yet, and an empty decision list in a build that sent nothing.
+#[test]
+fn observation_exports_answer_without_network_activity() {
+    assert_eq!(zag_bridge_last_apple_date(), 0);
+    let events = Events::new();
+    unsafe { zag_bridge_take_policy_decisions(events.context(), collect) };
+    assert_eq!(events.next(), json!([]));
+}
