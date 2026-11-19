@@ -334,7 +334,7 @@ actor ZagFreeAccountProvisioner {
 		case .create:
 			let key: (privateKey: Data, request: ZagCertificateRequest)
 			do {
-				key = try keys.makeKey(commonName: "Zag Store")
+				key = try keys.makeKey(commonName: "Zag Store", account: request.accountID, team: team)
 			} catch {
 				throw ZagProvisioningFailure(kind: .unavailable, step: .certificate)
 			}
@@ -348,7 +348,7 @@ actor ZagFreeAccountProvisioner {
 			}
 			// The certificate must be for the key just made.
 			var serial = issued.certificate.serialNumber, expiresAt = issued.certificate.expiresAt
-			switch keys.check(certificate: issued.data, privateKey: key.privateKey) {
+			switch keys.check(certificate: issued.data, privateKey: key.privateKey, account: request.accountID, team: team) {
 			case .matches(let inspectedSerial, let inspectedExpiry):
 				serial = inspectedSerial
 				expiresAt = inspectedExpiry

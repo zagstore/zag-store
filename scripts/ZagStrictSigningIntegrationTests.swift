@@ -195,6 +195,75 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 			if case .signer(let message)? = $0 as? ZagFreeAccountSigningError { return message.contains("did not verify") }
 			return false
 		}
+		await keychainHeldKeys(intermediate: intermediate)
 		print("SUCCESS: \(passed) strict signing integration checks passed")
+	}
+
+	/// The supervised experiment's path: the provisioner makes the key as a
+	/// Keychain key item, stores an identity without key bytes, and the
+	/// adapter signs through the key reference only.
+	static func keychainHeldKeys(intermediate: Data) async {
+		let secrets = MemorySecrets()
+		let (directory, _) = SimulatedAccounts.directory(now: { Date() }, secrets: secrets)
+		guard let account = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: directory) else { return check(false, "sign-in") }
+		let keys = ZagKeychainSigningKeys(namespace: "ZagStore.test.\(UUID().uuidString)")
+		defer { try? keys.deleteAll(account: account) }
+		let portal = ZagSimulatedDeveloperPortal(team: team, issuer: OpenSSLIssuer())
+		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: ZagKeychainSigningKeyFactory(keys: keys), secrets: secrets, account: account)
+		let authorization = try! await directory.authorize(ZagSigningScope(accountID: account, teamID: team))
+		let request = ZagProvisioningRequest(
+			accountID: account, team: team, deviceUDID: udid, deviceName: "Test iPhone",
+			app: component("com.example.notes", "Notes"), extensions: [], installedFreeAccountApps: []
+		)
+		guard case .success(let result) = await provisioner.provision(request, authorization: authorization),
+			  let identity = secrets.identity(account, team) else { return check(false, "provisioning with a Keychain key") }
+		check(identity.keyIsInKeychain && (try? keys.key(account: account, team: team)) != nil,
+			  "Keychain keys: the stored identity carries no key bytes; the key is a Keychain key item for this account and team")
+
+		var adapter = ZagFreeAccountSigningAdapter(signer: ZagZsignCodeSigner(), workRoot: work, gate: .simulationOnly)
+		adapter.keychainKeys = keys
+		adapter.testIntermediates = [intermediate]
+		let before = Set((try? FileManager.default.contentsOfDirectory(atPath: work.path)) ?? [])
+		let app = makeApp(extensions: [])
+		do {
+			let record = try adapter.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: Date())
+			check(record.owner?.scope.accountID == account && record.owner?.certificateSerial == identity.serialNumber,
+				  "Keychain keys: the app is signed and recorded for its own account and team")
+		} catch {
+			return check(false, "Keychain signing: \(error)")
+		}
+		let after = Set((try? FileManager.default.contentsOfDirectory(atPath: work.path)) ?? [])
+		check(after.subtracting(before).allSatisfy { !$0.hasPrefix("zag-free-account-signing-") },
+			  "Keychain keys: no key staging folder or key file is created")
+		let components: [String: (provision: Data, entitlements: Data)] = [
+			"": (result.app.profile.data, try! PropertyListSerialization.data(fromPropertyList: result.app.entitlements.dictionary, format: .xml, options: 0))
+		]
+		check(Zsign.verifyComponents(appPath: app.path, certificate: identity.certificate, components: components) == nil,
+			  "Keychain keys: the signed app verifies independently against the issued certificate")
+
+		// Another account's identity and key do not sign this account's app.
+		guard let other = await SimulatedAccounts.signIn(SimulatedAccounts.second, to: directory) else { return check(false, "second account") }
+		defer { try? keys.deleteAll(account: other) }
+		guard let otherAuthorization = try? await directory.authorize(ZagSigningScope(accountID: other, teamID: "SIMTEAM002")) else {
+			return check(false, "second account authorisation")
+		}
+		do {
+			_ = try adapter.sign(appAt: makeApp(extensions: []), with: result, identity: identity, authorization: otherAuthorization, now: Date())
+			check(false, "cross-account signing")
+		} catch {
+			check(error as? ZagFreeAccountSigningError == .notAuthorized && (try? keys.key(account: other, team: team)) == nil,
+				  "Keychain keys: another account's authorisation cannot sign this account's app, and it has no key item for this team")
+		}
+		// A missing key item is a clear failure, never a fallback to key files.
+		try? keys.delete(account: account, team: team)
+		var permissive = adapter
+		permissive.allowsKeyFiles = true
+		do {
+			_ = try permissive.sign(appAt: makeApp(extensions: []), with: result, identity: identity, authorization: authorization, now: Date())
+			check(false, "missing key")
+		} catch {
+			check(error as? ZagFreeAccountSigningError == .keychainKeyMissing,
+				  "Keychain keys: a missing key item fails clearly, with no fallback to a key file")
+		}
 	}
 }

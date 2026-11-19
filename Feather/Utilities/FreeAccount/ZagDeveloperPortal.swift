@@ -140,6 +140,19 @@ protocol ZagSigningKeyFactory: Sendable {
 	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest)
 	/// Whether an issued certificate is for `privateKey`, with its serial and expiry.
 	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck
+	func makeKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest)
+	func check(certificate: Data, privateKey: Data, account: UUID, team: String) -> ZagIssuedCertificateCheck
+}
+
+extension ZagSigningKeyFactory {
+	/// For one account and team. A factory whose keys stay in the Keychain
+	/// creates the key item for them and returns an empty `privateKey`.
+	func makeKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest) {
+		try makeKey(commonName: commonName)
+	}
+	func check(certificate: Data, privateKey: Data, account: UUID, team: String) -> ZagIssuedCertificateCheck {
+		check(certificate: certificate, privateKey: privateKey)
+	}
 }
 
 struct ZagDisabledSigningKeyFactory: ZagSigningKeyFactory {
@@ -154,8 +167,12 @@ struct ZagDisabledSigningKeyFactory: ZagSigningKeyFactory {
 struct ZagSigningIdentity: Codable, Equatable, Sendable, CustomStringConvertible {
 	let serialNumber: String
 	let certificate: Data
+	/// Empty when the key is a Keychain key item (`ZagKeychainSigningKeys`),
+	/// which is never exported.
 	let privateKey: Data
 	let expiresAt: Date
+
+	var keyIsInKeychain: Bool { privateKey.isEmpty }
 
 	var description: String { "[signing identity \(serialNumber)]" }
 }

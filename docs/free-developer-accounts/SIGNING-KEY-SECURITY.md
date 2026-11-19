@@ -49,3 +49,25 @@ That migration, and switching the adapter to `Zsign.signComponents`, waits for t
 - Sign-out keeps identities so refreshes can resume.
 - Removing an account deletes every item of that account.
 - Certificates are never revoked automatically.
+
+## Keychain-backed signing for the supervised experiment (19 Nov 2026)
+
+These changes make the Keychain key item the only signing path for free accounts.
+
+**Key creation.** `ZagKeychainSigningKeyFactory` makes each account and team's key as a Keychain key item, available after first unlock, on this device only and never synchronised.
+- The certificate request is made from the key reference.
+- The issued certificate is checked by possession: a fresh challenge signed with the key must verify with the certificate's public key.
+- The stored `ZagSigningIdentity` carries no key bytes (`keyIsInKeychain`).
+
+**Signing.** `ZagFreeAccountSigningAdapter` signs a Keychain-held identity only through the key reference (`signWithKeychainKey` → Zsign's raw-signer callback).
+- No key file, staging folder or exported key is involved.
+- A missing key item fails with `keychainKeyMissing`; it never falls back to a key file.
+- Another account's authorisation is refused.
+
+**The older key-file path is refused** unless `allowsKeyFiles` is set, which only its own tests do.
+
+**Production.** Keychain signing is compiled only with `ZAG_ZSIGN_STRICT`, which no Xcode configuration sets. Without it, a Keychain-held identity fails with `keychainSigningUnavailable`. The free-account signing gate stays closed. The path is enabled only in the separately approved experiment build, after the live workflow review.
+
+**Tests.**
+- `scripts/test-zag-zsign-branch.sh` covers the end-to-end path: provisioning with a Keychain key, signing, independent verification, no key file, cross-account refusal and a missing key.
+- `scripts/test-zag-free-account-signing.sh` covers the key policy in a build without the flag.

@@ -4,9 +4,9 @@ import Security
 // Signing keys kept as Keychain key items, one per account and team, so the
 // private key is never exported: the certificate request is made from the
 // key reference, and signatures are made with SecKeyCreateSignature through
-// Zsign's raw-signer callback (Zsign branch zag-free-account-signing, not
-// yet in the pinned submodule). Not used while ZagFreeAccountSigning is
-// disabled. See docs/free-developer-accounts/SIGNING-KEY-SECURITY.md.
+// Zsign's raw-signer callback (Zsign f34e51a). Not used while
+// ZagFreeAccountSigning is disabled. See
+// docs/free-developer-accounts/SIGNING-KEY-SECURITY.md.
 
 struct ZagKeychainSigningKeys {
 	enum Failure: Error, Equatable {
@@ -92,5 +92,46 @@ struct ZagKeychainSigningKeys {
 	/// has built. Nil when the key refuses.
 	static func signer(_ key: SecKey) -> (Data) -> Data? {
 		{ digestInfo in SecKeyCreateSignature(key, .rsaSignatureDigestPKCS1v15Raw, digestInfo as CFData, nil) as Data? }
+	}
+}
+
+/// Makes each account and team's key as a Keychain key item, so the identity
+/// stored by the provisioner carries no key bytes (`keyIsInKeychain`) and the
+/// adapter signs through the key reference only.
+struct ZagKeychainSigningKeyFactory: ZagSigningKeyFactory {
+	enum Failure: Error, Equatable { case accountRequired }
+
+	let keys: ZagKeychainSigningKeys
+
+	/// Keychain keys belong to an account and team.
+	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest) {
+		throw Failure.accountRequired
+	}
+
+	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck { .mismatch }
+
+	/// The provisioner asks for a key only when it will request a new
+	/// certificate, so a key left by an earlier, unfinished attempt is replaced.
+	func makeKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest) {
+		try keys.delete(account: account, team: team)
+		let made = try keys.create(account: account, team: team, commonName: commonName)
+		return (Data(), made.request)
+	}
+
+	/// The certificate is for the key item: a fresh challenge signed by the
+	/// key verifies with the certificate's public key.
+	func check(certificate: Data, privateKey: Data, account: UUID, team: String) -> ZagIssuedCertificateCheck {
+		var challenge = Data(count: 32)
+		guard privateKey.isEmpty,
+			  let inspection = ZagCertificateInspection(der: certificate),
+			  let parsed = SecCertificateCreateWithData(nil, certificate as CFData),
+			  let certificateKey = SecCertificateCopyKey(parsed),
+			  let key = try? keys.key(account: account, team: team),
+			  challenge.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }) == errSecSuccess,
+			  let signature = SecKeyCreateSignature(key, .rsaSignatureMessagePKCS1v15SHA256, challenge as CFData, nil),
+			  SecKeyVerifySignature(certificateKey, .rsaSignatureMessagePKCS1v15SHA256, challenge as CFData, signature, nil) else {
+			return .mismatch
+		}
+		return .matches(serialNumber: inspection.serialNumber, expiresAt: inspection.expiresAt)
 	}
 }
