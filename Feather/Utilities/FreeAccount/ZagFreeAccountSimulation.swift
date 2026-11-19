@@ -49,9 +49,11 @@ enum ZagFreeAccountSimulation {
 		secrets: ZagFreeAccountSecretStore = ZagKeychainFreeAccountSecretStore(service: keychainService),
 		preferences: ZagPreferenceStore = ZagUserDefaultsPreferences(),
 		diagnostics: ZagFreeAccountDiagnostics = ZagFreeAccountDiagnostics(),
-		operationTimeout: TimeInterval = 8
+		operationTimeout: TimeInterval = 8,
+		localState: ZagAccountLocalState? = nil
 	) -> ZagAccountDirectory {
 		var configuration = ZagAccountDirectory.Configuration()
+		configuration.localState = localState
 		configuration.namespace = accountsNamespace
 		configuration.legacySessionKey = sessionKey
 		configuration.authenticator = .init(operationTimeout: operationTimeout, twoFactorWindow: 600, maximumCodeAttempts: 3)

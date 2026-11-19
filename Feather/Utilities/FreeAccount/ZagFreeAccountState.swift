@@ -87,6 +87,11 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		case differentAccount
 		/// Sign-in is turned off in this build (live authentication not enabled).
 		case unavailable
+		/// Apple's sign-in reached an Apple Account already in Zag Store, through
+		/// an address never used for it here (perhaps an alias). Whether Apple's
+		/// account identifier is the same for every alias is not established, so
+		/// the two are not merged.
+		case addressNotRecognised
 	}
 
 	let kind: Kind
@@ -104,6 +109,7 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		case .cancelled: return "Sign-in was cancelled."
 		case .differentAccount: return "You signed in with a different Apple Account. This account was not changed."
 		case .unavailable: return "Apple Account sign-in is not available in this version of Zag Store."
+		case .addressNotRecognised: return "This Apple Account is already in Zag Store under a different address. Nothing was changed."
 		}
 	}
 
@@ -116,6 +122,7 @@ struct ZagFreeAccountFailure: Codable, Equatable, Sendable {
 		case .unexpectedResponse: return "Update Zag Store"
 		case .differentAccount: return "Sign in with this account's Apple ID, or add the other account separately"
 		case .unavailable: return "Use an imported certificate for now"
+		case .addressNotRecognised: return "Sign in with the address you first used for this account"
 		}
 	}
 
