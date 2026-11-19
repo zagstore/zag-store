@@ -23,6 +23,20 @@ final class ZagBridgeSlot: @unchecked Sendable {
 	private let lock = NSLock()
 	/// The operation started here whose terminal event has not reached Swift.
 	private var running: ZagBridgeEvents?
+	/// Calls to `zag_bridge_cancel` under way. The bridge is called without
+	/// the lock held, since it may answer on the calling thread. Meanwhile no
+	/// operation starts here, so its slot-wide cancellation cannot reach one.
+	private var cancelling = 0
+	/// How long a cancelled operation may take to send its terminal event
+	/// before Swift abandons it.
+	let cancellationGrace: TimeInterval
+	/// `zag_bridge_cancel`; tests replace it to act as a misbehaving bridge.
+	private let cancelBridge: @Sendable (UInt64) -> Int32
+
+	init(cancellationGrace: TimeInterval = 5, cancelBridge: @escaping @Sendable (UInt64) -> Int32 = { zag_bridge_cancel($0) }) {
+		self.cancellationGrace = cancellationGrace
+		self.cancelBridge = cancelBridge
+	}
 
 	deinit {
 		zag_bridge_close_slot(id)
@@ -36,7 +50,7 @@ final class ZagBridgeSlot: @unchecked Sendable {
 	func start(_ body: (UnsafeMutableRawPointer, zag_bridge_event_callback) -> Void) -> ZagBridgeEvents {
 		let events = ZagBridgeEvents(slot: self)
 		let started = lock.withLock {
-			guard running == nil else { return false }
+			guard running == nil, cancelling == 0 else { return false }
 			running = events
 			return true
 		}
@@ -49,11 +63,17 @@ final class ZagBridgeSlot: @unchecked Sendable {
 	}
 
 	/// Cancels `operation` while it is the one running here, never another.
-	fileprivate func cancel(_ operation: ZagBridgeEvents) {
-		lock.withLock {
-			guard running === operation else { return }
-			_ = zag_bridge_cancel(id)
+	/// Returns whether the cancellation reached the bridge.
+	fileprivate func cancel(_ operation: ZagBridgeEvents) -> Bool {
+		let reaches = lock.withLock {
+			guard running === operation else { return false }
+			cancelling += 1
+			return true
 		}
+		guard reaches else { return false }
+		_ = cancelBridge(id)
+		lock.withLock { cancelling -= 1 }
+		return true
 	}
 
 	fileprivate func ended(_ operation: ZagBridgeEvents) {
@@ -155,9 +175,12 @@ final class ZagBridgeOperations: @unchecked Sendable {
 		}
 	}
 
+	/// Gives up an operation whose terminal event did not come: its readers
+	/// get `cancelled` (once; nothing if it has already ended) and its slot is
+	/// freed. Anything the bridge sends for it later is ignored.
 	fileprivate func abandon(_ events: ZagBridgeEvents) {
 		lock.withLock { running = running.filter { $0.value !== events } }
-		events.deliver(.failed(.cancelled))
+		events.abandoned()
 	}
 
 	fileprivate func receive(_ context: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: Int) {
@@ -234,11 +257,25 @@ final class ZagBridgeEvents: @unchecked Sendable {
 		}
 	}
 
+	fileprivate func abandoned() {
+		slot?.ended(self)
+		deliver(.failed(.cancelled))
+	}
+
 	/// Cancels this operation in the bridge if it is still running there.
 	/// One that has already ended keeps its outcome (a certificate issued just
-	/// before cancelling is reported as issued).
+	/// before cancelling is reported as issued). The bridge answers with the
+	/// terminal event; should it not within the slot's grace period, Swift
+	/// abandons the operation, so no caller waits for it forever. (The bridge
+	/// then refuses a new operation in the slot as busy while the old one
+	/// still runs there.)
 	func cancel() {
-		slot?.cancel(self)
+		guard let slot, slot.cancel(self) else { return }
+		let grace = slot.cancellationGrace
+		Task { [weak self] in
+			try? await Task.sleep(nanoseconds: UInt64(max(0, grace) * 1_000_000_000))
+			if let self { ZagBridgeOperations.shared.abandon(self) }
+		}
 	}
 }
 

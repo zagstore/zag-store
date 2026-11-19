@@ -292,6 +292,7 @@ struct ZagAppleBridgeTests {
 
 		await anisetteStateFollowsTheAccount()
 		if let storedOne { await callbackOwnership(credential: storedOne) }
+		await teardownRaces()
 
 		// Secrets and diagnostics.
 		let everything = secrets.allBytes
@@ -530,6 +531,174 @@ struct ZagAppleBridgeTests {
 			check(isFailure(revoke, .invalidInput), "revocation: a revokeCertificate request is refused as invalid input")
 		}
 		check(operations.count == base, "ownership: every operation above was released exactly once")
+	}
+
+	/// Every event of an operation until nil (or until `seconds` pass).
+	static func drain(_ events: ZagBridgeEvents, within seconds: Double = 3) async -> [ZagBridgeEvent]? {
+		await within(seconds) {
+			var all: [ZagBridgeEvent] = []
+			while let event = await events.next() { all.append(event) }
+			return all
+		}
+	}
+
+	final class Context: @unchecked Sendable {
+		let lock = NSLock()
+		private var stored: UnsafeMutableRawPointer?
+		var value: UnsafeMutableRawPointer? {
+			get { lock.withLock { stored } }
+			set { lock.withLock { stored = newValue } }
+		}
+	}
+
+	/// G4 closeout (issues 1, 3 and 4): a terminal event that never comes,
+	/// callbacks racing slot teardown and cancellation, and a bridge that
+	/// answers a cancellation on the calling thread.
+	static func teardownRaces() async {
+		let operations = ZagBridgeOperations.shared
+		let base = operations.count
+		let grace = 0.3
+
+		// 1. A real caller's shape: the reader holds its slot (as portal(slot:)
+		// does), the bridge never sends the terminal event, and the caller is
+		// cancelled. Before: it waited forever and kept the slot alive.
+		do {
+			weak var released: ZagBridgeSlot?
+			let context = Context()
+			let call: Task<ZagBridgeEvent?, Never>
+			do {
+				let slot = ZagBridgeSlot(cancellationGrace: grace)
+				released = slot
+				let events = slot.start { saved, _ in context.value = saved }
+				call = Task {
+					let event = await withTaskCancellationHandler { await events.next() } onCancel: { events.cancel() }
+					withExtendedLifetime(slot) {}
+					return event
+				}
+			}
+			try? await Task.sleep(nanoseconds: 50_000_000)
+			call.cancel()
+			let event = await within(grace + 2) { await call.value }
+			check(isFailure(event ?? nil, .cancelled), "missing terminal: a cancelled caller holding its slot gets `cancelled` after the grace period")
+			try? await Task.sleep(nanoseconds: 50_000_000)
+			check(released == nil && operations.count == base, "missing terminal: the slot is then released and the operation unregistered")
+			emit(context.value, #"{"event":"result","value":1}"#)
+			check(operations.count == base, "missing terminal: a late terminal event after that is ignored")
+		}
+
+		// Abandoned after the grace period: the slot is usable, and the old
+		// operation's late events never reach the new one.
+		do {
+			let slot = ZagBridgeSlot(cancellationGrace: grace)
+			let old = Context(), new = Context()
+			let first = slot.start { saved, _ in old.value = saved }
+			first.cancel()
+			check(await drain(first, within: grace + 2).map { $0.count == 1 && isFailure($0.first, .cancelled) } == true,
+				  "missing terminal: the reader gets exactly one event, `cancelled`, then nil")
+			let second = slot.start { saved, _ in new.value = saved }
+			check(operations.count == base + 1, "missing terminal: after abandonment the slot starts a new operation")
+			emit(old.value, #"{"event":"result","value":"old"}"#)
+			emit(new.value, #"{"event":"result","value":"new"}"#)
+			check(await drain(second).map { $0.count == 1 && isResult($0.first, #""new""#) } == true && operations.count == base,
+				  "missing terminal: the abandoned operation's late event does not reach the new one")
+		}
+
+		// A terminal event that arrives within the grace period wins: the
+		// outcome is the bridge's, and the later abandonment changes nothing.
+		do {
+			let slot = ZagBridgeSlot(cancellationGrace: grace)
+			let context = Context()
+			let events = slot.start { saved, _ in context.value = saved }
+			events.cancel()
+			emit(context.value, #"{"event":"result","value":"issued"}"#)
+			try? await Task.sleep(nanoseconds: UInt64((grace + 0.2) * 1_000_000_000))
+			check(await drain(events).map { $0.count == 1 && isResult($0.first, #""issued""#) } == true,
+				  "cancel race: a result that arrives after cancelling is reported once, as the result; the grace timer changes nothing")
+		}
+
+		// 4. The bridge answers a cancellation on the calling thread. Before:
+		// a deadlock on the slot's lock.
+		do {
+			let context = Context()
+			final class Probe: @unchecked Sendable { let lock = NSLock(); var startedInside: ZagBridgeEvents?; var slot: ZagBridgeSlot? }
+			let probe = Probe()
+			let slot = ZagBridgeSlot(cancellationGrace: grace) { _ in
+				emit(context.value, #"{"event":"failed","kind":"cancelled"}"#)
+				// Something starting in the slot during the bridge's cancel call
+				// would be reached by that slot-wide cancellation: refused.
+				let inside = probe.lock.withLock { probe.slot }?.start { _, _ in }
+				probe.lock.withLock { probe.startedInside = inside }
+				return 0
+			}
+			probe.lock.withLock { probe.slot = slot }
+			let events = slot.start { saved, _ in context.value = saved }
+			let returned = await within(3) { events.cancel(); return true }
+			check(returned == true, "cancel reentrancy: a bridge answering a cancellation on the calling thread does not deadlock")
+			let inside = probe.lock.withLock { probe.startedInside }
+			let insideEvent = await within(1) { await inside?.next() } ?? nil
+			check(await drain(events).map { $0.count == 1 && isFailure($0.first, .cancelled) } == true
+				  && isFailure(insideEvent, .busy),
+				  "cancel reentrancy: the operation ends once, and nothing can start in the slot during the bridge's cancel call")
+			probe.lock.withLock { probe.slot = nil }
+			let after = slot.start { saved, _ in context.value = saved }
+			emit(context.value, #"{"event":"result","value":2}"#)
+			check(isResult(await after.next(), "2") && operations.count == base, "cancel reentrancy: the slot works normally afterwards")
+		}
+
+		// 3. Teardown orderings, each deterministic.
+		for (name, steps) in [
+			("terminal, then close", ["terminal", "close"]),
+			("close, then terminal", ["close", "terminal"]),
+			("cancel, terminal, close", ["cancel", "terminal", "close"]),
+			("cancel, close, terminal", ["cancel", "close", "terminal"]),
+			("close, cancel, terminal", ["close", "cancel", "terminal"]),
+		] {
+			let context = Context()
+			var slot: ZagBridgeSlot? = ZagBridgeSlot(cancellationGrace: grace)
+			let events = slot!.start { saved, _ in context.value = saved }
+			let reader = Task { await drain(events, within: grace + 2) }
+			try? await Task.sleep(nanoseconds: 20_000_000)
+			for step in steps {
+				switch step {
+				case "terminal": emit(context.value, #"{"event":"result","value":1}"#)
+				case "close": slot = nil
+				default: events.cancel()
+				}
+			}
+			let seen = await reader.value ?? nil
+			let once = seen.map { $0.count == 1 && (isResult($0.first, "1") || isFailure($0.first, .cancelled)) } ?? false
+			check(once && operations.count == base, "teardown (\(name)): the waiting reader gets exactly one terminal event, and the operation is released")
+		}
+
+		// 3. Stress: terminal delivery, slot closure and cancellation on
+		// separate threads at once, many times.
+		let rounds = 400
+		final class Tally: @unchecked Sendable { let lock = NSLock(); var exactlyOnce = 0, results = 0, cancellations = 0 }
+		let tally = Tally()
+		for round in 0..<rounds {
+			let context = Context()
+			final class Holder: @unchecked Sendable { let lock = NSLock(); var slot: ZagBridgeSlot? }
+			let holder = Holder()
+			holder.slot = ZagBridgeSlot(cancellationGrace: 0.05)
+			let events = holder.slot!.start { saved, _ in context.value = saved }
+			let reader = Task { await drain(events, within: 3) }
+			DispatchQueue.concurrentPerform(iterations: 3) { lane in
+				switch (lane + round) % 3 {
+				case 0: emit(context.value, #"{"event":"result","value":1}"#)
+				case 1: let dropped = holder.lock.withLock { () -> ZagBridgeSlot? in defer { holder.slot = nil }; return holder.slot }; _ = dropped
+				default: events.cancel()
+				}
+			}
+			let seen = await reader.value ?? nil
+			tally.lock.withLock {
+				if let seen, seen.count == 1 { tally.exactlyOnce += 1 }
+				if isResult(seen?.first, "1") { tally.results += 1 }
+				if isFailure(seen?.first, .cancelled) { tally.cancellations += 1 }
+			}
+		}
+		try? await Task.sleep(nanoseconds: 200_000_000)
+		check(tally.exactlyOnce == rounds && tally.results + tally.cancellations == rounds && operations.count == base,
+			  "stress: \(rounds) rounds of terminal, close and cancel at once: every reader got exactly one terminal event (\(tally.results) results, \(tally.cancellations) cancelled), none was lost, and nothing stays registered")
 	}
 
 	/// The bridge's anisette Keychain items (named `<scope>/<key>`, as the live
