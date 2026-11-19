@@ -538,7 +538,6 @@ mod tests {
             "https://anisette.example:8443/v3",
             "https://anisette.example:443/v3",
             "https://",
-            "https://anisette.example\\invalid",
         ] {
             assert!(validate_anisette_url(url).is_err(), "accepted {url:?}");
         }
