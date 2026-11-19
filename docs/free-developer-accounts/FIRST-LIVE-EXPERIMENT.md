@@ -1,43 +1,54 @@
 # The first live free-account installation: smallest path and gate evidence
 
-Status 18 November 2026: **prepared, not approved, nothing live.**
-- No Apple endpoint has been contacted.
+Status 19 November 2026: **prepared, not approved, nothing live.**
+- No Apple endpoint has been contacted, and no live Apple service has been tested.
 - Anisette stage 3 is disabled.
 - No real credentials have been requested.
 
-The experiment runs only after the owner separately approves it, and after the gates below are complete.
+The experiment runs only after the owner separately approves it, and after G1–G6 are complete. Each gate is approved on its own. The step-by-step procedure is in `SUPERVISED-EXPERIMENT-SEQUENCE.md`, and the decisions still needed, with their evidence, are in `GATES-APPROVAL.md`.
+
+Names marked "draft PR" refer to code that is not in `main` yet.
+
+## Where things stand
+
+| Item | State |
+|---|---|
+| Device tests A, B, C and D (iPhone 15 Pro Max) | **All passed** (`DEVICE-TEST-PHASE7.md`, `PHASE7-INTEGRATION.md`) |
+| RPPairing PR #25 (installed-profile reader) and Zsign-Zag PR #1 | **In `main`** through PR #27 |
+| `main` | `bcf30a9f`, with Zsign pinned to `f34e51a` |
+| Validation of `main` | **All 44 `scripts/test-zag-*.sh` suites and the package guard (15 checks) passed** |
+| Live Apple services | **Not tested.** Nothing has signed in to Apple, called the developer portal or fetched anisette data. |
+| Keychain-backed signing for the experiment | Draft PR #28 (compiled only with `ZAG_ZSIGN_STRICT`) |
+| Bridge to `zag-isideload` | Draft bridge PR, stacked on PR #26 (network compiled out; tested only against a scripted backend) |
+| `zag-isideload` fork | PR #26, draft and unmerged until the independent licence review (G2) |
 
 ## Smallest path: one simple IPA without extensions
 
 The target is one app: a tiny test app with no extensions, frameworks or capabilities beyond the defaults. It is installed once on the owner's iPhone 15 Pro Max, under a **dedicated** free Apple Account (G6), signed in through the Debug-only sign-in screen in a separately named test build (G5).
 
-Most of the steps already exist behind their disabled live implementations. The work left is the bridge from those Swift services to the trimmed `zag-isideload` (PR #26), plus the approved anisette provider.
-
 | Step | Existing component | State | Left for the experiment |
 |---|---|---|---|
-| 1. Apple Account sign-in (password and 2FA used only in memory) | `ZagFreeAccountAuthentication`, `ZagFreeAccountSignInModel`, Debug sign-in screen (device-tested with the simulation, 18 Nov) | Live service disabled | Bridge to `zag-isideload` `auth/`, with `live-network` enabled **only** in the experiment build; anisette provider from G3 |
-| 2. Personal Team | `ZagAppleAccounts` (per-account directory and session in the this-device-only Keychain) | Simulated | Team listing through the bridge (`dev/teams`) |
-| 3. Development certificate | `ZagFreeAccountProvisioner`, `ZagSigningKeyFactory` / `ZagKeychainSigningKey` (key generated on device, non-extractable) | Disabled factory in Release; Keychain key tested | Certificate request through the bridge; the issued certificate is checked against the Keychain key (`check`) |
-| 4. Device registration | `ZagDeveloperPortalService.registerDevice` | Disabled | The device's identifier comes from the existing pairing (never logged; the push guard blocks real UDIDs) |
-| 5. App ID and provisioning profile | `registerAppID`, `profile(for:)`, `ZagProvisioningProfileCheck` | Disabled; checks unit-tested | Bridge; App ID under a Zag Store-specific prefix, counted against the free limits (10 App IDs per 7 days, 3 apps per device) |
-| 6. Signing | `ZagFreeAccountSigningAdapter` → Zsign strict path (`signComponents`) | Zsign branch: real-certificate signing and verification pass with a non-extractable key (B/C in `DEVICE-TEST-PHASE7.md`); on-device launch pending | The production Zsign pointer moves only with the owner's approval |
-| 7. Installation | RPPairing install (existing pairing; Zag Store's own installer) | Production | None |
-| 8. Read-back | `ZagInstalledProfileCheck` + installed-profile reader (PR #25) | Device test A pending | Confirms the profile actually installed matches the one used to sign |
-| 9. Sign-out | Revocation and Keychain inventory (G1 amendment b) | Simulated and device-tested | Keychain inventory after sign-out shows only the expected items |
+| 1. Apple Account sign-in (password and 2FA used only in memory) | `ZagFreeAccountAuthenticator` → `ZagIsideloadAuthenticationService` (draft PR #29) → bridge → `zag-isideload` `auth/` | Bridge written; mock-tested (2FA, cancellation, deadline, expired session, network failure, account switching) | `live` enabled **only** in the experiment build; the anisette provider from G3 |
+| 2. Personal Team | Team listing through the bridge | Mock-tested | Confirm how Apple describes a Personal Team (the bridge reports `unknown`, so the free limits apply) |
+| 3. Development certificate | `ZagKeychainSigningKeyFactory` (draft PR #28): a this-device-only Keychain key that Zag Store never exports (software RSA, so not hardware-protected); the certificate is checked by proof of possession | Tested end to end with a test authority | Certificate request through the bridge |
+| 4. Device registration | `ZagIsideloadDeveloperPortal.registerDevice` (draft PR #29) | Mock-tested | The device's identifier comes from the existing pairing (never logged; the push guard blocks real UDIDs) |
+| 5. App ID and provisioning profile | `registerAppID`, `profile(for:)`, `ZagProvisioningProfileCheck` | Mock-tested; profile checks unit-tested | App ID under a Zag Store-specific prefix, counted against the free limits (10 App IDs per 7 days, 3 apps per device) |
+| 6. Signing | `ZagFreeAccountSigningAdapter.signWithKeychainKey` (draft PR #28) → Zsign `signComponents` with the Security-framework callback | Zsign `f34e51a` in `main`; Keychain path tested (PR #28); real-certificate signing passed in B and C | Only in the experiment build (`ZAG_ZSIGN_STRICT`) |
+| 7. Installation | RPPairing install (existing pairing; Zag Store's own installer) | Production; D passed | None |
+| 8. Read-back | Installed-profile reader (PR #25, in `main`) and `ZagInstalledProfileCheck` | Device test A passed | Confirms that the installed profile matches the one used to sign |
+| 9. Sign-out | Revocation and Keychain inventory (G1 amendment b) | Simulated and device-tested | The Keychain inventory after sign-out shows only the expected items |
 
-**Multi-account.** Every step is keyed by account ID and team. `zag-isideload` keeps each `AppleAccount` independent, with storage supplied per caller. A second account is not part of the first experiment.
+**Multi-account.** Every step is keyed by account ID and team. The bridge gives each account its own slot and refuses another account's session. A second account is not part of the first experiment.
 
-## G1–G6 checklist with the evidence so far
+## G1–G6: separately gated
 
-| Gate | Evidence gathered | State |
+| Gate | Evidence | State |
 |---|---|---|
-| **G1 Proposal** | `LIVE-AUTH-REVIEW-PROPOSAL.md`, `LIVE-AUTH-GATE-RECOMMENDATIONS.md`, `SUPERVISED-SIGN-IN-PLAN.md`, and this smallest path | **Incomplete:** the owner's approval of this experiment, with amendments (a) and (b) |
-| **G2 Protocol source** | Trimmed, hardened fork, PR #26 (network compiled out, 15 checks pass), `PROVENANCE.md` with per-file evidence and the dependency inventory | **Incomplete:** independent licence review (four files marked MPL-2.0 pending review; the Sideloader-reference question for `dev/`) |
-| **G3 Anisette** | Study running, stage 3 disabled | **Incomplete:** the study ends 25 Nov; then the provider decision and the stage 4 privacy review |
-| **G4 Code review** | Checklist in `SUPERVISED-SIGN-IN-PLAN.md`; fork hardening (no logging, no insecure TLS, allowlist, zeroised password buffers) | **Incomplete:** the bridge is not written yet; then a reviewer independent of the implementation |
-| **G5 Test build** | Separately named Debug IPAs built three times without touching the canonical IPA (sign-in test 18 Nov; phase 7 A/B/C) | **Partly ready:** the experiment build itself (bridge + `live-network`) does not exist yet |
-| **G6 Account readiness** | None yet | **Incomplete:** the owner creates a dedicated Apple Account (no payment method, recovery confirmed); never the personal account |
+| **G1 Proposal** | `LIVE-AUTH-REVIEW-PROPOSAL.md`, `LIVE-AUTH-GATE-RECOMMENDATIONS.md`, `SUPERVISED-SIGN-IN-PLAN.md`, this path, `SUPERVISED-EXPERIMENT-SEQUENCE.md` | **Open:** the owner's approval of the experiment, with amendments (a) and (b) |
+| **G2 Licence** | PR #26; `G2-LICENCE-REVIEW.md` (in draft PR #29): reproducible provenance, MPL-2.0 obligations, the Sideloader-reference question | **Open:** independent licence review |
+| **G3 Anisette** | Study running; stage 3 disabled | **Open:** the study ends 25 Nov; then the provider decision and the stage 4 privacy review |
+| **G4 Code review** | Bridge (draft PR #29), draft PR #28; `G4-SECURITY-REVIEW.md` (in #29: destinations, credentials, isolation, logging, TLS, failures, gates) | **Open:** independent security review (the implementation's author's own review does not count) |
+| **G5 Test build** | Separately named Debug IPAs built four times without touching the canonical IPA (sign-in test; A/B/C; D) | **Open:** the experiment build (bridge with `live`, `ZAG_ZSIGN_STRICT`, live switches) is **not** built. It needs G1–G4 first. |
+| **G6 Account readiness** | None yet | **Open:** the owner creates a dedicated Apple Account (no payment method, recovery confirmed); never the personal account |
 
-**Also outstanding before the experiment** (not gates):
-- device tests A, B and C;
-- the extension test, which needs per-extension profiles and is therefore deferred to after the first single-app installation.
+**Outstanding before the experiment, besides the gates:** the extension test. It needs per-extension profiles, so it is deferred until after the first single-app installation.

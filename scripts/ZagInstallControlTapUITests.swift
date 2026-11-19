@@ -86,8 +86,14 @@ final class ZagInstallControlTapUITests: XCTestCase {
 		reset()
 		app.buttons["morph"].tap()
 		edge.tap()
+		// Wait for the tap's event to be recorded, however late it lands
+		// (under load XCUITest delivers it more than a second after the
+		// morph), then leave the same 0.4 s for a second, wrong event.
+		let recorded = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label != %@", "none"), object: app.staticTexts["events"])
+		XCTAssertEqual(XCTWaiter.wait(for: [recorded], timeout: 5), .completed, "the tap must reach the control or the row")
 		Thread.sleep(forTimeInterval: 0.4)
-		let elapsed = Int(app.staticTexts["elapsed"].label) ?? -1
+		let label = app.staticTexts["elapsed"].label
+		guard let elapsed = Int(label) else { return XCTFail("the elapsed label \"\(label)\" is not a plain number of milliseconds") }
 		XCTAssertGreaterThanOrEqual(elapsed, 0, "the tap must reach the control or the row")
 		// `elapsed` is stamped at touch-up, but the hit test happens at
 		// touch-down (up to ~150 ms earlier), so a tap just after the hold

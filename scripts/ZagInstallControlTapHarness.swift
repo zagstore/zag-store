@@ -73,7 +73,9 @@ struct ZagInstallControlTapHarness: App {
 					.font(.caption2)
 					.accessibilityIdentifier("events")
 					.frame(height: 24)
-				Text("\(events.morphElapsed)")
+				// Verbatim: an interpolated Int is formatted for the locale
+				// ("1,550"), which the tests could not read as a number.
+				Text(verbatim: String(events.morphElapsed))
 					.font(.caption2)
 					.accessibilityIdentifier("elapsed")
 					.frame(height: 16)
