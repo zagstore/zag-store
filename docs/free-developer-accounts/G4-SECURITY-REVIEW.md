@@ -215,7 +215,9 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 - [ ] Every item is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and not synchronised: sessions and identities (`ZagKeychainFreeAccountSecretStore`), signing keys (`ZagKeychainSigningKeys`) and anisette state (`ZagBridgeAnisetteKeychain`).
 - [ ] No release code path exports a private key. `ZagSecuritySigningKeyFactory` is `DEBUG`-only, and the release scan checks it. The only remaining `SecKeyCopyExternalRepresentation` calls are on public keys.
 - [ ] The limitation is accepted: software RSA keys are exportable by the app's own process (section 3).
-- [ ] Lifecycle (`SIGNING-KEY-SECURITY.md`, "Signing-key lifecycle review"): switching, sign-out, removal, missing key, reinstall (open finding L1), restore.
+- [ ] Lifecycle (`SIGNING-KEY-SECURITY.md` in #28, "Signing-key lifecycle review"): switching, sign-out, removal, missing key, restore.
+- [ ] L2, transactional identity creation (#28): a new key in its own slot; one identity write publishes it, only after proof of possession; the journal and bounded retries; abandoned keys removed; no Keychain retagging.
+- [ ] L1, reinstall (#28): the ownership record is written before anything else; recovery only after a sign-in Apple accepted for the same account; ambiguous records unused; cleanup lists, then removes only confirmed accounts still orphaned; nothing deleted at launch; enumeration only of Zag Store's own service and key labels.
 
 ### D. Two-factor handling
 - [ ] Codes are digits only, checked in Swift and again in Rust. Retries are limited to 3 (the authenticator). A code after the backend ends the sign-in does not sign in.
