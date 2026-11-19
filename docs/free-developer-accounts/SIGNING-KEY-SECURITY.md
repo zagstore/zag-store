@@ -147,12 +147,13 @@ Keys are never retagged. The macOS file keychain reports success for a tag updat
 
 It does not assume what other apps can see, or that items survive deletion.
 
-**UI (20 Nov, Debug only).** Settings → Apple Accounts → **Stored Account Data**:
+**UI.** Settings → Apple Accounts → **Stored Account Data** (owner decision, 20 Nov: in Release, behind the Apple Accounts feature; see "Release gating" below):
 - It lists items in three groups: "Recoverable" (with the masked address), "Not Recoverable" and "Anisette State".
 - It removes one item, or all listed, only after a confirmation dialog. Removing a recoverable account warns that its keys cannot then be recovered by signing in.
 - It reports skipped and failed items, and never runs by itself.
-- Like the rest of the Apple Accounts screen it is compiled only in Debug. Offering it in Release is an owner decision.
-- The simulator walkthrough covers it: step 10 and 2 of the 13 in-app checks.
+- It is production code (`ZagStoredAccountDataView`, `ZagStoredAccountDataModel`). Debug builds reach it from the simulated Apple Accounts screen.
+- It works for signed-out and expired accounts too. Orphan cleanup needs no session; a registered account (signed in or not) is never listed as orphaned. Removing a signed-out or expired account is local and removes its keys and anisette state.
+- The simulator walkthrough covers it: step 10 and 2 of its in-app checks.
 
 ### Certificate request recovery (20 Nov)
 
@@ -169,7 +170,16 @@ A certificate request can be granted by Apple while its response is lost (networ
 - **Unknown.** Otherwise: the listing omits certificate data, the pending key is missing, or a match has expired. Provisioning stops with `certificateRequestUnresolved`.
   - Nothing more is requested, however often provisioning is retried.
   - Background refresh treats it as a signing failure and does not retry.
-- **Continuing after "unknown".** Only the user's decision continues, through `abandonUnresolvedCertificateRequest(accountID:team:)`. It discards the pending key and journal, and the next attempt makes one new request with a new key.
+- **Continuing after "unknown": the recovery screen** (owner decision, 20 Nov). The team shows "Certificate Request Unresolved", which opens Settings → Apple Accounts → Certificate Request (`ZagCertificateRecoveryView`, `ZagCertificateRecoveryModel`). It offers two actions:
+  - **Check Again** (`checkUnresolvedCertificateRequest`) reads the certificate listing only, never sends a request, and needs the account signed in.
+    - It settles the request exactly as provisioning would: recovered (proof of possession), not issued (full listing), or still unresolved.
+    - It changes nothing unless the request is still the one it checked.
+    - It can be cancelled; signed out, network failure or cancellation is reported and changes nothing.
+  - **Abandon Request** (`abandonUnresolvedCertificateRequest`) asks for confirmation first. The dialog warns that a certificate Apple may have issued keeps a slot until it expires or the user revokes it.
+    - It discards only the pending key and journal, and works signed out because it is local.
+    - The next signing makes one new request with a new key.
+  - The result is always reported: recovered, resolved as not issued, still unresolved, abandoned, nothing pending, or could not check (with why).
+  - Nothing is revoked, and nothing runs in the background. Background refresh maps the failure to "signing failed" and does not retry.
 
 **Never revoked.** The portal interface has no revoke operation at all. An uncertain certificate stays in the team's listing until it expires or the user revokes it elsewhere.
 
@@ -186,6 +196,15 @@ A certificate request can be granted by Apple while its response is lost (networ
 - the mark is written before sending, and a full listing showing nothing issued resends once.
 
 A further accounts check covers the refresh mapping.
+
+### Release gating (20 Nov)
+
+The two recovery screens and their models are compiled in Release (no `#if DEBUG`). Settings shows their entry only `if ZagAppleAccountsFeature.isEnabled`, which is `static let false` in this version. `test-zag-free-account-release-binary.sh` checks, on every Release scan:
+- the gate is closed in the source;
+- the two files are not Debug-only;
+- every Settings reference to the screens is inside the gate.
+
+The placement check was confirmed to refuse an ungated entry. The Debug-only simulation buttons ("Lose a Certificate Response", "Leave Items From an Earlier Installation") are scan markers that must be absent from Release.
 
 ### Account removal and local state (20 Nov)
 

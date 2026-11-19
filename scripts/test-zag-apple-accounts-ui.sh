@@ -41,6 +41,7 @@ xcrun -sdk iphonesimulator swiftc -target "$(uname -m)-apple-ios16.4-simulator" 
 	"$ROOT/Feather/Views/Settings/Appearance/ZagWallpaper.swift" \
 	"$ROOT/Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift" \
 	"$ROOT/Feather/Views/Settings/FreeAccount/ZagAppleAccountsDebugView.swift" \
+	"$ROOT/Feather/Views/Settings/FreeAccount/ZagAccountRecoveryViews.swift" \
 	"$WORK/ZagWideGamutTint.swift" "$ROOT/scripts/ZagAppleAccountsUIHarness.swift" -o "$APP/SignIn" \
 	-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements -Xlinker "$WORK/entitlements.plist"
 cat > "$APP/Info.plist" <<PLIST
@@ -122,7 +123,7 @@ cp "$LOG" "$OUT/demo.log" 2>/dev/null || { echo "FAIL: the demo never started"; 
 grep '^PASS\|^FAIL' "$OUT/demo.log"
 grep -q '^DONE' "$OUT/demo.log" || { echo "FAIL: the demo did not finish"; exit 1; }
 ! grep -q '^FAIL' "$OUT/demo.log" || { echo "FAIL: an in-app check failed"; exit 1; }
-[ "$(grep -c '^PASS' "$OUT/demo.log")" -eq 13 ] || { echo "FAIL: expected 13 in-app checks"; exit 1; }
-[ "$(grep -c '^STEP' "$OUT/demo.log")" -eq 11 ] || { echo "FAIL: expected 11 steps"; exit 1; }
-[ "$(ls "$OUT"/*.png | wc -l | tr -d ' ')" -eq 11 ] || { echo "FAIL: expected 11 screenshots"; exit 1; }
+[ "$(grep -c '^PASS' "$OUT/demo.log")" -eq 18 ] || { echo "FAIL: expected 18 in-app checks"; exit 1; }
+[ "$(grep -c '^STEP' "$OUT/demo.log")" -eq 14 ] || { echo "FAIL: expected 14 steps"; exit 1; }
+[ "$(ls "$OUT"/*.png | wc -l | tr -d ' ')" -eq 14 ] || { echo "FAIL: expected 14 screenshots"; exit 1; }
 echo "SUCCESS: Apple Accounts screen walkthrough on $DEVICE_NAME; screenshots and video in $OUT"
