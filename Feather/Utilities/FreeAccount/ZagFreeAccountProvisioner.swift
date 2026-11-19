@@ -201,6 +201,13 @@ actor ZagFreeAccountProvisioner {
 	private let operationTimeout: TimeInterval
 	private let now: @Sendable () -> Date
 	private(set) var currentStep: ZagProvisioningFailure.Step?
+	/// Account and team scopes with an operation running. Provisioning,
+	/// Check Again, Abandon and the unresolved-request query of one scope run
+	/// one at a time: the actor is reentrant at every portal call, and a
+	/// second operation could otherwise settle, send again or remove a
+	/// certificate request that is still out (two certificates for one key).
+	private var busyScopes: Set<ZagSigningScope> = []
+	private var scopeWaiters: [ZagSigningScope: [CheckedContinuation<Void, Never>]] = [:]
 
 	init(
 		portal: ZagDeveloperPortalService = ZagDisabledDeveloperPortal(),
@@ -229,7 +236,7 @@ actor ZagFreeAccountProvisioner {
 			return .failure(ZagProvisioningFailure(kind: .notAuthorized, step: .request))
 		}
 		do {
-			let result = try await run(request, limits: authorization.limits)
+			let result = try await exclusively(authorization.scope) { try await run(request, limits: authorization.limits) }
 			diagnostics.record("Provisioned \(result.app.bundleIdentifier); profiles expire \(ISO8601DateFormatter().string(from: result.expiresAt))", at: now())
 			return .success(result)
 		} catch let failure as ZagProvisioningFailure {
@@ -557,10 +564,13 @@ actor ZagFreeAccountProvisioner {
 	}
 
 	/// The account and team's certificate request whose outcome is unknown,
-	/// if any. Local only: nothing is sent.
-	func unresolvedCertificateRequest(accountID: UUID, team: String) -> ZagUnresolvedCertificateRequest? {
-		unresolvedPendingKey(account: accountID, team: team).map {
-			ZagUnresolvedCertificateRequest(accountID: accountID, team: team, startedAt: $0.startedAt, attempts: $0.attempts)
+	/// if any. Local only: nothing is sent. A request still out is not
+	/// unresolved; this waits for it.
+	func unresolvedCertificateRequest(accountID: UUID, team: String) async -> ZagUnresolvedCertificateRequest? {
+		await exclusively(ZagSigningScope(accountID: accountID, teamID: team)) {
+			unresolvedPendingKey(account: accountID, team: team).map {
+				ZagUnresolvedCertificateRequest(accountID: accountID, team: team, startedAt: $0.startedAt, attempts: $0.attempts)
+			}
 		}
 	}
 
@@ -576,6 +586,12 @@ actor ZagFreeAccountProvisioner {
 			  account == nil || account == accountID else {
 			return .checkFailed(.notAuthorized)
 		}
+		return await exclusively(authorization.scope) {
+			await checkUnresolved(accountID: accountID, team: team)
+		}
+	}
+
+	private func checkUnresolved(accountID: UUID, team: String) async -> ZagCertificateRecoveryOutcome {
 		guard let before = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
 		currentStep = .certificate
 		let portal = self.portal
@@ -620,12 +636,15 @@ actor ZagFreeAccountProvisioner {
 	/// a new one. Local only, so it works signed out. Any certificate Apple
 	/// issued for it is never revoked here; it stays in the team's listing
 	/// until it expires or the user revokes it.
+	/// A request still out is not abandoned; this waits for its outcome.
 	@discardableResult
-	func abandonUnresolvedCertificateRequest(accountID: UUID, team: String) -> ZagCertificateRecoveryOutcome {
-		guard let pending = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
-		abandon(pending, account: accountID, team: team)
-		diagnostics.record("An unconfirmed certificate request was abandoned by the user", at: now())
-		return .abandoned
+	func abandonUnresolvedCertificateRequest(accountID: UUID, team: String) async -> ZagCertificateRecoveryOutcome {
+		await exclusively(ZagSigningScope(accountID: accountID, teamID: team)) {
+			guard let pending = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
+			abandon(pending, account: accountID, team: team)
+			diagnostics.record("An unconfirmed certificate request was abandoned by the user", at: now())
+			return .abandoned
+		}
 	}
 
 	private func pendingKey(account: UUID, team: String) -> ZagPendingSigningKey? {
@@ -721,6 +740,23 @@ actor ZagFreeAccountProvisioner {
 	}
 
 	// MARK: Internals
+
+	/// Runs `body` once no other operation of `scope` is running here.
+	private func exclusively<T>(_ scope: ZagSigningScope, _ body: () async throws -> T) async rethrows -> T {
+		while busyScopes.contains(scope) {
+			await withCheckedContinuation { scopeWaiters[scope, default: []].append($0) }
+		}
+		busyScopes.insert(scope)
+		defer {
+			busyScopes.remove(scope)
+			if var waiting = scopeWaiters[scope], !waiting.isEmpty {
+				let next = waiting.removeFirst()
+				scopeWaiters[scope] = waiting.isEmpty ? nil : waiting
+				next.resume()
+			}
+		}
+		return try await body()
+	}
 
 	/// Runs one portal call under the operation deadline; maps its errors.
 	private func call<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
