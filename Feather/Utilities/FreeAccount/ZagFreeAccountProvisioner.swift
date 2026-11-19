@@ -207,7 +207,9 @@ actor ZagFreeAccountProvisioner {
 	/// second operation could otherwise settle, send again or remove a
 	/// certificate request that is still out (two certificates for one key).
 	private var busyScopes: Set<ZagSigningScope> = []
-	private var scopeWaiters: [ZagSigningScope: [CheckedContinuation<Void, Never>]] = [:]
+	private var scopeWaiters: [ZagSigningScope: [(ticket: UUID, continuation: CheckedContinuation<Void, Never>)]] = [:]
+	/// Operations waiting for their scope (tests).
+	var waitingOperations: Int { scopeWaiters.values.reduce(0) { $0 + $1.count } }
 
 	init(
 		portal: ZagDeveloperPortalService = ZagDisabledDeveloperPortal(),
@@ -566,8 +568,9 @@ actor ZagFreeAccountProvisioner {
 	/// The account and team's certificate request whose outcome is unknown,
 	/// if any. Local only: nothing is sent. A request still out is not
 	/// unresolved; this waits for it.
+	/// Cancelled while waiting: nil.
 	func unresolvedCertificateRequest(accountID: UUID, team: String) async -> ZagUnresolvedCertificateRequest? {
-		await exclusively(ZagSigningScope(accountID: accountID, teamID: team)) {
+		try? await exclusively(ZagSigningScope(accountID: accountID, teamID: team)) {
 			unresolvedPendingKey(account: accountID, team: team).map {
 				ZagUnresolvedCertificateRequest(accountID: accountID, team: team, startedAt: $0.startedAt, attempts: $0.attempts)
 			}
@@ -586,8 +589,12 @@ actor ZagFreeAccountProvisioner {
 			  account == nil || account == accountID else {
 			return .checkFailed(.notAuthorized)
 		}
-		return await exclusively(authorization.scope) {
-			await checkUnresolved(accountID: accountID, team: team)
+		do {
+			return try await exclusively(authorization.scope) {
+				await checkUnresolved(accountID: accountID, team: team)
+			}
+		} catch {
+			return .checkFailed(.cancelled)
 		}
 	}
 
@@ -639,11 +646,16 @@ actor ZagFreeAccountProvisioner {
 	/// A request still out is not abandoned; this waits for its outcome.
 	@discardableResult
 	func abandonUnresolvedCertificateRequest(accountID: UUID, team: String) async -> ZagCertificateRecoveryOutcome {
-		await exclusively(ZagSigningScope(accountID: accountID, teamID: team)) {
-			guard let pending = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
-			abandon(pending, account: accountID, team: team)
-			diagnostics.record("An unconfirmed certificate request was abandoned by the user", at: now())
-			return .abandoned
+		do {
+			return try await exclusively(ZagSigningScope(accountID: accountID, teamID: team)) {
+				guard let pending = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
+				abandon(pending, account: accountID, team: team)
+				diagnostics.record("An unconfirmed certificate request was abandoned by the user", at: now())
+				return .abandoned
+			}
+		} catch {
+			// Cancelled while waiting: nothing was abandoned.
+			return .checkFailed(.cancelled)
 		}
 	}
 
@@ -741,21 +753,37 @@ actor ZagFreeAccountProvisioner {
 
 	// MARK: Internals
 
-	/// Runs `body` once no other operation of `scope` is running here.
-	private func exclusively<T>(_ scope: ZagSigningScope, _ body: () async throws -> T) async rethrows -> T {
+	/// Runs `body` once no other operation of `scope` is running here. A
+	/// caller cancelled before or while it waits throws `CancellationError`
+	/// at once and runs nothing.
+	private func exclusively<T>(_ scope: ZagSigningScope, _ body: () async throws -> T) async throws -> T {
 		while busyScopes.contains(scope) {
-			await withCheckedContinuation { scopeWaiters[scope, default: []].append($0) }
+			try Task.checkCancellation()
+			let ticket = UUID()
+			await withTaskCancellationHandler {
+				await withCheckedContinuation { scopeWaiters[scope, default: []].append((ticket, $0)) }
+			} onCancel: {
+				Task { await self.stopWaiting(ticket, scope: scope) }
+			}
 		}
+		try Task.checkCancellation()
 		busyScopes.insert(scope)
 		defer {
 			busyScopes.remove(scope)
-			if var waiting = scopeWaiters[scope], !waiting.isEmpty {
-				let next = waiting.removeFirst()
-				scopeWaiters[scope] = waiting.isEmpty ? nil : waiting
-				next.resume()
-			}
+			// Every waiter checks again: one takes the scope, cancelled ones
+			// leave, the rest wait again. None depends on another to wake it.
+			scopeWaiters.removeValue(forKey: scope)?.forEach { $0.continuation.resume() }
 		}
 		return try await body()
+	}
+
+	/// A waiter whose task was cancelled stops waiting (resumed once: by
+	/// whichever of this and the scope's release removes it first).
+	private func stopWaiting(_ ticket: UUID, scope: ZagSigningScope) {
+		guard var waiting = scopeWaiters[scope], let index = waiting.firstIndex(where: { $0.ticket == ticket }) else { return }
+		let waiter = waiting.remove(at: index)
+		scopeWaiters[scope] = waiting.isEmpty ? nil : waiting
+		waiter.continuation.resume()
 	}
 
 	/// Runs one portal call under the operation deadline; maps its errors.
