@@ -224,17 +224,20 @@ pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emi
         if slot.signing_in || slot.portal_busy {
             return Err(FailureKind::Busy.into());
         }
-        match &slot.bound {
-            Some(bound) if *bound != credential.account_identifier => return Err(FailureKind::InvalidInput.into()),
-            Some(_) => {}
-            // A session restored after launch binds the slot on first use.
-            None => slot.bound = Some(credential.account_identifier.clone()),
+        if slot.bound.as_ref().is_some_and(|bound| *bound != credential.account_identifier) {
+            return Err(FailureKind::InvalidInput.into());
+        }
+        // Resolve the backend before mutating the slot. A disabled or absent
+        // backend must not leave the slot bound and permanently busy.
+        let backend = backend()?;
+        // A session restored after launch binds the slot on first use.
+        if slot.bound.is_none() {
+            slot.bound = Some(credential.account_identifier.clone());
         }
         slot.portal_busy = true;
         slot.cancels.push(cancel_tx);
-        Ok(slot.session.get_or_insert_with(Default::default).clone())
-    })
-    .and_then(|session| backend().map(|backend| (backend, session)));
+        Ok((backend, slot.session.get_or_insert_with(Default::default).clone()))
+    });
     let (backend, cache) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return send(&emit, failure(error.kind)),
@@ -259,18 +262,21 @@ pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emi
             result = run => result,
             _ = cancel_rx => Err(FailureKind::Cancelled.into()),
         };
-        let _ = with_slot(id, |slot| {
-            slot.portal_busy = false;
-            slot.cancels.retain(|cancel| !cancel.is_closed());
-            Ok(())
-        });
         match result {
             Ok(value) => json!({ "event": "result", "value": value }),
             Err(error) => failure(error.kind),
         }
     });
     runtime().spawn(async move {
-        send(&emit, task.await.unwrap_or_else(|_| failure(FailureKind::Malformed)));
+        // Always release the slot reservation, even if the worker panics.
+        // The callback receives its terminal event only after cleanup.
+        let event = task.await.unwrap_or_else(|_| failure(FailureKind::Malformed));
+        let _ = with_slot(id, |slot| {
+            slot.portal_busy = false;
+            slot.cancels.retain(|cancel| !cancel.is_closed());
+            Ok(())
+        });
+        send(&emit, event);
     });
 }
 
