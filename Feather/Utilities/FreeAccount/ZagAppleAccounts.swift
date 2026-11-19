@@ -208,6 +208,10 @@ actor ZagAccountDirectory {
 		var authenticator = ZagFreeAccountAuthenticator.Configuration()
 		/// How long a signing authorisation lasts.
 		var authorizationLifetime: TimeInterval = 600
+		/// Gives each account's authenticator its own service (the bridge keeps
+		/// one sign-in conversation per service). Nil: every authenticator
+		/// shares `service`.
+		var makeService: (@Sendable () -> ZagAppleAuthenticationService)?
 	}
 
 	private let service: ZagAppleAuthenticationService
@@ -255,7 +259,7 @@ actor ZagAccountDirectory {
 	private func makeAuthenticator(account: UUID?) -> ZagFreeAccountAuthenticator {
 		let index = keyIndex
 		return ZagFreeAccountAuthenticator(
-			service: service, anisette: anisette, secrets: secrets, sessions: sessionStore,
+			service: configuration.makeService?() ?? service, anisette: anisette, secrets: secrets, sessions: sessionStore,
 			diagnostics: diagnostics, configuration: configuration.authenticator,
 			account: account, identify: { index.id(forAppleAccount: $0) }, now: now
 		)

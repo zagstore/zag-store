@@ -26,8 +26,11 @@ done
 # closed gate (`ZagFreeAccountSigning.isEnabled`), checked in the source below.
 # Zsign itself exposes `signComponents` from f34e51a on, so the library name
 # is in every build; Zag Store's caller (ZagStrictComponentSigning, compiled
-# only with ZAG_ZSIGN_STRICT) is what must be absent.
-for marker in ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
+# only with ZAG_ZSIGN_STRICT) is what must be absent. The G4 bridge to
+# zag-isideload (compiled only with ZAG_APPLE_BRIDGE, its library never
+# linked by the Xcode project) must be absent too.
+for marker in ZagIsideloadAuthenticationService ZagIsideloadDeveloperPortal ZagBridgeAnisetteSource zag_bridge_open_slot \
+	ZagStore.anisette.bridge ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
 	simulationOnly SIMULATED0002 SIMPAID001 ZagSimulatedAnisetteSource ZagAppleAccountsDebugView ZagAppleAccountsLab \
 	"Apple Accounts (Simulated)" ZagStrictComponentSigning "Installed Profiles (Read Only)" ZagInstalledProfilesProbe; do
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
