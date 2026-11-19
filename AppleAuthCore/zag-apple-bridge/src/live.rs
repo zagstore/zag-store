@@ -151,7 +151,7 @@ fn validate_anisette_url(raw: &str) -> Result<(), Report> {
         .next()
         .unwrap_or_default();
     if authority.contains(':') {
-        return Err(rootcause::report!(PolicyError::HostNotAllowed));
+        return Err(rootcause::report!(PolicyError::HostNotAllowed).into());
     }
     let url = reqwest::Url::parse(raw)
         .map_err(|_| rootcause::report!(PolicyError::InvalidUrl))?;
