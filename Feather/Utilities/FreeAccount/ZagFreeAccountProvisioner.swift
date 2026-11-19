@@ -85,6 +85,33 @@ struct ZagPendingSigningKey: Codable, Equatable, Sendable {
 	}
 }
 
+/// A certificate request whose outcome is unknown (`certificateRequestUnresolved`).
+struct ZagUnresolvedCertificateRequest: Equatable, Sendable {
+	let accountID: UUID
+	let team: String
+	let startedAt: Date
+	let attempts: Int
+}
+
+/// What a recovery action did. Only `recovered`, `notIssued` and `abandoned`
+/// change anything, and none of them sends a certificate request or revokes.
+enum ZagCertificateRecoveryOutcome: Equatable, Sendable {
+	/// The certificate issued for the request was found in the team's listing
+	/// (proof of possession) and is now used. Nothing was requested.
+	case recovered(serialNumber: String, expiresAt: Date)
+	/// The listing shows no certificate was issued for it. Signing may send
+	/// the same request again.
+	case notIssued
+	/// Still cannot be established. Nothing changed.
+	case unresolved
+	/// The user gave the request up: its key and record are gone.
+	case abandoned
+	/// There is no unresolved request for this account and team.
+	case nothingPending
+	/// The check could not run (signed out, network, cancelled…). Nothing changed.
+	case checkFailed(ZagProvisioningFailure.Kind)
+}
+
 struct ZagProvisioningFailure: Error, Equatable, Sendable {
 	enum Step: String, Sendable {
 		case request
@@ -393,16 +420,7 @@ actor ZagFreeAccountProvisioner {
 			if let earlier = pendingKey(account: request.accountID, team: team), earlier.certificate == nil, earlier.submissionUnconfirmed == true {
 				switch resolveUnconfirmed(earlier, remote: remote, account: request.accountID, team: team) {
 				case .issued(let found):
-					var recovered = earlier
-					recovered.certificate = found
-					do {
-						try secrets.save(try JSONEncoder().encode(recovered), kind: .pendingSigningKey, account: request.accountID, team: team)
-					} catch {
-						throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
-					}
-					guard try finishPendingIdentity(account: request.accountID, team: team), let identity = storedIdentity(account: request.accountID, team: team) else {
-						throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
-					}
+					let identity = try adoptIssued(found, for: earlier, account: request.accountID, team: team)
 					changes.createdCertificate = true
 					diagnostics.record("A certificate issued for an interrupted request was found and used; none was requested again", at: now())
 					return identity
@@ -513,14 +531,101 @@ actor ZagFreeAccountProvisioner {
 			.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
 	}
 
+	/// Publishes the certificate found for a pending request through its
+	/// journal, as for any verified certificate.
+	private func adoptIssued(_ found: ZagPendingSigningKey.Issued, for pending: ZagPendingSigningKey, account: UUID, team: String) throws -> ZagSigningIdentity {
+		var recovered = pending
+		recovered.certificate = found
+		do {
+			try secrets.save(try JSONEncoder().encode(recovered), kind: .pendingSigningKey, account: account, team: team)
+		} catch {
+			throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
+		}
+		guard try finishPendingIdentity(account: account, team: team), let identity = storedIdentity(account: account, team: team) else {
+			throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
+		}
+		return identity
+	}
+
+	// MARK: Unresolved certificate requests (the user's recovery actions)
+
+	private func unresolvedPendingKey(account accountID: UUID, team: String) -> ZagPendingSigningKey? {
+		guard account == nil || account == accountID,
+			  let pending = pendingKey(account: accountID, team: team),
+			  pending.certificate == nil, pending.submissionUnconfirmed == true else { return nil }
+		return pending
+	}
+
+	/// The account and team's certificate request whose outcome is unknown,
+	/// if any. Local only: nothing is sent.
+	func unresolvedCertificateRequest(accountID: UUID, team: String) -> ZagUnresolvedCertificateRequest? {
+		unresolvedPendingKey(account: accountID, team: team).map {
+			ZagUnresolvedCertificateRequest(accountID: accountID, team: team, startedAt: $0.startedAt, attempts: $0.attempts)
+		}
+	}
+
+	/// Check Again: reads the team's certificate listing and settles the
+	/// request from it exactly as provisioning would, but never sends a
+	/// certificate request and never revokes. Needs the account's
+	/// authorisation (its portal session). Nothing changes unless the listing
+	/// settles the request, and only if the request is still the one checked.
+	func checkUnresolvedCertificateRequest(accountID: UUID, team: String, authorization: ZagSigningAuthorization) async -> ZagCertificateRecoveryOutcome {
+		defer { currentStep = nil }
+		guard authorization.isValid(at: now()),
+			  authorization.scope == ZagSigningScope(accountID: accountID, teamID: team),
+			  account == nil || account == accountID else {
+			return .checkFailed(.notAuthorized)
+		}
+		guard let before = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
+		currentStep = .certificate
+		let portal = self.portal
+		let remote: [ZagDevelopmentCertificate]
+		do {
+			remote = try await call { try await portal.certificates(team: team) }
+		} catch let failure as ZagProvisioningFailure {
+			diagnostics.record("Check Again could not read the certificate listing: \(failure.message)", at: now())
+			return .checkFailed(failure.kind)
+		} catch {
+			return .checkFailed(Self.kind(for: error))
+		}
+		if Task.isCancelled { return .checkFailed(.cancelled) }
+		// Abandoned or settled by provisioning while the listing was read.
+		guard let pending = unresolvedPendingKey(account: accountID, team: team),
+			  pending.keySlot == before.keySlot, pending.startedAt == before.startedAt, pending.request == before.request else {
+			return .nothingPending
+		}
+		switch resolveUnconfirmed(pending, remote: remote, account: accountID, team: team) {
+		case .issued(let found):
+			do {
+				_ = try adoptIssued(found, for: pending, account: accountID, team: team)
+			} catch let failure as ZagProvisioningFailure {
+				return .checkFailed(failure.kind)
+			} catch {
+				return .checkFailed(.keyStorage)
+			}
+			diagnostics.record("Check Again found the certificate issued for an interrupted request and used it; nothing was requested", at: now())
+			return .recovered(serialNumber: found.serialNumber, expiresAt: found.expiresAt)
+		case .notIssued:
+			markNotIssued(pending, account: accountID, team: team)
+			diagnostics.record("Check Again: the listing shows no certificate was issued for the interrupted request", at: now())
+			return .notIssued
+		case .unknown:
+			diagnostics.record("Check Again: the interrupted certificate request is still unresolved; nothing requested", at: now())
+			return .unresolved
+		}
+	}
+
 	/// The user's decision after `certificateRequestUnresolved`: give up the
 	/// unconfirmed request (its key and journal) so the next provisioning makes
-	/// a new one. Any certificate Apple issued for it is never revoked here; it
-	/// stays in the team's listing until it expires or the user revokes it.
-	func abandonUnresolvedCertificateRequest(accountID: UUID, team: String) {
-		guard account == nil || account == accountID, let pending = pendingKey(account: accountID, team: team), pending.certificate == nil else { return }
+	/// a new one. Local only, so it works signed out. Any certificate Apple
+	/// issued for it is never revoked here; it stays in the team's listing
+	/// until it expires or the user revokes it.
+	@discardableResult
+	func abandonUnresolvedCertificateRequest(accountID: UUID, team: String) -> ZagCertificateRecoveryOutcome {
+		guard let pending = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
 		abandon(pending, account: accountID, team: team)
 		diagnostics.record("An unconfirmed certificate request was abandoned by the user", at: now())
+		return .abandoned
 	}
 
 	private func pendingKey(account: UUID, team: String) -> ZagPendingSigningKey? {

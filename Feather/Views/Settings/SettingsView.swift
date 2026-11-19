@@ -614,6 +614,14 @@ extension SettingsView {
             NavigationLink(destination: ZagExperimentalSigningView().zagSettingsDestinationAvatar()) {
 				Label("Signing", systemImage: "signature")
 			}
+			// Apple Accounts: shown only when the feature is enabled (off in
+			// this version). Debug builds use the simulated screen below.
+			if ZagAppleAccountsFeature.isEnabled {
+				NavigationLink(destination: ZagStoredAccountDataScreen().zagSettingsDestinationAvatar()) {
+					Label("Apple Accounts: Stored Account Data", systemImage: "externaldrive.badge.person.crop")
+				}
+				.accessibilityIdentifier("settings.appleAccounts.storedData")
+			}
 			#if DEBUG
 			NavigationLink(destination: ZagFreeAccountDebugSignInView().zagSettingsDestinationAvatar()) {
 				Label("Apple Account (Simulated)", systemImage: "person.badge.key")

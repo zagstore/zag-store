@@ -33,17 +33,29 @@ final class ZagAppleAccountsLab: ObservableObject {
 	@Published var removal: ZagAccountRemovalPlan?
 	@Published var notice: String?
 	@Published private(set) var signingCheck: String?
-	/// Stored Account Data: what was found when the page was last loaded.
-	@Published private(set) var storedData: ZagOrphanedAccountItems?
-	/// What the user chose to remove, awaiting confirmation.
-	@Published var storedRemoval: ZagOrphanedAccountItems?
-	@Published private(set) var storedResult: String?
+	/// Stored Account Data, over this lab's directory.
+	let storedData: ZagStoredAccountDataModel
 	@Published var showsStoredData = false
+	/// The simulated developer team of the tester's Personal Team, and a
+	/// provisioner over it, for interrupting certificate requests.
+	let portal: ZagSimulatedDeveloperPortal
+	let provisioner: ZagFreeAccountProvisioner
+	/// Teams with a certificate request whose outcome is unknown.
+	@Published private(set) var unresolved: Set<ZagSigningScope> = []
+	@Published private(set) var recovery: ZagCertificateRecoveryModel?
+	@Published var showsRecovery = false
 	private var simulatedApps = 0
 
 	init() {
 		service = ZagSimulatedAuthenticationService(scenario: .signInSucceeds, clock: clock)
 		directory = ZagFreeAccountSimulation.makeDirectory(service: service, clock: clock, secrets: secrets, diagnostics: diagnostics)
+		storedData = ZagStoredAccountDataModel(source: directory)
+		let clock = clock
+		portal = ZagSimulatedDeveloperPortal(team: "SIMTEAM001", clock: { clock.now })
+		provisioner = ZagFreeAccountProvisioner(
+			portal: portal, keys: ZagSimulatedSigningKeyFactory(), secrets: secrets,
+			diagnostics: diagnostics, operationTimeout: 5, now: { clock.now }
+		)
 	}
 
 	var now: Date { clock.now }
@@ -61,6 +73,13 @@ final class ZagAppleAccountsLab: ObservableObject {
 		}
 		self.rows = rows
 		defaultScope = registry.defaultScope
+		var unresolved: Set<ZagSigningScope> = []
+		for account in registry.accounts {
+			for team in account.teams where await provisioner.unresolvedCertificateRequest(accountID: account.id, team: team.identifier) != nil {
+				unresolved.insert(ZagSigningScope(accountID: account.id, teamID: team.identifier))
+			}
+		}
+		self.unresolved = unresolved
 	}
 
 	func row(_ id: UUID) -> Row? { rows.first { $0.id == id } }
@@ -154,40 +173,24 @@ final class ZagAppleAccountsLab: ObservableObject {
 		await reload()
 	}
 
-	// MARK: Stored Account Data
+	// MARK: Certificate request recovery
 
-	/// Lists leftover items only when the page is opened; nothing is removed
-	/// at launch or without confirmation.
-	func loadStoredData() async {
-		do {
-			storedData = try await directory.orphanedItems()
-		} catch {
-			storedData = nil
-			notice = "Stored account data could not be read."
-		}
+	/// The recovery screen's model for `scope`, authorised through the
+	/// directory (so only while that account is signed in).
+	func openRecovery(_ scope: ZagSigningScope) {
+		let directory = directory
+		recovery = ZagCertificateRecoveryModel(scope: scope, service: provisioner) { try await directory.authorize($0) }
+		showsRecovery = true
 	}
 
-	func prepareStoredRemoval(accounts: [ZagOrphanedAccountItems.Account], scopes: [String]) {
-		storedResult = nil
-		storedRemoval = ZagOrphanedAccountItems(accounts: accounts, localStateScopes: scopes)
+	func teamName(_ scope: ZagSigningScope) -> String {
+		row(scope.accountID)?.record.team(scope.teamID)?.name ?? scope.teamID
 	}
 
-	/// The directory checks each item again immediately before deleting it.
-	func confirmStoredRemoval() async {
-		guard let confirmed = storedRemoval else { return }
-		storedRemoval = nil
-		do {
-			let result = try await directory.removeOrphanedItems(confirmed)
-			let removed = result.removed.count + result.removedLocalState.count
-			var parts = ["Removed \(removed)."]
-			if !result.skipped.isEmpty { parts.append("\(result.skipped.count) changed since you confirmed and \(result.skipped.count == 1 ? "was" : "were") kept.") }
-			let failed = result.failed.count + result.failedLocalState.count
-			if failed > 0 { parts.append("\(failed) could not be removed; try again.") }
-			storedResult = parts.joined(separator: " ")
-		} catch {
-			storedResult = "Nothing was removed: stored data could not be checked."
-		}
-		await loadStoredData()
+	func closeRecovery() async {
+		showsRecovery = false
+		recovery = nil
+		await reload()
 	}
 
 	// MARK: Simulation
@@ -203,6 +206,33 @@ final class ZagAppleAccountsLab: ObservableObject {
 		try? secrets.save(try JSONEncoder().encode(record), kind: .accountRecord, account: recoverable, team: nil)
 		try? secrets.save(Data("simulated".utf8), kind: .session, account: recoverable, team: nil)
 		try? secrets.save(Data("simulated".utf8), kind: .session, account: unowned, team: nil)
+	}
+
+	/// Signs a simulated app with the scope's team while Apple's answer to the
+	/// certificate request is lost: the certificate is issued, the app never
+	/// hears of it. A second attempt then stops as unresolved and sends nothing.
+	@discardableResult
+	func interruptCertificateRequest(_ scope: ZagSigningScope) async -> [ZagProvisioningFailure.Kind] {
+		guard scope.teamID == portal.team, let authorization = try? await directory.authorize(scope) else { return [] }
+		simulatedApps += 1
+		let request = ZagProvisioningRequest(
+			accountID: scope.accountID, team: scope.teamID,
+			deviceUDID: "00000000-0000000000000000", deviceName: "Simulated iPhone",
+			app: .init(originalBundleIdentifier: "com.example.interrupted\(simulatedApps)", name: "Interrupted", entitlements: (try? ZagEntitlementSet([:]))!),
+			extensions: [], installedFreeAccountApps: []
+		)
+		await portal.fail(.submitCertificateRequest, with: .lostResponse)
+		var kinds: [ZagProvisioningFailure.Kind] = []
+		for _ in 0..<2 {
+			if case .failure(let failure) = await provisioner.provision(request, authorization: authorization) { kinds.append(failure.kind) }
+		}
+		await reload()
+		return kinds
+	}
+
+	/// Certificate requests the simulated team has received.
+	func certificateSubmissions() async -> Int {
+		await portal.calls.filter { $0 == .submitCertificateRequest }.count
 	}
 
 	/// Records a simulated installed app for the scope (nothing is signed).
@@ -293,7 +323,7 @@ private struct ZagAppleAccountsList: View {
 
 			Section {
 				NavigationLink {
-					ZagStoredAccountDataView(lab: lab)
+					ZagLabStoredAccountData(lab: lab)
 				} label: {
 					Label("Stored Account Data", systemImage: "externaldrive.badge.person.crop")
 				}
@@ -337,7 +367,10 @@ private struct ZagAppleAccountsList: View {
 		.navigationTitle("Apple Accounts")
 		.navigationBarTitleDisplayMode(.inline)
 		.zagWallpaperSurface()
-		.navigationDestination(isPresented: $lab.showsStoredData) { ZagStoredAccountDataView(lab: lab) }
+		.navigationDestination(isPresented: $lab.showsStoredData) { ZagLabStoredAccountData(lab: lab) }
+		.navigationDestination(isPresented: Binding(get: { lab.showsRecovery && lab.recovery != nil }, set: { if !$0 { Task { await lab.closeRecovery() } } })) {
+			if let model = lab.recovery { ZagCertificateRecoveryView(model: model, teamName: lab.teamName(model.scope)) }
+		}
 		.sheet(isPresented: Binding(
 			get: { lab.signIn != nil },
 			set: { presented in if !presented, lab.signIn != nil { Task { await lab.cancelSignIn() } } }
@@ -591,6 +624,14 @@ private struct ZagAppleAccountDetail: View {
 			} label: {
 				Label("Check Signing With This Team", systemImage: "signature")
 			}
+			if lab.unresolved.contains(scope) {
+				Button {
+					lab.openRecovery(scope)
+				} label: {
+					Label("Certificate Request Unresolved", systemImage: "questionmark.diamond").foregroundStyle(.orange)
+				}
+				.accessibilityIdentifier("team.certificateUnresolved.\(team.identifier)")
+			}
 			ForEach(apps, id: \.bundleIdentifier) { app in
 				ZagOwnedAppRow(app: app, now: lab.now)
 			}
@@ -598,6 +639,13 @@ private struct ZagAppleAccountDetail: View {
 				lab.addSimulatedApp(scope)
 			} label: {
 				Label("Add Simulated App", systemImage: "plus.app")
+			}
+			if team.identifier == lab.portal.team, signedIn {
+				Button {
+					Task { await lab.interruptCertificateRequest(scope) }
+				} label: {
+					Label("Lose a Certificate Response (Simulation)", systemImage: "wifi.exclamationmark")
+				}
 			}
 		} header: {
 			Text(team.name)
@@ -609,117 +657,19 @@ private struct ZagAppleAccountDetail: View {
 	}
 }
 
-/// Settings → Apple Accounts → Stored Account Data: Zag Store's own Keychain
-/// items (and anisette state) that belong to no account in the list. Shows
-/// which can be recovered by signing in again and which can only be removed;
-/// removes only what the user confirms, after the directory checks each item
-/// again. Never runs by itself.
-private struct ZagStoredAccountDataView: View {
+/// The production Stored Account Data screen over the lab's directory, with
+/// a simulation button that leaves items as an earlier installation would.
+private struct ZagLabStoredAccountData: View {
 	@ObservedObject var lab: ZagAppleAccountsLab
 
 	var body: some View {
-		let data = lab.storedData
-		let recoverable = data?.accounts.filter(\.isRecoverable) ?? []
-		let unowned = data?.accounts.filter { !$0.isRecoverable } ?? []
-		let scopes = data?.localStateScopes ?? []
-		Form {
-			if data?.isEmpty ?? true {
-				Section {
-					Text(data == nil ? "Checking…" : "No stored data outside your accounts.").foregroundStyle(.secondary)
-				}
+		ZagStoredAccountDataView(model: lab.storedData) {
+			Button {
+				lab.simulateEarlierInstallation()
+				Task { await lab.storedData.load() }
+			} label: {
+				Label("Leave Items From an Earlier Installation (Simulation)", systemImage: "testtube.2")
 			}
-			if !recoverable.isEmpty {
-				Section {
-					ForEach(recoverable, id: \.id) { account in
-						item(account.maskedAppleID ?? "Apple Account", detail: "Sign in to this Apple Account again to recover its signing keys.") {
-							lab.prepareStoredRemoval(accounts: [account], scopes: [])
-						}
-					}
-				} header: {
-					Text("Recoverable")
-				} footer: {
-					Text("Signing in again restores these accounts with their keys, so their apps keep the same certificate.")
-				}
-			}
-			if !unowned.isEmpty {
-				Section {
-					ForEach(unowned, id: \.id) { account in
-						item("Unidentified account", detail: "No record says which Apple Account this was. It can only be removed.") {
-							lab.prepareStoredRemoval(accounts: [account], scopes: [])
-						}
-					}
-				} header: {
-					Text("Not Recoverable")
-				}
-			}
-			if !scopes.isEmpty {
-				Section {
-					ForEach(scopes, id: \.self) { scope in
-						item("Sign-in device data", detail: "Anisette state no account uses.") {
-							lab.prepareStoredRemoval(accounts: [], scopes: [scope])
-						}
-					}
-				} header: {
-					Text("Anisette State")
-				}
-			}
-			if let data, !data.isEmpty {
-				Section {
-					Button(role: .destructive) {
-						lab.prepareStoredRemoval(accounts: data.accounts, scopes: data.localStateScopes)
-					} label: {
-						Label("Remove All Listed…", systemImage: "trash")
-					}
-					.accessibilityIdentifier("storedData.removeAll")
-				}
-			}
-			if let result = lab.storedResult {
-				Section { Text(result).font(.footnote).accessibilityIdentifier("storedData.result") }
-			}
-			Section {
-				Button {
-					lab.simulateEarlierInstallation()
-					Task { await lab.loadStoredData() }
-				} label: {
-					Label("Leave Items From an Earlier Installation", systemImage: "testtube.2")
-				}
-			} header: {
-				Label("Simulation", systemImage: "testtube.2")
-			} footer: {
-				Text("Nothing here is removed automatically. Each item is checked again just before removal; one that changed is kept. Certificates are never revoked.")
-			}
-		}
-		.navigationTitle("Stored Account Data")
-		.navigationBarTitleDisplayMode(.inline)
-		.zagWallpaperSurface()
-		.task { await lab.loadStoredData() }
-		.confirmationDialog(
-			"Remove Stored Data?",
-			isPresented: Binding(get: { lab.storedRemoval != nil }, set: { if !$0 { lab.storedRemoval = nil } }),
-			titleVisibility: .visible
-		) {
-			Button("Remove", role: .destructive) { Task { await lab.confirmStoredRemoval() } }
-			Button("Cancel", role: .cancel) { lab.storedRemoval = nil }
-		} message: {
-			let accounts = lab.storedRemoval?.accounts ?? []
-			Text(accounts.contains(where: \.isRecoverable)
-				 ? "A recoverable account's signing keys are deleted and cannot be recovered by signing in. Its certificates are not revoked."
-				 : "These items are deleted from this device. Certificates are not revoked.")
-		}
-	}
-
-	private func item(_ title: String, detail: String, remove: @escaping () -> Void) -> some View {
-		HStack {
-			VStack(alignment: .leading, spacing: 2) {
-				Text(title).font(.body.weight(.semibold))
-				Text(detail).font(.caption).foregroundStyle(.secondary)
-			}
-			Spacer()
-			Button(role: .destructive, action: remove) {
-				Image(systemName: "trash")
-			}
-			.buttonStyle(.borderless)
-			.accessibilityLabel("Remove")
 		}
 	}
 }
@@ -933,34 +883,66 @@ struct ZagAppleAccountsDebugDemo {
 
 		// Stored Account Data: clear leftovers of earlier runs, then leave items
 		// as an earlier installation would.
-		await lab.loadStoredData()
-		if let earlier = lab.storedData, !earlier.isEmpty {
-			lab.prepareStoredRemoval(accounts: earlier.accounts, scopes: earlier.localStateScopes)
-			await lab.confirmStoredRemoval()
+		let stored = lab.storedData
+		await stored.load()
+		if let earlier = stored.data, !earlier.isEmpty {
+			stored.prepareRemoval(accounts: earlier.accounts, scopes: earlier.localStateScopes)
+			await stored.confirmRemoval()
 		}
 		lab.simulateEarlierInstallation()
 		lab.showsStoredData = true
-		await lab.loadStoredData()
-		let found = lab.storedData?.accounts ?? []
+		await stored.load()
+		let found = stored.data?.accounts ?? []
 		check(found.count == 2 && found.filter(\.isRecoverable).map(\.maskedAppleID) == ["e•••@example.invalid"] && lab.rows.count == 2,
 			  "stored data lists items no account owns, recoverable and not, and nothing is removed by listing")
 		await step("10-stored-account-data")
 		if let unowned = found.first(where: { !$0.isRecoverable }) {
-			lab.prepareStoredRemoval(accounts: [unowned], scopes: [])
-			await lab.confirmStoredRemoval()
+			stored.prepareRemoval(accounts: [unowned], scopes: [])
+			await stored.confirmRemoval()
 		}
-		let left = lab.storedData?.accounts ?? []
+		let left = stored.data?.accounts ?? []
 		check(left.count == 1 && left.first?.isRecoverable == true && signedIn(free) && signedIn(paid),
 			  "only the confirmed item is removed; the accounts are untouched")
-		if let rest = lab.storedData {
-			lab.prepareStoredRemoval(accounts: rest.accounts, scopes: rest.localStateScopes)
-			await lab.confirmStoredRemoval()
+		if let rest = stored.data {
+			stored.prepareRemoval(accounts: rest.accounts, scopes: rest.localStateScopes)
+			await stored.confirmRemoval()
 		}
 		lab.showsStoredData = false
+		try? await Task.sleep(nanoseconds: 800_000_000)
+
+		// A certificate request whose answer is lost, on the tester's Personal Team.
+		let personal = ZagSigningScope(accountID: free, teamID: "SIMTEAM001")
+		let kinds = await lab.interruptCertificateRequest(personal)
+		let sent = await lab.certificateSubmissions()
+		check(kinds == [.network, .certificateRequestUnresolved] && sent == 1 && lab.unresolved == [personal],
+			  "a lost certificate response leaves the request unresolved; signing again stops and sends nothing")
+		lab.openRecovery(personal)
+		guard let recovery = lab.recovery else {
+			check(false, "the recovery screen opens")
+			return append("DONE\n")
+		}
+		await recovery.load()
+		await recovery.checkAgain()
+		await recovery.checkAgain()
+		let afterChecks = await lab.certificateSubmissions()
+		check(recovery.checks == 2 && recovery.outcome == .unresolved && recovery.request != nil && afterChecks == 1,
+			  "Check Again only reads the certificate list: still unresolved, nothing requested, however often")
+		await step("11-certificate-unresolved")
+		recovery.requestAbandon()
+		check(recovery.phase == .confirmingAbandon && recovery.request != nil, "abandoning asks for confirmation first")
+		await step("12-abandon-confirmation")
+		await recovery.confirmAbandon()
+		let afterAbandon = await lab.certificateSubmissions()
+		check(recovery.outcome == .abandoned && recovery.request == nil && afterAbandon == 1 && recovery.message?.contains("certificate slot") == true,
+			  "after confirmation the request is abandoned, nothing is revoked or requested, and the occupied slot is reported")
+		await step("13-certificate-abandoned")
+		await lab.closeRecovery()
+		check(lab.unresolved.isEmpty, "the team no longer shows an unresolved request")
+		try? await Task.sleep(nanoseconds: 800_000_000)
 
 		await lab.relaunchAfter31Days()
 		check(!signedIn(free) && !signedIn(paid) && lab.rows.count == 2, "after the sessions expire, every account needs signing in again")
-		await step("11-expired-after-relaunch")
+		await step("14-expired-after-relaunch")
 		append("DONE\n")
 	}
 }

@@ -88,6 +88,10 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 		await localStateLifecycle()
 		await cleanupRevalidation()
 		unresolvedCertificateIsNotRetried()
+		await recoveryActions()
+		await storedDataModel()
+		await signedOutAndExpiredRemoval()
+		check(!ZagAppleAccountsFeature.isEnabled, "release gating: the Apple Accounts feature (its Release screens) is off in this version")
 		ledgerOwnership()
 		limits()
 		print("SUCCESS: \(passed) multi-account checks passed")
@@ -494,6 +498,135 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 			  "recovery: an unresolved certificate request is never retried automatically by background refresh")
 	}
 
+	// MARK: Unresolved certificate request: the user's recovery actions
+
+	static func provisioning(_ world: World, _ account: UUID) -> (ZagSimulatedDeveloperPortal, ZagFreeAccountProvisioner, ZagProvisioningRequest) {
+		let clock = world.clock
+		let portal = ZagSimulatedDeveloperPortal(team: "SIMTEAM001", clock: { clock.now })
+		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: ZagSimulatedSigningKeyFactory(), secrets: world.secrets, operationTimeout: 5, now: { clock.now })
+		let request = ZagProvisioningRequest(
+			accountID: account, team: "SIMTEAM001", deviceUDID: "00000000-0000000000000000", deviceName: "Test iPhone",
+			app: .init(originalBundleIdentifier: "com.example.notes", name: "Notes", entitlements: try! ZagEntitlementSet([:])),
+			extensions: [], installedFreeAccountApps: []
+		)
+		return (portal, provisioner, request)
+	}
+
+	static func submissions(_ portal: ZagSimulatedDeveloperPortal) async -> Int {
+		await portal.calls.filter { $0 == .submitCertificateRequest }.count
+	}
+
+	@MainActor
+	static func recoveryActions() async {
+		let world = World()
+		let directory = world.directory
+		let tester = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: directory)!
+		let scope = ZagSigningScope(accountID: tester, teamID: "SIMTEAM001")
+		let (portal, provisioner, request) = provisioning(world, tester)
+		await portal.fail(.submitCertificateRequest, with: .lostResponse)
+		let lost = await provisioner.provision(request, authorization: try! await directory.authorize(scope))
+		let model = ZagCertificateRecoveryModel(scope: scope, service: provisioner) { try await directory.authorize($0) }
+		await model.load()
+		check(lost.failureKind == .network && model.request?.attempts == 1 && model.phase == .idle,
+			  "recovery: a lost certificate response is shown as an unresolved request")
+
+		for _ in 0..<3 { await model.checkAgain() }
+		let afterChecks = await submissions(portal)
+		check(model.checks == 3 && model.outcome == .unresolved && model.request != nil && afterChecks == 1
+			  && model.message?.contains("Nothing was requested or revoked") == true,
+			  "recovery: repeated Check Again only reads the listing; it stays unresolved and nothing is requested")
+		let again = await provisioner.provision(request, authorization: try! await directory.authorize(scope))
+		let afterSigning = await submissions(portal)
+		check(again.failureKind == .certificateRequestUnresolved && afterSigning == 1,
+			  "recovery: signing again stops as unresolved and sends nothing (no retry)")
+
+		// Cancelling Check Again while the listing is outstanding.
+		await portal.fail(.certificates, with: .noResponse)
+		let running = Task { await model.checkAgain() }
+		for _ in 0..<200 where model.phase != .checking { await Task.yield() }
+		try? await Task.sleep(nanoseconds: 50_000_000)
+		model.cancelCheck()
+		await running.value
+		await portal.fail(.certificates, with: nil)
+		let afterCancel = await submissions(portal)
+		check(model.outcome == .checkFailed(.cancelled) && model.request != nil && model.phase == .idle && afterCancel == 1
+			  && model.message?.contains("cancelled") == true,
+			  "recovery: a cancelled Check Again changes nothing")
+
+		// Signed out: Check Again cannot read the listing; Abandon still works.
+		try! await directory.signOut(tester)
+		await model.checkAgain()
+		check(model.outcome == .checkFailed(.notAuthorized) && model.request != nil && model.message?.contains("sign in") == true,
+			  "recovery: signed out, Check Again is refused and changes nothing")
+		model.requestAbandon()
+		check(model.phase == .confirmingAbandon, "recovery: Abandon asks for confirmation")
+		model.cancelAbandon()
+		check(model.phase == .idle && model.request != nil, "recovery: cancelling the confirmation abandons nothing")
+		model.requestAbandon()
+		await model.confirmAbandon()
+		let afterAbandon = await submissions(portal)
+		check(model.outcome == .abandoned && model.request == nil && afterAbandon == 1 && world.secrets.keys(of: tester).allSatisfy { !$0.contains("pendingSigningKey") }
+			  && model.message?.contains("certificate slot") == true,
+			  "recovery: confirmed Abandon (even signed out) removes the request only, warns of the occupied slot, and requests nothing")
+		model.requestAbandon()
+		let twice = await provisioner.abandonUnresolvedCertificateRequest(accountID: tester, team: "SIMTEAM001")
+		check(model.phase == .idle && twice == .nothingPending, "recovery: with nothing unresolved there is nothing to abandon")
+
+		// A provisioner bound to another account cannot see or act on it.
+		let (otherPortal, _, _) = provisioning(world, tester)
+		let bound = ZagFreeAccountProvisioner(portal: otherPortal, keys: ZagSimulatedSigningKeyFactory(), secrets: world.secrets, account: UUID())
+		let foreign = await bound.abandonUnresolvedCertificateRequest(accountID: tester, team: "SIMTEAM001")
+		let foreignView = await bound.unresolvedCertificateRequest(accountID: tester, team: "SIMTEAM001")
+		check(foreign == .nothingPending && foreignView == nil, "recovery: another account's provisioner neither sees nor abandons the request")
+	}
+
+	// MARK: Stored Account Data model
+
+	@MainActor
+	static func storedDataModel() async {
+		let world = World()
+		let orphan = UUID()
+		try! world.secrets.save(Data("x".utf8), kind: .session, account: orphan, team: nil)
+		let model = ZagStoredAccountDataModel(source: world.directory)
+		await model.load()
+		check(model.data?.accounts.map(\.id) == [orphan] && model.pendingRemoval == nil, "stored data: loading lists leftovers and removes nothing")
+		model.prepareRemoval(accounts: model.data!.accounts, scopes: [])
+		model.cancelRemoval()
+		await model.confirmRemoval()
+		check(world.secrets.keys(of: orphan).count == 1 && model.result == nil, "stored data: nothing is removed without confirmation")
+		model.prepareRemoval(accounts: model.data!.accounts, scopes: [])
+		await model.confirmRemoval()
+		check(world.secrets.keys(of: orphan).isEmpty && model.result == "Removed 1." && model.data?.isEmpty == true,
+			  "stored data: a confirmed removal is reported and the list reloads")
+		let partial = ZagStoredAccountDataModel.describe(ZagOrphanRemoval(removed: [UUID()], skipped: [UUID()], failed: [UUID()], failedLocalState: ["s1"]))
+		check(partial == "Removed 1. 1 changed since you confirmed and was kept. 2 could not be removed and are still listed; try again.",
+			  "stored data: partial failures and skipped items are reported, never hidden")
+	}
+
+	// MARK: Signed-out and expired accounts: removal stays local and safe
+
+	static func signedOutAndExpiredRemoval() async {
+		let clock = TestClock(), secrets = MemorySecrets(), state = FakeLocalState()
+		let (directory, _) = SimulatedAccounts.directory(now: { clock.now }, secrets: secrets, localState: state)
+		let scopeOut = state.scope(forAppleID: SimulatedAccounts.second), scopeExpired = state.scope(forAppleID: SimulatedAccounts.paid)
+		state.create(scopeOut); state.create(scopeExpired)
+		let out = await SimulatedAccounts.signIn(SimulatedAccounts.second, to: directory)!
+		let expired = await SimulatedAccounts.signIn(SimulatedAccounts.paid, to: directory)!
+		try! await directory.signOut(out)
+		let orphans = try! await directory.orphanedItems()
+		check(orphans.isEmpty, "signed out: a registered account's items are never listed as orphaned, signed in or not")
+		var ledger = ZagRefreshLedger()
+		try! await directory.remove(try! await directory.removalPlan(for: out, ledger: ledger).confirm(.forgetRecords), ledger: &ledger)
+		check(!state.has(scopeOut) && secrets.keys(of: out).isEmpty && state.has(scopeExpired),
+			  "signed out: removing a signed-out account removes its items and anisette state, and only those")
+		clock.advance(days: 31)
+		let lapsed: Bool
+		if case .some(.signedIn(let session)) = await directory.state(of: expired) { lapsed = session.isExpired(at: clock.now) } else { lapsed = true }
+		try! await directory.remove(try! await directory.removalPlan(for: expired, ledger: ledger).confirm(.forgetRecords), ledger: &ledger)
+		check(lapsed && !state.has(scopeExpired) && secrets.keys(of: expired).isEmpty,
+			  "expired: removing an account whose session expired works locally and removes its anisette state")
+	}
+
 	static func ledgerOwnership() {
 		let now = Date(timeIntervalSince1970: 1_795_000_000)
 		let a = ZagSigningScope(accountID: UUID(), teamID: "SIMTEAM001"), b = ZagSigningScope(accountID: UUID(), teamID: "SIMTEAM002")
@@ -556,5 +689,12 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 			  "the published limits: 10 App IDs and 3 devices for free teams, 100 devices per platform for paid teams")
 		check(ZagKeychainFreeAccountSecretStore.itemName(.signingPrivateKey, account: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!, team: "SIMTEAM001")
 			  == "00000000-0000-4000-8000-000000000001.signingPrivateKey.SIMTEAM001", "Keychain items are named by account, kind and team")
+	}
+}
+
+extension Result where Failure == ZagProvisioningFailure {
+	var failureKind: ZagProvisioningFailure.Kind? {
+		if case .failure(let failure) = self { return failure.kind }
+		return nil
 	}
 }
