@@ -17,6 +17,7 @@ final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	struct Failure: Error {}
 	private let lock = NSLock()
 	var items: [String: Data] = [:]
+	func accountIDs() throws -> Set<UUID> { lock.withLock { Set(items.keys.compactMap { UUID(uuidString: String($0.prefix(36))) }) } }
 	var failDeletes = false
 	private func name(_ kind: ZagFreeAccountSecretKind, _ account: UUID, _ team: String?) -> String {
 		ZagKeychainFreeAccountSecretStore.itemName(kind, account: account, team: team)
@@ -35,7 +36,11 @@ final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 			items = items.filter { !$0.key.hasPrefix("\(account.uuidString).") }
 		}
 	}
-	func keys(of account: UUID) -> Set<String> { lock.withLock { Set(items.keys.filter { $0.hasPrefix("\(account.uuidString).") }) } }
+	/// The account's items other than its ownership record (checked on its own).
+	func keys(of account: UUID) -> Set<String> {
+		lock.withLock { Set(items.keys.filter { $0.hasPrefix("\(account.uuidString).") && !$0.hasSuffix(".accountRecord") }) }
+	}
+	func hasRecord(_ account: UUID) -> Bool { lock.withLock { items["\(account.uuidString).accountRecord"] != nil } }
 }
 
 struct World {
@@ -77,6 +82,8 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 		await migration()
 		await interruptedMigration()
 		await removal()
+		await reinstall()
+		await ambiguousRecords()
 		ledgerOwnership()
 		limits()
 		print("SUCCESS: \(passed) multi-account checks passed")
@@ -99,6 +106,7 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 
 		check(world.secrets.keys(of: tester) == ["\(tester.uuidString).session"] && world.secrets.keys(of: second) == ["\(second.uuidString).session"],
 			  "each account has its own Keychain session item")
+		check(ids.allSatisfy(world.secrets.hasRecord), "each account has a Keychain ownership record (L1)")
 		let summaries = world.preferences.keys.filter { $0.hasPrefix(ZagFreeAccountSimulation.accountsNamespace + ".session.") }
 		check(summaries.count == 3 && !world.preferences.keys.contains(ZagFreeAccountSimulation.sessionKey),
 			  "each account has its own session summary; the single-account key is not used")
@@ -281,7 +289,8 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 		world.secrets.failDeletes = false
 		try! await directory.remove(current.confirm(.forgetRecords), ledger: &ledger)
 		let registry = await directory.registry
-		check(world.secrets.keys(of: gone).isEmpty && world.secrets.keys(of: keep).count == 2 && registry.account(gone) == nil,
+		check(world.secrets.keys(of: gone).isEmpty && !world.secrets.hasRecord(gone) && world.secrets.hasRecord(keep)
+			  && world.secrets.keys(of: keep).count == 2 && registry.account(gone) == nil,
 			  "removal deletes all of that account's Keychain items and its record, and nothing of the other")
 		check(registry.defaultScope == ZagSigningScope(accountID: keep, teamID: "SIMTEAM001"), "a removed default moves to a remaining account")
 		check(Set(ledger.records.keys) == ["com.example.c"], "\"forget\" removes the account's refresh records only")
@@ -292,6 +301,81 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 	}
 
 	// MARK: Refresh records by account
+
+	// MARK: Reinstall: recovery and orphaned items (L1)
+
+	/// Preferences are cleared by a reinstall; Keychain items may remain.
+	static func reinstall() async {
+		let world = World()
+		let keys = ZagKeychainSigningKeys(namespace: ZagFreeAccountSimulation.accountsNamespace)
+		let owner = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: world.directory)!
+		let other = await SimulatedAccounts.signIn(SimulatedAccounts.second, to: world.directory)!
+		try! world.secrets.save(Data("identity".utf8), kind: .signingPrivateKey, account: owner, team: "SIMTEAM001")
+		_ = try! keys.create(account: owner, team: "SIMTEAM001", commonName: "Zag Test")
+		defer { try? keys.deleteAll(account: owner) }
+
+		let clock = world.clock
+		let fresh = SimulatedAccounts.directory(now: { clock.now }, secrets: world.secrets, preferences: TestPreferences(), service: world.service).directory
+		_ = await fresh.start()
+		let emptyRegistry = await fresh.registry.accounts.isEmpty
+		check(emptyRegistry && world.secrets.keys(of: owner).count == 2 && world.secrets.hasRecord(owner) && (try? keys.key(account: owner, team: "SIMTEAM001")) != nil,
+			  "after a reinstall, nothing is deleted at launch")
+		let found = try! await fresh.orphanedItems().accounts
+		let ownerItems = found.first { $0.id == owner }, otherItems = found.first { $0.id == other }
+		check(ownerItems?.isRecoverable == true && ownerItems?.maskedAppleID != nil && otherItems?.isRecoverable == true,
+			  "earlier accounts' items are listed as recoverable by signing in, with the masked address only")
+
+		let paid = await SimulatedAccounts.signIn(SimulatedAccounts.paid, to: fresh)!
+		check(paid != owner && paid != other, "a sign-in to a different Apple Account never takes over an earlier account's items")
+
+		// The user reviews a plan; meanwhile one account is recovered by signing in.
+		let plan = try! await fresh.orphanedItems()
+		let recovered = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: fresh)
+		check(recovered == owner && (try? world.secrets.load(.signingPrivateKey, account: owner, team: "SIMTEAM001")) == Data("identity".utf8)
+			  && (try? keys.key(account: owner, team: "SIMTEAM001")) != nil,
+			  "signing in again to the same Apple Account recovers its account ID, identity and signing key")
+		let removed = try! await fresh.removeOrphanedItems(plan)
+		check(removed.contains(other) && !removed.contains(owner) && !removed.contains(paid), "cleanup removes only accounts still orphaned when it runs")
+		check(world.secrets.keys(of: other).isEmpty && !world.secrets.hasRecord(other) && world.secrets.keys(of: owner).count == 2
+			  && world.secrets.keys(of: paid).count == 1,
+			  "cleanup leaves recovered and registered accounts' items untouched")
+
+		// Items with no ownership record are listed as unowned; only those confirmed go.
+		let unownedKey = UUID(), unownedSecret = UUID()
+		_ = try! keys.create(account: unownedKey, team: "SIMTEAM001", commonName: "Zag Test")
+		_ = try! keys.create(account: unownedKey, team: "SIMTEAM002", slot: "PENDING1", commonName: "Zag Test")
+		try! world.secrets.save(Data("x".utf8), kind: .session, account: unownedSecret, team: nil)
+		let unowned = try! await fresh.orphanedItems()
+		let keyOnly = unowned.accounts.first { $0.id == unownedKey }, secretOnly = unowned.accounts.first { $0.id == unownedSecret }
+		check(keyOnly?.isRecoverable == false && secretOnly?.isRecoverable == false,
+			  "Keychain key items and secrets with no ownership record are found, and listed as unowned")
+		_ = try! await fresh.removeOrphanedItems(ZagOrphanedAccountItems(accounts: [keyOnly!]))
+		check((try? keys.key(account: unownedKey, team: "SIMTEAM001")) == nil && (try? keys.key(account: unownedKey, team: "SIMTEAM002", slot: "PENDING1")) == nil
+			  && world.secrets.keys(of: unownedSecret).count == 1,
+			  "cleanup removes every key of the confirmed account (every team and slot), and nothing it was not asked to")
+		_ = try! await fresh.removeOrphanedItems(ZagOrphanedAccountItems(accounts: [secretOnly!]))
+		check(world.secrets.keys(of: unownedSecret).isEmpty, "a confirmed unowned account's secrets are removed")
+	}
+
+	/// Two ownership records naming the same Apple Account are ambiguous: neither
+	/// is used. A sign-in in progress is never listed as orphaned.
+	static func ambiguousRecords() async {
+		let world = World()
+		let other = await SimulatedAccounts.signIn(SimulatedAccounts.second, to: world.directory)!
+		let copy = UUID()
+		try! world.secrets.save(world.secrets.load(.accountRecord, account: other, team: nil)!, kind: .accountRecord, account: copy, team: nil)
+		let clock = world.clock
+		let fresh = SimulatedAccounts.directory(now: { clock.now }, secrets: world.secrets, preferences: TestPreferences(), service: world.service).directory
+		_ = await fresh.start()
+		let inProgress = await fresh.newSignIn()
+		_ = await inProgress.signIn(appleID: SimulatedAccounts.second, password: ZagEphemeralSecret(ZagFreeAccountSimulation.password))
+		let session = signedIn(await inProgress.state)
+		check(session != nil && session?.accountID != other && session?.accountID != copy,
+			  "with two records for one Apple Account, neither is recovered; a new account ID is used")
+		let orphans = try! await fresh.orphanedItems().accounts.map(\.id)
+		check(orphans.contains(other) && orphans.contains(copy) && !orphans.contains(session!.accountID),
+			  "a sign-in in progress is never listed as orphaned")
+	}
 
 	static func ledgerOwnership() {
 		let now = Date(timeIntervalSince1970: 1_795_000_000)

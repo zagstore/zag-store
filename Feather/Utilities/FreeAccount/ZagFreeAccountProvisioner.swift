@@ -50,6 +50,35 @@ struct ZagProvisioningResult: Sendable {
 	var expiresAt: Date { ([app] + extensions).map(\.profile.expiresAt).min() ?? app.profile.expiresAt }
 }
 
+/// A certificate request in progress for one account and team, kept with
+/// `ZagFreeAccountSecretKind.pendingSigningKey`. The same request is retried at
+/// most `maximumAttempts` times within `lifetime`; after that a new key is made.
+/// `certificate` is set once Apple's certificate has been verified against the
+/// pending key, so an interrupted finish is completed rather than re-requested.
+struct ZagPendingSigningKey: Codable, Equatable, Sendable {
+	static let maximumAttempts = 3
+	static let lifetime: TimeInterval = 86_400
+
+	struct Issued: Codable, Equatable, Sendable {
+		let data: Data
+		let serialNumber: String
+		let expiresAt: Date
+	}
+
+	let request: Data
+	/// Empty when the key is a Keychain key item.
+	let privateKey: Data
+	/// The new key's slot (`ZagKeychainSigningKeys`), beside the key in use.
+	let keySlot: String?
+	let startedAt: Date
+	var attempts: Int
+	var certificate: Issued?
+
+	func allowsRetry(at now: Date) -> Bool {
+		attempts < Self.maximumAttempts && now >= startedAt && now.timeIntervalSince(startedAt) < Self.lifetime
+	}
+}
+
 struct ZagProvisioningFailure: Error, Equatable, Sendable {
 	enum Step: String, Sendable {
 		case request
@@ -314,6 +343,11 @@ actor ZagFreeAccountProvisioner {
 	/// for a certificate. Never revokes one.
 	private func signingIdentity(for request: ZagProvisioningRequest, team: String, changes: inout ZagProvisioningResult.Changes) async throws -> ZagSigningIdentity {
 		let portal = self.portal
+		// A certificate issued and verified before an interruption is stored
+		// first, so it is reused rather than requested again.
+		if try finishPendingIdentity(account: request.accountID, team: team) {
+			changes.createdCertificate = true
+		}
 		// Each account and team has its own identity.
 		let stored = (try? secrets.load(.signingPrivateKey, account: request.accountID, team: team))
 			.flatMap { $0 }
@@ -324,7 +358,7 @@ actor ZagFreeAccountProvisioner {
 		// be missing after a reset, a restore or a removed item). Otherwise a
 		// new key and certificate are made instead of failing at signing.
 		let usable = stored.flatMap {
-			keys.check(certificate: $0.certificate, privateKey: $0.privateKey, account: request.accountID, team: team) == .mismatch ? nil : $0
+			keys.check(certificate: $0.certificate, privateKey: $0.privateKey, account: request.accountID, team: team, keySlot: $0.keySlot) == .mismatch ? nil : $0
 		}
 		if stored != nil && usable == nil {
 			diagnostics.record("Stored signing key missing or not matching its certificate; a new one is needed", at: now())
@@ -342,13 +376,11 @@ actor ZagFreeAccountProvisioner {
 		case .userMustRevoke(let candidates):
 			throw ZagProvisioningFailure(kind: .certificateMustBeRevoked(candidates: candidates), step: .certificate)
 		case .create:
-			let key: (privateKey: Data, request: ZagCertificateRequest)
-			do {
-				key = try keys.makeKey(commonName: "Zag Store", account: request.accountID, team: team)
-			} catch {
-				throw ZagProvisioningFailure(kind: .unavailable, step: .certificate)
-			}
-			let csr = key.request
+			// The new key is made beside the key in use, and the stored identity
+			// (possibly still valid) stays in use until the new certificate is
+			// verified and stored.
+			let pending = try beginPendingKey(account: request.accountID, team: team, inUse: stored)
+			let csr = ZagCertificateRequest(data: pending.request)
 			let issued: ZagIssuedCertificate
 			do {
 				issued = try await call { try await portal.submitCertificateRequest(csr, team: team) }
@@ -356,34 +388,135 @@ actor ZagFreeAccountProvisioner {
 				let valid = remote.filter { $0.expiresAt > now() }.sorted { $0.expiresAt < $1.expiresAt }
 				throw ZagProvisioningFailure(kind: .certificateMustBeRevoked(candidates: valid), step: .certificate)
 			}
-			// The certificate must be for the key just made.
+			// The certificate must be for the pending key. If not, this request is
+			// abandoned: nothing is published and the next attempt starts afresh.
 			var serial = issued.certificate.serialNumber, expiresAt = issued.certificate.expiresAt
-			switch keys.check(certificate: issued.data, privateKey: key.privateKey, account: request.accountID, team: team) {
+			switch keys.check(certificate: issued.data, privateKey: pending.privateKey, account: request.accountID, team: team, keySlot: pending.keySlot) {
 			case .matches(let inspectedSerial, let inspectedExpiry):
 				serial = inspectedSerial
 				expiresAt = inspectedExpiry
 			case .notInspected:
 				break
 			case .mismatch:
+				abandon(pending, account: request.accountID, team: team)
 				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
 			}
 			guard !issued.data.isEmpty, expiresAt > now() else {
+				abandon(pending, account: request.accountID, team: team)
 				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
 			}
-			let identity = ZagSigningIdentity(
-				serialNumber: serial,
-				certificate: issued.data,
-				privateKey: key.privateKey,
-				expiresAt: expiresAt
-			)
+			// Journal the verified certificate before changing anything, so an
+			// interruption from here on is finished by the next attempt.
+			var verified = pending
+			verified.certificate = ZagPendingSigningKey.Issued(data: issued.data, serialNumber: serial, expiresAt: expiresAt)
 			do {
-				try secrets.save(try JSONEncoder().encode(identity), kind: .signingPrivateKey, account: request.accountID, team: team)
+				try secrets.save(try JSONEncoder().encode(verified), kind: .pendingSigningKey, account: request.accountID, team: team)
 			} catch {
 				throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
+			}
+			guard try finishPendingIdentity(account: request.accountID, team: team),
+				  let identity = (try? secrets.load(.signingPrivateKey, account: request.accountID, team: team))
+					.flatMap({ $0 })
+					.flatMap({ try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }) else {
+				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
 			}
 			changes.createdCertificate = true
 			diagnostics.record("Development certificate created", at: now())
 			return identity
+		}
+	}
+
+	// MARK: Pending signing keys
+
+	private func pendingKey(account: UUID, team: String) -> ZagPendingSigningKey? {
+		(try? secrets.load(.pendingSigningKey, account: account, team: team))
+			.flatMap { $0 }
+			.flatMap { try? JSONDecoder().decode(ZagPendingSigningKey.self, from: $0) }
+	}
+
+	/// The pending key and request to submit: the same request again while it
+	/// has attempts and time left and its key is still there; otherwise a new
+	/// key, after removing this team's keys that neither the identity in use
+	/// nor a request in progress names (abandoned attempts).
+	private func beginPendingKey(account: UUID, team: String, inUse: ZagSigningIdentity?) throws -> ZagPendingSigningKey {
+		var pending: ZagPendingSigningKey
+		if let earlier = pendingKey(account: account, team: team),
+		   earlier.certificate == nil,
+		   earlier.allowsRetry(at: now()),
+		   keys.hasKey(account: account, team: team, keySlot: earlier.keySlot) {
+			pending = earlier
+			pending.attempts += 1
+			diagnostics.record("Retrying the pending certificate request (attempt \(pending.attempts) of \(ZagPendingSigningKey.maximumAttempts))", at: now())
+		} else {
+			try? secrets.delete(.pendingSigningKey, account: account, team: team)
+			try? keys.discardKeys(account: account, team: team, except: inUse.map { [$0.keySlot] } ?? [])
+			let made: (privateKey: Data, request: ZagCertificateRequest, keySlot: String?)
+			do {
+				made = try keys.makePendingKey(commonName: "Zag Store", account: account, team: team)
+			} catch {
+				throw ZagProvisioningFailure(kind: .unavailable, step: .certificate)
+			}
+			pending = ZagPendingSigningKey(request: made.request.data, privateKey: made.privateKey, keySlot: made.keySlot, startedAt: now(), attempts: 1, certificate: nil)
+		}
+		do {
+			try secrets.save(try JSONEncoder().encode(pending), kind: .pendingSigningKey, account: account, team: team)
+		} catch {
+			abandon(pending, account: account, team: team)
+			throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
+		}
+		return pending
+	}
+
+	/// Publishes a journalled, verified certificate: checks possession again,
+	/// stores the identity naming the new key (the one write that switches to
+	/// it), clears the journal, then removes the previous key. Each step can be
+	/// repeated, so an interruption at any point is finished by the next call.
+	/// A journal that no longer verifies is discarded without publishing
+	/// anything. True when an identity was stored.
+	private func finishPendingIdentity(account: UUID, team: String) throws -> Bool {
+		guard let pending = pendingKey(account: account, team: team), let issued = pending.certificate else { return false }
+		let previous = (try? secrets.load(.signingPrivateKey, account: account, team: team))
+			.flatMap { $0 }
+			.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
+		var serial = issued.serialNumber, expiresAt = issued.expiresAt
+		switch keys.check(certificate: issued.data, privateKey: pending.privateKey, account: account, team: team, keySlot: pending.keySlot) {
+		case .matches(let inspectedSerial, let inspectedExpiry):
+			serial = inspectedSerial
+			expiresAt = inspectedExpiry
+		case .notInspected:
+			break
+		case .mismatch:
+			expiresAt = .distantPast
+		}
+		guard expiresAt > now() else {
+			diagnostics.record("A pending certificate no longer matches its key or has expired; discarded", at: now())
+			abandon(pending, account: account, team: team)
+			return false
+		}
+		let identity = ZagSigningIdentity(serialNumber: serial, certificate: issued.data, privateKey: pending.privateKey, expiresAt: expiresAt, keySlot: pending.keySlot)
+		do {
+			try secrets.save(try JSONEncoder().encode(identity), kind: .signingPrivateKey, account: account, team: team)
+			try secrets.delete(.pendingSigningKey, account: account, team: team)
+		} catch {
+			throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
+		}
+		if let previous, previous.keyIsInKeychain, previous.keySlot != pending.keySlot {
+			// If this fails, the key is removed with the next new request's
+			// abandoned keys, or with the account.
+			try? keys.discardKey(account: account, team: team, keySlot: previous.keySlot)
+		}
+		return true
+	}
+
+	/// Removes a request in progress: its journal and its key (never the key
+	/// the stored identity uses).
+	private func abandon(_ pending: ZagPendingSigningKey, account: UUID, team: String) {
+		try? secrets.delete(.pendingSigningKey, account: account, team: team)
+		let inUse = (try? secrets.load(.signingPrivateKey, account: account, team: team))
+			.flatMap { $0 }
+			.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
+		if inUse.map({ $0.keySlot != pending.keySlot }) ?? true {
+			try? keys.discardKey(account: account, team: team, keySlot: pending.keySlot)
 		}
 	}
 

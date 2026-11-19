@@ -36,12 +36,15 @@ func file(_ data: Data, _ name: String) -> URL {
 	return url
 }
 
-struct OpenSSLIssuer: ZagSimulatedIssuer {
+final class OpenSSLIssuer: ZagSimulatedIssuer, @unchecked Sendable {
+	/// Validity of the certificates issued from now on.
+	var days = 365
+
 	func certificate(for request: ZagCertificateRequest, serialNumber: String) throws -> Data {
 		let csr = file(request.data, "request.der"), cert = work.appendingPathComponent("cert-\(serialNumber).der")
 		let result = run(openssl, ["x509", "-req", "-inform", "DER", "-in", csr.path,
 			"-CA", authority.appendingPathComponent("ca.pem").path, "-CAkey", authority.appendingPathComponent("ca.key").path,
-			"-set_serial", "0x\(serialNumber)", "-days", "365", "-outform", "DER", "-out", cert.path])
+			"-set_serial", "0x\(serialNumber)", "-days", "\(days)", "-outform", "DER", "-out", cert.path])
 		guard result.status == 0 else { throw ZagPortalError.malformedResponse }
 		return try Data(contentsOf: cert)
 	}
@@ -59,12 +62,21 @@ struct OpenSSLIssuer: ZagSimulatedIssuer {
 final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	private let lock = NSLock()
 	var items: [String: Data] = [:]
-	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = secret } }
+	func accountIDs() throws -> Set<UUID> { lock.withLock { Set(items.keys.compactMap { UUID(uuidString: String($0.prefix(36))) }) } }
+	/// Simulates an interruption between verifying a certificate and storing it.
+	var failIdentitySaves = false
+	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws {
+		if failIdentitySaves && kind == .signingPrivateKey { throw ZagPortalError.network }
+		lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = secret }
+	}
 	func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] } }
 	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = nil } }
 	func deleteAll(account: UUID) throws { lock.withLock { items = items.filter { !$0.key.hasPrefix("\(account).") } } }
 	func identity(_ account: UUID, _ team: String) -> ZagSigningIdentity? {
 		lock.withLock { items["\(account).signingPrivateKey.\(team)"] }.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
+	}
+	func pending(_ account: UUID, _ team: String) -> ZagPendingSigningKey? {
+		lock.withLock { items["\(account).pendingSigningKey.\(team)"] }.flatMap { try? JSONDecoder().decode(ZagPendingSigningKey.self, from: $0) }
 	}
 }
 
@@ -196,6 +208,7 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 			return false
 		}
 		await keychainHeldKeys(intermediate: intermediate)
+		await pendingKeys()
 		print("SUCCESS: \(passed) strict signing integration checks passed")
 	}
 
@@ -217,7 +230,7 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 		)
 		guard case .success(let result) = await provisioner.provision(request, authorization: authorization),
 			  let identity = secrets.identity(account, team) else { return check(false, "provisioning with a Keychain key") }
-		check(identity.keyIsInKeychain && (try? keys.key(account: account, team: team)) != nil,
+		check(identity.keyIsInKeychain && identity.keySlot != nil && (try? keys.key(account: account, team: team, slot: identity.keySlot)) != nil,
 			  "Keychain keys: the stored identity carries no key bytes; the key is a Keychain key item for this account and team")
 
 		var adapter = ZagFreeAccountSigningAdapter(signer: ZagZsignCodeSigner(), workRoot: work, gate: .simulationOnly)
@@ -255,7 +268,7 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 				  "Keychain keys: another account's authorisation cannot sign this account's app, and it has no key item for this team")
 		}
 		// A missing key item is a clear failure, never a fallback to key files.
-		try? keys.delete(account: account, team: team)
+		try? keys.delete(account: account, team: team, slot: identity.keySlot)
 		var permissive = adapter
 		permissive.allowsKeyFiles = true
 		do {
@@ -270,7 +283,7 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 		guard case .success(let renewed) = await provisioner.provision(request, authorization: authorization),
 			  let replacement = secrets.identity(account, team) else { return check(false, "provisioning after a lost key") }
 		check(renewed.changes.createdCertificate && replacement.serialNumber != identity.serialNumber
-			  && replacement.keyIsInKeychain && (try? keys.key(account: account, team: team)) != nil,
+			  && replacement.keyIsInKeychain && (try? keys.key(account: account, team: team, slot: replacement.keySlot)) != nil,
 			  "Keychain keys: an identity whose key is missing is not reused; a new key and certificate are made")
 
 		// A certificate issued for another key (a wrong lookup, or a request in an
@@ -301,6 +314,138 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 			check(false, "account removal: \(error)")
 		}
 	}
+}
+
+extension Tests {
+	/// L2: a new key stays pending until its certificate is issued, verified
+	/// and stored; the working identity is untouched until then.
+	static func pendingKeys() async {
+		let secrets = MemorySecrets()
+		let (directory, _) = SimulatedAccounts.directory(now: { Date() }, secrets: secrets)
+		guard let account = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: directory) else { return check(false, "sign-in") }
+		let keys = ZagKeychainSigningKeys(namespace: "ZagStore.test.\(UUID().uuidString)")
+		defer { try? keys.deleteAll(account: account) }
+		let factory = ZagKeychainSigningKeyFactory(keys: keys)
+		let issuer = OpenSSLIssuer()
+		issuer.days = 3
+		let simulated = ZagSimulatedDeveloperPortal(team: team, issuer: issuer)
+		// This test issues more certificates than Apple's limit of 2 allows.
+		await simulated.setCertificateLimit(20)
+		let portal = ScriptedCertificatePortal(inner: simulated)
+		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: factory, secrets: secrets, account: account)
+		let authorization = try! await directory.authorize(ZagSigningScope(accountID: account, teamID: team))
+		let request = ZagProvisioningRequest(
+			accountID: account, team: team, deviceUDID: udid, deviceName: "Test iPhone",
+			app: component("com.example.notes", "Notes"), extensions: [], installedFreeAccountApps: []
+		)
+		func provision() async -> ZagProvisioningResult? {
+			if case .success(let result) = await provisioner.provision(request, authorization: authorization) { return result }
+			return nil
+		}
+		func works(_ identity: ZagSigningIdentity) -> Bool {
+			if case .matches = factory.check(certificate: identity.certificate, privateKey: identity.privateKey, account: account, team: team, keySlot: identity.keySlot) { return true }
+			return false
+		}
+		// A still-valid identity with under 7 days left: the next provisioning renews it.
+		guard await provision() != nil, let first = secrets.identity(account, team) else { return check(false, "first identity") }
+		issuer.days = 365
+
+		// The request fails before Apple answers: the working identity is untouched.
+		portal.failNext(2)
+		let failed = await provision()
+		check(failed == nil && secrets.identity(account, team) == first && works(first)
+			  && secrets.pending(account, team).map { factory.hasKey(account: account, team: team, keySlot: $0.keySlot) } == true
+			  && secrets.pending(account, team)?.attempts == 1,
+			  "L2: an interrupted certificate request leaves the working identity and its key in use; the new key stays pending")
+		_ = await provision()
+		check(portal.submitted.count == 3 && portal.submitted[1] == portal.submitted[2] && secrets.pending(account, team)?.attempts == 2
+			  && secrets.identity(account, team) == first,
+			  "L2: a retry resubmits the same request with the same pending key")
+		issuer.days = 3
+		guard let renewed = await provision(), let second = secrets.identity(account, team) else { return check(false, "renewal") }
+		check(renewed.changes.createdCertificate && portal.submitted[3] == portal.submitted[1] && second.serialNumber != first.serialNumber
+			  && works(second) && !works(first) && (try? keys.slots(account: account, team: team)) == [second.keySlot] && secrets.pending(account, team) == nil,
+			  "L2: on success the identity switches to the new key in one write; the old key is then removed")
+
+		// Retries are bounded: after three attempts a new key and request are made.
+		portal.failNext(4)
+		for _ in 0..<4 { _ = await provision() }
+		let attempts = Array(portal.submitted.suffix(4))
+		check(attempts[0] == attempts[1] && attempts[1] == attempts[2] && attempts[3] != attempts[2]
+			  && secrets.pending(account, team)?.attempts == 1 && secrets.identity(account, team) == second && works(second),
+			  "L2: the same request is retried at most \(ZagPendingSigningKey.maximumAttempts) times, then replaced; the identity stays in use")
+		check(Set((try? keys.slots(account: account, team: team)) ?? []) == Set([second.keySlot, secrets.pending(account, team)?.keySlot]),
+			  "L2: the abandoned request's key is removed; only the key in use and the current request's key remain")
+
+		// Interrupted after the certificate was verified: finished, not re-requested.
+		issuer.days = 365
+		secrets.failIdentitySaves = true
+		let interrupted = await provision()
+		let journal = secrets.pending(account, team)
+		check(interrupted == nil && journal?.certificate != nil && secrets.identity(account, team) == second,
+			  "L2: a certificate verified but not yet stored is kept in the journal; nothing is published")
+		secrets.failIdentitySaves = false
+		let before = portal.submitted.count
+		guard let finished = await provision(), let third = secrets.identity(account, team) else { return check(false, "finish") }
+		check(finished.changes.createdCertificate && portal.submitted.count == before && third.serialNumber == journal?.certificate?.serialNumber
+			  && works(third) && secrets.pending(account, team) == nil && (try? keys.slots(account: account, team: team)) == [third.keySlot],
+			  "L2: the next attempt publishes the journalled certificate without requesting another")
+
+		// A lost response: Apple issued a certificate the app never received. (The
+		// identity's key is removed first, so a new certificate is needed.)
+		try? keys.delete(account: account, team: team, slot: third.keySlot)
+		portal.loseNext(1)
+		_ = await provision()
+		let unissued = portal.submitted.count
+		guard await provision() != nil, let fourth = secrets.identity(account, team) else { return check(false, "after a lost response") }
+		check(portal.submitted.count == unissued + 1 && portal.submitted[unissued] == portal.submitted[unissued - 1]
+			  && fourth.serialNumber != third.serialNumber && works(fourth),
+			  "L2: after a lost response the same request is retried; the certificate Apple issued unseen is not used (it counts against the limit until it expires)")
+
+		// Pending keys belong to one account and team.
+		let other = UUID()
+		defer { try? keys.deleteAll(account: other) }
+		_ = try? keys.create(account: other, team: team, slot: "PENDING1", commonName: "Other")
+		check((try? keys.slots(account: account, team: team)) == [fourth.keySlot] && (try? keys.slots(account: other, team: team)) == ["PENDING1"]
+			  && works(fourth),
+			  "L2: another account's key for the same team is separate and never touches this account's keys")
+		try? keys.deleteAll(account: other)
+		check((try? keys.slots(account: other, team: team))?.isEmpty == true && works(fourth), "L2: removing an account removes all its keys, pending ones included")
+	}
+}
+
+/// Records each certificate request; fails the next ones before Apple would
+/// see them (`failNext`), or after the certificate is issued (`loseNext`, the
+/// response is lost).
+final class ScriptedCertificatePortal: ZagDeveloperPortalService, @unchecked Sendable {
+	let inner: ZagDeveloperPortalService
+	private let lock = NSLock()
+	private var failures = 0, losses = 0
+	private(set) var submitted: [Data] = []
+	init(inner: ZagDeveloperPortalService) { self.inner = inner }
+	func failNext(_ count: Int) { lock.withLock { failures = count } }
+	func loseNext(_ count: Int) { lock.withLock { losses = count } }
+	func devices(team: String) async throws -> [ZagRegisteredDevice] { try await inner.devices(team: team) }
+	func registerDevice(udid: String, name: String, team: String) async throws -> ZagRegisteredDevice { try await inner.registerDevice(udid: udid, name: name, team: team) }
+	func appIDs(team: String) async throws -> [ZagRegisteredAppID] { try await inner.appIDs(team: team) }
+	func registerAppID(bundleIdentifier: String, name: String, team: String) async throws -> ZagRegisteredAppID { try await inner.registerAppID(bundleIdentifier: bundleIdentifier, name: name, team: team) }
+	func appGroups(team: String) async throws -> [ZagRegisteredAppGroup] { try await inner.appGroups(team: team) }
+	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup { try await inner.registerAppGroup(identifier, team: team) }
+	func assignAppGroups(_ groups: [String], to appID: ZagRegisteredAppID, team: String) async throws { try await inner.assignAppGroups(groups, to: appID, team: team) }
+	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] { try await inner.certificates(team: team) }
+	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
+		let (fail, lose): (Bool, Bool) = lock.withLock {
+			submitted.append(request.data)
+			if failures > 0 { failures -= 1; return (true, false) }
+			if losses > 0 { losses -= 1; return (false, true) }
+			return (false, false)
+		}
+		if fail { throw ZagPortalError.network }
+		let issued = try await inner.submitCertificateRequest(request, team: team)
+		if lose { throw ZagPortalError.network }
+		return issued
+	}
+	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile { try await inner.profile(for: appID, team: team) }
 }
 
 /// Answers every certificate request with a certificate for a different key.

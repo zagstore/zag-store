@@ -140,19 +140,35 @@ protocol ZagSigningKeyFactory: Sendable {
 	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest)
 	/// Whether an issued certificate is for `privateKey`, with its serial and expiry.
 	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck
-	func makeKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest)
-	func check(certificate: Data, privateKey: Data, account: UUID, team: String) -> ZagIssuedCertificateCheck
+	// A new key is made beside the one in use. The stored identity names the
+	// key it uses (`ZagSigningIdentity.keySlot`), so the key in use stays in use
+	// until the new certificate is issued, verified and stored, and switching is
+	// that one write (`ZagPendingSigningKey`).
+	func makePendingKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest, keySlot: String?)
+	/// Whether an issued certificate is for this account and team's key in
+	/// `keySlot` (or for `privateKey`, for a factory that returns key bytes).
+	func check(certificate: Data, privateKey: Data, account: UUID, team: String, keySlot: String?) -> ZagIssuedCertificateCheck
+	func hasKey(account: UUID, team: String, keySlot: String?) -> Bool
+	func discardKey(account: UUID, team: String, keySlot: String?) throws
+	/// Removes the team's keys other than those in `keeping`: keys of abandoned
+	/// attempts that no identity or request in progress names.
+	func discardKeys(account: UUID, team: String, except keeping: Set<String?>) throws
 }
 
 extension ZagSigningKeyFactory {
-	/// For one account and team. A factory whose keys stay in the Keychain
-	/// creates the key item for them and returns an empty `privateKey`.
-	func makeKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest) {
-		try makeKey(commonName: commonName)
+	/// For a factory whose key bytes are returned (and kept, while a request is
+	/// in progress, in `ZagPendingSigningKey`). A factory whose keys stay in the
+	/// Keychain implements these with key items and returns an empty `privateKey`.
+	func makePendingKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest, keySlot: String?) {
+		let made = try makeKey(commonName: commonName)
+		return (made.privateKey, made.request, nil)
 	}
-	func check(certificate: Data, privateKey: Data, account: UUID, team: String) -> ZagIssuedCertificateCheck {
+	func check(certificate: Data, privateKey: Data, account: UUID, team: String, keySlot: String?) -> ZagIssuedCertificateCheck {
 		check(certificate: certificate, privateKey: privateKey)
 	}
+	func hasKey(account: UUID, team: String, keySlot: String?) -> Bool { true }
+	func discardKey(account: UUID, team: String, keySlot: String?) throws {}
+	func discardKeys(account: UUID, team: String, except keeping: Set<String?>) throws {}
 }
 
 struct ZagDisabledSigningKeyFactory: ZagSigningKeyFactory {
@@ -171,6 +187,9 @@ struct ZagSigningIdentity: Codable, Equatable, Sendable, CustomStringConvertible
 	/// which is never exported.
 	let privateKey: Data
 	let expiresAt: Date
+	/// The slot of the Keychain key item (`ZagKeychainSigningKeys`); nil for
+	/// key bytes, or a key made before slots existed.
+	var keySlot: String? = nil
 
 	var keyIsInKeychain: Bool { privateKey.isEmpty }
 

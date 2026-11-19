@@ -306,6 +306,7 @@ import Foundation
 	static func secretStoreContract() {
 		final class MemoryStore: ZagFreeAccountSecretStore, @unchecked Sendable {
 			var items: [String: Data] = [:]
+			func accountIDs() throws -> Set<UUID> { Set(items.keys.compactMap { UUID(uuidString: String($0.prefix(36))) }) }
 			func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = secret }
 			func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] }
 			func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = nil }

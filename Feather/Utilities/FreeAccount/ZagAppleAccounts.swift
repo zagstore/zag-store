@@ -174,26 +174,78 @@ struct ZagAccountRemovalPlan: Equatable, Sendable {
 	}
 }
 
+/// Which Apple Account owns an account ID, kept in the Keychain beside the
+/// account's items (`ZagFreeAccountSecretKind.accountRecord`). Preferences do
+/// not survive a reinstall; Keychain items may, and this record is how a later
+/// sign-in to the same Apple Account finds them again. Nothing in it is secret.
+struct ZagAccountOwnershipRecord: Codable, Equatable, Sendable {
+	/// `ZagAppleAccountRecord.accountKey`: a hash of the identifier Apple
+	/// returns at sign-in.
+	let accountKey: String
+	var maskedAppleID: String?
+}
+
 /// Apple account identifier → stable account ID, shared with the
 /// authenticators' `identify` closures.
 final class ZagAccountKeyIndex: @unchecked Sendable {
 	private let lock = NSLock()
 	private var ids: [String: UUID] = [:]
+	private let secrets: ZagFreeAccountSecretStore?
+
+	init(secrets: ZagFreeAccountSecretStore? = nil) {
+		self.secrets = secrets
+	}
 
 	func set(_ id: UUID, for key: String) { lock.withLock { ids[key] = id } }
 	func remove(_ id: UUID) { lock.withLock { ids = ids.filter { $0.value != id } } }
 	func key(for id: UUID) -> String? { lock.withLock { ids.first { $0.value == id }?.key } }
+	var knownIDs: Set<UUID> { lock.withLock { Set(ids.values) } }
 
-	/// The known ID for this Apple Account, or a new one remembered for it.
+	/// The known ID for this Apple Account; else the ID its ownership record
+	/// names (items left by an earlier installation); else a new one. Called
+	/// only after Apple has accepted a sign-in, so only the owner of the Apple
+	/// Account recovers its items. The ID is recorded before anything is stored
+	/// under it.
 	func id(forAppleAccount identifier: String) -> UUID {
 		let key = ZagAppleAccountRecord.accountKey(for: identifier)
 		return lock.withLock {
 			if let id = ids[key] { return id }
-			let id = UUID()
+			let id = recordedOwner(of: key) ?? UUID()
 			ids[key] = id
+			if let secrets, (try? Self.record(of: id, in: secrets)) == nil,
+			   let data = try? JSONEncoder().encode(ZagAccountOwnershipRecord(accountKey: key)) {
+				try? secrets.save(data, kind: .accountRecord, account: id, team: nil)
+			}
 			return id
 		}
 	}
+
+	/// The single account ID whose record names this key. Two records for one
+	/// key are ambiguous, so neither is used.
+	private func recordedOwner(of key: String) -> UUID? {
+		guard let secrets, let candidates = try? secrets.accountIDs() else { return nil }
+		let owners = candidates.filter { (try? Self.record(of: $0, in: secrets))??.accountKey == key }
+		return owners.count == 1 ? owners.first : nil
+	}
+
+	static func record(of id: UUID, in secrets: ZagFreeAccountSecretStore) throws -> ZagAccountOwnershipRecord? {
+		try secrets.load(.accountRecord, account: id, team: nil).flatMap { try? JSONDecoder().decode(ZagAccountOwnershipRecord.self, from: $0) }
+	}
+}
+
+/// Keychain items whose account is not in the registry, typically left by an
+/// earlier installation. Nothing is removed without a confirmed plan.
+struct ZagOrphanedAccountItems: Equatable, Sendable {
+	struct Account: Equatable, Sendable {
+		let id: UUID
+		/// The account has an ownership record: signing in to the same Apple
+		/// Account again recovers its items.
+		let isRecoverable: Bool
+		/// From the ownership record, when the account was added.
+		let maskedAppleID: String?
+	}
+
+	let accounts: [Account]
 }
 
 /// The accounts on this device: sign-in, sessions, the default, signing
@@ -222,7 +274,7 @@ actor ZagAccountDirectory {
 	private let diagnostics: ZagFreeAccountDiagnostics
 	private let configuration: Configuration
 	private let now: @Sendable () -> Date
-	private let keyIndex = ZagAccountKeyIndex()
+	private let keyIndex: ZagAccountKeyIndex
 	private(set) var registry: ZagAccountRegistry
 	private var authenticators: [UUID: ZagFreeAccountAuthenticator] = [:]
 
@@ -242,6 +294,7 @@ actor ZagAccountDirectory {
 		self.diagnostics = diagnostics
 		self.configuration = configuration
 		self.now = now
+		keyIndex = ZagAccountKeyIndex(secrets: secrets)
 		registry = preferences.data(forKey: configuration.namespace + ".registry.v2")
 			.flatMap { try? JSONDecoder().decode(ZagAccountRegistry.self, from: $0) } ?? ZagAccountRegistry()
 		for account in registry.accounts { keyIndex.set(account.id, for: account.accountKey) }
@@ -275,6 +328,7 @@ actor ZagAccountDirectory {
 		migrateSingleAccount()
 		var states: [UUID: ZagFreeAccountState] = [:]
 		for account in registry.accounts {
+			recordOwnership(account.id, accountKey: account.accountKey, maskedAppleID: account.maskedAppleID)
 			let authenticator = authenticators[account.id] ?? makeAuthenticator(account: account.id)
 			authenticators[account.id] = authenticator
 			states[account.id] = await authenticator.restore()
@@ -338,8 +392,17 @@ actor ZagAccountDirectory {
 		guard let key = keyIndex.key(for: summary.accountID) else { throw ZagAccountError.unknownAccount(summary.accountID) }
 		registry.upsert(id: summary.accountID, accountKey: key, maskedAppleID: summary.maskedAppleID, teams: summary.teams, now: now())
 		try persist()
+		recordOwnership(summary.accountID, accountKey: key, maskedAppleID: summary.maskedAppleID)
 		authenticators[summary.accountID] = authenticator
 		return summary.accountID
+	}
+
+	/// Writes the account's ownership record if it is missing or out of date.
+	private func recordOwnership(_ id: UUID, accountKey: String, maskedAppleID: String) {
+		let record = ZagAccountOwnershipRecord(accountKey: accountKey, maskedAppleID: maskedAppleID)
+		guard (try? ZagAccountKeyIndex.record(of: id, in: secrets)) != record,
+			  let data = try? JSONEncoder().encode(record) else { return }
+		try? secrets.save(data, kind: .accountRecord, account: id, team: nil)
 	}
 
 	func state(of id: UUID) async -> ZagFreeAccountState? {
@@ -417,5 +480,41 @@ actor ZagAccountDirectory {
 		case .forgetRecords: for bundle in plan.dependentApps { ledger.forget(bundle) }
 		}
 		diagnostics.record("Account removed; \(plan.dependentApps.count) apps no longer refresh", at: now())
+	}
+
+	// MARK: Items left by an earlier installation
+
+	/// Accounts with Keychain items (in this directory's namespace) that no
+	/// registered account and no sign-in in progress owns. Found only through
+	/// this app's own items: the secret store's service and this namespace's
+	/// key labels. Nothing is removed here, and nothing is removed at launch.
+	func orphanedItems() throws -> ZagOrphanedAccountItems {
+		let owned = Set(registry.accounts.map(\.id)).union(keyIndex.knownIDs)
+		let found = try secrets.accountIDs().union(try configuration.signingKeys.accountsWithKeys())
+		let accounts = found.subtracting(owned)
+			.map { id in
+				let record = (try? ZagAccountKeyIndex.record(of: id, in: secrets)) ?? nil
+				return ZagOrphanedAccountItems.Account(id: id, isRecoverable: record != nil, maskedAppleID: record?.maskedAppleID)
+			}
+			.sorted { $0.id.uuidString < $1.id.uuidString }
+		return ZagOrphanedAccountItems(accounts: accounts)
+	}
+
+	/// Removes the items of exactly the accounts the user confirmed, and only
+	/// those still orphaned now (one recovered by a sign-in since is kept).
+	/// Key items first, then the secrets, the ownership record among them.
+	/// Returns the accounts removed.
+	@discardableResult
+	func removeOrphanedItems(_ confirmed: ZagOrphanedAccountItems) throws -> [UUID] {
+		let current = Set(try orphanedItems().accounts.map(\.id))
+		let removable = confirmed.accounts.map(\.id).filter(current.contains)
+		for id in removable {
+			try configuration.signingKeys.deleteAll(account: id)
+			try secrets.deleteAll(account: id)
+		}
+		if !removable.isEmpty {
+			diagnostics.record("Removed the Keychain items of \(removable.count) accounts from an earlier installation", at: now())
+		}
+		return removable
 	}
 }

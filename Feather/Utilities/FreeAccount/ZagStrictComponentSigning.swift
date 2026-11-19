@@ -36,7 +36,7 @@ extension ZagFreeAccountSigningAdapter {
 		now: Date
 	) throws -> ZagSignedAppRecord {
 		guard identity.keyIsInKeychain, let keychainKeys,
-			  let key = try? keychainKeys.key(account: authorization.scope.accountID, team: result.team) else {
+			  let key = try? keychainKeys.key(account: authorization.scope.accountID, team: result.team, slot: identity.keySlot) else {
 			throw ZagFreeAccountSigningError.keychainKeyMissing
 		}
 		var intermediates: [Data] = []

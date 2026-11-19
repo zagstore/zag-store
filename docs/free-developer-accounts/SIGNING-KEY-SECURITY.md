@@ -72,24 +72,86 @@ These changes make the Keychain key item the only signing path for free accounts
 - `scripts/test-zag-zsign-branch.sh` covers the end-to-end path: provisioning with a Keychain key, signing, independent verification, no key file, cross-account refusal and a missing key.
 - `scripts/test-zag-free-account-signing.sh` covers the key policy in a build without the flag.
 
-## Signing-key lifecycle review (19 Nov 2026)
+## Signing-key lifecycle review (19 Nov 2026; L1 and L2 implemented the same day)
 
-Each key is a Keychain key item. It is tagged `<namespace>.signing-key.<account ID>.<team>` and labelled `<namespace>.signing-key.<account ID>`. The matching identity (the certificate, with no key bytes) is in the account's generic-password items.
+**Where things are kept**
+- **Keys.** Each key is a Keychain key item, labelled `<namespace>.signing-key.<account ID>`. Its tag is `<label>.<team>.<slot>`; each new key gets a new slot.
+- **Identity.** The matching identity holds the certificate and the slot of its key, with no key bytes. It is in the account's generic-password items.
+- **Ownership record.** This is also among the account's generic-password items. It holds the hashed Apple Account key and the masked address, nothing secret.
+
+Keys are never retagged. The macOS file keychain reports success for a tag update without applying it, so "swapping" a key by renaming it is not relied on.
 
 | Event | What happens to the key and identity | Evidence |
 |---|---|---|
-| **Switching accounts** | Nothing moves. Signing needs a `ZagSigningAuthorization` for exactly one account and team. The adapter loads only that account and team's key item, so another account's authorisation cannot sign with this account's identity. | Strict integration: "another account's authorisation cannot sign this account's app" |
-| **Sign-out** | The session is removed. The key and identity stay (owner decision, 18 Nov). They cannot be used, because signing needs a signed-in authorisation. | `test-zag-apple-accounts.sh`, `test-zag-free-account-signing.sh` |
-| **Account removal** (confirmed) | **Changed today.** The key items are now removed first (`Configuration.signingKeys.deleteAll`), then every generic-password item, the summary and the record. If the Keychain refuses, nothing has been removed yet and the removal can be repeated. | Strict integration: "removing the account removes its signing key items and identities" |
-| **Missing key reference** (Keychain reset, restore, deleted item) | **Changed today.** Before reuse, the provisioner checks the stored identity against its key by proof of possession. If the key is missing or does not match, the identity is not reused: a new key and certificate are made. Signing with such an identity fails with `keychainKeyMissing`, never by falling back to a key file. | Strict integration: "an identity whose key is missing is not reused…", "a missing key item fails clearly…" |
-| **Unfinished certificate request** | `makeKey` replaces the key of that account and team before requesting. If the request then fails, the old identity's key is gone, so it is no longer reused (see above). | By design. See finding L2 below. |
-| **App deleted and reinstalled** | iOS keeps Keychain items after an app is deleted, but the account registry (preferences) is lost. Account IDs are random UUIDs remembered in that registry, so a new sign-in gets a **new** account ID, and the old session, identities and key items are orphaned: unreachable but not removed. | **Open: finding L1** |
+| **Switching accounts** | Nothing moves. Signing needs a `ZagSigningAuthorization` for exactly one account and team. The adapter loads only the key in the slot that account and team's identity names. | Strict integration: "another account's authorisation cannot sign this account's app" |
+| **Sign-out** | The session is removed. The key, identity and ownership record stay (owner decision, 18 Nov). They cannot be used, because signing needs a signed-in authorisation. | `test-zag-apple-accounts.sh`, `test-zag-free-account-signing.sh` |
+| **Account removal** (confirmed) | Every key item of the account (every team and slot, pending ones included) is removed first, then every generic-password item (the ownership record among them), the summary and the record. The key removal repeats until no match is left, because the macOS file keychain removes one match per call. If the Keychain refuses, the account stays registered and the removal can be repeated. | Strict integration: "removing the account removes…"; accounts suite; simulator Keychain harness |
+| **Missing key reference** (Keychain reset, restore, deleted item) | Before reuse, the stored identity is checked against its slot's key by proof of possession. If the key is missing or does not match, a new key and certificate are made. Signing with such an identity fails with `keychainKeyMissing`, never by falling back to a key file. | Strict integration: "an identity whose key is missing is not reused…" |
+| **New certificate (L2)** | See "L2: transactional identity creation" below. The identity in use, even one about to expire, keeps working until a new one is stored. | Strict integration: ten "L2:" checks |
+| **App deleted and reinstalled (L1)** | See "L1: recovery and cleanup after a reinstall" below. Nothing is deleted automatically. | Accounts suite: eleven reinstall and orphan checks; simulator Keychain harness |
 | **Device restore or migration** | Every item is `…ThisDeviceOnly` and not synchronised, so nothing moves to another device. The provisioner makes new keys there. | Item attributes (`ZagKeychainSigningKeys.create`, `ZagKeychainFreeAccountSecretStore.save`) |
 
-**Open findings that need a decision**
-- **L1: orphaned Keychain items after a reinstall.**
-  - Option (a): on a fresh install (no registry in preferences), sweep the namespace's items that belong to no registered account. This deletes automatically, so it is guarded: it runs only when no registry data exists at all, never on decoding failure.
-  - Option (b): derive account IDs deterministically from the Apple Account, so a reinstall reconnects to its items. Old sessions are then re-validated, and identities are re-checked by proof of possession.
-  - Option (c): leave them, and document a manual "Reset free-account data" action.
-- **L2: a failed certificate request discards a still-valid key.** The new key could be created under a temporary tag and swapped in only after the certificate is issued and checked. This is low impact: only identities that expire within 7 days, or are missing, take this path.
-- **Exportability.** As recorded above, iOS does not enforce `kSecAttrIsExtractable: false` for software RSA keys. The Secure Enclave cannot hold the RSA-2048 keys Apple's development certificates need. "Never exported" means Zag Store's code never exports the key: it uses the key only through `SecKeyCreateSignature`, and no code path calls `SecKeyCopyExternalRepresentation` on a private key. It does not mean export is impossible.
+### L2: transactional identity creation (owner decision, 19 Nov: approved)
+
+1. **New key.** A new key is made in a new slot, beside the key in use. A journal (`ZagPendingSigningKey`) records:
+   - the certificate request and the key's slot;
+   - when the request started, and how many attempts it has had.
+2. **Request.** The request is sent. If it fails (network, no response, rate limit, certificate limit), nothing else changes, and the identity in use keeps working.
+3. **Bounded retries.**
+   - The next attempt resubmits **the same request with the same key**, up to 3 attempts within 24 hours.
+   - After that, the request is abandoned and a new key is made.
+   - A request is never retried for another account or team: the journal and the slot are per account and team.
+4. **Verification.** The issued certificate must verify against the new key by proof of possession. If it does not, the request is abandoned: its key and journal are deleted, and nothing is published.
+5. **Journal.** The verified certificate is written to the journal before anything else changes.
+6. **Publication.** The identity is rewritten to name the new slot. This **single write** publishes the new identity. The journal is then cleared and the previous key deleted.
+   - **Interrupted before the write:** the next attempt finishes the publication from the journal, after checking possession again, without requesting another certificate.
+   - **Interrupted after the write:** the next attempt finds nothing left to do except remove the old key.
+7. **Cleaning up abandoned keys.** A pending key is never published. It is deleted when:
+   - its request is abandoned;
+   - a new request starts (any key of that account and team that neither the identity in use nor a request in progress names);
+   - the account is removed.
+
+**Limitation (Apple's side).** If Apple issues a certificate but the response is lost, the app never receives that certificate. The retry asks for another. The unseen certificate counts against Apple's limit of 2 until it expires or is revoked. When the limit is reached, Zag Store asks the user to choose one to revoke. Recovering it would need the certificate's data in the portal listing; the bridge does not provide that today.
+
+### L1: recovery and cleanup after a reinstall (owner decision, 19 Nov: approved)
+
+**Background.**
+- A reinstall clears the preferences (the account registry), but Keychain items can remain.
+- Account IDs are random, so before this change a new sign-in got a new ID and the earlier items became unreachable.
+- Keychain items surviving an app's deletion is behaviour, not a documented guarantee. Zag Store does not depend on it either way.
+
+**Ownership record.**
+- When Apple accepts a sign-in, the account ID is chosen and its ownership record is written **before** anything is stored under that ID.
+- The record holds `SHA-256` of the account identifier Apple returned, plus, once the account is added, its masked address.
+
+**Recovery.**
+- After a reinstall, a sign-in that **Apple has accepted** for the same Apple Account finds its record and reuses that account ID.
+- So only the owner of the Apple Account recovers its items. A different Apple Account always gets a new ID.
+- Two records naming one Apple Account are ambiguous, so neither is used.
+- Team ownership is not assumed: a recovered identity is reused only if its key passes proof of possession and the team's portal still lists its certificate. Otherwise a new one is made, as for a missing key.
+
+**Cleanup is explicit, scoped and safe.**
+- `orphanedItems()` lists the account IDs that own items in this app's own storage but belong to no registered account and no sign-in in progress.
+  - It looks only at this app's own items: the secret store's own service, and this namespace's key labels.
+  - It marks each as "recoverable by signing in" (has a record, with the masked address if known) or "unowned" (no record).
+- Nothing is removed at launch.
+- `removeOrphanedItems(_:)` removes exactly the accounts the user confirmed, and only those still orphaned when it runs. An account recovered by a sign-in in the meantime is kept.
+- It removes key items first, then secrets.
+
+**Enumeration used.** `SecItemCopyMatching` with `kSecMatchLimitAll` and `kSecReturnAttributes`, through the documented API only, over:
+- the generic-password items of Zag Store's own service;
+- the private-key items of the app's own access group, keeping only labels in Zag Store's namespace.
+
+It does not assume what other apps can see, or that items survive deletion.
+
+**Not yet decided: UI.** No screen offers the cleanup yet. Where to offer it (for example Settings → Apple Accounts → "Data from an earlier installation") is a product decision.
+
+### Exportability
+
+As recorded above, iOS does not enforce `kSecAttrIsExtractable: false` for software RSA keys, and the Secure Enclave cannot hold the RSA-2048 keys Apple's development certificates need.
+
+"Never exported" means Zag Store's release code never exports the key:
+- It uses the key only through `SecKeyCreateSignature`.
+- The test-only key factory that exports keys is compiled only in Debug, and the release scan checks it is absent.
+
+It does not mean export is impossible.
