@@ -274,6 +274,7 @@ It must be validated against Apple's real responses; mocks alone don't count.
 
 **Phase 7 working documents (18 Nov 2026).**
 - `FIRST-LIVE-EXPERIMENT.md`: the smallest path to the first supervised free-account installation, and the G1–G6 evidence.
+- `SUPERVISED-EXPERIMENT-SEQUENCE.md`: the supervised live experiment step by step, its stop rules, and what is required before the first live sign-in.
 - `DEVICE-TEST-PHASE7.md`: the installed-profiles (PR #25) and Zsign branch device tests.
 - `WEBSITE-INSTALL-FEASIBILITY.md`: installing from zagstore.app with a visitor's free account.
 - The trimmed isideload fork and its provenance evidence: PR #26, `AppleAuthCore/zag-isideload/PROVENANCE.md`.
