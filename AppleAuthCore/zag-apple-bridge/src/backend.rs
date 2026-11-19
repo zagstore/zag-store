@@ -202,3 +202,20 @@ pub trait PortalSession: Send {
 pub fn valid_anisette_scope(scope: &str) -> bool {
     !scope.is_empty() && scope.len() <= 64 && scope.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    /// G4: the fork can revoke certificates (`revoke_development_cert`), but
+    /// the bridge's requests cannot express it. Swift cannot ask for one.
+    #[test]
+    fn portal_requests_cannot_revoke_a_certificate() {
+        for op in ["revokeCertificate", "revokeDevelopmentCert", "revoke_development_cert", "RevokeCertificate"] {
+            let json = format!(r#"{{"op":"{op}","team":"T","serialNumber":"0123"}}"#);
+            assert!(serde_json::from_str::<PortalRequest>(&json).is_err(), "{op} must not parse");
+        }
+        let listing = serde_json::from_str::<PortalRequest>(r#"{"op":"certificates","team":"T"}"#);
+        assert!(matches!(listing, Ok(PortalRequest::Certificates { .. })));
+    }
+}
