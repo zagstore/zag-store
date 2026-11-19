@@ -342,5 +342,7 @@ struct ZagAppleBridgeTests {
 			  "anisette state: confirmed cleanup removes orphaned anisette state")
 		check(!ZagIsideloadBridge.isValidAnisetteScope("../x") && (try? state.remove(scope: "")) == nil,
 			  "anisette state: an invalid scope is refused before anything is deleted")
+		check((ZagAppleAccountsFeature.configuration().localState as? ZagBridgeAnisetteLocalState)?.service == ZagBridgeAnisetteKeychain.service,
+			  "anisette state: with the bridge, the production directory removes and lists the bridge's anisette state")
 	}
 }

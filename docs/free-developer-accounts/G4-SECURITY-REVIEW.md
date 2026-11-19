@@ -264,3 +264,17 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 
 ### I. Gates
 - [ ] Section 8 holds on the commits reviewed. Run `scripts/test-zag-apple-bridge.sh`, `scripts/test-zag-free-account-release-binary.sh` on a Release build, and `scripts/test-zag-isideload-fork.sh`.
+
+### J. Recovery screens and Release gating (#28, owner decisions 20 Nov)
+- [ ] Check Again (`checkUnresolvedCertificateRequest`) only reads the certificate listing: it never submits a request or revokes, acts only if the journal is unchanged after the listing returns, and changes nothing on cancellation, sign-out or network failure.
+- [ ] Abandon (`abandonUnresolvedCertificateRequest`) needs confirmation in the UI, warns that an issued certificate may still occupy a slot, removes only the pending key and journal, and works signed out (local only).
+- [ ] An unresolved request is never retried in the background (`ZagFreeAccountLifecycle.reason` maps it to `signingFailed`), and signing stops as unresolved until it is settled.
+- [ ] Every outcome is reported to the user (`ZagCertificateRecoveryModel.message`): recovered, not issued, still unresolved, abandoned, nothing pending, could not check.
+- [ ] Stored Account Data and Certificate Request are Release code; Settings reaches them only `if ZagAppleAccountsFeature.isEnabled` (`false`). The Release scan checks the gate, the files and the entry placement.
+- [ ] Removal of signed-out and expired accounts is local and complete (keys, anisette state, secrets); registered accounts are never listed as orphaned.
+
+### Commit set for this review (20 Nov)
+- PR #26 (fork) `4b1a6984`: unchanged since G2 was prepared.
+- PR #28 `64de6694` (base `main` `e077cf04`).
+- PR #29: the head named in its description. It contains #28 `64de6694` through merge commits only, plus the bridge commits.
+- Merge order if approved: #26, then #28, then #29. Nothing is merged before the independent G2 and G4 reviews.

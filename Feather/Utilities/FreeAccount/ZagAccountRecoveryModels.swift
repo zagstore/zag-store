@@ -18,8 +18,19 @@ enum ZagAppleAccountsFeature {
 		ZagAccountDirectory(
 			anisette: ZagNoAnisetteSource(),
 			secrets: ZagKeychainFreeAccountSecretStore(),
-			preferences: ZagUserDefaultsPreferences()
+			preferences: ZagUserDefaultsPreferences(),
+			configuration: configuration()
 		)
+	}
+
+	/// With the bridge compiled in, its anisette state is each account's local
+	/// state: listed when orphaned, removed with its account.
+	static func configuration() -> ZagAccountDirectory.Configuration {
+		var configuration = ZagAccountDirectory.Configuration()
+		#if ZAG_APPLE_BRIDGE
+		configuration.localState = ZagBridgeAnisetteLocalState()
+		#endif
+		return configuration
 	}
 }
 
