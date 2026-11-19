@@ -170,6 +170,11 @@ enum ZagIsideloadBridge {
 		return "a" + SHA256.hash(data: Data(normalised.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
 	}
 
+	/// Matches the bridge's own check (`valid_anisette_scope`).
+	static func isValidAnisetteScope(_ scope: String) -> Bool {
+		(1...64).contains(scope.count) && scope.allSatisfy { ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" }
+	}
+
 	static func signIn(slot: ZagBridgeSlot, appleID: String, password: ZagEphemeralSecret) throws -> ZagBridgeEvents {
 		let email = Array(appleID.utf8)
 		let scope = anisetteScope(forAppleID: appleID)
@@ -361,7 +366,13 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 	}
 
 	private static func certificate(_ c: Certificate) -> ZagDevelopmentCertificate {
-		ZagDevelopmentCertificate(serialNumber: c.serialNumber, name: c.name, machineName: c.machineName, expiresAt: Date(timeIntervalSince1970: c.expiresAt))
+		ZagDevelopmentCertificate(
+			serialNumber: c.serialNumber, name: c.name, machineName: c.machineName,
+			expiresAt: Date(timeIntervalSince1970: c.expiresAt),
+			// Undecodable data counts as absent: the certificate is then not
+			// recognised by key, which is the cautious outcome.
+			data: c.data.flatMap { Data(base64Encoded: $0) }.flatMap { $0.isEmpty ? nil : $0 }
+		)
 	}
 
 	func devices(team: String) async throws -> [ZagRegisteredDevice] {
@@ -484,6 +495,49 @@ enum ZagBridgeAnisetteKeychain {
 		guard let value else { return }
 		value.update(repeating: 0, count: length)
 		value.deallocate()
+	}
+}
+
+/// The anisette state as each account's local state: the directory records an
+/// account's scope at sign-in and removes the scope's items with the account.
+/// Items are found only under this service; the scope is the part of the item
+/// name before the first "/".
+struct ZagBridgeAnisetteLocalState: ZagAccountLocalState {
+	var service = ZagBridgeAnisetteKeychain.service
+
+	func scope(forAppleID appleID: String) -> String { ZagIsideloadBridge.anisetteScope(forAppleID: appleID) }
+
+	private func names() throws -> [String] {
+		let query: [String: Any] = [
+			kSecClass as String: kSecClassGenericPassword,
+			kSecAttrService as String: service,
+			kSecMatchLimit as String: kSecMatchLimitAll,
+			kSecReturnAttributes as String: true,
+		]
+		var result: CFTypeRef?
+		let status = SecItemCopyMatching(query as CFDictionary, &result)
+		if status == errSecItemNotFound { return [] }
+		guard status == errSecSuccess, let items = result as? [[String: Any]] else { throw ZagAccountError.storage }
+		return items.compactMap { $0[kSecAttrAccount as String] as? String }
+	}
+
+	func scopes() throws -> Set<String> {
+		Set(try names().compactMap { name in
+			name.firstIndex(of: "/").map { String(name[..<$0]) }.flatMap { ZagIsideloadBridge.isValidAnisetteScope($0) ? $0 : nil }
+		})
+	}
+
+	func remove(scope: String) throws {
+		guard ZagIsideloadBridge.isValidAnisetteScope(scope) else { throw ZagAccountError.storage }
+		for name in try names() where name.hasPrefix(scope + "/") {
+			let status = SecItemDelete([
+				kSecClass as String: kSecClassGenericPassword,
+				kSecAttrService as String: service,
+				kSecAttrAccount as String: name,
+			] as CFDictionary)
+			guard status == errSecSuccess || status == errSecItemNotFound else { throw ZagAccountError.storage }
+		}
+		guard try !scopes().contains(scope) else { throw ZagAccountError.storage }
 	}
 }
 #endif

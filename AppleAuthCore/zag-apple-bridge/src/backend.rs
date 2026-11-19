@@ -176,7 +176,8 @@ pub struct Certificate {
     pub machine_name: Option<String>,
     /// Unix seconds.
     pub expires_at: u64,
-    /// DER, base64; present for a certificate just issued.
+    /// DER, base64; present for a certificate just issued, and in a listing
+    /// when the portal includes it.
     pub data: Option<String>,
 }
 

@@ -56,7 +56,7 @@ Results flow back as JSON events: `codeRequired`, `signedIn`, `result` or `faile
 | Apple Account password | Swift `ZagEphemeralSecret`, then copied into a Rust `Zeroizing<String>`; the fork borrows it as `&str` | One sign-in, including the wait for a code | Swift wipes it when the operation ends. Rust's copy is zeroised when the sign-in future ends or is cancelled. The fork's derived buffers are zeroised (`PROVENANCE.md`). **Never stored.** |
 | Verification code | Swift `String`, then Rust `Zeroizing<String>`, then the fork | One answer | Rust's copy is zeroised. **Residual:** the fork passes the code by value into an HTTP header, which cannot be wiped. |
 | Session (credential) | A token Swift stores in the this-device-only Keychain (`ZagFreeAccountSecretKind.session`). The bridge's token is opaque base64 of `{adsid, developer-services token, duration, expiry}`. | Until it expires, the user signs out, or the account is removed | The bridge zeroises its event buffers after delivery, and its copy of the credential when the cached session is dropped. Swift zeroes the JSON it sends. **Residual:** Swift `String` copies of the token cannot be wiped. |
-| Anisette device state | The Keychain (`ZagStore.anisette.bridge`), `AfterFirstUnlockThisDeviceOnly`, never synchronised; each item is named `<account's anisette scope>/<key>` | Device lifetime (not yet removed with the account: see section 4) | **One device state per Apple Account** (owner decision, 19 Nov). Opaque to Zag Store. |
+| Anisette device state | The Keychain (`ZagStore.anisette.bridge`), `AfterFirstUnlockThisDeviceOnly`, never synchronised; each item is named `<account's anisette scope>/<key>` | Until the account is removed (its scope is in the account's ownership record), or until the user removes it as orphaned (Stored Account Data) | **One device state per Apple Account** (owner decision, 19 Nov). Opaque to Zag Store. |
 | Signing key | A Keychain key item per account and team (PR #28), `AfterFirstUnlockThisDeviceOnly`, not synchronised | Until the account is removed (its key items are deleted then), or replaced when a new certificate is needed | Zag Store never exports it: it is used only through `SecKeyCreateSignature`. **Not hardware-enforced:** iOS does not enforce `kSecAttrIsExtractable: false` for software RSA keys, and the Secure Enclave cannot hold RSA-2048. Code in the app's process could export it. The exporting test factory is `DEBUG`-only, and the release scan checks it is absent. |
 
 **Not kept anywhere:**
@@ -81,19 +81,31 @@ Results flow back as JSON events: `codeRequired`, `signedIn`, `result` or `faile
   - Every key the anisette provider stores is prefixed with that scope, so no account reads or writes another's device state.
   - The scope is kept inside the session token, so portal sessions reopen with the device state their sign-in used.
   - A missing or malformed scope is refused. There is no shared default.
-- **What is still shared.**
-  - **The backend configuration.** One anisette provider URL and **one device serial** for all accounts. If the serial is unique to this device, it links the accounts to each other at the provider and possibly at Apple. G3 must choose a value that identifies nobody (for example a common value), or make it per account.
-  - **The client's network identity.** The IP address is the same for every account.
+- **Removal (20 Nov).**
+  - At sign-in, the account directory (#28) records the account's anisette scope in its ownership record (`localStateScopes`).
+  - `ZagBridgeAnisetteLocalState` makes the anisette Keychain the directory's `ZagAccountLocalState`.
+  - Removing an account deletes, in order: its key items, the items of each recorded scope, then its secrets.
+  - If the anisette items cannot be deleted, removal fails with `localStateNotRemoved` and the account stays, record included. Removing it again finishes.
+  - Scopes with items that no account's record names (an earlier installation, an interrupted removal) are listed in Stored Account Data and removed only on confirmation.
+  - Scopes are validated before anything is deleted.
+- **Privacy: per-account state does not make accounts unlinkable.**
+  - Per-account state stops one account's anisette state being read, overwritten or deleted by another. It does **not** make the accounts unlinkable, and Zag Store does not claim it does.
+  - Accounts used from the same device can still be correlated by:
+    - **the device serial:** one value is configured for all accounts. If it is unique to this device, the provider and possibly Apple can link every account that uses it;
+    - **the IP address:** the same for every account at any moment, seen by Apple and by the anisette provider;
+    - **any persistent pseudonymous identifier** the provider or Apple's protocol keeps or derives (for example a provider-side device or client identifier, or timing and usage patterns), whether or not it is visible to Zag Store;
+    - **the anisette provider itself:** one provider sees requests for every account.
+  - Choosing the provider and the serial (shared, common or per account) is left to **G3**. Nothing in #28 or #29 decides it.
 - **Stop condition (owner, 19 Nov).** If the chosen provider requires one device identity shared by all accounts, this is a privacy trade-off. It comes back to the owner before the experiment.
-- **Not yet done.**
-  - A removed account's anisette items are not deleted. The account directory (#28) does not know the scope. Wiring this needs #28 and #29 together, for example by recording the scope in the account's ownership record.
-  - Anisette items of an earlier installation are not listed by the orphan cleanup either.
 
 **Tests (Swift):**
 - two accounts in one directory;
 - the second account does not see the first account's device;
 - a portal bound to one account refuses the other account's session;
-- each account signs in with its own anisette scope (the scripted backend refuses another's); the scope is a hash, the same for the same address in any case.
+- each account signs in with its own anisette scope (the scripted backend refuses another's); the scope is a hash, the same for the same address in any case;
+- the scope is recorded at sign-in; removing the account deletes exactly its anisette items; orphaned state is listed and removed only on confirmation; invalid scopes are refused (5 checks, on a test-only Keychain service).
+
+**Tests (#28, a fake local state):** a failing anisette removal is reported, the account and record stay, and a repeated removal finishes; another account's state is never removed.
 
 **Tests (Rust):** the same checks, plus rebinding.
 - A sign-in without a scope, with a malformed one, or with another account's is refused.
@@ -166,6 +178,8 @@ None of these can be settled without Apple's services. Each is marked `EXPERIMEN
 | 3 | **Finding a newly issued certificate by its request's identifier** | Not found: `malformed`, and nothing is stored. Found but wrong: the provisioner's proof-of-possession check (the certificate's public key must verify a signature made by this account and team's Keychain key) fails, so nothing is stored. A listing with any certificate lacking a serial or expiry now fails as a whole: dropping it would hide a certificate from the certificate plan and could waste the quota. | `ZagKeychainSigningKeyFactory.check`; PR #28 strict integration (wrong certificate refused); `live.rs` certificates listing |
 | 4 | **Certificate request format** (PEM, as upstream) | Apple refuses the request (`refused`), and nothing is created locally beyond the key, which is replaced on the next attempt. A certificate issued for anything else fails the possession check (3). | As in 3 |
 | 5 | **Anisette device serial** | **Changed:** there is no default any more (it was `"0"`). `configureLive(anisetteURL:deviceSerial:)` must be given a serial: 1–32 letters or digits, decided with the G3 provider. Missing or malformed: configuration is refused. | Rust live gate test (missing, empty and malformed serials refused); `valid_serial` unit test |
+| 6 | **Certificate content in the listing** (`cert_content` of `listAllDevelopmentCerts`) | The bridge passes it when present. Without it, a certificate whose issue response was lost cannot be recognised by key, so provisioning stops with `certificateRequestUnresolved` and requests nothing more, until the user abandons the request. Nothing is revoked. | 7 strict integration "recovery" checks (#28); bridge listing check; Rust live build |
+| 7 | **Whether every alias of an Apple Account returns the same `adsid`** | Not assumed. A known account reached through an unrecorded address is refused (`addressNotRecognised`); nothing is merged or stored. | Accounts checks "aliases" (#28) |
 
 **Fixed values that also fail closed:**
 - **Verification codes are 6 digits.** A code of another length is refused locally (`ZagTwoFactorPrompt.normalisedCode`), so a different length stops the sign-in.
@@ -180,7 +194,7 @@ None of these can be settled without Apple's services. Each is marked `EXPERIMEN
    - the code in an HTTP header;
    - the token in ordinary heap memory inside the fork while a session object exists.
 2. Should the anisette host be pinned?
-3. *(Decided by the owner, 19 Nov: per-account anisette state, implemented.)* Is the remaining shared configuration acceptable? That is the one device serial and the one provider (section 4).
+3. *(Decided by the owner, 19 Nov: per-account anisette state, implemented.)* Is the remaining shared configuration acceptable? That is the one device serial and the one provider (section 4). Per-account state does not give unlinkability: the serial, the IP address and any persistent pseudonymous identifier can correlate accounts. The provider and serial are G3 decisions.
 4. Is the binding rule (first use binds a restored slot) sufficient? Should a portal also check the credential against the directory's account record?
 5. Anything in sections 2–8 to change before the experiment build is made?
 
@@ -210,6 +224,9 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 - [ ] A bound slot refuses another account's credential. Rebinding drops the cached session (`slot.rs` `finish_sign_in`, `portal`).
 - [ ] Portal operations stay within the account's teams. Signing needs `ZagSigningAuthorization` for exactly one account and team (#28).
 - [ ] Anisette state is per account: the scope is required, prefixed to every storage key, and carried in the token (`live.rs` `KeychainStorage`, `StoredToken`). The remaining shared configuration is in question 3.
+- [ ] No document or UI claims that per-account anisette state makes accounts unlinkable (section 4, "Privacy").
+- [ ] Removing an account removes its anisette items (`ZagBridgeAnisetteLocalState`, `ZagAccountDirectory.remove`); a failure leaves the account removable again; orphaned scopes are listed and removed only on confirmation.
+- [ ] Aliases (#28): a known account reached through an address not recorded for it is refused (`addressNotRecognised`); nothing is merged or stored. Apple's `adsid` is SRP-authenticated, but whether aliases share it is not established.
 
 ### C. Keychain accessibility and key exportability (#28)
 - [ ] Every item is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and not synchronised: sessions and identities (`ZagKeychainFreeAccountSecretStore`), signing keys (`ZagKeychainSigningKeys`) and anisette state (`ZagBridgeAnisetteKeychain`).
@@ -218,6 +235,8 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 - [ ] Lifecycle (`SIGNING-KEY-SECURITY.md` in #28, "Signing-key lifecycle review"): switching, sign-out, removal, missing key, restore.
 - [ ] L2, transactional identity creation (#28): a new key in its own slot; one identity write publishes it, only after proof of possession; the journal and bounded retries; abandoned keys removed; no Keychain retagging.
 - [ ] L1, reinstall (#28): the ownership record is written before anything else; recovery only after a sign-in Apple accepted for the same account; ambiguous records unused; cleanup lists, then removes only confirmed accounts still orphaned; nothing deleted at launch; enumeration only of Zag Store's own service and key labels.
+- [ ] Cleanup revalidation (#28): each item is checked again immediately before deletion (still orphaned, ownership unchanged since confirmation); removed, skipped and failed are reported separately. The Debug page Settings → Apple Accounts → Stored Account Data asks for confirmation and never runs by itself.
+- [ ] Certificate request recovery (#28): the journal is marked unconfirmed before sending; a lost response is resolved only by proof of possession against listed certificate data; otherwise `certificateRequestUnresolved` stops further requests until the user abandons the request; nothing is ever revoked (the portal interface has no revoke operation). The bridge passes listed certificate content (`live.rs` `Certificates`); whether Apple includes it is not established.
 
 ### D. Two-factor handling
 - [ ] Codes are digits only, checked in Swift and again in Rust. Retries are limited to 3 (the authenticator). A code after the backend ends the sign-in does not sign in.

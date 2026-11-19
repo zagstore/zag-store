@@ -14,6 +14,7 @@ final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? { lock.withLock { items[key(kind, account, team)] } }
 	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items[key(kind, account, team)] = nil } }
 	func deleteAll(account: UUID) throws { lock.withLock { items = items.filter { !$0.key.hasPrefix("\(account).") } } }
+	func accountIDs() throws -> Set<UUID> { lock.withLock { Set(items.keys.compactMap { UUID(uuidString: String($0.prefix(36))) }) } }
 	var allBytes: Data { lock.withLock { items.values.reduce(Data(), +) } }
 }
 
@@ -38,7 +39,7 @@ func team(_ id: String) -> [String: Any] { ["identifier": id, "name": "Personal 
 
 let script: [String: Any] = ["accounts": [
 	["email": "one@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC1", "teams": [team("BRTEAM0001")],
-	 "issuedCertificate": issuedCertificate.base64EncodedString(),
+	 "issuedCertificate": issuedCertificate.base64EncodedString(), "listsCertificateContent": true,
 	 "anisetteScope": ZagIsideloadBridge.anisetteScope(forAppleID: "one@bridge.invalid")],
 	["email": "two@bridge.invalid", "password": passwordTwo, "accountIdentifier": "BRIDGEACC2", "teams": [team("BRTEAM0002")],
 	 "anisetteScope": ZagIsideloadBridge.anisetteScope(forAppleID: "two@bridge.invalid")],
@@ -54,8 +55,9 @@ let script: [String: Any] = ["accounts": [
 	 "teams": [["identifier": "BRTEAM0010", "name": "Team", "kind": "unknown"]]],
 ]]
 
-func makeDirectory(secrets: MemorySecrets, diagnostics: ZagFreeAccountDiagnostics) -> ZagAccountDirectory {
+func makeDirectory(secrets: MemorySecrets, diagnostics: ZagFreeAccountDiagnostics, localState: ZagAccountLocalState? = nil) -> ZagAccountDirectory {
 	var configuration = ZagAccountDirectory.Configuration()
+	configuration.localState = localState
 	configuration.namespace = "ZagStore.bridge-test.\(UUID().uuidString)"
 	configuration.authenticator = .init(operationTimeout: 5, twoFactorWindow: 600, maximumCodeAttempts: 3)
 	configuration.makeService = { ZagIsideloadAuthenticationService() }
@@ -226,7 +228,10 @@ struct ZagAppleBridgeTests {
 		check(appID?.bundleIdentifier == "com.example.bridge.notes" && appID?.expiresAt != nil, "portal: an App ID is registered, with its expiry")
 		let issued = try? await portalOne.submitCertificateRequest(ZagCertificateRequest(data: Data("CSR".utf8)), team: "BRTEAM0001")
 		check(issued?.data == issuedCertificate, "portal: an issued certificate is returned with its DER data")
-		check((try? await portalOne.certificates(team: "BRTEAM0001"))?.count == 1, "portal: the certificate is listed")
+		let listed = try? await portalOne.certificates(team: "BRTEAM0001")
+		check(listed?.count == 1, "portal: the certificate is listed")
+		check(listed?.first?.data == issuedCertificate,
+			  "portal: a listing that includes certificate content passes it on, so a lost issue response can be recognised by key")
 		do {
 			_ = try await portalOne.profile(for: appID!, team: "BRTEAM0001")
 			check(false, "portal: profile")
@@ -280,6 +285,8 @@ struct ZagAppleBridgeTests {
 			check(error as? ZagPortalError == .sessionRejected, "portal: an account without a stored session must sign in again")
 		}
 
+		await anisetteStateFollowsTheAccount()
+
 		// Secrets and diagnostics.
 		let everything = secrets.allBytes
 		for secret in [passwordOne, passwordTwo, deviceCode, smsCode] {
@@ -296,5 +303,44 @@ struct ZagAppleBridgeTests {
 			  "diagnostics: credentials describe themselves without the token")
 
 		print("SUCCESS: \(passed) Apple bridge integration checks passed")
+	}
+
+	/// The bridge's anisette Keychain items (named `<scope>/<key>`, as the live
+	/// storage names them) are each account's local state: recorded at sign-in,
+	/// removed with the account, and listed when no account owns them. A test
+	/// service keeps this apart from the app's own items.
+	static func anisetteStateFollowsTheAccount() async {
+		let service = "ZagStore.anisette.bridge-test.\(UUID().uuidString)"
+		let state = ZagBridgeAnisetteLocalState(service: service)
+		func plant(_ name: String) {
+			SecItemAdd([
+				kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+				kSecAttrAccount as String: name, kSecValueData as String: Data("opaque".utf8),
+			] as CFDictionary, nil)
+		}
+		defer { SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service] as CFDictionary) }
+		let scopeTwo = ZagIsideloadBridge.anisetteScope(forAppleID: "two@bridge.invalid")
+		let stray = "a" + String(repeating: "0", count: 32)
+		plant("\(scopeTwo)/adi.pb"); plant("\(scopeTwo)/device.json"); plant("\(stray)/adi.pb")
+
+		let secrets = MemorySecrets()
+		let directory = makeDirectory(secrets: secrets, diagnostics: ZagFreeAccountDiagnostics(), localState: state)
+		let signIn = await directory.newSignIn()
+		guard let account = signedInAccount(await signIn.signIn(appleID: "two@bridge.invalid", password: ZagEphemeralSecret(passwordTwo))),
+			  (try? await directory.adopt(signIn)) != nil else { return check(false, "anisette state: sign-in") }
+		check((try? ZagAccountKeyIndex.record(of: account, in: secrets))??.localStateScopes == [scopeTwo],
+			  "anisette state: the account's anisette scope is recorded with it at sign-in")
+		check((try? await directory.orphanedItems())?.localStateScopes == [stray],
+			  "anisette state: state no account's record names is listed as orphaned; the account's own is not")
+
+		var ledger = ZagRefreshLedger()
+		guard let plan = try? await directory.removalPlan(for: account, ledger: ledger),
+			  (try? await directory.remove(plan.confirm(.forgetRecords), ledger: &ledger)) != nil else { return check(false, "anisette state: removal") }
+		check((try? state.scopes()) == [stray], "anisette state: removing the account removes its anisette items, and only those")
+		let result = try? await directory.removeOrphanedItems(ZagOrphanedAccountItems(accounts: [], localStateScopes: [stray]))
+		check(result?.removedLocalState == [stray] && (try? state.scopes())?.isEmpty == true,
+			  "anisette state: confirmed cleanup removes orphaned anisette state")
+		check(!ZagIsideloadBridge.isValidAnisetteScope("../x") && (try? state.remove(scope: "")) == nil,
+			  "anisette state: an invalid scope is refused before anything is deleted")
 	}
 }

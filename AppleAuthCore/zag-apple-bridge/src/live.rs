@@ -385,6 +385,8 @@ impl PortalSession for LiveSession {
                 let certificates = self.session.list_ios_certs(&team(&t)).await.map_err(c)?;
                 // A certificate without a serial or an expiry fails the whole
                 // listing: dropping it would hide it from the certificate plan.
+                // Its content, when Apple includes it, lets a certificate whose
+                // issue response was lost be recognised by its key.
                 let listed = certificates
                     .into_iter()
                     .map(|cert| {
@@ -393,7 +395,7 @@ impl PortalSession for LiveSession {
                             name: cert.name.unwrap_or_default(),
                             machine_name: cert.machine_name,
                             expires_at: seconds(cert.expiration_date)?,
-                            data: None,
+                            data: cert.cert_content.map(|content| STANDARD.encode(content.as_ref() as &[u8])).filter(|encoded| !encoded.is_empty()),
                         })
                     })
                     .collect::<Option<Vec<_>>>()

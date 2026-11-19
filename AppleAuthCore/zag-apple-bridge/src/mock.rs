@@ -52,6 +52,10 @@ pub struct MockAccount {
     /// The anisette scope this account must be signed in with, if any.
     #[serde(default)]
     pub anisette_scope: Option<String>,
+    /// The certificate listing includes each certificate's content (whether
+    /// Apple's does is not established; by default the mock leaves it out).
+    #[serde(default)]
+    pub lists_certificate_content: bool,
 }
 
 fn none() -> String {
@@ -231,7 +235,8 @@ impl PortalSession for MockSession {
                     expires_at: now() + 7 * 86_400,
                     data: self.account.issued_certificate.clone(),
                 };
-                state.certificates.push(Certificate { data: None, ..certificate.clone() });
+                let listed = if self.account.lists_certificate_content { certificate.data.clone() } else { None };
+                state.certificates.push(Certificate { data: listed, ..certificate.clone() });
                 to_value(&certificate)
             }
             PortalRequest::Profile { team, .. } if team_ok(&team) => {
