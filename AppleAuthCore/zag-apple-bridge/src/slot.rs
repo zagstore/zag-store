@@ -64,6 +64,8 @@ struct Slot {
     /// The Apple Account this slot belongs to, once known.
     bound: Option<String>,
     signing_in: bool,
+    /// Only one portal request may run in a slot; cancellation is slot-wide.
+    portal_busy: bool,
     answers: Option<mpsc::UnboundedSender<CodeAction>>,
     /// Stops every running operation in this slot.
     cancels: Vec<oneshot::Sender<()>>,
@@ -132,7 +134,7 @@ pub fn sign_in(id: u64, anisette_scope: String, email: String, password: Zeroizi
     let (answers_tx, answers_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let started = with_slot(id, |slot| {
-        if slot.signing_in {
+        if slot.signing_in || slot.portal_busy {
             return Err(FailureKind::Busy.into());
         }
         slot.signing_in = true;
@@ -217,16 +219,25 @@ fn finish_sign_in(id: u64, account: Option<String>) {
 pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emit) {
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let prepared = with_slot(id, |slot| {
-        match &slot.bound {
-            Some(bound) if *bound != credential.account_identifier => return Err(FailureKind::InvalidInput.into()),
-            Some(_) => {}
-            // A session restored after launch binds the slot on first use.
-            None => slot.bound = Some(credential.account_identifier.clone()),
+        // A slot's cancellation is intentionally broad. Refuse overlapping
+        // operations rather than let one caller cancel another's mutation.
+        if slot.signing_in || slot.portal_busy {
+            return Err(FailureKind::Busy.into());
         }
+        if slot.bound.as_ref().is_some_and(|bound| *bound != credential.account_identifier) {
+            return Err(FailureKind::InvalidInput.into());
+        }
+        // Resolve the backend before mutating the slot. A disabled or absent
+        // backend must not leave the slot bound and permanently busy.
+        let backend = backend()?;
+        // A session restored after launch binds the slot on first use.
+        if slot.bound.is_none() {
+            slot.bound = Some(credential.account_identifier.clone());
+        }
+        slot.portal_busy = true;
         slot.cancels.push(cancel_tx);
-        Ok(slot.session.get_or_insert_with(Default::default).clone())
-    })
-    .and_then(|session| backend().map(|backend| (backend, session)));
+        Ok((backend, slot.session.get_or_insert_with(Default::default).clone()))
+    });
     let (backend, cache) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return send(&emit, failure(error.kind)),
@@ -251,16 +262,102 @@ pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emi
             result = run => result,
             _ = cancel_rx => Err(FailureKind::Cancelled.into()),
         };
-        let _ = with_slot(id, |slot| {
-            slot.cancels.retain(|cancel| !cancel.is_closed());
-            Ok(())
-        });
         match result {
             Ok(value) => json!({ "event": "result", "value": value }),
             Err(error) => failure(error.kind),
         }
     });
     runtime().spawn(async move {
-        send(&emit, task.await.unwrap_or_else(|_| failure(FailureKind::Malformed)));
+        // Always release the slot reservation, even if the worker panics.
+        // The callback receives its terminal event only after cleanup.
+        let event = task.await.unwrap_or_else(|_| failure(FailureKind::Malformed));
+        let _ = with_slot(id, |slot| {
+            slot.portal_busy = false;
+            slot.cancels.retain(|cancel| !cancel.is_closed());
+            Ok(())
+        });
+        send(&emit, event);
     });
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[cfg(not(any(feature = "live", feature = "mock")))]
+    #[test]
+    fn disabled_backend_does_not_reserve_or_bind_the_slot() {
+        let id = open();
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let collected = events.clone();
+        portal(
+            id,
+            Credential {
+                account_identifier: "test-account".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
+                expires_at: u64::MAX,
+            },
+            PortalRequest::Teams,
+            Box::new(move |bytes| {
+                collected.lock().unwrap().push(serde_json::from_slice(bytes).unwrap());
+            }),
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[json!({"event":"failed","kind":"disabled"})]
+        );
+        with_slot(id, |slot| {
+            assert!(!slot.portal_busy);
+            assert!(slot.bound.is_none());
+            assert!(slot.session.is_none());
+            assert!(slot.cancels.is_empty());
+            Ok(())
+        }).unwrap();
+        close(id);
+    }
+
+    #[test]
+    fn busy_portal_slot_rejects_overlapping_portal_and_sign_in() {
+        let id = open();
+        with_slot(id, |slot| {
+            slot.portal_busy = true;
+            Ok(())
+        }).unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let portal_events = events.clone();
+        portal(
+            id,
+            Credential {
+                account_identifier: "test-account".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
+                expires_at: u64::MAX,
+            },
+            PortalRequest::Teams,
+            Box::new(move |bytes| {
+                portal_events.lock().unwrap().push(serde_json::from_slice(bytes).unwrap());
+            }),
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[json!({"event":"failed","kind":"busy"})]
+        );
+
+        let sign_in_events = events.clone();
+        sign_in(
+            id,
+            "atest".to_string(),
+            "test@example.invalid".to_string(),
+            Zeroizing::new("not-a-real-password".to_string()),
+            Box::new(move |bytes| {
+                sign_in_events.lock().unwrap().push(serde_json::from_slice(bytes).unwrap());
+            }),
+        );
+        assert_eq!(
+            events.lock().unwrap().last(),
+            Some(&json!({"event":"failed","kind":"busy"}))
+        );
+        close(id);
+    }
 }

@@ -139,11 +139,33 @@ pub(crate) fn valid_serial(serial: &str) -> bool {
     !serial.is_empty() && serial.len() <= 32 && serial.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Reject unsafe anisette endpoints before constructing a provider, not only
+/// when its HTTP or WebSocket client attempts a connection.
+fn validate_anisette_url(raw: &str) -> Result<(), Report> {
+    // URL parsers normalize an explicit :443 away. Reject explicit authority
+    // ports from the raw input before parsing so the policy is unambiguous.
+    let authority = raw
+        .strip_prefix("https://")
+        .ok_or_else(|| rootcause::report!(PolicyError::NotSecure))?
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains(':') {
+        return Err(rootcause::report!(PolicyError::HostNotAllowed).into());
+    }
+    let url = reqwest::Url::parse(raw)
+        .map_err(|_| rootcause::report!(PolicyError::InvalidUrl))?;
+    let host = isideload::net_policy::host_of(raw)?;
+    isideload::net_policy::check_url(&url, &[host], "https")
+        .map_err(|error| rootcause::report!(error))?;
+    Ok(())
+}
+
 impl IsideloadBackend {
     pub fn new(anisette_url: &str, device_serial: &str, storage: ZagBridgeStorage) -> Result<Self, Report> {
-        // The provider accepts only an https URL; its host becomes its client's
-        // only allowed host.
-        isideload::net_policy::host_of(anisette_url)?;
+        // Apply the complete URL policy at configuration time. The provider
+        // also checks every outbound HTTP and WebSocket request.
+        validate_anisette_url(anisette_url)?;
         if !valid_serial(device_serial) {
             return Err(rootcause::report!("device serial"));
         }
@@ -517,6 +539,20 @@ mod tests {
         for scope in ["", "has space", "a/b", &"a".repeat(65)] {
             assert!(KeychainStorage::new(storage, scope).is_err(), "scope {scope:?} is refused");
         }
+    }
+
+    #[test]
+    fn anisette_configuration_rejects_unsafe_urls() {
+        for url in [
+            "http://anisette.example/v3",
+            "https://user:secret@anisette.example/v3",
+            "https://anisette.example:8443/v3",
+            "https://anisette.example:443/v3",
+            "https://",
+        ] {
+            assert!(validate_anisette_url(url).is_err(), "accepted {url:?}");
+        }
+        assert!(validate_anisette_url("https://anisette.example/v3").is_ok());
     }
 
     #[test]
