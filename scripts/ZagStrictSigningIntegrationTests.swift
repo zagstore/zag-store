@@ -265,5 +265,26 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 			check(error as? ZagFreeAccountSigningError == .keychainKeyMissing,
 				  "Keychain keys: a missing key item fails clearly, with no fallback to a key file")
 		}
+		// Provisioning again does not reuse the identity whose key is gone: it
+		// makes a new key and certificate.
+		guard case .success(let renewed) = await provisioner.provision(request, authorization: authorization),
+			  let replacement = secrets.identity(account, team) else { return check(false, "provisioning after a lost key") }
+		check(renewed.changes.createdCertificate && replacement.serialNumber != identity.serialNumber
+			  && replacement.keyIsInKeychain && (try? keys.key(account: account, team: team)) != nil,
+			  "Keychain keys: an identity whose key is missing is not reused; a new key and certificate are made")
+
+		// Removing the account removes its key items in the directory's namespace.
+		let directoryKeys = ZagKeychainSigningKeys(namespace: ZagFreeAccountSimulation.accountsNamespace)
+		_ = try? directoryKeys.create(account: account, team: team, commonName: "Removal test")
+		defer { try? directoryKeys.deleteAll(account: account) }
+		var ledger = ZagRefreshLedger()
+		do {
+			let plan = try await directory.removalPlan(for: account, ledger: ledger)
+			try await directory.remove(plan.confirm(.forgetRecords), ledger: &ledger)
+			check((try? directoryKeys.key(account: account, team: team)) == nil && secrets.identity(account, team) == nil,
+				  "Keychain keys: removing the account removes its signing key items and identities")
+		} catch {
+			check(false, "account removal: \(error)")
+		}
 	}
 }

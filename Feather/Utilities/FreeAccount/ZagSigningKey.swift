@@ -270,6 +270,10 @@ enum ZagIssuedCertificateCheck: Equatable, Sendable {
 	case notInspected
 }
 
+#if DEBUG
+// Tests only: this factory exports the private key as bytes (for the key-file
+// signing path, which the adapter refuses unless allowed). Release builds have
+// only the Keychain factory, which never exports a key.
 /// RSA 2048 keys from the Security framework. The key is created in memory,
 /// not in the Keychain; the caller keeps the exported key in
 /// `ZagSigningIdentity`, in the non-synchronizing Keychain.
@@ -304,3 +308,4 @@ struct ZagSecuritySigningKeyFactory: ZagSigningKeyFactory {
 		return .matches(serialNumber: inspection.serialNumber, expiresAt: inspection.expiresAt)
 	}
 }
+#endif

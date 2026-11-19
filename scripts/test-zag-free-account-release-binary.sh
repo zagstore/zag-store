@@ -27,7 +27,7 @@ done
 # Zsign itself exposes `signComponents` from f34e51a on, so the library name
 # is in every build; Zag Store's caller (ZagStrictComponentSigning, compiled
 # only with ZAG_ZSIGN_STRICT) is what must be absent.
-for marker in ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
+for marker in ZagSecuritySigningKeyFactory ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
 	simulationOnly SIMULATED0002 SIMPAID001 ZagSimulatedAnisetteSource ZagAppleAccountsDebugView ZagAppleAccountsLab \
 	"Apple Accounts (Simulated)" ZagStrictComponentSigning "Installed Profiles (Read Only)" ZagInstalledProfilesProbe; do
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi

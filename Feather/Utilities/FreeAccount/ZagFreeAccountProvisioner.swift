@@ -319,15 +319,25 @@ actor ZagFreeAccountProvisioner {
 			.flatMap { $0 }
 			.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
 		let remote = try await call { try await portal.certificates(team: team) }
+		// The stored identity counts as "key on this device" only if its key is
+		// still there and still belongs to its certificate (a Keychain key can
+		// be missing after a reset, a restore or a removed item). Otherwise a
+		// new key and certificate are made instead of failing at signing.
+		let usable = stored.flatMap {
+			keys.check(certificate: $0.certificate, privateKey: $0.privateKey, account: request.accountID, team: team) == .mismatch ? nil : $0
+		}
+		if stored != nil && usable == nil {
+			diagnostics.record("Stored signing key missing or not matching its certificate; a new one is needed", at: now())
+		}
 		let plan = ZagCertificatePlan.make(
 			remote: remote,
-			localKeySerials: stored.map { [$0.serialNumber] } ?? [],
+			localKeySerials: usable.map { [$0.serialNumber] } ?? [],
 			limit: nil,
 			now: now()
 		)
 		switch plan {
 		case .reuse(let serial):
-			guard let stored, stored.serialNumber == serial else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate) }
+			guard let stored = usable, stored.serialNumber == serial else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate) }
 			return stored
 		case .userMustRevoke(let candidates):
 			throw ZagProvisioningFailure(kind: .certificateMustBeRevoked(candidates: candidates), step: .certificate)

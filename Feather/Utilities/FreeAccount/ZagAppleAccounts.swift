@@ -208,6 +208,11 @@ actor ZagAccountDirectory {
 		var authenticator = ZagFreeAccountAuthenticator.Configuration()
 		/// How long a signing authorisation lasts.
 		var authorizationLifetime: TimeInterval = 600
+
+		/// The Keychain key items of this directory's accounts. The provisioner's
+		/// `ZagKeychainSigningKeyFactory` must use these, so that removing an
+		/// account removes its keys.
+		var signingKeys: ZagKeychainSigningKeys { ZagKeychainSigningKeys(namespace: namespace) }
 	}
 
 	private let service: ZagAppleAuthenticationService
@@ -388,7 +393,8 @@ actor ZagAccountDirectory {
 	}
 
 	/// Removes the account after confirmation: its session, every Keychain
-	/// item (all teams' signing identities), its summary and its record.
+	/// item (all teams' signing identities and signing key items), its
+	/// summary and its record.
 	/// Its apps are never moved to another account; they keep their owner
 	/// and stop refreshing, or are forgotten. Other accounts are untouched.
 	func remove(_ confirmation: ZagAccountRemovalPlan.Confirmation, ledger: inout ZagRefreshLedger) async throws {
@@ -397,6 +403,9 @@ actor ZagAccountDirectory {
 		if let authenticator = authenticators[confirmation.accountID] {
 			await authenticator.cancel()
 		}
+		// Keys first: if the Keychain refuses, nothing has been removed yet and
+		// the removal can be repeated.
+		try configuration.signingKeys.deleteAll(account: confirmation.accountID)
 		try secrets.deleteAll(account: confirmation.accountID)
 		sessionStore.remove(account: confirmation.accountID)
 		authenticators[confirmation.accountID] = nil
