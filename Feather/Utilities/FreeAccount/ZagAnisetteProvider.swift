@@ -207,7 +207,12 @@ protocol ZagAnisetteSource: Sendable {
 enum ZagAnisetteLive {
 	/// No live provider is implemented or enabled in this phase. Enabling one
 	/// needs the provider evaluation and the supervised test plan.
+	#if ZAG_LIVE_EXPERIMENT && ZAG_APPLE_BRIDGE && ZAG_ZSIGN_STRICT && !DEBUG
+	/// G5 experiment build only (plan §3.2): the G3 provider through the bridge.
+	static let isEnabled = true
+	#else
 	static let isEnabled = false
+	#endif
 }
 
 /// Stands in for every configured provider while live providers are disabled.

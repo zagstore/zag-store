@@ -1,4 +1,4 @@
-#if DEBUG
+#if DEBUG || ZAG_LIVE_EXPERIMENT
 import SwiftUI
 
 // Debug builds only: reads the provisioning profiles installed on this
@@ -130,7 +130,11 @@ final class ZagInstalledProfilesProbe: ObservableObject {
 		var lines = ["Zag Store installed-profile read-back test"]
 		switch phase {
 		case .idle, .reading: lines.append("Not finished")
-		case .failed(let message): lines.append("Read failed: \(message)")
+		case .failed(let message):
+			lines.append("Read failed: \(message)")
+			#if ZAG_LIVE_EXPERIMENT
+			lines.append("G5 read-back: unavailable (the device's profiles could not be read)")
+			#endif
 		case .done:
 			lines.append("Profiles returned: \(profiles.count); readable: \(readable.count); unreadable: \(profiles.count - readable.count)")
 			lines.append("Fields present: UUID \(field { $0.uuid != nil }), team \(field { $0.team != nil }), App ID \(field { $0.appID != nil }), expiry \(field { $0.expires != nil })")
@@ -139,6 +143,10 @@ final class ZagInstalledProfilesProbe: ObservableObject {
 			lines.append("Match: \(Self.describe(match))")
 			lines.append("Control, altered expiry (expect mismatch): \(Self.describe(alteredExpiry))")
 			lines.append("Control, absent profile (expect not verified): \(Self.describe(missingProfile))")
+			#if ZAG_LIVE_EXPERIMENT
+			// G5 (checklist M10): the four results, kept distinct.
+			lines.append("G5 read-back: \(match.map { ZagExperimentReadback.classify($0, readSucceeded: true).rawValue } ?? "not run")")
+			#endif
 		}
 		return lines.joined(separator: "\n")
 	}
@@ -298,4 +306,17 @@ struct ZagInstalledProfilesDebugView: View {
 		}
 	}
 }
+#if !DEBUG
+// The experiment build (no DEBUG) lacks the Debug sign-in screen's modifier.
+private extension View {
+	@ViewBuilder
+	func zagFreeAccountGlass<S: Shape>(in shape: S) -> some View {
+		if #available(iOS 26.0, *) {
+			self.glassEffect(.regular, in: shape)
+		} else {
+			self.background(.ultraThinMaterial, in: shape)
+		}
+	}
+}
+#endif
 #endif

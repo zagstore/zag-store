@@ -173,8 +173,18 @@ final class ZagCertificateRecoveryModel: ObservableObject {
 
 	func cancelCheck() { checkTask?.cancel() }
 
+	/// G5 E3: during the live experiment an unresolved request is never
+	/// abandoned; only Check Again is offered.
+	static var abandonDisabled: Bool {
+		#if ZAG_LIVE_EXPERIMENT
+		return true
+		#else
+		return false
+		#endif
+	}
+
 	func requestAbandon() {
-		guard phase == .idle, request != nil else { return }
+		guard phase == .idle, request != nil, !Self.abandonDisabled else { return }
 		outcome = nil
 		phase = .confirmingAbandon
 	}

@@ -115,8 +115,13 @@ protocol ZagDeveloperPortalService: Sendable {
 }
 
 enum ZagLivePortal {
+	#if ZAG_LIVE_EXPERIMENT && ZAG_APPLE_BRIDGE && ZAG_ZSIGN_STRICT && !DEBUG
+	/// G5 experiment build only (plan §3.2): the live portal, bounded by the campaign.
+	static let isEnabled = true
+	#else
 	/// The live developer-portal service is not implemented or enabled.
 	static let isEnabled = false
+	#endif
 }
 
 struct ZagDisabledDeveloperPortal: ZagDeveloperPortalService {

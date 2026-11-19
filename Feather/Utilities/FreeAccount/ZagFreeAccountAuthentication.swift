@@ -171,8 +171,13 @@ protocol ZagAppleAuthenticationService: Sendable {
 }
 
 enum ZagLiveAuthentication {
+	#if ZAG_LIVE_EXPERIMENT && ZAG_APPLE_BRIDGE && ZAG_ZSIGN_STRICT && !DEBUG
+	/// G5 experiment build only (plan §3.2): live sign-in, bounded by the campaign.
+	static let isEnabled = true
+	#else
 	/// Live Apple Account authentication is not implemented or enabled.
 	static let isEnabled = false
+	#endif
 }
 
 struct ZagDisabledAuthenticationService: ZagAppleAuthenticationService {

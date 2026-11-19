@@ -11,8 +11,13 @@ import ZsignSwift
 // RPPairing installer are unchanged.
 
 enum ZagFreeAccountSigning {
+	#if ZAG_LIVE_EXPERIMENT && ZAG_APPLE_BRIDGE && ZAG_ZSIGN_STRICT && !DEBUG
+	/// G5 experiment build only (plan §3.2): the campaign's one test app.
+	static let isEnabled = true
+	#else
 	/// Signing with Apple Account certificates is not enabled in this version.
 	static let isEnabled = false
+	#endif
 }
 
 /// Whether free-account signing may run. Release builds can only make the

@@ -243,12 +243,69 @@ actor ZagFreeAccountProvisioner {
 			return .success(result)
 		} catch let failure as ZagProvisioningFailure {
 			diagnostics.record("Provisioning failed at \(failure.step.rawValue): \(failure.message)", at: now())
+			experimentStop(failure.kind)
 			return .failure(failure)
 		} catch {
 			let failure = ZagProvisioningFailure(kind: Self.kind(for: error), step: currentStep ?? .request)
 			diagnostics.record("Provisioning failed at \(failure.step.rawValue): \(failure.message)", at: now())
+			experimentStop(failure.kind)
 			return .failure(failure)
 		}
+	}
+
+	// MARK: G5 experiment
+
+	/// G5 (plan §7.3): in the experiment build every provisioning failure is a
+	/// stop and halts the campaign, except a refusal by the campaign itself
+	/// (already recorded, and halted where its check requires) and a local
+	/// authorisation that lapsed before anything was sent.
+	private func experimentStop(_ kind: ZagProvisioningFailure.Kind) {
+		#if ZAG_LIVE_EXPERIMENT
+		let rule: ZagStopRule? = switch kind {
+		// A cancellation is a stop only between consume and the result, where
+		// the portal adapter has already halted.
+		case .unavailable, .notAuthorized, .invalidRequest, .cancelled: nil
+		case .certificateMustBeRevoked: .certificateMustBeRevoked
+		case .certificateRequestUnresolved: .certificateUnresolved
+		case .deviceLimitReached: .deviceLimit
+		case .appIDCapacityExhausted, .installSlotsFull: .appIDCapacity
+		case .identifierUnavailable: .identifierUnavailable
+		case .invalidProfile: .profileProblem
+		case .keyStorage, .sessionRejected, .network, .rateLimited, .unexpectedResponse, .timedOut: .ownerUnrecognised
+		}
+		if let rule { ZagLiveExperiment.campaign.halt(rule) }
+		#endif
+	}
+
+	private func experimentFailure(_ kind: ZagProvisioningFailure.Kind) -> String? {
+		#if ZAG_LIVE_EXPERIMENT
+		return ZagExperimentFailureMap.failure(kind)
+		#else
+		return nil
+		#endif
+	}
+
+	/// G5: one `cert.*` event (logging spec §4.7); nothing outside the experiment.
+	private func experimentEvent(_ name: String, outcome: String = "ok", failure: String? = nil, transition: String? = nil,
+								 result: String? = nil, count: Int? = nil, possession: Bool? = nil) {
+		#if ZAG_LIVE_EXPERIMENT
+		var fields: [String: ZagLogValue] = [:]
+		if let transition { fields["transition"] = .string(transition) }
+		switch name {
+		case "cert.recovery":
+			fields["action"] = .string("checkAgain")
+			if let result { fields["result"] = .string(result) }
+			if let count { fields["listingCount"] = .int(min(500, count)) }
+		case "cert.limit":
+			fields["reason"] = .string("certificateMustBeRevoked")
+			if let count { fields["candidateCount"] = .int(min(500, count)) }
+		case "cert.verify":
+			if let possession { fields["possessionMatch"] = .bool(possession) }
+		default:
+			if let count { fields["attempts"] = .int(min(10, count)) }
+		}
+		ZagLiveExperiment.logger?.record(name, outcome: outcome, failure: failure, fields: fields)
+		#endif
 	}
 
 	// MARK: Steps
@@ -422,6 +479,7 @@ actor ZagFreeAccountProvisioner {
 			guard let stored = usable, stored.serialNumber == serial else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate) }
 			return stored
 		case .userMustRevoke(let candidates):
+			experimentEvent("cert.limit", outcome: "blocked", failure: "portal.certificateLimit", count: candidates.count)
 			throw ZagProvisioningFailure(kind: .certificateMustBeRevoked(candidates: candidates), step: .certificate)
 		case .create:
 			// An earlier request whose outcome is unknown is settled first, from
@@ -439,6 +497,7 @@ actor ZagFreeAccountProvisioner {
 					try? secrets.save(try JSONEncoder().encode(settled), kind: .pendingSigningKey, account: request.accountID, team: team)
 				case .unknown:
 					diagnostics.record("An interrupted certificate request cannot be confirmed from the listing; nothing requested", at: now())
+					experimentEvent("cert.journal", outcome: "blocked", failure: "cert.unresolved", transition: "unresolved", count: earlier.attempts)
 					throw ZagProvisioningFailure(kind: .certificateRequestUnresolved, step: .certificate)
 				}
 			}
@@ -446,6 +505,7 @@ actor ZagFreeAccountProvisioner {
 			// (possibly still valid) stays in use until the new certificate is
 			// verified and stored.
 			var pending = try beginPendingKey(account: request.accountID, team: team, inUse: stored)
+			experimentEvent("cert.journal", transition: "pendingCreated", count: pending.attempts)
 			// Written ahead: if the app stops while the request is out, its
 			// outcome is treated as unknown.
 			pending.submissionUnconfirmed = true
@@ -454,6 +514,7 @@ actor ZagFreeAccountProvisioner {
 			} catch {
 				throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
 			}
+			experimentEvent("cert.journal", transition: "submissionUnconfirmedSet", count: pending.attempts)
 			let csr = ZagCertificateRequest(data: pending.request)
 			let issued: ZagIssuedCertificate
 			do {
@@ -461,11 +522,23 @@ actor ZagFreeAccountProvisioner {
 			} catch ZagPortalError.certificateLimitReached {
 				markNotIssued(pending, account: request.accountID, team: team)
 				let valid = remote.filter { $0.expiresAt > now() }.sorted { $0.expiresAt < $1.expiresAt }
+				experimentEvent("cert.limit", outcome: "blocked", failure: "portal.certificateLimit", count: valid.count)
 				throw ZagProvisioningFailure(kind: .certificateMustBeRevoked(candidates: valid), step: .certificate)
 			} catch let failure as ZagProvisioningFailure where failure.kind == .rateLimited || failure.kind == .sessionRejected {
 				// Apple refused the request: nothing was issued.
 				markNotIssued(pending, account: request.accountID, team: team)
 				throw failure
+			} catch {
+				#if ZAG_LIVE_EXPERIMENT
+				if let refusal = error as? ZagLiveExperimentRefusal {
+					// G5: refused by the campaign before anything was sent (E1);
+					// the request is settled as not issued.
+					markNotIssued(pending, account: request.accountID, team: team)
+					experimentEvent("cert.submit", outcome: "blocked", failure: ZagExperimentFailureMap.failure(refusal))
+					throw ZagProvisioningFailure(kind: .unavailable, step: .certificate)
+				}
+				#endif
+				throw error
 			}
 			// The certificate must be for the pending key. If not, this request is
 			// abandoned: nothing is published and the next attempt starts afresh.
@@ -474,9 +547,14 @@ actor ZagFreeAccountProvisioner {
 			case .matches(let inspectedSerial, let inspectedExpiry):
 				serial = inspectedSerial
 				expiresAt = inspectedExpiry
+				experimentEvent("cert.verify", possession: true)
 			case .notInspected:
-				break
+				experimentEvent("cert.verify", possession: false)
 			case .mismatch:
+				experimentEvent("cert.verify", outcome: "failed", failure: "cert.possessionMismatch", possession: false)
+				#if ZAG_LIVE_EXPERIMENT
+				ZagLiveExperiment.campaign.halt(.possessionMismatch)
+				#endif
 				abandon(pending, account: request.accountID, team: team)
 				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
 			}
@@ -493,12 +571,14 @@ actor ZagFreeAccountProvisioner {
 			} catch {
 				throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
 			}
+			experimentEvent("cert.journal", transition: "issuedRecorded", count: verified.attempts)
 			guard try finishPendingIdentity(account: request.accountID, team: team),
 				  let identity = (try? secrets.load(.signingPrivateKey, account: request.accountID, team: team))
 					.flatMap({ $0 })
 					.flatMap({ try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }) else {
 				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
 			}
+			experimentEvent("cert.swap")
 			changes.createdCertificate = true
 			diagnostics.record("Development certificate created", at: now())
 			return identity
@@ -532,6 +612,7 @@ actor ZagFreeAccountProvisioner {
 		var settled = pending
 		settled.submissionUnconfirmed = false
 		try? secrets.save(try JSONEncoder().encode(settled), kind: .pendingSigningKey, account: account, team: team)
+		experimentEvent("cert.journal", transition: "submissionUnconfirmedCleared", count: pending.attempts)
 	}
 
 	private func storedIdentity(account: UUID, team: String) -> ZagSigningIdentity? {
@@ -607,6 +688,7 @@ actor ZagFreeAccountProvisioner {
 			remote = try await call { try await portal.certificates(team: team) }
 		} catch let failure as ZagProvisioningFailure {
 			diagnostics.record("Check Again could not read the certificate listing: \(failure.message)", at: now())
+			experimentEvent("cert.recovery", outcome: "failed", failure: experimentFailure(failure.kind), result: "checkFailed")
 			return .checkFailed(failure.kind)
 		} catch {
 			return .checkFailed(Self.kind(for: error))
@@ -627,13 +709,16 @@ actor ZagFreeAccountProvisioner {
 				return .checkFailed(.keyStorage)
 			}
 			diagnostics.record("Check Again found the certificate issued for an interrupted request and used it; nothing was requested", at: now())
+			experimentEvent("cert.recovery", result: "recovered", count: remote.count)
 			return .recovered(serialNumber: found.serialNumber, expiresAt: found.expiresAt)
 		case .notIssued:
 			markNotIssued(pending, account: accountID, team: team)
 			diagnostics.record("Check Again: the listing shows no certificate was issued for the interrupted request", at: now())
+			experimentEvent("cert.recovery", result: "notIssued", count: remote.count)
 			return .notIssued
 		case .unknown:
 			diagnostics.record("Check Again: the interrupted certificate request is still unresolved; nothing requested", at: now())
+			experimentEvent("cert.recovery", outcome: "blocked", failure: "cert.unresolved", result: "unresolved", count: remote.count)
 			return .unresolved
 		}
 	}
@@ -646,6 +731,10 @@ actor ZagFreeAccountProvisioner {
 	/// A request still out is not abandoned; this waits for its outcome.
 	@discardableResult
 	func abandonUnresolvedCertificateRequest(accountID: UUID, team: String) async -> ZagCertificateRecoveryOutcome {
+		#if ZAG_LIVE_EXPERIMENT
+		// E3 (G5 plan §5.2): never during a campaign; only Check Again.
+		if ZagLiveExperiment.campaign.refusesAbandon { return .checkFailed(.unavailable) }
+		#endif
 		do {
 			return try await exclusively(ZagSigningScope(accountID: accountID, teamID: team)) {
 				guard let pending = unresolvedPendingKey(account: accountID, team: team) else { return .nothingPending }
@@ -742,6 +831,7 @@ actor ZagFreeAccountProvisioner {
 	/// Removes a request in progress: its journal and its key (never the key
 	/// the stored identity uses).
 	private func abandon(_ pending: ZagPendingSigningKey, account: UUID, team: String) {
+		experimentEvent("cert.journal", transition: "pendingDiscarded", count: pending.attempts)
 		try? secrets.delete(.pendingSigningKey, account: account, team: team)
 		let inUse = (try? secrets.load(.signingPrivateKey, account: account, team: team))
 			.flatMap { $0 }
@@ -798,6 +888,10 @@ actor ZagFreeAccountProvisioner {
 			default: throw ZagProvisioningFailure(kind: Self.kind(for: error), step: step)
 			}
 		} catch {
+			#if ZAG_LIVE_EXPERIMENT
+			// G5: a campaign refusal reaches the step that can settle it.
+			if let refusal = error as? ZagLiveExperimentRefusal { throw refusal }
+			#endif
 			throw ZagProvisioningFailure(kind: Task.isCancelled ? .cancelled : Self.kind(for: error), step: step)
 		}
 	}

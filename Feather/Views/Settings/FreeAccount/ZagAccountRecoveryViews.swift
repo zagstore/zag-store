@@ -179,7 +179,7 @@ struct ZagCertificateRecoveryView: View {
 				} label: {
 					Label("Abandon Request…", systemImage: "xmark.bin").foregroundStyle(.red)
 				}
-				.disabled(model.request == nil || model.phase != .idle)
+				.disabled(model.request == nil || model.phase != .idle || ZagCertificateRecoveryModel.abandonDisabled)
 				.accessibilityIdentifier("certificateRecovery.abandon")
 			} footer: {
 				Text("Check Again only reads the certificate list; it never requests a certificate. Zag Store never revokes a certificate and never retries this in the background.")

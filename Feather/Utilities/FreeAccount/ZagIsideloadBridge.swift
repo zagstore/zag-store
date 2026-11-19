@@ -302,6 +302,33 @@ enum ZagIsideloadBridge {
 		} == ZAG_BRIDGE_OK
 	}
 
+	#if ZAG_LIVE_EXPERIMENT
+	/// G5: configures the live backend from the campaign's compiled G3 values,
+	/// only once the campaign is armed. The placeholders configure nothing.
+	static func configureFromCampaign(_ campaign: ZagLiveExperimentCampaign = ZagLiveExperiment.campaign) -> Bool {
+		let constants = campaign.constants
+		guard campaign.state == .armed, let host = constants.providerHost, let url = URL(string: constants.anisetteURL),
+			  !constants.deviceSerial.isEmpty else { return false }
+		let configured = configureLive(anisetteURL: url, deviceSerial: constants.deviceSerial)
+		ZagLiveExperiment.logger?.record("build.configureLive", outcome: configured ? "ok" : "failed",
+										  fields: ["providerHost": .string(host), "serialPolicy": .string(constants.deviceSerialPolicy)])
+		return configured
+	}
+
+	/// G5: the bridge's network-policy decisions since the last call (JSON).
+	static func takePolicyDecisions() -> Data {
+		final class Box { var data = Data("[]".utf8) }
+		let box = Box()
+		withExtendedLifetime(box) {
+			zag_bridge_take_policy_decisions(Unmanaged.passUnretained(box).toOpaque()) { context, bytes, length in
+				guard let context, let bytes else { return }
+				Unmanaged<Box>.fromOpaque(context).takeUnretainedValue().data = Data(bytes: bytes, count: length)
+			}
+		}
+		return box.data
+	}
+	#endif
+
 	#if DEBUG
 	/// Tests only: the bridge's scripted backend (a library built with `mock`).
 	static func configureMock(_ script: Data) -> Bool {
@@ -336,11 +363,16 @@ enum ZagIsideloadBridge {
 	}
 
 	static func portal(slot: ZagBridgeSlot, credential: ZagSessionCredential, request: [String: Any]) async -> ZagBridgeEvent {
+		guard let requestJSON = try? JSONSerialization.data(withJSONObject: request) else { return .failed(.invalidInput) }
+		return await portal(slot: slot, credential: credential, requestJSON: requestJSON)
+	}
+
+	static func portal(slot: ZagBridgeSlot, credential: ZagSessionCredential, requestJSON: Data) async -> ZagBridgeEvent {
 		guard var credentialJSON = try? JSONSerialization.data(withJSONObject: [
 			"accountIdentifier": credential.accountIdentifier,
 			"token": credential.token,
 			"expiresAt": UInt64(max(0, credential.expiresAt.timeIntervalSince1970)),
-		]), let requestJSON = try? JSONSerialization.data(withJSONObject: request) else { return .failed(.invalidInput) }
+		]) else { return .failed(.invalidInput) }
 		defer { credentialJSON.resetBytes(in: 0..<credentialJSON.count) }
 		let events = credentialJSON.withUnsafeBytes { credentialBytes in
 			requestJSON.withUnsafeBytes { requestBytes in
@@ -385,6 +417,9 @@ actor ZagIsideloadAuthenticationService: ZagAppleAuthenticationService {
 
 	func signIn(appleID: String, password: ZagEphemeralSecret, anisette: ZagAnisetteData) async throws -> ZagSignInStep {
 		try ensureIdle()
+		#if ZAG_LIVE_EXPERIMENT
+		try ZagLiveExperimentHooks.beginSignIn()
+		#endif
 		if let earlier = events {
 			// The authenticator abandoned an earlier sign-in waiting for a code.
 			earlier.cancel()
@@ -438,7 +473,11 @@ actor ZagIsideloadAuthenticationService: ZagAppleAuthenticationService {
 	/// After a code, a repeated prompt means the code was not accepted; the
 	/// sign-in keeps waiting for the next one.
 	private func step(afterCode: Bool) async throws -> ZagSignInStep {
-		switch await next() {
+		let event = await next()
+		#if ZAG_LIVE_EXPERIMENT
+		try ZagLiveExperimentHooks.signInStep(event, afterCode: afterCode)
+		#endif
+		switch event {
 		case .codeRequired(let challenge, let retry):
 			if afterCode && retry { throw ZagAuthenticationServiceError.twoFactorRejected }
 			return .twoFactorRequired(challenge)
@@ -475,14 +514,36 @@ actor ZagIsideloadAuthenticationService: ZagAppleAuthenticationService {
 /// account's stored session. Its own slot is bound to the account on first
 /// use; another account's credential is refused by the bridge.
 struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
+	/// Sends one portal request (JSON) with the account's session.
+	typealias Transport = @Sendable (ZagSessionCredential, Data) async -> ZagBridgeEvent
+
 	let account: UUID
 	let secrets: ZagFreeAccountSecretStore
 	private let slot = ZagBridgeSlot()
+	private let transport: Transport?
+	#if ZAG_LIVE_EXPERIMENT
+	let campaign: ZagLiveExperimentCampaign
+	#endif
 
 	init(account: UUID, secrets: ZagFreeAccountSecretStore) {
 		self.account = account
 		self.secrets = secrets
+		transport = nil
+		#if ZAG_LIVE_EXPERIMENT
+		campaign = ZagLiveExperiment.campaign
+		#endif
 	}
+
+	#if ZAG_G5_TESTS
+	/// Tests only: the bridge replaced by a scripted transport, below the
+	/// adapter (so its campaign checks and budget run unchanged).
+	init(account: UUID, secrets: ZagFreeAccountSecretStore, campaign: ZagLiveExperimentCampaign, transport: @escaping Transport) {
+		self.account = account
+		self.secrets = secrets
+		self.transport = transport
+		self.campaign = campaign
+	}
+	#endif
 
 	private func call<T: Decodable>(_ request: [String: Any], as type: T.Type) async throws -> T {
 		let value = try await raw(request)
@@ -490,10 +551,24 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		return decoded
 	}
 
-	private func raw(_ request: [String: Any]) async throws -> Data {
+	private func credential() throws -> ZagSessionCredential {
 		guard let data = try? secrets.load(.session, account: account),
 			  let credential = try? JSONDecoder().decode(ZagSessionCredential.self, from: data) else { throw ZagPortalError.sessionRejected }
-		switch await ZagIsideloadBridge.portal(slot: slot, credential: credential, request: request) {
+		return credential
+	}
+
+	private func raw(_ request: [String: Any]) async throws -> Data {
+		let credential = try credential()
+		guard let requestJSON = try? JSONSerialization.data(withJSONObject: request) else { throw ZagPortalError.malformedResponse }
+		let event = if let transport {
+			await transport(credential, requestJSON)
+		} else {
+			await ZagIsideloadBridge.portal(slot: slot, credential: credential, requestJSON: requestJSON)
+		}
+		#if ZAG_LIVE_EXPERIMENT
+		ZagLiveExperimentHooks.drainPolicyDecisions(campaign: campaign)
+		#endif
+		switch event {
 		case .result(let value):
 			return value
 		case .failed(let failure):
@@ -536,40 +611,101 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		)
 	}
 
+	#if ZAG_LIVE_EXPERIMENT
+	private typealias Operation = ZagLiveOperation
+
+	/// The campaign's gate before every operation (plan §5.2, §5.5). A
+	/// mutating call first needs the E4 account-state check (C8).
+	private func gate(_ operation: Operation, team: String) async throws {
+		if operation == .portalMutate { try await checkAccountStateIfNeeded(team: team) }
+		try campaign.authorize(operation)
+	}
+
+	/// E4 (C8), once per process before the first mutating call: the
+	/// dedicated account has no certificate, App ID or device.
+	private func checkAccountStateIfNeeded(team: String) async throws {
+		guard campaign.needsAccountStateCheck else { return }
+		try campaign.authorize(.portalRead)
+		let certificates = try await call(["op": "certificates", "team": team], as: [Certificate].self)
+		let appIDs = try await call(["op": "appIds", "team": team], as: [AppID].self)
+		let devices = try await call(["op": "devices", "team": team], as: [Device].self)
+		try campaign.verifyAccountState(certificates: certificates.count, appIDs: appIDs.count, devices: devices.count)
+	}
+	#else
+	private enum Operation { case portalRead, portalMutate, certificateList }
+	private func gate(_ operation: Operation, team: String) async throws {}
+	#endif
+
 	func devices(team: String) async throws -> [ZagRegisteredDevice] {
-		try await call(["op": "devices", "team": team], as: [Device].self).map { ZagRegisteredDevice(udid: $0.udid, name: $0.name) }
+		try await gate(.portalRead, team: team)
+		return try await call(["op": "devices", "team": team], as: [Device].self).map { ZagRegisteredDevice(udid: $0.udid, name: $0.name) }
 	}
 
 	func registerDevice(udid: String, name: String, team: String) async throws -> ZagRegisteredDevice {
+		try await gate(.portalMutate, team: team)
 		let device = try await call(["op": "registerDevice", "team": team, "udid": udid, "name": name], as: Device.self)
 		return ZagRegisteredDevice(udid: device.udid, name: device.name)
 	}
 
 	func appIDs(team: String) async throws -> [ZagRegisteredAppID] {
-		try await call(["op": "appIds", "team": team], as: [AppID].self).map(Self.appID)
+		try await gate(.portalRead, team: team)
+		return try await call(["op": "appIds", "team": team], as: [AppID].self).map(Self.appID)
 	}
 
 	func registerAppID(bundleIdentifier: String, name: String, team: String) async throws -> ZagRegisteredAppID {
-		Self.appID(try await call(["op": "registerAppId", "team": team, "bundleIdentifier": bundleIdentifier, "name": name], as: AppID.self))
+		try await gate(.portalMutate, team: team)
+		return Self.appID(try await call(["op": "registerAppId", "team": team, "bundleIdentifier": bundleIdentifier, "name": name], as: AppID.self))
 	}
 
 	func appGroups(team: String) async throws -> [ZagRegisteredAppGroup] {
-		try await call(["op": "appGroups", "team": team], as: [Group].self).map { ZagRegisteredAppGroup(identifier: $0.identifier) }
+		try await gate(.portalRead, team: team)
+		return try await call(["op": "appGroups", "team": team], as: [Group].self).map { ZagRegisteredAppGroup(identifier: $0.identifier) }
 	}
 
 	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup {
-		ZagRegisteredAppGroup(identifier: try await call(["op": "registerAppGroup", "team": team, "identifier": identifier], as: Group.self).identifier)
+		try await gate(.portalMutate, team: team)
+		return ZagRegisteredAppGroup(identifier: try await call(["op": "registerAppGroup", "team": team, "identifier": identifier], as: Group.self).identifier)
 	}
 
 	func assignAppGroups(_ groups: [String], to appID: ZagRegisteredAppID, team: String) async throws {
+		try await gate(.portalMutate, team: team)
 		_ = try await raw(["op": "assignAppGroups", "team": team, "groups": groups, "appId": appID.identifier])
 	}
 
 	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] {
-		try await call(["op": "certificates", "team": team], as: [Certificate].self).map(Self.certificate)
+		try await gate(.certificateList, team: team)
+		return try await call(["op": "certificates", "team": team], as: [Certificate].self).map(Self.certificate)
 	}
 
 	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
+		#if ZAG_LIVE_EXPERIMENT
+		// E1 (G5 plan §5.2): the one choke point. Nothing below runs unless the
+		// campaign's single submission is recorded first.
+		try await ZagCertificateBudget.consume(
+			campaign: campaign,
+			accountKey: ZagAppleAccountRecord.accountKey(for: try credential().accountIdentifier),
+			recheckCertificates: {
+				try await checkAccountStateIfNeeded(team: team)
+				return try await call(["op": "certificates", "team": team], as: [Certificate].self).count
+			}
+		)
+		do {
+			let issued = try await sendCertificateRequest(request, team: team)
+			ZagLiveExperimentHooks.certificateSubmitted(issued: true)
+			return issued
+		} catch {
+			// Any outcome other than an issued certificate after consuming is a
+			// stop (plan §7.3): the campaign halts; nothing is sent again.
+			ZagLiveExperimentHooks.certificateSubmitted(issued: false)
+			campaign.halt(.interruptedAfterConsume)
+			throw error
+		}
+		#else
+		return try await sendCertificateRequest(request, team: team)
+		#endif
+	}
+
+	private func sendCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
 		let issued = try await call([
 			"op": "submitCertificateRequest", "team": team,
 			"request": request.data.base64EncodedString(), "machineName": "Zag Store",
@@ -579,6 +715,7 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
+		try await gate(.portalMutate, team: team)
 		let profile = try await call(["op": "profile", "team": team, "appId": appID.identifier], as: Profile.self)
 		guard let data = Data(base64Encoded: profile.data) else { throw ZagPortalError.malformedResponse }
 		return try ZagIssuedProfile(profileData: data)
@@ -605,6 +742,9 @@ struct ZagBridgeAnisetteSource: ZagAnisetteSource {
 		if allowsTestBackend { return ZagAnisetteData(managedByBridgeAt: Date()) }
 		#endif
 		guard ZagAnisetteLive.isEnabled, ZagIsideloadBridge.liveCompiled else { throw ZagAnisetteError.liveProvidersDisabled }
+		#if ZAG_LIVE_EXPERIMENT
+		do { try ZagLiveExperiment.campaign.authorize(.signIn) } catch { throw ZagAnisetteError.liveProvidersDisabled }
+		#endif
 		return ZagAnisetteData(managedByBridgeAt: Date())
 	}
 }
@@ -710,4 +850,80 @@ struct ZagBridgeAnisetteLocalState: ZagAccountLocalState {
 		guard try !scopes().contains(scope) else { throw ZagAccountError.storage }
 	}
 }
+#if ZAG_LIVE_EXPERIMENT
+// MARK: - G5 experiment hooks
+
+/// G5: what the experiment checks and records around the bridge's sign-in
+/// and certificate request (plan §5.5, §7.3; logging spec §4).
+enum ZagLiveExperimentHooks {
+	private static let lock = NSLock()
+	nonisolated(unsafe) private static var consecutiveFailures = 0
+
+	static func beginSignIn() throws {
+		try ZagLiveExperiment.campaign.authorize(.signIn)
+		ZagLiveExperiment.logger?.record("auth.signin.start", outcome: "started")
+		ZagLiveExperiment.logger?.record("auth.state", fields: ["from": .string("signedOut"), "to": .string("signingIn")])
+	}
+
+	/// Each sign-in step: records it, and stops on the authentication rules.
+	/// When signed in, C5 (Apple's authenticated time) and C6 (the account
+	/// pin) are checked, and the team must be one free Personal Team.
+	static func signInStep(_ event: ZagBridgeEvent?, afterCode: Bool) throws {
+		let campaign = ZagLiveExperiment.campaign, logger = ZagLiveExperiment.logger
+		drainPolicyDecisions(campaign: campaign)
+		switch event {
+		case .codeRequired(let challenge, let retry)?:
+			if afterCode && retry {
+				logger?.record("auth.twoFactor.submit", outcome: "failed", failure: "apple.twoFactorRejected", fields: ["result": .string("rejected")])
+				try failed(campaign, rule: nil)
+			}
+			let kind = switch challenge.method { case .sms: "sms"; case .trustedDevice: "trustedDevice" }
+			logger?.record("auth.twoFactor.challenge", fields: ["kind": .string(kind), "smsNumberCount": .int(challenge.maskedDestination == nil ? 0 : 1)])
+			logger?.record("auth.state", fields: ["from": .string("signingIn"), "to": .string("awaitingTwoFactor")])
+		case .signedIn(let session)?:
+			lock.withLock { consecutiveFailures = 0 }
+			if afterCode { logger?.record("auth.twoFactor.submit", fields: ["result": .string("accepted")]) }
+			try campaign.authorize(.portalRead)
+			try campaign.checkAccount(ZagAppleAccountRecord.accountKey(for: session.credential.accountIdentifier))
+			let kinds = Set(session.teams.map(\.kind))
+			let teamKind = kinds == [.personalFree] ? "personal" : kinds.isDisjoint(with: [.individualPaid, .organization]) ? "unknown" : "paid"
+			var fields: [String: ZagLogValue] = ["teamCount": .int(min(500, session.teams.count)), "teamKind": .string(teamKind)]
+			if session.teams.count == 1, let logger { fields["teamRef"] = .string(logger.ref("team", session.teams[0].identifier)) }
+			logger?.record("portal.teams", outcome: session.teams.count == 1 && teamKind != "paid" ? "ok" : "blocked", fields: fields)
+			guard session.teams.count == 1, teamKind != "paid" else {
+				campaign.halt(.teamCount)
+				throw ZagAuthenticationServiceError.malformedResponse
+			}
+			logger?.record("auth.state", fields: ["from": .string(afterCode ? "awaitingTwoFactor" : "signingIn"), "to": .string("signedIn")])
+		case .failed(let failure)?:
+			logger?.record("auth.state", outcome: "failed", failure: ZagExperimentFailureMap.failure(failure),
+						   fields: ["from": .string("signingIn"), "to": .string("failed")])
+			try failed(campaign, rule: failure == .rateLimited ? .authLimit : nil)
+		case .result?, nil:
+			break
+		}
+	}
+
+	/// Two consecutive failures of any kind, or a limit, stop the campaign.
+	private static func failed(_ campaign: ZagLiveExperimentCampaign, rule: ZagStopRule?) throws {
+		let count = lock.withLock { consecutiveFailures += 1; return consecutiveFailures }
+		if let rule {
+			campaign.halt(rule)
+		} else if count >= 2 {
+			campaign.halt(.authTwoFailures)
+		}
+	}
+
+	/// Records the bridge's policy decisions; any blocked request is a stop.
+	static func drainPolicyDecisions(campaign: ZagLiveExperimentCampaign) {
+		guard let logger = ZagLiveExperiment.logger else { return }
+		if logger.recordPolicyDecisions(ZagIsideloadBridge.takePolicyDecisions()) { campaign.halt(.policyBlocked) }
+	}
+
+	static func certificateSubmitted(issued: Bool) {
+		ZagLiveExperiment.logger?.record("cert.submit", outcome: issued ? "ok" : "failed", failure: issued ? nil : "cert.unresolved",
+										  fields: ["result": .string(issued ? "issued" : "unknown")])
+	}
+}
+#endif
 #endif

@@ -54,11 +54,17 @@ actor ZagFirstLaunchReporter {
 
 	/// Called by ZagLaunchGate.finish(). Returns at once.
 	nonisolated static func launchBecameInteractive() {
+		#if ZAG_LIVE_EXPERIMENT
+		// G5 (plan §3.2, checklist M12): the experiment build sends no
+		// analytics. Every report path starts here, so nothing is sent.
+		return
+		#else
 		guard isActive else { return }
 		Task.detached(priority: .background) {
 			try? await Task.sleep(for: .seconds(3))
 			await shared.run()
 		}
+		#endif
 	}
 
 	nonisolated static var isActive: Bool {
