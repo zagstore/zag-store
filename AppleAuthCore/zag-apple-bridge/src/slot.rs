@@ -285,6 +285,38 @@ mod concurrency_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[cfg(not(any(feature = "live", feature = "mock")))]
+    #[test]
+    fn disabled_backend_does_not_reserve_or_bind_the_slot() {
+        let id = open();
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let collected = events.clone();
+        portal(
+            id,
+            Credential {
+                account_identifier: "test-account".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
+                expires_at: u64::MAX,
+            },
+            PortalRequest::Teams,
+            Box::new(move |bytes| {
+                collected.lock().unwrap().push(serde_json::from_slice(bytes).unwrap());
+            }),
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[json!({"event":"failed","kind":"disabled"})]
+        );
+        with_slot(id, |slot| {
+            assert!(!slot.portal_busy);
+            assert!(slot.bound.is_none());
+            assert!(slot.session.is_none());
+            assert!(slot.cancels.is_empty());
+            Ok(())
+        }).unwrap();
+        close(id);
+    }
+
     #[test]
     fn busy_portal_slot_rejects_overlapping_portal_and_sign_in() {
         let id = open();
