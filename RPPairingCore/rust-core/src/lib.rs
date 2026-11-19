@@ -15,6 +15,7 @@ use idevice::services::afc::{opcode::AfcFopenMode, AfcClient};
 use idevice::services::installation_proxy::InstallationProxyClient;
 use idevice::services::house_arrest::HouseArrestClient;
 use idevice::services::lockdown::LockdownClient;
+use idevice::services::misagent::MisagentClient;
 use idevice::utils::installation::{
     install_package_with_callback_rsd,
     upgrade_package_with_callback_rsd,
@@ -1669,6 +1670,83 @@ async fn run_installed_app_icons(
             }
 
             emit(callback, 503, success_count.to_string());
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Reads the provisioning profiles installed on the device (misagent
+/// CopyAll, over RSD). Read only: nothing is installed or removed. Each
+/// profile is written, exactly as the device returned it, to
+/// <output_dir>/<index>.mobileprovision; Swift parses and matches them.
+///
+/// Callback codes:
+/// 601 = starting
+/// 602 = profile written (message: absolute path)
+/// 603 = complete (message: count)
+/// -8  = failure
+#[no_mangle]
+pub unsafe extern "C" fn zag_installed_profiles(
+    device_ip: *const c_char,
+    pairing_path: *const c_char,
+    output_dir: *const c_char,
+    callback: Option<ZagRPPairingCallback>,
+) -> bool {
+    let Some(callback) = callback else { return false; };
+    if device_ip.is_null() || pairing_path.is_null() || output_dir.is_null() {
+        return false;
+    }
+    let Ok(device_ip) = CStr::from_ptr(device_ip).to_str().map(str::to_owned) else { return false; };
+    let Ok(pairing_path) = CStr::from_ptr(pairing_path).to_str().map(PathBuf::from) else { return false; };
+    let Ok(output_dir) = CStr::from_ptr(output_dir).to_str().map(PathBuf::from) else { return false; };
+
+    thread::spawn(move || {
+        emit(callback, 601, "Reading installed provisioning profiles");
+        let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                emit(callback, -8, format!("Installed-profile runtime failed: {error}"));
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            if let Err(error) = run_installed_profiles(device_ip, pairing_path, output_dir, callback).await {
+                emit(callback, -8, error);
+            }
+        });
+    });
+    true
+}
+
+async fn run_installed_profiles(
+    device_ip: String,
+    pairing_path: PathBuf,
+    output_dir: PathBuf,
+    callback: ZagRPPairingCallback,
+) -> Result<(), String> {
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("Unable to create the profile folder: {error}"))?;
+
+    with_zag_device_session(
+        &device_ip,
+        &pairing_path,
+        |_stage, _message| {},
+        |mut adapter, mut handshake| async move {
+            let mut misagent = MisagentClient::connect_rsd(&mut adapter, &mut handshake)
+                .await
+                .map_err(|error| format!("misagent over RSD failed: {error}"))?;
+            let profiles = misagent
+                .copy_all()
+                .await
+                .map_err(|error| format!("misagent profile listing failed: {error}"))?;
+            for (index, profile) in profiles.iter().enumerate() {
+                let path = output_dir.join(format!("{index}.mobileprovision"));
+                std::fs::write(&path, profile)
+                    .map_err(|error| format!("Unable to write an installed profile: {error}"))?;
+                emit(callback, 602, path.to_string_lossy().to_string());
+            }
+            emit(callback, 603, profiles.len().to_string());
             Ok(())
         },
     )

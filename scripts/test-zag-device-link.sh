@@ -133,6 +133,13 @@ def excluding_local_cleanup(source):
     start = source.index('\tfunc forgetPairing() throws {')
     end = source.index('\n\tfileprivate func receive(code:', start)
     return source[:start] + '<local cleanup>\n' + source[end:]
+def excluding_installed_profiles(source):
+    # PR #25: the read-only installed-profile reader (misagent), purely
+    # additive; each block is removed exactly, so any other change still fails.
+    for block in ['private func zagInstalledProfilesCallback(_ code: Int32, _ message: UnsafePointer<CChar>?) {\n\tlet text = message.map { String(cString: $0) } ?? ""\n\tDispatchQueue.main.async {\n\t\tZagRPPairingCore.shared.receiveInstalledProfiles(code: code, message: text)\n\t}\n}\n\n', '\tprivate var installedProfilesDirectory: URL?\n\tprivate var installedProfilesCompletion: ((Result<[Data], Error>) -> Void)?\n', '\t/// The provisioning profiles installed on the device, exactly as it\n\t/// returns them (misagent, read only). Used to confirm which profile, and\n\t/// so which expiry, an app signed by Zag Store was installed with.\n\tfunc readInstalledProfiles(\n\t\tdeviceIP: String = "10.7.0.1",\n\t\tcompletion: @escaping (Result<[Data], Error>) -> Void\n\t) {\n\t\tguard installedProfilesCompletion == nil else { return completion(.failure(InstalledAppsError.alreadyRunning)) }\n\t\tguard pairingFileExists else { return completion(.failure(InstalledAppsError.notPaired)) }\n\t\tguard acquireTransport("Installed profiles") else { return completion(.failure(InstalledAppsError.alreadyRunning)) }\n\n\t\tlet directory = FileManager.default.temporaryDirectory\n\t\t\t.appendingPathComponent("ZagStore-InstalledProfiles-\\(UUID().uuidString)", isDirectory: true)\n\t\tinstalledProfilesDirectory = directory\n\t\tinstalledProfilesCompletion = completion\n\t\tlet started = deviceIP.withCString { ip in\n\t\t\tSelf.pairingFileURL.path.withCString { pairingPath in\n\t\t\t\tdirectory.path.withCString { outputDirectory in\n\t\t\t\t\tzag_installed_profiles(ip, pairingPath, outputDirectory, zagInstalledProfilesCallback)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif !started {\n\t\t\tfinishInstalledProfiles(.failure(InstalledAppsError.couldNotStart))\n\t\t}\n\t}\n\n\tfileprivate func receiveInstalledProfiles(code: Int32, message: String) {\n\t\tswitch code {\n\t\tcase 603:\n\t\t\t// Read every file the core wrote, in order, then remove the folder.\n\t\t\tlet count = Int(message) ?? 0\n\t\t\tlet profiles = (0..<count).compactMap { index in\n\t\t\t\tinstalledProfilesDirectory.flatMap { try? Data(contentsOf: $0.appendingPathComponent("\\(index).mobileprovision")) }\n\t\t\t}\n\t\t\tfinishInstalledProfiles(profiles.count == count ? .success(profiles) : .failure(InstalledAppsError.refreshFailed("An installed profile could not be read.")))\n\t\tcase -8:\n\t\t\tZagLogger.shared.error("RPPairing", "Installed-profile listing failed: \\(message)")\n\t\t\tfinishInstalledProfiles(.failure(InstalledAppsError.refreshFailed(message)))\n\t\tdefault:\n\t\t\tbreak\n\t\t}\n\t}\n\n\tprivate func finishInstalledProfiles(_ result: Result<[Data], Error>) {\n\t\treleaseTransport("Installed profiles")\n\t\tif let directory = installedProfilesDirectory { try? FileManager.default.removeItem(at: directory) }\n\t\tinstalledProfilesDirectory = nil\n\t\tlet completion = installedProfilesCompletion\n\t\tinstalledProfilesCompletion = nil\n\t\tcompletion?(result)\n\t}\n\n']:
+        assert source.count(block) == 1, block[:60]
+        source = source.replace(block, '')
+    return source
 def excluding_gate4_presentation(source):
     # Gate4 publication cadence and the verified-staging (209) hook only;
     # each documented edit is reversed exactly, so any other change still fails.
@@ -143,7 +150,7 @@ def excluding_gate4_presentation(source):
         assert source.count(line) == 1, line
         source = source.replace(line, '')
     return source.replace('\t\t\tgate4Staged = nil\n', '')
-assert excluding_local_cleanup(excluding_pin_presentation(excluding_gate4_presentation(current))) == excluding_local_cleanup(excluding_pin_presentation(baseline))
+assert excluding_local_cleanup(excluding_pin_presentation(excluding_gate4_presentation(excluding_installed_profiles(current)))) == excluding_local_cleanup(excluding_pin_presentation(baseline))
 PYCODE
 }
 check "install: installer core is unchanged outside PIN presentation and explicit local-cleanup guards" installer_core_unchanged
