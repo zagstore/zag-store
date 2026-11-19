@@ -20,6 +20,8 @@ final class ZagAppleAccountsLab: ObservableObject {
 	let service: ZagSimulatedAuthenticationService
 	let directory: ZagAccountDirectory
 	let diagnostics = ZagFreeAccountDiagnostics()
+	/// The simulation's own Keychain service, never the production one.
+	let secrets = ZagKeychainFreeAccountSecretStore(service: ZagFreeAccountSimulation.keychainService)
 
 	@Published private(set) var rows: [Row] = []
 	@Published private(set) var defaultScope: ZagSigningScope?
@@ -31,11 +33,17 @@ final class ZagAppleAccountsLab: ObservableObject {
 	@Published var removal: ZagAccountRemovalPlan?
 	@Published var notice: String?
 	@Published private(set) var signingCheck: String?
+	/// Stored Account Data: what was found when the page was last loaded.
+	@Published private(set) var storedData: ZagOrphanedAccountItems?
+	/// What the user chose to remove, awaiting confirmation.
+	@Published var storedRemoval: ZagOrphanedAccountItems?
+	@Published private(set) var storedResult: String?
+	@Published var showsStoredData = false
 	private var simulatedApps = 0
 
 	init() {
 		service = ZagSimulatedAuthenticationService(scenario: .signInSucceeds, clock: clock)
-		directory = ZagFreeAccountSimulation.makeDirectory(service: service, clock: clock, diagnostics: diagnostics)
+		directory = ZagFreeAccountSimulation.makeDirectory(service: service, clock: clock, secrets: secrets, diagnostics: diagnostics)
 	}
 
 	var now: Date { clock.now }
@@ -146,7 +154,56 @@ final class ZagAppleAccountsLab: ObservableObject {
 		await reload()
 	}
 
+	// MARK: Stored Account Data
+
+	/// Lists leftover items only when the page is opened; nothing is removed
+	/// at launch or without confirmation.
+	func loadStoredData() async {
+		do {
+			storedData = try await directory.orphanedItems()
+		} catch {
+			storedData = nil
+			notice = "Stored account data could not be read."
+		}
+	}
+
+	func prepareStoredRemoval(accounts: [ZagOrphanedAccountItems.Account], scopes: [String]) {
+		storedResult = nil
+		storedRemoval = ZagOrphanedAccountItems(accounts: accounts, localStateScopes: scopes)
+	}
+
+	/// The directory checks each item again immediately before deleting it.
+	func confirmStoredRemoval() async {
+		guard let confirmed = storedRemoval else { return }
+		storedRemoval = nil
+		do {
+			let result = try await directory.removeOrphanedItems(confirmed)
+			let removed = result.removed.count + result.removedLocalState.count
+			var parts = ["Removed \(removed)."]
+			if !result.skipped.isEmpty { parts.append("\(result.skipped.count) changed since you confirmed and \(result.skipped.count == 1 ? "was" : "were") kept.") }
+			let failed = result.failed.count + result.failedLocalState.count
+			if failed > 0 { parts.append("\(failed) could not be removed; try again.") }
+			storedResult = parts.joined(separator: " ")
+		} catch {
+			storedResult = "Nothing was removed: stored data could not be checked."
+		}
+		await loadStoredData()
+	}
+
 	// MARK: Simulation
+
+	/// Leaves items as an earlier installation would: one account with an
+	/// ownership record (recoverable by signing in) and one without.
+	func simulateEarlierInstallation() {
+		let recoverable = UUID(), unowned = UUID()
+		let record = ZagAccountOwnershipRecord(
+			accountKey: ZagAppleAccountRecord.accountKey(for: "SIMULATED-EARLIER"),
+			maskedAppleID: "e•••@example.invalid"
+		)
+		try? secrets.save(try JSONEncoder().encode(record), kind: .accountRecord, account: recoverable, team: nil)
+		try? secrets.save(Data("simulated".utf8), kind: .session, account: recoverable, team: nil)
+		try? secrets.save(Data("simulated".utf8), kind: .session, account: unowned, team: nil)
+	}
 
 	/// Records a simulated installed app for the scope (nothing is signed).
 	func addSimulatedApp(_ scope: ZagSigningScope) {
@@ -181,13 +238,18 @@ final class ZagAppleAccountsLab: ObservableObject {
 
 struct ZagAppleAccountsDebugView: View {
 	@StateObject private var lab = ZagAppleAccountsLab()
+	@State private var started = false
 	var runsDemo = false
 
 	var body: some View {
+		// Started once: the task runs again whenever a pushed page pops.
 		ZagAppleAccountsList(lab: lab)
 			.task {
+				guard !started else { return }
+				started = true
 				await lab.start()
-				if runsDemo { await ZagAppleAccountsDebugDemo(lab: lab).run() }
+				// Not tied to this view's lifetime, which ends while a page is pushed.
+				if runsDemo { Task { await ZagAppleAccountsDebugDemo(lab: lab).run() } }
 			}
 	}
 }
@@ -230,6 +292,17 @@ private struct ZagAppleAccountsList: View {
 			}
 
 			Section {
+				NavigationLink {
+					ZagStoredAccountDataView(lab: lab)
+				} label: {
+					Label("Stored Account Data", systemImage: "externaldrive.badge.person.crop")
+				}
+				.accessibilityIdentifier("accounts.storedData")
+			} footer: {
+				Text("Keychain items Zag Store kept for accounts no longer in this list, such as after reinstalling.")
+			}
+
+			Section {
 				Button {
 					Task { await lab.checkSigning(nil) }
 				} label: {
@@ -264,6 +337,7 @@ private struct ZagAppleAccountsList: View {
 		.navigationTitle("Apple Accounts")
 		.navigationBarTitleDisplayMode(.inline)
 		.zagWallpaperSurface()
+		.navigationDestination(isPresented: $lab.showsStoredData) { ZagStoredAccountDataView(lab: lab) }
 		.sheet(isPresented: Binding(
 			get: { lab.signIn != nil },
 			set: { presented in if !presented, lab.signIn != nil { Task { await lab.cancelSignIn() } } }
@@ -535,6 +609,121 @@ private struct ZagAppleAccountDetail: View {
 	}
 }
 
+/// Settings → Apple Accounts → Stored Account Data: Zag Store's own Keychain
+/// items (and anisette state) that belong to no account in the list. Shows
+/// which can be recovered by signing in again and which can only be removed;
+/// removes only what the user confirms, after the directory checks each item
+/// again. Never runs by itself.
+private struct ZagStoredAccountDataView: View {
+	@ObservedObject var lab: ZagAppleAccountsLab
+
+	var body: some View {
+		let data = lab.storedData
+		let recoverable = data?.accounts.filter(\.isRecoverable) ?? []
+		let unowned = data?.accounts.filter { !$0.isRecoverable } ?? []
+		let scopes = data?.localStateScopes ?? []
+		Form {
+			if data?.isEmpty ?? true {
+				Section {
+					Text(data == nil ? "Checking…" : "No stored data outside your accounts.").foregroundStyle(.secondary)
+				}
+			}
+			if !recoverable.isEmpty {
+				Section {
+					ForEach(recoverable, id: \.id) { account in
+						item(account.maskedAppleID ?? "Apple Account", detail: "Sign in to this Apple Account again to recover its signing keys.") {
+							lab.prepareStoredRemoval(accounts: [account], scopes: [])
+						}
+					}
+				} header: {
+					Text("Recoverable")
+				} footer: {
+					Text("Signing in again restores these accounts with their keys, so their apps keep the same certificate.")
+				}
+			}
+			if !unowned.isEmpty {
+				Section {
+					ForEach(unowned, id: \.id) { account in
+						item("Unidentified account", detail: "No record says which Apple Account this was. It can only be removed.") {
+							lab.prepareStoredRemoval(accounts: [account], scopes: [])
+						}
+					}
+				} header: {
+					Text("Not Recoverable")
+				}
+			}
+			if !scopes.isEmpty {
+				Section {
+					ForEach(scopes, id: \.self) { scope in
+						item("Sign-in device data", detail: "Anisette state no account uses.") {
+							lab.prepareStoredRemoval(accounts: [], scopes: [scope])
+						}
+					}
+				} header: {
+					Text("Anisette State")
+				}
+			}
+			if let data, !data.isEmpty {
+				Section {
+					Button(role: .destructive) {
+						lab.prepareStoredRemoval(accounts: data.accounts, scopes: data.localStateScopes)
+					} label: {
+						Label("Remove All Listed…", systemImage: "trash")
+					}
+					.accessibilityIdentifier("storedData.removeAll")
+				}
+			}
+			if let result = lab.storedResult {
+				Section { Text(result).font(.footnote).accessibilityIdentifier("storedData.result") }
+			}
+			Section {
+				Button {
+					lab.simulateEarlierInstallation()
+					Task { await lab.loadStoredData() }
+				} label: {
+					Label("Leave Items From an Earlier Installation", systemImage: "testtube.2")
+				}
+			} header: {
+				Label("Simulation", systemImage: "testtube.2")
+			} footer: {
+				Text("Nothing here is removed automatically. Each item is checked again just before removal; one that changed is kept. Certificates are never revoked.")
+			}
+		}
+		.navigationTitle("Stored Account Data")
+		.navigationBarTitleDisplayMode(.inline)
+		.zagWallpaperSurface()
+		.task { await lab.loadStoredData() }
+		.confirmationDialog(
+			"Remove Stored Data?",
+			isPresented: Binding(get: { lab.storedRemoval != nil }, set: { if !$0 { lab.storedRemoval = nil } }),
+			titleVisibility: .visible
+		) {
+			Button("Remove", role: .destructive) { Task { await lab.confirmStoredRemoval() } }
+			Button("Cancel", role: .cancel) { lab.storedRemoval = nil }
+		} message: {
+			let accounts = lab.storedRemoval?.accounts ?? []
+			Text(accounts.contains(where: \.isRecoverable)
+				 ? "A recoverable account's signing keys are deleted and cannot be recovered by signing in. Its certificates are not revoked."
+				 : "These items are deleted from this device. Certificates are not revoked.")
+		}
+	}
+
+	private func item(_ title: String, detail: String, remove: @escaping () -> Void) -> some View {
+		HStack {
+			VStack(alignment: .leading, spacing: 2) {
+				Text(title).font(.body.weight(.semibold))
+				Text(detail).font(.caption).foregroundStyle(.secondary)
+			}
+			Spacer()
+			Button(role: .destructive, action: remove) {
+				Image(systemName: "trash")
+			}
+			.buttonStyle(.borderless)
+			.accessibilityLabel("Remove")
+		}
+	}
+}
+
 private struct ZagOwnedAppRow: View {
 	let app: ZagSignedAppRecord
 	let now: Date
@@ -742,9 +931,36 @@ struct ZagAppleAccountsDebugDemo {
 			  "removal deletes only that account; its app keeps its owner and stops refreshing")
 		await step("09-removed")
 
+		// Stored Account Data: clear leftovers of earlier runs, then leave items
+		// as an earlier installation would.
+		await lab.loadStoredData()
+		if let earlier = lab.storedData, !earlier.isEmpty {
+			lab.prepareStoredRemoval(accounts: earlier.accounts, scopes: earlier.localStateScopes)
+			await lab.confirmStoredRemoval()
+		}
+		lab.simulateEarlierInstallation()
+		lab.showsStoredData = true
+		await lab.loadStoredData()
+		let found = lab.storedData?.accounts ?? []
+		check(found.count == 2 && found.filter(\.isRecoverable).map(\.maskedAppleID) == ["e•••@example.invalid"] && lab.rows.count == 2,
+			  "stored data lists items no account owns, recoverable and not, and nothing is removed by listing")
+		await step("10-stored-account-data")
+		if let unowned = found.first(where: { !$0.isRecoverable }) {
+			lab.prepareStoredRemoval(accounts: [unowned], scopes: [])
+			await lab.confirmStoredRemoval()
+		}
+		let left = lab.storedData?.accounts ?? []
+		check(left.count == 1 && left.first?.isRecoverable == true && signedIn(free) && signedIn(paid),
+			  "only the confirmed item is removed; the accounts are untouched")
+		if let rest = lab.storedData {
+			lab.prepareStoredRemoval(accounts: rest.accounts, scopes: rest.localStateScopes)
+			await lab.confirmStoredRemoval()
+		}
+		lab.showsStoredData = false
+
 		await lab.relaunchAfter31Days()
 		check(!signedIn(free) && !signedIn(paid) && lab.rows.count == 2, "after the sessions expire, every account needs signing in again")
-		await step("10-expired-after-relaunch")
+		await step("11-expired-after-relaunch")
 		append("DONE\n")
 	}
 }

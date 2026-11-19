@@ -294,9 +294,11 @@ actor ZagFreeAccountAuthenticator {
 	/// The account this authenticator belongs to (multi-account), if any.
 	/// Once bound it never signs in, stores or removes another account.
 	private(set) var boundAccountID: UUID?
-	/// Maps Apple's account identifier to Zag Store's stable account ID, so
-	/// the same Apple Account signing in again keeps its ID (and its assets).
-	private let identify: (@Sendable (String) -> UUID)?
+	/// Maps Apple's account identifier (and the address entered) to Zag
+	/// Store's stable account ID, so the same Apple Account signing in again
+	/// keeps its ID (and its assets). Nil: the sign-in is refused (an address
+	/// not known for that account; aliases are never merged by guesswork).
+	private let identify: (@Sendable (_ accountIdentifier: String, _ appleID: String) -> UUID?)?
 
 	init(
 		service: ZagAppleAuthenticationService = ZagDisabledAuthenticationService(),
@@ -306,7 +308,7 @@ actor ZagFreeAccountAuthenticator {
 		diagnostics: ZagFreeAccountDiagnostics = ZagFreeAccountDiagnostics(),
 		configuration: Configuration = Configuration(),
 		account: UUID? = nil,
-		identify: (@Sendable (String) -> UUID)? = nil,
+		identify: (@Sendable (_ accountIdentifier: String, _ appleID: String) -> UUID?)? = nil,
 		now: @escaping @Sendable () -> Date = { Date() }
 	) {
 		self.boundAccountID = account
@@ -544,7 +546,16 @@ actor ZagFreeAccountAuthenticator {
 		}
 		// The stable ID for this Apple Account. An authenticator bound to one
 		// account refuses to become another.
-		let resolvedID = identify?(validated.credential.accountIdentifier) ?? accountID
+		let resolvedID: UUID
+		if let identify {
+			guard let identified = identify(validated.credential.accountIdentifier, appleID) else {
+				fail(.addressNotRecognised, "Sign-in reached a known Apple Account through an address not recorded for it; nothing stored")
+				return
+			}
+			resolvedID = identified
+		} else {
+			resolvedID = accountID
+		}
 		if let boundAccountID, resolvedID != boundAccountID {
 			fail(.differentAccount, "Sign-in was for a different Apple Account; nothing stored")
 			return

@@ -29,7 +29,7 @@ done
 # only with ZAG_ZSIGN_STRICT) is what must be absent. The G4 bridge to
 # zag-isideload (compiled only with ZAG_APPLE_BRIDGE, its library never
 # linked by the Xcode project) must be absent too.
-for marker in ZagIsideloadAuthenticationService ZagIsideloadDeveloperPortal ZagBridgeAnisetteSource zag_bridge_open_slot \
+for marker in ZagSecuritySigningKeyFactory ZagIsideloadAuthenticationService ZagIsideloadDeveloperPortal ZagBridgeAnisetteSource zag_bridge_open_slot \
 	ZagStore.anisette.bridge ZagSimulatedDeveloperPortal ZagSimulatedSigningKeyFactory SIMULATED-PROFILE SIMULATED-CERTIFICATE \
 	simulationOnly SIMULATED0002 SIMPAID001 ZagSimulatedAnisetteSource ZagAppleAccountsDebugView ZagAppleAccountsLab \
 	"Apple Accounts (Simulated)" ZagStrictComponentSigning "Installed Profiles (Read Only)" ZagInstalledProfilesProbe; do

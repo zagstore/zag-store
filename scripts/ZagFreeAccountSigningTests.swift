@@ -84,6 +84,7 @@ final class TestClock: @unchecked Sendable {
 final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	private let lock = NSLock()
 	var items: [String: Data] = [:]
+	func accountIDs() throws -> Set<UUID> { lock.withLock { Set(items.keys.compactMap { UUID(uuidString: String($0.prefix(36))) }) } }
 	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = secret } }
 	func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] } }
 	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { lock.withLock { items["\(account).\(kind)" + (team.map { ".\($0)" } ?? "")] = nil } }
@@ -260,7 +261,7 @@ struct Harness {
 		let lifecycle = ZagFreeAccountLifecycle(
 			directory: directory,
 			provisioner: provisioner,
-			adapter: ZagFreeAccountSigningAdapter(signer: signer, workRoot: staging, gate: .simulationOnly),
+			adapter: ZagFreeAccountSigningAdapter(signer: signer, workRoot: staging, gate: .simulationOnly, allowsKeyFiles: true),
 			installer: device,
 			secrets: secrets
 		)
@@ -501,6 +502,27 @@ struct Harness {
 			  && !FileManager.default.fileExists(atPath: appex.appendingPathComponent("embedded.mobileprovision").path),
 			  "Zsign's ordinary path refuses a certificate that only carries Apple's WWDR name, and signs nothing")
 
+		// Key policy: an identity whose key is in the Keychain is never signed
+		// by writing a key file; this build (without ZAG_ZSIGN_STRICT) has no
+		// Keychain signing at all. Key files need an explicit opt-in.
+		let keychainHeld = ZagSigningIdentity(serialNumber: identity.serialNumber, certificate: identity.certificate, privateKey: Data(), expiresAt: identity.expiresAt)
+		do {
+			_ = try h.adapter.sign(appAt: makeApp(), with: result, identity: keychainHeld, authorization: auth, now: h.clock.now)
+			check(false, "Keychain-held identity without Keychain signing")
+		} catch {
+			check(error as? ZagFreeAccountSigningError == .keychainSigningUnavailable && h.signer.calls == 0 && h.stagingIsEmpty,
+				  "a Keychain-held identity is refused in a build without Keychain signing, and no key file is written")
+		}
+		var noKeyFiles = h.adapter
+		noKeyFiles.allowsKeyFiles = false
+		do {
+			_ = try noKeyFiles.sign(appAt: makeApp(), with: result, identity: identity, authorization: auth, now: h.clock.now)
+			check(false, "key file without opt-in")
+		} catch {
+			check(error as? ZagFreeAccountSigningError == .keyFilesNotAllowed && h.signer.calls == 0 && h.stagingIsEmpty,
+				  "writing a key file for the signer is refused unless explicitly allowed")
+		}
+
 		let other = ZagSigningIdentity(serialNumber: "DEADBEEF", certificate: identity.certificate, privateKey: identity.privateKey, expiresAt: identity.expiresAt)
 		do {
 			_ = try h.adapter.sign(appAt: makeApp(), with: result, identity: other, authorization: auth, now: h.clock.now)
@@ -644,7 +666,7 @@ struct Harness {
 		let disabled = ZagFreeAccountLifecycle(
 			directory: limited.directory,
 			provisioner: ZagFreeAccountProvisioner(secrets: MemorySecrets(), now: { limited.clock.now }),
-			adapter: ZagFreeAccountSigningAdapter(signer: limited.signer, workRoot: limited.staging),
+			adapter: ZagFreeAccountSigningAdapter(signer: limited.signer, workRoot: limited.staging, allowsKeyFiles: true),
 			installer: limited.device, secrets: MemorySecrets()
 		)
 		var none = ZagRefreshLedger()

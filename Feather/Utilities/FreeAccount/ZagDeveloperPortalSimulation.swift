@@ -161,7 +161,7 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		if let issuer {
 			let data = try issuer.certificate(for: request, serialNumber: serial)
 			guard let inspection = ZagCertificateInspection(der: data) else { throw ZagPortalError.malformedResponse }
-			let certificate = ZagDevelopmentCertificate(serialNumber: inspection.serialNumber, name: "Zag Store", machineName: "Zag Store", expiresAt: inspection.expiresAt)
+			let certificate = ZagDevelopmentCertificate(serialNumber: inspection.serialNumber, name: "Zag Store", machineName: "Zag Store", expiresAt: inspection.expiresAt, data: data)
 			issuedCertificates.append(certificate)
 			certificateFiles[inspection.serialNumber] = data
 			return ZagIssuedCertificate(certificate: certificate, data: data)
