@@ -1,6 +1,6 @@
 # G4: security review package for the Apple Account bridge
 
-Status 19 November 2026 (revised the same day for review readiness): **implementation ready for an independent security review. Not reviewed. No live Apple service has been contacted.** The author of the bridge has not reviewed it independently. G4 stays open until a reviewer independent of the implementation records the decision in section 10.
+Status 19 November 2026 (revised the same day for review readiness; remediation for issue #33 in section 12): **implementation ready for an independent security review. Not reviewed. No live Apple service has been contacted.** The author of the bridge has not reviewed it independently. G4 stays open until a reviewer independent of the implementation records the decision in section 10.
 
 ## 1. What is under review
 
@@ -136,8 +136,8 @@ All three clients in the live build verify TLS. The fork has no switch to turn t
 
 ## 7. Failure handling
 
-- **Every operation ends with exactly one terminal event**, including when it is cancelled, its slot is closed, its input is malformed, or the operation panics (checked in Rust). Swift's per-operation event queue is released on that event.
-- **Cancellation.** Swift task cancellation and the authenticator's `cancel()` call `zag_bridge_cancel`, which drops the running future, including any request in flight.
+- **Every operation ends with exactly one terminal event**, including when it is cancelled, its slot is closed, its input is malformed, or the operation panics (checked in Rust). Swift does not rely on it for memory safety: the callback context is a registry token, and messages for an operation that has ended are ignored (section 12).
+- **Cancellation.** Swift task cancellation and the authenticator's `cancel()` call `zag_bridge_cancel`, which drops the running future, including any request in flight. Swift runs one operation per slot, and cancels only the operation that is still running, so a late cancellation never reaches a newer one (section 12). An operation that completed before the cancellation took effect keeps its outcome.
   - The authenticator's deadline (`operationTimeout`) cancels the same way. Checked: a sign-in that does not answer is stopped in under 3 s with a 0.3 s deadline.
   - A sign-in abandoned at the code prompt is cancelled when the next one starts.
 - **Verification codes:**
@@ -214,9 +214,10 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 ### A. Swift/Rust boundary (FFI)
 - [ ] `src/ffi.rs`: every pointer is null-checked; lengths are capped (64 KiB; codes 16 bytes); UTF-8 is validated; no pointer is kept after a call returns.
 - [ ] `ZagBridgeStorage` callbacks: `retrieve` buffers are freed by `release` (zeroed first); keys are NUL-terminated; failures return non-zero.
-- [ ] The callback `context` is released exactly once, on the terminal event (`ZagBridgeEvents.start`). There is no use after release.
+- [ ] The callback `context` is a token in `ZagBridgeOperations`, not an object pointer. An operation is registered once and removed once: by the bridge's terminal event, decided by the event *name* and not by whether Swift could parse it, or when its slot closes. Repeated, late, stray and `NULL` callbacks are ignored (section 12).
 - [ ] Each started operation delivers exactly one terminal event: on success, failure, cancellation, slot closure, malformed input and panic (`slot.rs`; Rust tests).
-- [ ] Events are delivered on a bridge thread. `ZagBridgeEvents` is lock-protected, and no Swift actor is entered from that thread.
+- [ ] Events are delivered on a bridge thread. `ZagBridgeEvents`, `ZagBridgeSlot` and `ZagBridgeOperations` are lock-protected. No lock is held while a continuation is resumed, and no Swift actor is entered from that thread.
+- [ ] A message Swift cannot read while the bridge carries on is passed to the reader as `malformed`, and the operation is cancelled; the slot stays busy until the bridge's own terminal event.
 - [ ] The C header matches the exports (`test-zag-apple-bridge.sh`).
 
 ### B. Account isolation
@@ -230,6 +231,8 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 
 ### C. Keychain accessibility and key exportability (#28)
 - [ ] Every item is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and not synchronised: sessions and identities (`ZagKeychainFreeAccountSecretStore`), signing keys (`ZagKeychainSigningKeys`) and anisette state (`ZagBridgeAnisetteKeychain`).
+- [ ] Writes are add-or-update in place, so a failed write leaves the previous value: the secret store and, since section 12, the anisette store. A Keychain lookup that returns anything but a key reference is refused, not force-cast.
+- [ ] Items live in the app's default access group only. There are no `keychain-access-groups`, App Groups or app extensions (`Feather.entitlements`, project).
 - [ ] No release code path exports a private key. `ZagSecuritySigningKeyFactory` is `DEBUG`-only, and the release scan checks it. The only remaining `SecKeyCopyExternalRepresentation` calls are on public keys.
 - [ ] The limitation is accepted: software RSA keys are exportable by the app's own process (section 3).
 - [ ] Lifecycle (`SIGNING-KEY-SECURITY.md` in #28, "Signing-key lifecycle review"): switching, sign-out, removal, missing key, restore.
@@ -246,6 +249,9 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 ### E. Cancellation
 - [ ] Task cancellation, `cancel()`, the deadline and slot closure all reach `zag_bridge_cancel` and drop the running future, including an in-flight request.
 - [ ] A sign-in abandoned at the code prompt is cancelled by the next sign-in.
+- [ ] Cancellation is per operation in Swift (`ZagBridgeSlot.cancel(_:)`): it reaches the bridge only while that operation is still the one running in its slot. Overlapping operations in a slot are refused as `busy` in Swift and again in Rust (#34).
+- [ ] The authenticator refuses calls that arrive while another call waits for an event (actor reentrancy).
+- [ ] A cancellation that races a completed certificate request reports the request's real outcome; a cancelled request whose outcome is unknown stays unconfirmed (section 12).
 
 ### F. Credential lifetime
 - [ ] The password is never stored; Rust's copy is zeroised on every path, including cancellation.
@@ -267,6 +273,7 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 
 ### J. Recovery screens and Release gating (#28, owner decisions 20 Nov)
 - [ ] Check Again (`checkUnresolvedCertificateRequest`) only reads the certificate listing: it never submits a request or revokes, acts only if the journal is unchanged after the listing returns, and changes nothing on cancellation, sign-out or network failure.
+- [ ] Provisioning, Check Again, Abandon and the unresolved-request query of one account and team run one at a time in the provisioner (`exclusively`). A request that is still out is never settled from another operation's listing, sent again, abandoned or shown as unresolved (section 12).
 - [ ] Abandon (`abandonUnresolvedCertificateRequest`) needs confirmation in the UI, warns that an issued certificate may still occupy a slot, removes only the pending key and journal, and works signed out (local only).
 - [ ] An unresolved request is never retried in the background (`ZagFreeAccountLifecycle.reason` maps it to `signingFailed`), and signing stops as unresolved until it is settled.
 - [ ] Every outcome is reported to the user (`ZagCertificateRecoveryModel.message`): recovered, not issued, still unresolved, abandoned, nothing pending, could not check.
@@ -278,3 +285,124 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 - PR #28 `64de6694`: branched from `main` `bcf30a9f`. `main` is now `e077cf04`, which adds only #30's documentation, and #28 merges into it without conflicts.
 - PR #29: the head named in its description. It contains #28 `64de6694` through merge commits only, plus the bridge commits.
 - Merge order if approved: #26, then #28, then #29. Nothing is merged before the independent G2 and G4 reviews.
+
+## 12. Remediation for issue #33 (for re-review)
+
+These are review findings and test gaps, not confirmed exploits. Nothing here was run against Apple or an anisette server.
+
+**Branches:**
+- #34 (`review/g4-anisette-url-validation`, `280d50e8`) is the base. It covers issue items 1 and 2: the full anisette URL policy at configuration time, and slot-level exclusivity in Rust.
+- This remediation is stacked on #34. The frozen heads #26, #28 and #29 are unchanged.
+
+### 12.1 Swift/Rust callback ownership (`ZagIsideloadBridge.swift`)
+
+**Before:**
+- The context was `Unmanaged.passRetained(events)`. It was released on the first event that *Swift parsed* as terminal.
+- Anything Swift could not parse became `failed(.malformed)` and counted as terminal.
+
+**Confirmed defects:**
+
+| # | Defect | Trigger | Effect before |
+|---|---|---|---|
+| 1 | Early release | A message Swift cannot read while the bridge continues, e.g. `codeRequired` with `codeLength` outside 4–8 | Context released; the bridge's real terminal event then used freed memory |
+| 2 | Double release | A repeated terminal event | Use after free and an over-release |
+| 3 | Lost reader | Two overlapping `next()` calls (actor reentrancy) | The first continuation was overwritten and never resumed |
+| 4 | Cancellation reaching another operation | Rust frees the slot before Swift receives the terminal event; a late cancel handler called the slot-wide `zag_bridge_cancel` | Could stop a newer operation in the same slot |
+| 5 | No reclamation | No terminal event ever arrives | The retained context leaked |
+
+Rust delivers exactly one terminal event per started operation, so defects 2 and 5 need a faulty bridge. The Swift side no longer depends on that for memory safety.
+
+**After:**
+- **The context is a token.** `ZagBridgeOperations` maps a number to the operation.
+  - The bridge's terminal event (`signedIn`, `result` or `failed` by name) removes the operation. So does the slot closing first.
+  - Repeated, late, stray, unknown-token and `NULL` callbacks find nothing and are ignored.
+- **Unusable messages.** A message Swift cannot use while the bridge continues reaches the reader as `malformed`, and Swift cancels the operation. The slot stays busy until the bridge's own terminal event.
+- **One operation per slot in Swift**, until its terminal event reaches Swift. `cancel(_:)` calls `zag_bridge_cancel` only while that operation is still the running one.
+- **Readers.** Several readers are served in turn, and none is left waiting.
+- **The authenticator** refuses `signIn`, `requestCode` and `submitCode` while another call is waiting (actor reentrancy).
+- **Message copies** of each callback are wiped after parsing.
+
+### 12.2 Keychain, account isolation, key deletion and credentials
+
+**Reviewed:**
+- `ZagKeychainSigningKeys`:
+  - RSA-2048, permanent, `AfterFirstUnlockThisDeviceOnly`, not synchronised.
+  - The tag is `<namespace>.signing-key.<account UUID>.<team>[.<slot>]`, with team and slot alphanumeric. The label is per account.
+  - Deletion is by tag, or by label for the whole account, repeated until none is left. Other accounts and teams are untouched (Keychain harness and strict tests).
+- `ZagKeychainFreeAccountSecretStore`: add-or-update, per-item protection class, deletion scoped by account prefix.
+- `ZagBridgeAnisetteKeychain` and `ZagBridgeAnisetteLocalState`.
+- Entitlements: no shared access groups or extensions.
+- Credential buffers: the password goes from `ZagEphemeralSecret` to a Rust `Zeroizing` copy. The token is wiped from the credential JSON. The C buffers are wiped after delivery.
+
+**Fixed:**
+- **The anisette store** was delete-then-add, so a failed add lost the account's anisette state (a new anisette device at the next sign-in). It is now add, or update in place.
+- **`ZagKeychainSigningKeys.key(tag:)`** force-cast the Keychain result. A non-key result is now refused.
+- **2FA code bytes** passed to `zag_bridge_answer` are wiped. The bridge keeps its own zeroising copy.
+
+**Unchanged and accepted residuals:** listed under 12.6.
+
+### 12.3 Certificate issuance recovery and duplicate prevention (`ZagFreeAccountProvisioner`)
+
+**Confirmed defect: a duplicate request because of actor reentrancy.**
+- Two signings of one team at once:
+  1. The first writes its request as unconfirmed, then awaits the submission.
+  2. The second re-enters and settles that in-flight request from its own listing as "not issued".
+  3. With a listing that includes certificate content, the second then sends the same request again: two certificates for one key, and two of the team's slots.
+- Check Again racing a retry did the same.
+- Abandon could remove the key of a request that was still out.
+- **Reproduced** before the fix: the overlap check failed with "sent 2", and the Check Again race failed with "got notIssued".
+
+**Fix:**
+- Provisioning, Check Again, Abandon and the unresolved-request query of one account and team run one at a time (`exclusively`). Other scopes are unaffected.
+- `abandonUnresolvedCertificateRequest` and `unresolvedCertificateRequest` became `async`. All callers already awaited them.
+
+**Already correct, now covered by tests:**
+- A cancellation, timeout, dropped connection or unreadable response after the request was sent leaves it unconfirmed, never "not issued".
+- With no certificate content in the listing, signing stops as unresolved and sends nothing, however often it is retried.
+- With content, the issued certificate is recovered with no new request.
+- Only an explicit refusal (rate limit, session rejected, certificate limit) marks a request "not issued".
+
+### 12.4 Revocation stays impossible through the bridge
+- `PortalRequest` has no revocation operation, and `live.rs` never calls the fork's `revoke_development_cert`.
+- Rust test `portal_requests_cannot_revoke_a_certificate`: `revokeCertificate`, `revokeDevelopmentCert`, `revoke_development_cert` and `RevokeCertificate` do not deserialise.
+- Swift check: a `revokeCertificate` portal request is refused as `invalidInput`.
+
+### 12.5 Evidence
+
+**New tests:**
+
+| Suite | Before | After | New coverage |
+|---|---|---|---|
+| `test-zag-apple-bridge.sh` (Swift) | 62 | 94 | Ownership: repeated, malformed, stray, `NULL`, unknown-token and missing terminal events through the real C callback. Concurrent readers. Stale-cancel targeting against the mock backend. 40 cancel-versus-complete races. Authenticator reentrancy. Closing at the 2FA prompt. Revocation refused. Anisette in-place update. |
+| `test-zag-apple-bridge.sh` (Rust) | default 3, mock 13, live 6 | default 4, mock 14, live 7 | Revocation cannot be deserialised |
+| `test-zag-zsign-branch.sh` (strict integration) | 44 | 64 | Overlapping signings, cancellation after issuance, four ambiguous responses, Check Again and Abandon racing a request in flight |
+
+**Mutation checks:** the new bridge checks fail against each of three mutants:
+- terminal decided by parsing (fails at "malformed: it stays registered until the bridge's own terminal event");
+- slot-wide cancel ("cancel targeting: … left the running sign-in untouched");
+- a single overwritten reader ("readers: … none waits forever").
+
+**Full regression:** run sequentially on code commit `a8684417` (macOS, Xcode 26.5, iOS 26.5 simulator). Everything is clean:
+- all 44 `scripts/test-zag-*.sh` suites pass, including:
+  - `apple-bridge`: Rust 4, 14 and 7; Swift 94;
+  - `zsign-branch`: 86 strict, 64 integration, 3 DER;
+  - `apple-accounts`: 95;
+  - `apple-accounts-ui` walkthrough;
+  - `isideload-fork`;
+  - `install-control-taps`: 8 of 8;
+- the Release build succeeds, and the Release scan passes;
+- package guard: 16;
+- the canonical IPA is unchanged (`67d1a79b`).
+
+The suites not run are the three that need arguments or the owner's certificate (section 3 of the hand-off).
+
+### 12.6 Remaining limitations and unresolved risks
+
+- **Live behaviour is untested.** None of this has run against Apple or an anisette server.
+- **A bridge that never sends a terminal event:** Swift reclaims the operation only when its slot closes. The authenticator's drain after cancelling (`signIn`) and a portal call's reader would still wait. That needs a Rust defect, and Rust tests cover every path to a terminal event.
+- **Malformed messages while the bridge continues:** the slot is busy until the bridge's terminal event after Swift's cancellation, so an immediate new sign-in can be refused as `busy` (fail closed).
+- **Waiting is not cancellation-aware:** an operation waiting for the scope (12.3) waits until the running one finishes, bounded by the operation deadline. `currentStep` is shared across scopes, so a failure's reported step can be wrong while two teams provision at once. This affects reporting only.
+- **Residual secrets in memory:** the token and code in Swift `String` and `NSString` copies (`JSONSerialization`), `Data` copies returned by the Keychain, and the fork's heap memory (question 1).
+- **Key exportability:** software RSA keys can be exported by the app's own process. `kSecAttrIsExtractable` is not enforced for them, and the Secure Enclave cannot hold RSA-2048.
+- **Apple-side state:** whether the live listing includes certificate content is unknown. Without it, a lost response stays unresolved until the user abandons it, which may leave an issued certificate occupying a slot (never revoked by Zag Store).
+- **Independence:** this remediation was written by the implementer. G4 stays open until the independent reviewer completes section 10 against the remediation head.
