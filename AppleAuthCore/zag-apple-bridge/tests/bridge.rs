@@ -88,6 +88,7 @@ mod scripted {
             { "email": "slow@zag.test", "password": "pw", "accountIdentifier": "ACC5", "delayMilliseconds": 30000 },
             { "email": "short@zag.test", "password": "pw", "accountIdentifier": "ACC6", "sessionLifetime": 1, "teams": [team("TEAMSIX006")] },
             { "email": "flaky@zag.test", "password": "pw", "accountIdentifier": "ACC7", "portalFailure": "network", "teams": [team("TEAMSVN007")] },
+            { "email": "panic@zag.test", "password": "pw", "accountIdentifier": "ACC8", "panics": true },
         ]});
         let bytes = script.to_string();
         assert_eq!(unsafe { zag_bridge_configure_mock(bytes.as_ptr(), bytes.len()) }, ZAG_BRIDGE_OK);
@@ -210,6 +211,17 @@ mod scripted {
         assert_eq!(portal(slot, &credential, teams), json!({ "event": "failed", "kind": "sessionExpired" }));
         let unknown = json!({ "accountIdentifier": "ACC6", "token": "forged", "expiresAt": 4_000_000_000u64 });
         assert_eq!(portal(slot, &unknown, json!({ "op": "teams" })), json!({ "event": "failed", "kind": "sessionExpired" }));
+        zag_bridge_close_slot(slot);
+    }
+
+    #[test]
+    fn a_panicking_operation_still_ends_with_one_terminal_event() {
+        let _guard = configure();
+        let slot = zag_bridge_open_slot();
+        let events = Events::new();
+        sign_in(slot, "panic@zag.test", "pw", &events);
+        assert_eq!(events.next(), json!({ "event": "failed", "kind": "malformed" }));
+        signed_in(slot, "first@zag.test", "pw-one");
         zag_bridge_close_slot(slot);
     }
 

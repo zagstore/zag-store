@@ -157,7 +157,7 @@ pub fn sign_in(id: u64, email: String, password: Zeroizing<String>, emit: Emit) 
             send(&prompt_emit, json!({ "event": "codeRequired", "prompt": prompt }));
         }
     });
-    runtime().spawn(async move {
+    let task = runtime().spawn(async move {
         let prompter = Prompter { prompts: prompts_tx, answers: tokio::sync::Mutex::new(answers_rx) };
         let result = tokio::select! {
             result = backend.sign_in(&email, password, &prompter) => result,
@@ -177,13 +177,21 @@ pub fn sign_in(id: u64, email: String, password: Zeroizing<String>, emit: Emit) 
                     },
                     "teams": signed_in.teams,
                 });
-                send(&emit, event);
+                event
             }
             Err(error) => {
                 finish_sign_in(id, None);
-                send(&emit, failure(error.kind));
+                failure(error.kind)
             }
         }
+    });
+    // The terminal event is delivered even if the operation panics.
+    runtime().spawn(async move {
+        let event = task.await.unwrap_or_else(|_| {
+            finish_sign_in(id, None);
+            failure(FailureKind::Malformed)
+        });
+        send(&emit, event);
     });
 }
 
@@ -223,7 +231,7 @@ pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emi
         Ok(prepared) => prepared,
         Err(error) => return send(&emit, failure(error.kind)),
     };
-    runtime().spawn(async move {
+    let task = runtime().spawn(async move {
         let run = async {
             let mut cache = cache.lock().await;
             let reusable = cache.as_ref().is_some_and(|cached| cached.token == credential.token);
@@ -248,8 +256,11 @@ pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emi
             Ok(())
         });
         match result {
-            Ok(value) => send(&emit, json!({ "event": "result", "value": value })),
-            Err(error) => send(&emit, failure(error.kind)),
+            Ok(value) => json!({ "event": "result", "value": value }),
+            Err(error) => failure(error.kind),
         }
+    });
+    runtime().spawn(async move {
+        send(&emit, task.await.unwrap_or_else(|_| failure(FailureKind::Malformed)));
     });
 }

@@ -46,6 +46,9 @@ pub struct MockAccount {
     pub issued_certificate: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// The sign-in panics (checks that a terminal event still arrives).
+    #[serde(default)]
+    pub panics: bool,
 }
 
 fn none() -> String {
@@ -102,6 +105,9 @@ impl Backend for MockBackend {
             .ok_or(BridgeError::new(FailureKind::Rejected))?;
         if account.delay_milliseconds > 0 {
             tokio::time::sleep(Duration::from_millis(account.delay_milliseconds)).await;
+        }
+        if account.panics {
+            panic!("scripted panic");
         }
         if account.sign_in_failure == Some(FailureKind::Network) {
             return Err(FailureKind::Network.into());
