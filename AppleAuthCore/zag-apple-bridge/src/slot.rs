@@ -273,3 +273,53 @@ pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emi
         send(&emit, task.await.unwrap_or_else(|_| failure(FailureKind::Malformed)));
     });
 }
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn busy_portal_slot_rejects_overlapping_portal_and_sign_in() {
+        let id = open();
+        with_slot(id, |slot| {
+            slot.portal_busy = true;
+            Ok(())
+        }).unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let portal_events = events.clone();
+        portal(
+            id,
+            Credential {
+                account_identifier: "test-account".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
+                expires_at: u64::MAX,
+            },
+            PortalRequest::Teams,
+            Box::new(move |bytes| {
+                portal_events.lock().unwrap().push(serde_json::from_slice(bytes).unwrap());
+            }),
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[json!({"event":"failed","kind":"busy"})]
+        );
+
+        let sign_in_events = events.clone();
+        sign_in(
+            id,
+            "atest".to_string(),
+            "test@example.invalid".to_string(),
+            Zeroizing::new("not-a-real-password".to_string()),
+            Box::new(move |bytes| {
+                sign_in_events.lock().unwrap().push(serde_json::from_slice(bytes).unwrap());
+            }),
+        );
+        assert_eq!(
+            events.lock().unwrap().last(),
+            Some(&json!({"event":"failed","kind":"busy"}))
+        );
+        close(id);
+    }
+}
