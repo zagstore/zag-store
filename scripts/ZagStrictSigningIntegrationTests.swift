@@ -273,6 +273,20 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 			  && replacement.keyIsInKeychain && (try? keys.key(account: account, team: team)) != nil,
 			  "Keychain keys: an identity whose key is missing is not reused; a new key and certificate are made")
 
+		// A certificate issued for another key (a wrong lookup, or a request in an
+		// unexpected format answered for something else) is refused, and nothing
+		// is stored.
+		let wrongPortal = WrongKeyPortal(inner: ZagSimulatedDeveloperPortal(team: team, issuer: OpenSSLIssuer()))
+		let wrongSecrets = MemorySecrets()
+		let wrongProvisioner = ZagFreeAccountProvisioner(portal: wrongPortal, keys: ZagKeychainSigningKeyFactory(keys: keys), secrets: wrongSecrets, account: account)
+		let wrongResult = await wrongProvisioner.provision(request, authorization: authorization)
+		if case .failure(let failure) = wrongResult {
+			check(failure.step == .certificate && wrongSecrets.identity(account, team) == nil,
+				  "Keychain keys: a certificate that is not for this account's key is refused and nothing is stored")
+		} else {
+			check(false, "wrong-key certificate accepted")
+		}
+
 		// Removing the account removes its key items in the directory's namespace.
 		let directoryKeys = ZagKeychainSigningKeys(namespace: ZagFreeAccountSimulation.accountsNamespace)
 		_ = try? directoryKeys.create(account: account, team: team, commonName: "Removal test")
@@ -287,4 +301,23 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 			check(false, "account removal: \(error)")
 		}
 	}
+}
+
+/// Answers every certificate request with a certificate for a different key.
+struct WrongKeyPortal: ZagDeveloperPortalService {
+	let inner: ZagDeveloperPortalService
+	func devices(team: String) async throws -> [ZagRegisteredDevice] { try await inner.devices(team: team) }
+	func registerDevice(udid: String, name: String, team: String) async throws -> ZagRegisteredDevice { try await inner.registerDevice(udid: udid, name: name, team: team) }
+	func appIDs(team: String) async throws -> [ZagRegisteredAppID] { try await inner.appIDs(team: team) }
+	func registerAppID(bundleIdentifier: String, name: String, team: String) async throws -> ZagRegisteredAppID { try await inner.registerAppID(bundleIdentifier: bundleIdentifier, name: name, team: team) }
+	func appGroups(team: String) async throws -> [ZagRegisteredAppGroup] { try await inner.appGroups(team: team) }
+	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup { try await inner.registerAppGroup(identifier, team: team) }
+	func assignAppGroups(_ groups: [String], to appID: ZagRegisteredAppID, team: String) async throws { try await inner.assignAppGroups(groups, to: appID, team: team) }
+	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] { try await inner.certificates(team: team) }
+	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
+		let other = SecKeyCreateRandomKey([kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits: 2048] as CFDictionary, nil)!
+		let substitute = try ZagCertificateSigningRequest.make(commonName: "Someone Else", privateKey: other)
+		return try await inner.submitCertificateRequest(ZagCertificateRequest(data: substitute), team: team)
+	}
+	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile { try await inner.profile(for: appID, team: team) }
 }
