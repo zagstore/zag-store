@@ -275,6 +275,6 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 
 ### Commit set for this review (20 Nov)
 - PR #26 (fork) `4b1a6984`: unchanged since G2 was prepared.
-- PR #28 `64de6694` (base `main` `e077cf04`).
+- PR #28 `64de6694`: branched from `main` `bcf30a9f`. `main` is now `e077cf04`, which adds only #30's documentation, and #28 merges into it without conflicts.
 - PR #29: the head named in its description. It contains #28 `64de6694` through merge commits only, plus the bridge commits.
 - Merge order if approved: #26, then #28, then #29. Nothing is merged before the independent G2 and G4 reviews.
