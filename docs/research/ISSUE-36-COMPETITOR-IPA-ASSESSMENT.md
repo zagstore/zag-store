@@ -23,7 +23,7 @@ The three outcomes #36 asks about:
 | (b) Use the existing external LocalDevVPN with Zag Store on iOS 27? | **Zag Store already does.** Every direct installation in today's releases goes through LocalDevVPN and on-device RemotePairing. This has been demonstrated on an iPhone 15 Pro Max running iOS 27.2 (§4.1). The free-account installer reuses that same installer unchanged. No VPN extension is needed for the first experiment. |
 | (c) Simplify pairing? | **Already done; there is nothing to adopt from Tetherless.** Tetherless's iOS 27 "Pair with…" flow advertises the same Bonjour service (`_remotepairing-pairable-host._tcp`) that Zag Store already ships for iOS 17 and later (§4.2). |
 
-**Fastest safe route (§7):** the first free-account sign-and-install experiment is blocked only by the Apple side: G2 licensing, G4 approval, the G3 provider decision (its study ends 25 Nov), and owner authorisation. It is not blocked by transport or pairing. The experiment can reuse the existing pairing, LocalDevVPN and installer without changes. "Installed but not verifiable" is the expected result until the misagent reader (draft #25) is approved.
+**Fastest safe route (§7):** the first free-account sign-and-install experiment is blocked only by the Apple side: G2 licensing, G4 approval, the G3 provider decision (its study ends 25 Nov), and owner authorisation. It is not blocked by transport or pairing. The experiment can reuse the existing pairing, LocalDevVPN and installer without changes. The installed profile can be read back with the misagent reader already in `main` (PR #25 through #27, device test A passed), using the Debug-only Installed Profiles screen. *(Corrected 19 Nov; see §10.)*
 
 ## 2. Verification of GPT-6's report
 
@@ -136,7 +136,7 @@ So the "external LocalDevVPN instead of our own VPN extension" question is alrea
 | T1 | Does a free-account-signed app install through the same path? | [live test needed] | §7, step 5. `installation_proxy` validates the embedded profile, which should not depend on the transport. |
 | T2 | SideStore warns that "LocalDevVPN may not support the lockdown protocol on iOS 26.4+". | [archive observed] warning; [hypothesis] it concerns the legacy lockdown port (62078) that SideStore's minimuxer uses. Zag uses RPPairing and RSD on iOS 17+, and its iOS 27.2 installs work. | No action for iOS 17+. Zag's legacy pairing-file path covers only iOS 16.4–16.7, where the warning doesn't apply. |
 | T3 | Mobile data | [public source] Zag already detects "connection refused" with Mobile Data on, and has the Mobile Data Toggle Shortcut flow. | Unchanged. |
-| T4 | Reading the installed profile and its expiry | [public source] Not possible today. Needs the idevice `misagent` reader, draft PR #25. SideStore does this ("Installing provisioning profile via RSD misagent"). | Not needed for the first install. The result will honestly be "installed, not verifiable". Prioritise #25 before any automatic refresh. |
+| T4 | Reading the installed profile and its expiry | [public source] **Already possible:** the RPPairing `misagent` reader (PR #25) is in `main` through PR #27 (`bcf30a9f`), and device test A passed (`DEVICE-TEST-PHASE7.md`). The free-account installer's own `installedProfiles` hook is not wired, and its comment saying #25 is a draft is out of date. *(Corrected; see §10.)* | Verify through the Debug-only Installed Profiles (Read Only) screen, as `SUPERVISED-EXPERIMENT-SEQUENCE.md` step 9 does. Wire the installer hook before any automatic refresh. |
 | T5 | A free account's 3-app and 7-day limits, and refresh | [live test needed] | After the first success (§7, step 7). |
 
 ### 4.2 Tetherless's iOS 27 "Pair with…"
@@ -211,8 +211,8 @@ Each step needs the gate shown, and none is authorised by this report.
 | 2 | G2 licence and provenance decision for `zag-isideload` (MPL-2.0 files, MIT, the GPL-3.0 reference question) | Owner and reviewer | Recorded decision |
 | 3 | G3: study report on 25 Nov, privacy desk review, provider and serial choice, per-account state decision | Owner | §3.4 criteria |
 | 4 | Experiment build: an isolated Debug or preview build with the free-account gate on only in that build; a dedicated Apple Account with no payment method, whose 2FA the owner holds; production IPA and gates unchanged | Owner (explicit) | The build's feature flags are listed; the canonical IPA hash is unchanged |
-| 5 | **Single run:** sign in → register this device (UDID from the existing pairing) → list certificates → issue at most one → one App ID and profile → sign one small test app → install through the existing RPPairing installer | Owner, present | App launches on device; one certificate issued; nothing revoked; redacted log (§5.2); result "installed, not verifiable" accepted |
-| 6 | misagent profile reader (#25) | Review | The installed profile's UUID and expiry are read back |
+| 5 | **Single run:** sign in → register this device (UDID from the existing pairing) → list certificates → issue at most one → one App ID and profile → sign one small test app → install through the existing RPPairing installer | Owner, present | App launches on device; one certificate issued; nothing revoked; redacted log (§5.2); installed profile VERIFIED by the read-back screen |
+| 6 | Wire the installer's `installedProfiles` hook to the existing misagent reader | Review | The installer reports VERIFIED without the Debug screen |
 | 7 | Refresh within 7 days; the 3-app limit; expiry behaviour; Shortcuts-assisted refresh | Later | Documented results |
 
 **What I would not do first:**
@@ -228,7 +228,7 @@ Each step needs the gate shown, and none is authorised by this report.
 | P0 | G4 approval (#35); G2 decision; G3 decision after 25 Nov | GPT-6; owner |
 | P1 | An experiment build plan listing exactly which gates open and where (doc only) | Claude, on request |
 | P1 | Redacted experiment logger spec matching §5.2 (doc only; no code until approved) | Claude, on request |
-| P2 | misagent reader #25 review | Reviewer |
+| P2 | Wire the free-account installer to the existing misagent reader (#25 is in `main`) | Claude, on request |
 | P2 | Owner-operated v3 server feasibility (licence, hosting, Apple-library provenance) | Claude research, on request |
 | P3 | Pairing failure-message review against Tetherless's wording | Low |
 
@@ -240,3 +240,10 @@ Each step needs the gate shown, and none is authorised by this report.
 - The Tetherless `auth.itunes.apple.com` association rests on co-located strings, not control flow.
 - The G3 study is incomplete.
 - Every Apple behaviour stays [live test needed].
+
+## 10. Correction (19 November 2026)
+
+The first version of this report (`88b2590a`) said the installed-profile (`misagent`) reader was an unapproved draft (PR #25), so the experiment could only report "installed, not verifiable". That was wrong. I relied on an out-of-date comment in `ZagFreeAccountRPPairingInstaller.swift`.
+- PR #25 was merged into `main` through PR #27 (`bcf30a9f`), and device test A passed (`DEVICE-TEST-PHASE7.md`).
+- What remains is only wiring the free-account installer's own `installedProfiles` hook.
+- §1, §4.1 (T4), §7 and §8 are corrected. The conclusions on anisette, LocalDevVPN, pairing and the allowlist are unchanged.
