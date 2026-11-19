@@ -163,10 +163,18 @@ assert 'case 211' not in core_src and 'Acknowledg' not in coord
 # No edits to cryptographic admission, rollback or metadata; the only native
 # change is the self-update Upgrade exchange in lib.rs.
 changed=subprocess.check_output(['git','diff','ea191fff','--name-only'],cwd=root,text=True).splitlines()
-assert {p for p in changed if p.startswith('RPPairingCore/')} <= {'RPPairingCore/rust-core/src/lib.rs'}
-# Swift core changes are limited to publication cadence and the 209 hook.
+# PR #25 (read-only installed-profile reader) also adds its declaration to
+# the bridge header and the build script's header, and a crate feature: those
+# files must equal the reviewed, device-tested #25 commit exactly.
+pr25 = ['RPPairingCore/build-rust.sh', 'RPPairingCore/rust-core/Cargo.toml', 'Feather/RPPairing/ZagRPPairingBridge.h']
+for path in pr25:
+ if path in changed:
+  assert (root/path).read_text() == subprocess.check_output(['git','show','25cdc49a:'+path],cwd=root,text=True), path
+assert {p for p in changed if p.startswith('RPPairingCore/')} <= {'RPPairingCore/rust-core/src/lib.rs', *pr25}
+# Swift core changes are limited to publication cadence, the 209 hook and
+# the #25 reader (checked exactly by test-zag-device-link.sh).
 assert {p for p in changed if p.startswith('Feather/RPPairing/')} <= {
- 'Feather/RPPairing/ZagRPPairingCore.swift','Feather/RPPairing/ZagGate4PublicationPolicy.swift'}
+ 'Feather/RPPairing/ZagRPPairingCore.swift','Feather/RPPairing/ZagGate4PublicationPolicy.swift', *pr25}
 core=read('Feather/RPPairing/ZagRPPairingCore.swift')
 for invariant in ['gate4Completion?(.success(()))','ZagRPPairingFailure.classify(message, installationStarted: installationStarted)',
                   'gate4AttemptEvents.append(ZagGate4Event(code: code, message: message))','gate4Progress?(percent)']:
