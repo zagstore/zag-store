@@ -16,11 +16,20 @@ Status 19 November 2026: **no gate is complete.**
 
 ## Decisions outside G1–G6 that block or shape the experiment
 
+**Still open**
+
 | Decision | Options | Where |
 |---|---|---|
 | Merges: #26 (after G2), #29 and #28 | Approve each, in that order | The PRs |
-| L1: orphaned Keychain items after a reinstall | (a) a guarded sweep on fresh install, (b) deterministic account IDs, (c) document a manual reset | `SIGNING-KEY-SECURITY.md` (#28) |
-| L2: a failed certificate request discards a still-valid key | Swap the key in only after the certificate is issued, or accept | same |
-| Anisette device state shared by accounts | Accept, or one per account | `G4-SECURITY-REVIEW.md` §10, question 3 |
 | Pinning the anisette host | Pin or not | `G4-SECURITY-REVIEW.md` §10, question 2 |
-| Merging #30 (documentation only) | Merge independently, or with #29 | #30 |
+| The anisette device serial, sent for every account | A value that identifies nobody, or one per account (with G3) | `G4-SECURITY-REVIEW.md` §4 |
+| Where to offer cleanup of an earlier installation's items | A Settings entry, or none | `SIGNING-KEY-SECURITY.md` (#28), L1 |
+
+**Decided by the owner, 19 November 2026** (implemented in draft PRs; part of the G4 review)
+
+| Decision | Implemented in |
+|---|---|
+| **L1, reinstall:** guarded recovery and cleanup. Recover only items with verifiable ownership; cleanup explicit, scoped and safe; no undocumented Keychain assumptions. | #28 |
+| **L2, certificate requests:** transactional. A new key stays pending until its certificate is issued and verified; bounded retries; never publish an incomplete identity; abandoned keys removed. | #28 |
+| **Anisette state:** one per Apple Account. If the chosen provider requires a shared device identity, stop and bring it back for approval. | #29 |
+| **#30:** controlled documentation-only merge. | Merged as `e077cf04` |
