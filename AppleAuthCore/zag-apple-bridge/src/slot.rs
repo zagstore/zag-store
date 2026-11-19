@@ -64,6 +64,8 @@ struct Slot {
     /// The Apple Account this slot belongs to, once known.
     bound: Option<String>,
     signing_in: bool,
+    /// Only one portal request may run in a slot; cancellation is slot-wide.
+    portal_busy: bool,
     answers: Option<mpsc::UnboundedSender<CodeAction>>,
     /// Stops every running operation in this slot.
     cancels: Vec<oneshot::Sender<()>>,
@@ -132,7 +134,7 @@ pub fn sign_in(id: u64, anisette_scope: String, email: String, password: Zeroizi
     let (answers_tx, answers_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let started = with_slot(id, |slot| {
-        if slot.signing_in {
+        if slot.signing_in || slot.portal_busy {
             return Err(FailureKind::Busy.into());
         }
         slot.signing_in = true;
@@ -217,12 +219,18 @@ fn finish_sign_in(id: u64, account: Option<String>) {
 pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emit) {
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let prepared = with_slot(id, |slot| {
+        // A slot's cancellation is intentionally broad. Refuse overlapping
+        // operations rather than let one caller cancel another's mutation.
+        if slot.signing_in || slot.portal_busy {
+            return Err(FailureKind::Busy.into());
+        }
         match &slot.bound {
             Some(bound) if *bound != credential.account_identifier => return Err(FailureKind::InvalidInput.into()),
             Some(_) => {}
             // A session restored after launch binds the slot on first use.
             None => slot.bound = Some(credential.account_identifier.clone()),
         }
+        slot.portal_busy = true;
         slot.cancels.push(cancel_tx);
         Ok(slot.session.get_or_insert_with(Default::default).clone())
     })
@@ -252,6 +260,7 @@ pub fn portal(id: u64, credential: Credential, request: PortalRequest, emit: Emi
             _ = cancel_rx => Err(FailureKind::Cancelled.into()),
         };
         let _ = with_slot(id, |slot| {
+            slot.portal_busy = false;
             slot.cancels.retain(|cancel| !cancel.is_closed());
             Ok(())
         });
