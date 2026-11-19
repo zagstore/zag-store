@@ -556,3 +556,20 @@ As before, the suites not run are the three that need arguments or the owner's c
   - For a certificate request, provisioning reports `cancelled`, and the request stays unconfirmed: settled from the listing, or by the user. It is never sent again blindly.
 - **An uncancelled reader** whose bridge never sends a terminal event waits until its caller cancels it. Every production caller has a deadline: the authenticator's `operationTimeout` and the provisioner's `ZagDeadline`.
 - **Section 12.6 still applies** except where struck through: live behaviour untested, residual secrets in memory, exportable software keys, unknown listing content, and that the implementer wrote this.
+
+## 14. Pre-experiment verification summary (19 November 2026, by the implementer; for re-review)
+
+Head: `027d848e` on `experiment/g5-live-test`. This summary is not the independent review. G4 stays **open**.
+
+| Area | Evidence | Status |
+|---|---|---|
+| Bridge lifecycle | §13.1–13.4: exactly one terminal event; slot destruction; callbacks racing teardown; lock reentrancy. `test-zag-apple-bridge.sh` passes. | Fixed, awaiting re-review |
+| Cancellation | `tokio::select!` drops a sign-in on cancel (`slot.rs:164`, `:261`). Swift abandons an operation after the grace period (§13.6). **New finding, fixed in `027d848e`:** an ended provisioning WebSocket made `remote_v3/mod.rs` loop on `None` without yielding. tokio-tungstenite 0.29.0 returns `Ready(None)` at once (`lib.rs:297`), so cancellation could never take effect, and a core spun with the slot busy. It is now an error. `test-zag-isideload-fork.sh` checks for it (mutation-tested). | Fixed, needs re-review |
+| Keychain errors | §12.2. Replace-in-place keeps the previous anisette state on a failed write. | Awaiting re-review |
+| Certificate and private key | §12.3. One-use budget, consumed before the send. Possession check, journal and recovery. No revocation path (§12.4; G5 suite check). | Awaiting re-review |
+| Credentials | The password is borrowed and wiped (`Zeroizing`). Never persisted or logged. Never sent to the anisette host (allowlist). Residual copies: §10 question 1. | Residuals for the reviewer |
+| Network guard (C5) | Only `guarded_client` builds HTTP clients: https only, no redirects, the Guard with the time gate around each request (`net_policy.rs:79-111`). In experiment builds `configureLive` refuses an unconfigured gate (`0d365529`). End-to-end test: a refused Date sends no credentials. Source checks in `test-zag-g5-experiment.sh` (mutation-tested). | Fixed, needs re-review |
+
+**Correction to §10 question 3.** The device serial is validated and stored, but the fork never transmits it: `X-Apple-I-SRL-NO` is commented out in `anisette/mod.rs`. It does not correlate accounts. The IP address and the provider still can.
+
+**Remaining code blockers: none known.** Live behaviour remains untested (§12.6).

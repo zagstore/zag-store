@@ -198,6 +198,29 @@ All paths are under `AppleAuthCore/zag-isideload/src/`. Every retained file is l
 - [ ] The obligations hold for each channel Zag Store uses: IPA download, AppTesters, and any source.
 - [ ] The acknowledgements entry for the first release that includes the bridge is drafted, covering isideload, the MPL-covered files, Rust dependencies, `ring` and `webpki-roots`. It is **not written yet**.
 
+## 8a. Re-verification at `027d848e` (19 November 2026, by the implementer; not a review)
+
+- **Recorded diff:** `upstream-changes.diff` had not been updated since `49c01e9e`. It no longer described the G5 changes to the fork (`permit_observed` in `websocket.rs`, `pub(crate) URL_BAG` in `grandslam.rs`), so `zag-g2-reproduce.sh` failed. It was regenerated in `027d848e`.
+- **Reproduction:** run against the upstream archives used before (SHA-256: isideload `0184e477…a0a667`, apple-private-apis `b7520340…1c82bb1`), `zag-g2-reproduce.sh` reports "differs from upstream exactly as recorded". The archives are not git checkouts, so their commits are not checked by the script. The reviewer should use their own checkouts.
+- **Similarity:** figures unchanged from section 2. The `dev/` files' longest run against Sideloader is still 7 tokens.
+- **MPL headers:** exactly the four Decision A files carry an MPL-2.0 header.
+- **Licence files:** `LICENSE-MPL-2.0` and `LICENSE-isideload-MIT` ("Copyright (c) 2025 nab138") are present.
+- **Assets:** `apple_root.cer` SHA-256 is `b0b1730e…11001f024`.
+- **Dependencies:** `test-zag-isideload-fork.sh` passes (239 locked crates, 186 compiled for iOS, none copyleft). The bridge's iOS build adds only crates already in section 4.
+- **Fork change since #26:** `027d848e` changes one line of `remote_v3/mod.rs` (Decision A). An ended provisioning socket is now an error instead of a busy loop. The change stays under the file's licence.
+- **Still unresolved:** Decisions A–D and section 6 are legal questions for the independent reviewer. None is answered here.
+
+### Draft acknowledgements text (not in the app; for the first release that includes the bridge)
+
+> **Apple Account sign-in and developer services** use code from isideload by nab138 (MIT License, Copyright (c) 2025 nab138), modified by Zag Store. The files `auth/apple_account.rs`, `auth/grandslam.rs`, `anisette/remote_v3/mod.rs` and `anisette/remote_v3/state.rs` are derived in part from SideStore's apple-private-apis (omnisette, icloud-auth) and are distributed under the Mozilla Public License 2.0 *[pending Decision A]*. Their source, including Zag Store's changes, is available at https://github.com/zagstore/zag-store under `AppleAuthCore/zag-isideload`.
+>
+> **Rust libraries.** The sign-in bridge includes open-source Rust crates under the MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0 and CDLA-Permissive-2.0 licences; the full list is in `AppleAuthCore/zag-isideload/LICENCE-INVENTORY.tsv`. It includes *ring* (Apache-2.0 AND ISC, including code derived from OpenSSL and BoringSSL, whose notices are reproduced in full) and webpki-roots (CDLA-Permissive-2.0).
+
+Before release, the reviewer confirms:
+- the licence list against the inventory;
+- whether *ring*'s and the Apache-2.0 crates' NOTICE texts must be reproduced in full in the app;
+- the wording that Decision B requires.
+
 ## 9. Decision record (for the independent reviewer)
 
 | Field | Entry |
