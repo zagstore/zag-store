@@ -20,6 +20,11 @@ final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 
 nonisolated(unsafe) var passed = 0
 
+final class WaitBox<T>: @unchecked Sendable {
+	let lock = NSLock()
+	var value: T?
+}
+
 func check(_ condition: Bool, _ name: String) {
 	guard condition else {
 		print("FAIL: \(name)")
@@ -286,6 +291,7 @@ struct ZagAppleBridgeTests {
 		}
 
 		await anisetteStateFollowsTheAccount()
+		if let storedOne { await callbackOwnership(credential: storedOne) }
 
 		// Secrets and diagnostics.
 		let everything = secrets.allBytes
@@ -302,7 +308,228 @@ struct ZagAppleBridgeTests {
 		check(String(describing: brief.credential).contains("[session credential]") && !String(describing: brief).contains(brief.credential.token),
 			  "diagnostics: credentials describe themselves without the token")
 
+		check(ZagBridgeOperations.shared.count == 0, "ownership: after every operation, none is still registered with the bridge")
 		print("SUCCESS: \(passed) Apple bridge integration checks passed")
+	}
+
+	/// Sends one message through the bridge's callback, as the bridge does.
+	static func emit(_ context: UnsafeMutableRawPointer?, _ json: String?) {
+		guard var bytes = json.map({ Array($0.utf8) }) else { return ZagBridgeOperations.callback(context, nil, 0) }
+		ZagBridgeOperations.callback(context, &bytes, bytes.count)
+	}
+
+	static let validPrompt = #"{"event":"codeRequired","prompt":{"method":"trustedDevice","codeLength":6}}"#
+
+	/// The value `body` returns within `seconds`, or nil if it is still waiting.
+	static func within<T: Sendable>(_ seconds: Double, _ body: @escaping @Sendable () async -> T) async -> T? {
+		let box = WaitBox<T>()
+		Task { let value = await body(); box.lock.withLock { box.value = value } }
+		let deadline = Date().addingTimeInterval(seconds)
+		while Date() < deadline {
+			if let value = box.lock.withLock({ box.value }) { return value }
+			try? await Task.sleep(nanoseconds: 10_000_000)
+		}
+		return box.lock.withLock { box.value }
+	}
+
+	static func isResult(_ event: ZagBridgeEvent?, _ value: String) -> Bool {
+		if case .result(let data) = event { return String(decoding: data, as: UTF8.self) == value }
+		return false
+	}
+
+	static func isFailure(_ event: ZagBridgeEvent?, _ kind: ZagBridgeFailure) -> Bool {
+		if case .failed(kind) = event { return true }
+		return false
+	}
+
+	/// G4: who owns the callback context, and when. Fake operations drive the
+	/// real callback with the messages a faulty bridge could send; real ones
+	/// (the scripted backend) check cancellation and completion races.
+	static func callbackOwnership(credential: ZagSessionCredential) async {
+		let operations = ZagBridgeOperations.shared
+		let base = operations.count
+
+		// A repeated terminal event, and messages after it.
+		weak var released: ZagBridgeEvents?
+		do {
+			let slot = ZagBridgeSlot()
+			var context: UnsafeMutableRawPointer?
+			let events = slot.start { saved, _ in context = saved }
+			released = events
+			check(operations.count == base + 1, "ownership: a started operation is registered once")
+			emit(context, #"{"event":"result","value":1}"#)
+			emit(context, #"{"event":"result","value":2}"#)
+			emit(context, #"{"event":"failed","kind":"network"}"#)
+			emit(context, validPrompt)
+			let first = await events.next(), second = await events.next()
+			check(isResult(first, "1") && second == nil, "ownership: only the first terminal event is delivered; later ones are ignored")
+			check(operations.count == base, "ownership: the operation is released once, by its first terminal event")
+		}
+		check(released == nil, "ownership: nothing keeps a finished operation alive")
+
+		// A message Swift cannot read while the bridge carries on: before,
+		// this released the context and the bridge's real terminal event then
+		// reached freed memory.
+		do {
+			let slot = ZagBridgeSlot()
+			var context: UnsafeMutableRawPointer?
+			let events = slot.start { saved, _ in context = saved }
+			emit(context, #"{"event":"codeRequired","prompt":{"method":"trustedDevice","codeLength":3}}"#)
+			check(isFailure(await events.next(), .malformed), "malformed: an unreadable prompt ends the operation for Swift as malformed")
+			check(operations.count == base + 1, "malformed: it stays registered until the bridge's own terminal event")
+			var reached = false
+			let refused = slot.start { _, _ in reached = true }
+			check(isFailure(await refused.next(), .busy) && !reached, "malformed: the slot accepts nothing new until the bridge has finished")
+			emit(context, #"{"event":"failed","kind":"cancelled"}"#)
+			check(operations.count == base, "malformed: the bridge's terminal event then releases it, safely")
+			emit(context, #"{"event":"failed","kind":"cancelled"}"#)
+			let next = slot.start { saved, _ in context = saved }
+			check(operations.count == base + 1, "malformed: the slot is free again")
+			emit(context, #"{"event":"result","value":null}"#)
+			check(isResult(await next.next(), "null"), "malformed: the next operation works normally")
+		}
+
+		// Unreadable, empty and stray messages.
+		do {
+			let slot = ZagBridgeSlot()
+			var context: UnsafeMutableRawPointer?
+			let events = slot.start { saved, _ in context = saved }
+			emit(nil, #"{"event":"result","value":1}"#)
+			emit(UnsafeMutableRawPointer(bitPattern: UInt.max), #"{"event":"failed","kind":"network"}"#)
+			check(operations.count == base + 1, "stray: a callback for no registered operation is ignored")
+			emit(context, nil)
+			check(isFailure(await events.next(), .malformed) && operations.count == base + 1,
+				  "stray: an empty message is malformed, and the operation stays registered until the bridge ends it")
+			emit(context, "not json")
+			emit(context, #"{"event":"failed","kind":"cancelled"}"#)
+			check(await events.next() == nil && operations.count == base, "stray: the terminal event still releases it")
+		}
+
+		// The terminal event never comes: closing the slot releases the operation.
+		do {
+			var context: UnsafeMutableRawPointer?
+			var events: ZagBridgeEvents?
+			do {
+				let slot = ZagBridgeSlot()
+				events = slot.start { saved, _ in context = saved }
+			}
+			let reader = events
+			check(isFailure(await within(2) { await reader?.next() } ?? nil, .cancelled) && operations.count == base,
+				  "missing terminal: a waiting reader gets `cancelled` when the slot closes, and the operation is released")
+			emit(context, #"{"event":"result","value":1}"#)
+			check(await events?.next() == nil, "missing terminal: a late terminal event after that is ignored")
+		}
+
+		// Several readers of one operation: none is left waiting.
+		do {
+			let slot = ZagBridgeSlot()
+			var context: UnsafeMutableRawPointer?
+			let events = slot.start { saved, _ in context = saved }
+			let one = Task { await events.next() }, two = Task { await events.next() }, three = Task { await events.next() }
+			try? await Task.sleep(nanoseconds: 100_000_000)
+			emit(context, validPrompt)
+			emit(context, #"{"event":"result","value":1}"#)
+			let results = await within(2) { [await one.value, await two.value, await three.value] }
+			let delivered = results?.compactMap { $0 } ?? []
+			check(results != nil && delivered.count == 2 && delivered.contains { isResult($0, "1") },
+				  "readers: concurrent readers each get one event or nil; none waits forever")
+		}
+
+		// Cancelling an operation that has ended never cancels the next one in
+		// the slot (the bridge's cancellation is slot-wide).
+		do {
+			let slot = ZagBridgeSlot()
+			var context: UnsafeMutableRawPointer?
+			let ended = slot.start { saved, _ in context = saved }
+			emit(context, #"{"event":"result","value":1}"#)
+			_ = await ended.next()
+			let signIn = try? ZagIsideloadBridge.signIn(slot: slot, appleID: "codes@bridge.invalid", password: ZagEphemeralSecret(passwordOne))
+			guard let signIn, case .codeRequired = await signIn.next() else { return check(false, "cancel targeting: sign-in") }
+			ended.cancel()
+			let overlapping = await ZagIsideloadBridge.portal(slot: slot, credential: credential, request: ["op": "teams"])
+			check(isFailure(overlapping, .busy), "cancel targeting: a portal call during a sign-in in the same slot is refused as busy")
+			let code = Array(deviceCode.utf8)
+			check(zag_bridge_answer(slot.id, ZAG_BRIDGE_ANSWER_CODE, code, code.count) == ZAG_BRIDGE_OK,
+				  "cancel targeting: cancelling the ended operation left the running sign-in untouched")
+			if case .signedIn = await signIn.next() {
+				check(true, "cancel targeting: and the sign-in completes")
+			} else {
+				check(false, "cancel targeting: and the sign-in completes")
+			}
+		}
+
+		// Cancellation racing completion, many times, on one slot.
+		do {
+			let slot = ZagBridgeSlot()
+			var outcomes: [String: Int] = [:]
+			for attempt in 0..<40 {
+				let call = Task { await ZagIsideloadBridge.portal(slot: slot, credential: credential, request: ["op": "certificates", "team": "BRTEAM0001"]) }
+				if attempt % 4 != 0 { try? await Task.sleep(nanoseconds: UInt64(attempt % 4) * 200_000) }
+				call.cancel()
+				let event = await within(5) { await call.value }
+				let name = event.map { event -> String in
+					switch event {
+					case .result: "result"
+					case .failed(let kind): kind.rawValue
+					default: "other"
+					}
+				} ?? "hung"
+				outcomes[name, default: 0] += 1
+			}
+			check(Set(outcomes.keys).isSubset(of: ["result", "cancelled"]),
+				  "race: cancelling as a portal call completes ends it once, as a result or as cancelled (\(outcomes))")
+			check(operations.count == base, "race: afterwards no operation is still registered")
+			if case .result = await ZagIsideloadBridge.portal(slot: slot, credential: credential, request: ["op": "teams"]) {
+				check(true, "race: the slot still works")
+			} else {
+				check(false, "race: the slot still works")
+			}
+		}
+
+		// The authenticator's actor is reentrant while it waits: a second call
+		// is refused instead of touching the first one's sign-in.
+		do {
+			let service = ZagIsideloadAuthenticationService()
+			let anisette = ZagAnisetteData(managedByBridgeAt: Date())
+			let waiting = Task { try await service.signIn(appleID: "slow@bridge.invalid", password: ZagEphemeralSecret(passwordOne), anisette: anisette) }
+			try? await Task.sleep(nanoseconds: 150_000_000)
+			var refusals = 0
+			if (try? await service.submitCode("482913", challenge: ZagTwoFactorChallenge(method: .trustedDevice, codeLength: 6, maskedDestination: nil, canRequestSMS: false),
+											  appleID: "slow@bridge.invalid", password: ZagEphemeralSecret(passwordOne), anisette: anisette)) == nil { refusals += 1 }
+			if (try? await service.requestCode(by: .sms, anisette: anisette)) == nil { refusals += 1 }
+			if (try? await service.signIn(appleID: "two@bridge.invalid", password: ZagEphemeralSecret(passwordTwo), anisette: anisette)) == nil { refusals += 1 }
+			check(refusals == 3, "reentrancy: calls arriving while a sign-in waits are refused")
+			waiting.cancel()
+			let outcome = await within(3) { (try? await waiting.value) == nil }
+			check(outcome == true, "reentrancy: the waiting sign-in is still the one cancelled, and ends")
+			if case .authenticated = try? await service.signIn(appleID: "two@bridge.invalid", password: ZagEphemeralSecret(passwordTwo), anisette: anisette) {
+				check(true, "reentrancy: the authenticator works normally afterwards")
+			} else {
+				check(false, "reentrancy: the authenticator works normally afterwards")
+			}
+		}
+
+		// Closing an authenticator that waits for a verification code.
+		do {
+			do {
+				let service = ZagIsideloadAuthenticationService()
+				let step = try? await service.signIn(appleID: "codes@bridge.invalid", password: ZagEphemeralSecret(passwordOne),
+													 anisette: ZagAnisetteData(managedByBridgeAt: Date()))
+				guard case .twoFactorRequired = step else { return check(false, "close at 2FA: sign-in") }
+				check(operations.count == base + 1, "close at 2FA: the sign-in waiting for a code is registered")
+			}
+			let released = await within(2) { ZagBridgeOperations.shared.count == base ? true : nil }
+			check(released == true, "close at 2FA: releasing the authenticator closes its slot and releases the sign-in")
+		}
+
+		// The bridge offers no certificate revocation (G4 §4).
+		do {
+			let slot = ZagBridgeSlot()
+			let revoke = await ZagIsideloadBridge.portal(slot: slot, credential: credential,
+														  request: ["op": "revokeCertificate", "team": "BRTEAM0001", "serialNumber": "0123"])
+			check(isFailure(revoke, .invalidInput), "revocation: a revokeCertificate request is refused as invalid input")
+		}
+		check(operations.count == base, "ownership: every operation above was released exactly once")
 	}
 
 	/// The bridge's anisette Keychain items (named `<scope>/<key>`, as the live
@@ -322,6 +549,24 @@ struct ZagAppleBridgeTests {
 		let scopeTwo = ZagIsideloadBridge.anisetteScope(forAppleID: "two@bridge.invalid")
 		let stray = "a" + String(repeating: "0", count: 32)
 		plant("\(scopeTwo)/adi.pb"); plant("\(scopeTwo)/device.json"); plant("\(stray)/adi.pb")
+
+		// The live storage's writes: an existing item is replaced in place.
+		let stored = "\(scopeTwo)/store-test"
+		func put(_ value: String) -> Int32 {
+			var bytes = Array(value.utf8)
+			return stored.withCString { ZagBridgeAnisetteKeychain.store($0, &bytes, bytes.count, service: service) }
+		}
+		func get() -> String? {
+			var buffer: UnsafeMutablePointer<UInt8>?
+			var length = 0
+			guard stored.withCString({ ZagBridgeAnisetteKeychain.retrieve($0, &buffer, &length, service: service) }) == 0, let buffer else { return nil }
+			defer { ZagBridgeAnisetteKeychain.release(buffer, length) }
+			return String(decoding: UnsafeBufferPointer(start: buffer, count: length), as: UTF8.self)
+		}
+		check(put("first") == 0 && put("second") == 0 && get() == "second",
+			  "anisette storage: writing an item again replaces its value in place, without deleting it first")
+		check(stored.withCString { ZagBridgeAnisetteKeychain.store($0, nil, 0, service: service) } == 1 && get() == "second",
+			  "anisette storage: a refused write leaves the previous value")
 
 		let secrets = MemorySecrets()
 		let directory = makeDirectory(secrets: secrets, diagnostics: ZagFreeAccountDiagnostics(), localState: state)
