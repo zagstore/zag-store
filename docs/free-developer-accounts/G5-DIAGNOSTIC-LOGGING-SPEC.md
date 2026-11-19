@@ -6,6 +6,7 @@ This document specifies what the experiment build (`G5-EXPERIMENT-BUILD-PLAN.md`
 - The logger is compiled only under `ZAG_LIVE_EXPERIMENT`, and is absent from every other build. The clean production build and scan (build plan §4.2) prove this.
 - It is implemented only in the reviewed experiment commit (build plan §3.2), after approval.
 - Revision 2 addresses GPT-6's findings 4–6 on `5839add7`; §11 lists the corrections.
+- Revision 3 (with build plan revision 3) adds the campaign registry events (`campaign.durability`, `campaign.check`, `campaign.window`, `campaign.registryWrite`) and test L11.
 
 ## 1. Design principles
 
@@ -68,8 +69,11 @@ Events that fail schema validation (§7.1) at record time are dropped, and repla
 |---|---|
 | `build.identity` | `campaignID` (format `G5-C` plus 1–3 digits); `branchSHA8`, `bridgeLibSHA8`, `zsignSHA8`; `installID8`; `conditions` (a sorted subset of `ZAG_APPLE_BRIDGE`, `ZAG_ZSIGN_STRICT`, `ZAG_LIVE_EXPERIMENT`); `debugCompiled: false`. `true` can't be compiled, and any other value fails validation. |
 | `build.configureLive` | `outcome`; `providerHost`; `serialPolicy` (`g3Fixed`, `g3PerAccount`; not the value) |
-| `campaign.durability` | `probe` (`written`, `foundAfterReinstall`, `absent`); `armed: Bool` (E5) |
-| `campaign.state` | `from`, `to` (`unarmed`, `ready`, `spent`, `halted`); `reason` (a stop rule or `consume`) |
+| `campaign.durability` | `registryProbe` (`present`, `absent`); `containerMarker` (`present`, `absent`); `result` (`probeWritten`, `stillProbing`, `armed`) (E5; build plan §5.2) |
+| `campaign.state` | `from`, `to` (`none`, `probing`, `armed`, `spent`, `closed`, `halted`); `reason` (a stop rule, `consume` or `end`) |
+| `campaign.check` | `check` (`C1`–`C8`); `result` (`pass`, `refuse`) (build plan §5.5). Never nonces, account keys or times. |
+| `campaign.window` | `deviceClock` (`inside`, `before`, `after`); `authenticated` (`inside`, `before`, `after`, `notYetChecked`); `skewWithinTenMinutes: Bool`. Never the times themselves. |
+| `campaign.registryWrite` | `outcome`; `readBackMatches: Bool` |
 | `campaign.accountPin` | `result` (`pinnedNow`, `matches`, `mismatch`). Never the account key. |
 
 ### 4.2 `transport.preflight` and `readback.preflight`
@@ -345,6 +349,7 @@ owner notes:
 | L8 | **Verification classes.** Scripted read-back results `verified`, `mismatch`, `notVerified` and `unavailable` produce distinct events and verdicts. `unavailable` on otherwise passing runs yields `INCOMPLETE`, never `PASS`. P3 `unavailable` stops the run before any live operation. |
 | L9 | **Key handling.** A source scan of every file compiled into the experiment build finds no private-key export API: `SecKeyCopyExternalRepresentation` on a private key, `SecItemExport`, or a `kSecReturnData` query for `kSecClassKey`. `privateKeyExportCalls` is 0 after a full mock run. A mutant that exports the key raises the counter and fails the suite. |
 | L10 | **Budget events.** The build plan's T1–T16 each emit the expected `cert.budget` and `campaign.state` events. |
+| L11 | **Campaign checks.** Each of C1–C8 refusing emits `campaign.check result: refuse`, followed by the expected `campaign.state` transition. The exported report contains no nonce, account key or timestamp other than the header's rounded start hour. |
 
 ## 11. Revision 2: corrections for GPT-6's review of `5839add7`
 

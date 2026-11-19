@@ -3,7 +3,8 @@
 Status 19 November 2026, **revision 2: plan only.**
 - Nothing in this document has been built, merged, enabled or run.
 - No Apple, developer-portal or anisette service has been contacted.
-- Revision 2 addresses GPT-6's seven findings on revision 1 (`5839add7`); §12 lists each correction.
+- Revision 2 addresses GPT-6's seven findings on revision 1 (`5839add7`); §13 lists each correction.
+- Revision 3 addresses GPT-6's final two findings on revision 2 (`a8afce89`); see §12, §5.2 (E5, E6) and the new §5.5. The implementation handoff is `G5-IMPLEMENTATION-CHECKLIST.md`.
 
 This plan implements the G5 gate of `GATES-APPROVAL.md`. It refines the engineering part of `SUPERVISED-EXPERIMENT-SEQUENCE.md` §1, whose step-by-step owner procedure (§2) it keeps. The companion `G5-DIAGNOSTIC-LOGGING-SPEC.md` defines what the experiment records.
 
@@ -124,7 +125,10 @@ One file also carries guards that stop a misconfigured build:
 ```
 
 **2. Campaign configuration**, `ZagLiveExperimentCampaign`, compiled only under `ZAG_LIVE_EXPERIMENT`:
-- `campaignID`: a constant naming the campaign the owner authorised in writing, for example `G5-C1` (E6). It is fixed in the source, never generated at run time.
+- `campaignID` and `campaignNumber`: constants naming the campaign the owner authorised in writing, for example `G5-C1` and `1` (E6). Fixed in the source, never generated at run time.
+- `notBefore` and `notAfter`: the authorised window (§5.5).
+- `buildNonce`: 16 random bytes.
+- These constants live in one file, `ZagLiveExperimentCampaignConstants.swift`. The build procedure writes it and commits it as a separate, mechanical **constants commit** on top of the reviewed experiment commit (§4.4). Every build therefore has its own commit SHA, and the build check verifies that the constants commit changes only that file, in the expected format.
 - the G3 anisette URL and the device-serial policy, as recorded in the G3 decision;
 - the account namespace `ZagStore.accounts.live-test`;
 - the test bundle ID `com.zagstore.livetest.hello`.
@@ -150,7 +154,7 @@ Everything else under `#if DEBUG` stays out of the experiment build, including:
 
 **6. Visible identification:**
 - display name "Zag LIVE TEST";
-- a permanent banner showing "LIVE TEST", the campaign ID, the branch SHA and the campaign state: `ready`, `spent`, `halted` or `closed`.
+- a permanent banner showing "LIVE TEST", the campaign ID, the branch SHA and the campaign state: `probing`, `armed`, `spent`, `closed` or `halted`.
 
 **What the commit must not do:**
 - change `net_policy.rs`;
@@ -252,7 +256,13 @@ xcodebuild -project Feather.xcodeproj -scheme Feather -configuration Release \
   OTHER_LDFLAGS='$(inherited) <scratch>/libzag_apple_bridge.a'
 ```
 
-- This is the same invocation as §4.2, plus the two settings, in its own derived-data directory.
+- This is the same invocation as §4.2, plus the two settings and `INFOPLIST_KEY_CFBundleDisplayName='Zag LIVE TEST'` (the project generates its Info.plist, so the shared `Info.plist` is not edited). It uses its own derived-data directory.
+- **Before the build,** `scripts/zag-g5-build-check.sh`:
+  - generates `buildNonce`;
+  - writes the constants file from the `authorised` ledger row (ID, number and window);
+  - makes the constants commit;
+  - refuses unless the ledger row is `authorised`, the window has not passed, and `campaignNumber` is greater than every `built` or closed row.
+- After the build, the ledger row becomes `built`, with the SHA and nonce.
 - `git diff` after the build must be empty.
 
 **Checks before the IPA is handed over.** All must pass, and each result is recorded with its count:
@@ -301,7 +311,7 @@ The budget and the halt are bound to the **campaign** (a fixed ID authorised in 
 
 | Layer | Where the state lives | Survives | Lost by |
 |---|---|---|---|
-| **Device ledger** (E1, E2) | Keychain, live-test service, `AfterFirstUnlockThisDeviceOnly`, not synchronised | relaunch, rebuild, reinstall (if E5 confirms that items persist after deletion), account switch | device erase, or a Keychain reset |
+| **Device ledger** (E1, E2): the registry, §5.5 | Keychain, `ZagStore.live-test.registry`, `AfterFirstUnlockThisDeviceOnly`, not synchronised | relaunch, rebuild, reinstall (if E5 confirms that items persist after deletion), account switch | device erase, or a Keychain reset |
 | **Account pin** (E1) | the device ledger | as above | as above |
 | **Account state** (E4) | Apple's own records for the dedicated account | everything on the device | only the owner revoking or deleting outside Zag Store |
 | **Campaign ledger** (E6) | `docs/free-developer-accounts/G5-CAMPAIGNS.md` and the build check | everything on the device | nothing: it is the repository's history |
@@ -311,10 +321,10 @@ The budget and the halt are bound to the **campaign** (a fixed ID authorised in 
 - **The ledger record**, a Keychain item keyed by `campaignID` only (not by install ID, account or team), holds:
   - `submissions` (0 or 1);
   - `accountKey`, the hashed account key already used by `ZagAccountOwnershipRecord`;
-  - `state`: `ready`, `spent` or `halted`.
+  - `state`: `probing`, `armed`, `spent`, `closed` or `halted` (§5.5).
 - **`consume` refuses** with `.certificateBudgetSpent` unless all of these hold:
   - the record exists and has `submissions == 0`;
-  - its state is `ready`;
+  - its state is `armed`;
   - the signed-in account's key equals the pinned `accountKey`, or nothing is pinned yet, in which case this account is pinned now, atomically with the increment.
   - It then writes `submissions = 1` and `state = spent` **before** returning. A write failure refuses the request.
 - **What this rules out:**
@@ -344,18 +354,104 @@ The budget and the halt are bound to the **campaign** (a fixed ID authorised in 
 - Immediately before `consume`, the certificate list is read again and must still show zero.
 - Since Zag Store never revokes, the dedicated account keeps every certificate a campaign issued. After any issuance, every later campaign on that account fails E4, even if every on-device record is lost.
 
-**E5, Keychain durability preflight:**
-- The device ledger is useful across reinstalls only if iOS keeps the app's Keychain items after the app is deleted. That is long-standing behaviour, but it is not a documented guarantee. [live test needed]
-- **Before arming**, without network:
-  - First launch: the build writes a durability probe into the campaign record and shows "Delete and reinstall this build to arm the campaign".
-  - Later launch, probe present: the campaign is armed.
-  - Later launch, probe absent: it looks the same as a first launch, so arming never happens. The check fails closed.
-- If the probe never survives, the campaign can't arm. The owner then decides whether to proceed on E4 and E6 alone.
+**E5, Keychain durability preflight (strictly fail-closed; revision 3):**
+- The device ledger protects across reinstalls only if iOS keeps the app's Keychain items after the app is deleted. That is long-standing behaviour, but it is not a documented guarantee. [live test needed]
+- The campaign arms only on **positive proof** that it does. Two stores are compared:
+  - the **registry**, a Keychain item (§5.5);
+  - a **container marker**, a file in the app's own container, which deleting the app removes.
+- The procedure runs without network:
 
-**E6, single-use campaign ledger (process and build check):**
-- `G5-CAMPAIGNS.md` (created with the experiment commit) holds one row per campaign: ID, the owner's written authorisation (quoted), the dedicated account's label (`A`, not the address), the branch SHA, the IPA SHA-256, and the state (`authorised`, `built`, `running`, `closed: PASS/SAFE STOP/UNRESOLVED/SAFETY FAILURE/INCOMPLETE`).
-- The build procedure (§4.1, step 6) refuses a campaign ID that is not `authorised`, or that is already `built` or later.
-- A campaign is never reused. Each new one needs a new owner authorisation naming a dedicated account, and E4 refuses an account that a previous campaign used.
+| Launch | Registry probe | Container marker | Result |
+|---|---|---|---|
+| 1st | absent | absent | Write the probe (registry state `probing`) and the marker. Show "Delete this app, reinstall the same IPA, then open it." Not armed. |
+| Relaunch without reinstalling | present | present | Still `probing`; the same instruction. Not armed. |
+| After deleting and reinstalling | **present** | **absent** | Proof that the Keychain survived and the container did not. Write `armed` and a new marker. |
+| After deleting and reinstalling, Keychain lost | absent | absent | Looks exactly like the first launch, so it writes a new probe and never arms. |
+
+- **Why the app alone can't report failure.** After a Keychain loss, both stores are empty, which is the same as a first launch. The app can't detect the failure, so it never arms on anything but positive proof. Failure therefore always means "not armed".
+- **The owner's procedure decides.** The owner performs exactly **one** delete-and-reinstall cycle (build plan P0).
+  - If the app then shows "Campaign armed", E5 passed.
+  - If it shows the first-launch instruction again, E5 has **failed**. The owner records this, deletes the app and does not repeat the cycle.
+- **There is no override.** No setting, gesture, URL scheme or Debug option skips E5, because no `DEBUG` code is compiled in.
+- **If E5 fails, the campaign cannot proceed under its existing authorisation.** The campaign is recorded as closed (`INCOMPLETE: durability not proven`) in `G5-CAMPAIGNS.md`. Any alternative, for example relying on E4 and the authorisation window alone, requires all of:
+  - a separately documented security review of that alternative;
+  - a revised test plan;
+  - the owner's explicit approval of a new campaign under it.
+
+  Nothing in this plan is that alternative.
+
+**E6, campaign identity, single use and expiry (revision 3):**
+
+`G5-CAMPAIGNS.md` in the repository is an **administrative** safeguard. It records authorisations, and the build procedure checks it (§4.1, step 6). It cannot constrain an IPA that has already been built. Enforcement inside the binary is specified in §5.5.
+
+The administrative ledger has one row per campaign:
+- the ID, a sequential number (`G5-C1`, `G5-C2`, …);
+- the owner's written authorisation (quoted);
+- the authorisation window (`notBefore`, `notAfter`);
+- the dedicated account's label (`A`, not the address);
+- the branch SHA, the build nonce and the IPA SHA-256;
+- the state: `authorised`, `built`, `running`, or `closed: <class>`.
+
+A campaign is never reused. Each new one needs a new authorisation naming a new dedicated account. E4 refuses any account that a previous campaign used.
+
+### 5.5 Local enforcement inside the experiment binary (revision 3)
+
+**Compiled into each experiment build, as constants:**
+- `campaignNumber`: the sequential number of `campaignID`.
+- `buildNonce`: 16 random bytes generated by the build procedure (§4.4) and passed as a compile-time constant. Two builds from the same commit therefore differ. The value is recorded in the ledger row.
+- `notBefore` and `notAfter`: the authorisation window, at most 7 days and recommended 72 hours.
+
+**One device-wide Keychain item, the registry.**
+- Service `ZagStore.live-test.registry`, `AfterFirstUnlockThisDeviceOnly`, not synchronised.
+- It is shared by every experiment build, because the bundle ID and access group are unchanged.
+- It holds:
+  - `highestCampaignNumber`;
+  - per campaign: `state`, `buildNonce`, `submissions`, the pinned account key, and the E5 probe and counters.
+- **Writes are atomic:** one `SecItemUpdate` of the whole item, then a read-back compared byte-for-byte. A failed write or a failed read-back halts the campaign.
+- Ledger records (E1, E2) are fields of this item. The account directory's inventory and "Remove" never list or delete it.
+
+**State machine, enforced by the one function that writes the registry:**
+
+```text
+(no record) ─probe→ probing ─E5 proof→ armed ─consume→ spent ─end→ closed
+      any state ─stop rule / inconsistency→ halted          (terminal)
+      spent, closed, halted never return to probing or armed
+```
+
+**Local checks, at every launch and before every live operation:**
+
+| Check | Enforces | Refuses (and halts, where a record exists) when |
+|---|---|---|
+| C1 Campaign identity | this build and campaign | the registry's record for `campaignID` has a different `buildNonce`. A rebuild, or another IPA claiming the same campaign, can't run it. |
+| C2 Single use | one campaign per number | the record's state is `spent`, `closed` or `halted`; live operations other than recovery reads, sign-out and inventory are refused. |
+| C3 Monotonic campaigns | an older build can't run after a newer one | `campaignNumber < highestCampaignNumber`. Arming also requires `campaignNumber > highestCampaignNumber`, unless this is the same campaign and build resuming. |
+| C4 Window, device clock | expiry | the device clock is outside `notBefore…notAfter` at arming or launch. This check is weak, because the clock can be changed. |
+| C5 Window, authenticated time | expiry, independent of the device clock | the `Date` header of the first TLS-verified response from `gsa.apple.com` (the lookup, before any credential is sent) is outside the window, or more than 10 minutes from the device clock. Checked again before `consume`. Only the comparison result is logged. |
+| C6 Account pin (E1) | one account | the signed-in account key differs from the pinned key |
+| C7 Consistency | tampering or partial loss | a container marker says `armed` or later for this campaign, but the registry record is missing or disagrees. A Keychain loss detected without deleting the app halts the campaign; the registry is rewritten as `halted`. |
+| C8 E4 account state | a server-side record that survives every local loss | the account shows any certificate, Zag App ID or device before the first mutating call, or any certificate before `consume` |
+
+**Which protections survive which event:**
+
+| Event | Registry (C1–C3, C6, halt, budget) | Container marker (C7) | Window (C4, C5) | E4 (C8) | Administrative ledger |
+|---|---|---|---|---|---|
+| Relaunch | survives | survives | applies | applies | applies |
+| Delete and reinstall the same IPA | survives (proven by E5 before arming) | lost, by design | applies | applies | applies |
+| Rebuild with the same campaign ID | survives; C1 refuses (nonce differs) | lost if the app was replaced | applies | applies | the build check refuses (`built` already) |
+| A **previously built IPA launched again**, its campaign spent, closed or halted | survives; C2 refuses | lost | applies | applies | the row is closed |
+| A previously built IPA for an **older** campaign, after a newer campaign armed | survives; C3 refuses | lost | applies (the older window has usually expired) | applies | closed |
+| A previously built IPA **never armed**, newest number, still inside its window | no record yet: it can arm through E5 | — | applies | applies | the row is `built`; §8.3 deletes the IPA |
+| Account switched in the app | survives; C6 refuses and halts | survives | applies | applies to the new account | — |
+| **Device erase**, or Keychain reset | **lost** | lost | **applies**: C5 uses Apple's authenticated time | **applies**: the account keeps any certificate, App ID and device a campaign created | applies |
+| Device clock changed | survives | survives | C4 is defeated; **C5 still applies** | applies | applies |
+
+**What a device erase leaves exposed:**
+- A still-held IPA for a campaign whose window hasn't expired could be reinstalled. It would pass E5 again, because erase wipes the Keychain, and it would arm.
+- Before any credential is sent, C5 refuses if the window has passed.
+- Inside the window:
+  - if the earlier run made any portal change, C8 refuses before any mutating call;
+  - if it stopped before any portal change (for example during 2FA), sign-in and read-only calls could run again, but no certificate beyond the first could be issued.
+- **Mitigations:** the short window, and deleting the IPA when the campaign closes (§8.3). This is listed in §10 as a residual risk.
 
 ### 5.3 Existing safeguards relied upon (G4 scope)
 
@@ -402,7 +498,7 @@ This is `SUPERVISED-EXPERIMENT-SEQUENCE.md` §2, with preflight steps and the sa
 
 | # | Step | Component | Expected | Logged phase |
 |---|---|---|---|---|
-| P0 | Install the experiment IPA; E5 durability preflight (delete, reinstall, relaunch) | E5 | campaign armed; banner shows `ready` | `build`, `campaign` |
+| P0 | Install the experiment IPA and open it; C1–C4 pass; then **exactly one** delete-and-reinstall cycle (E5) | E5, §5.5 | "Campaign armed"; banner shows `armed`. The first-launch instruction again is an E5 failure: stop, and the campaign is closed. | `build`, `campaign` |
 | P1 | Confirm the "LIVE TEST" banner, the campaign ID and the branch SHA | — | match the ledger row | `build` |
 | P2 | Pairing and LocalDevVPN health check (Settings → Installation → Diagnostics); Developer Mode on | existing RPPairing | all stages pass | `transport.preflight` |
 | **P3** | **Read-back preflight:** Installed Profiles (Read Only) → Read, before any live operation (finding 6) | RPPairing misagent reader (PR #25, in `main`) and `ZagInstalledProfileCheck` | the reader returns the installed profiles, and Zag Store's own embedded profile is **VERIFIED** (as in device test A) | `readback.preflight` |
@@ -460,9 +556,10 @@ Every class closes the campaign (E6). None leaves a reusable allowance.
 
 **Preflight:**
 - E5 not armed;
+- any of C1–C8 refusing (§5.5);
 - P2 health check fails;
 - P3 read-back is anything other than `verified`;
-- the ledger record is not `ready`.
+- the ledger record is not `armed`.
 
 **Authentication:**
 - two consecutive failures of any kind;
@@ -544,12 +641,21 @@ Every class closes the campaign (E6). None leaves a reusable allowance.
 
 These follow a PASS through separate decisions.
 
-## 10. Residual limitations
+## 10. Residual limitations (revision 3)
 
-- **A device erase or Keychain reset** removes the device ledger. E4 (the account's own certificate list) and E6 (the repository ledger, plus the deleted IPA) still prevent a second certificate on the same account. Sign-in with the same account could happen again only by reinstalling a closed campaign's IPA, which §8.3 deletes.
-- **E5** depends on observed iOS behaviour, not a documented guarantee. If the probe never survives a reinstall, the campaign never arms.
-- **Revocation outside Zag Store.** If the owner revokes the certificate in Xcode or on Apple's website, E4 can no longer see it. E1 and E6 still apply.
-- The build check in E6 is a process control in a single-owner repository. It records intent; it does not stop a determined local override.
+- **Device erase or Keychain reset.**
+  - The registry is lost (§5.5).
+  - What still applies:
+    - C5 expiry, checked against Apple's authenticated time;
+    - C8, the account's own certificates, App IDs and devices;
+    - the administrative ledger;
+    - deletion of the IPA.
+  - The exposure: a still-held IPA inside its window, for a campaign that stopped **before any portal change**, could repeat sign-in and read-only calls. It could not issue a certificate the account doesn't already block.
+- **E5** depends on observed iOS behaviour. It is strictly fail-closed: no proof, no campaign.
+- **C5** trusts the `Date` header of a TLS-verified Apple response, received before any credential is sent. An attacker would need to defeat TLS to forge it.
+- **Revocation outside Zag Store.** If the owner revokes the certificate in Xcode or on Apple's website, C8 can no longer see it. The registry and the window still apply.
+- **The administrative ledger** controls what gets built and recorded. It cannot reach into a built IPA; §5.5 does that.
+- **Someone with the source and the signing certificate** can always build a binary without these checks. The safeguards protect against mistakes and reuse, not against the owner deliberately bypassing them. That is the owner's own risk to manage.
 
 ## 11. Approvals checklist (all must be recorded before §4)
 
@@ -562,10 +668,19 @@ These follow a PASS through separate decisions.
 | 5 | Merges in §2.2, each approved | the PRs |
 | 6 | §3.2 experiment commit, including the E1–E6 tests (§5.4), reviewed by GPT-6 | the commit's review |
 | 7 | G6: account ready (A1–A6, yes or no) | `FIRST-LIVE-EXPERIMENT.md` |
-| 8 | **G5: owner authorises building campaign `G5-C1`** | `G5-CAMPAIGNS.md` and `FIRST-LIVE-EXPERIMENT.md` |
+| 8 | **G5: owner authorises building campaign `G5-C1`, with its window (`notBefore`, `notAfter`; at most 7 days) and dedicated account label** | `G5-CAMPAIGNS.md` and `FIRST-LIVE-EXPERIMENT.md` |
 | 9 | Owner authorises running it, on a stated date | `G5-CAMPAIGNS.md` |
 
-## 12. Revision 2: corrections for GPT-6's review of `5839add7`
+## 12. Revision 3: GPT-6's final two findings on `a8afce89`
+
+| # | Finding | Correction |
+|---|---|---|
+| 1 | Keychain durability must be strictly fail-closed | E5 arms only on positive proof: the registry probe is present and the container marker absent, after one delete-and-reinstall. There is no override, and failure means "not armed". After a failure, the campaign is closed and cannot proceed under its authorisation. Any alternative needs a separately documented security review, a revised test plan and explicit owner approval. |
+| 2 | The GitHub ledger cannot enforce anything in a built IPA | §5.5 specifies the binary's own enforcement: a compiled campaign number, build nonce and window, and a device-wide registry with a one-way state machine. Checks C1–C8 cover identity, single use, monotonic campaigns, window by device clock and by Apple's authenticated time, account pin, store consistency and account state. The table shows what survives relaunch, reinstall, rebuild, a previously built IPA, an account switch, device erase and a clock change. |
+
+The implementation checklist is in `G5-IMPLEMENTATION-CHECKLIST.md`.
+
+## 13. Revision 2: corrections for GPT-6's review of `5839add7`
 
 | # | Finding | Correction |
 |---|---|---|
