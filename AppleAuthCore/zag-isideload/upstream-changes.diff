@@ -1,6 +1,6 @@
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/Cargo.toml zag-isideload/Cargo.toml
---- upstream/Cargo.toml	2026-10-28 14:42:44
-+++ zag-isideload/Cargo.toml	2026-11-18 17:25:32
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/Cargo.toml zag-isideload/Cargo.toml
+--- upstream/Cargo.toml	2026-11-19 20:33:59
++++ zag-isideload/Cargo.toml	2026-11-19 20:33:59
 @@ -1,81 +1,53 @@
 +# Zag Store fork of nab138/isideload, pinned to upstream commit
 +# 326e56229d0790d5d3ac9ec0f8cb1d47f8bc1bc5 (crate 0.5.2). Only sign-in,
@@ -108,9 +108,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
 +[dev-dependencies]
 +tokio = { version = "1.49", features = ["macros", "rt"] }
 +rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/mod.rs zag-isideload/src/anisette/mod.rs
---- upstream/src/anisette/mod.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/anisette/mod.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/anisette/mod.rs zag-isideload/src/anisette/mod.rs
+--- upstream/src/anisette/mod.rs	2026-11-19 20:33:59
++++ zag-isideload/src/anisette/mod.rs	2026-11-19 20:33:59
 @@ -8,7 +8,6 @@
  use serde::Deserialize;
  use std::{collections::HashMap, sync::Arc};
@@ -129,9 +129,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  pub trait AnisetteProvider {
      async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report>;
  
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/remote_v3/mod.rs zag-isideload/src/anisette/remote_v3/mod.rs
---- upstream/src/anisette/remote_v3/mod.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/anisette/remote_v3/mod.rs	2026-11-18 17:57:10
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/anisette/remote_v3/mod.rs zag-isideload/src/anisette/remote_v3/mod.rs
+--- upstream/src/anisette/remote_v3/mod.rs	2026-11-19 20:33:59
++++ zag-isideload/src/anisette/remote_v3/mod.rs	2026-11-19 20:33:59
 @@ -1,3 +1,12 @@
 +// Provenance note (Zag Store fork): parts of this file closely match code in
 +// SideStore/apple-private-apis (omnisette/src/remote_anisette_v3.rs), which is licensed under the
@@ -267,7 +267,7 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  
          debug!("Starting provisioning at {}", websocket_url);
          // let (mut ws_stream, _) = timeout(
-@@ -300,7 +271,7 @@
+@@ -300,14 +271,16 @@
          // .context("Failed to connect to provisioning socket")?
          // .context("Failed to connect to provisioning socket")?;
  
@@ -276,9 +276,19 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
              .await
              .context("Failed to connect to provisioning socket")?;
  
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/remote_v3/state.rs zag-isideload/src/anisette/remote_v3/state.rs
---- upstream/src/anisette/remote_v3/state.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/anisette/remote_v3/state.rs	2026-11-18 17:57:10
+         debug!("Connected to provisioning socket");
+ 
+         loop {
+-            let Some(msg) = ws.next().await else { continue };
++            // Zag Store fork: an ended stream returns None at once, every
++            // time; continuing would spin without yielding (uncancellable).
++            let Some(msg) = ws.next().await else { bail!("Provisioning socket ended unexpectedly") };
+             let msg = msg?;
+ 
+             let text = match msg {
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/anisette/remote_v3/state.rs zag-isideload/src/anisette/remote_v3/state.rs
+--- upstream/src/anisette/remote_v3/state.rs	2026-11-19 20:33:59
++++ zag-isideload/src/anisette/remote_v3/state.rs	2026-11-19 20:33:59
 @@ -1,3 +1,12 @@
 +// Provenance note (Zag Store fork): parts of this file closely match code in
 +// SideStore/apple-private-apis (omnisette/src/remote_anisette_v3.rs), which is licensed under the
@@ -292,9 +302,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  // Serialization/Desieralization borrowed from https://github.com/SideStore/apple-private-apis/blob/master/omnisette/src/remote_anisette_v3.rs
  
  use plist::Data;
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/anisette/remote_v3/websocket.rs zag-isideload/src/anisette/remote_v3/websocket.rs
---- upstream/src/anisette/remote_v3/websocket.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/anisette/remote_v3/websocket.rs	2026-11-18 17:20:59
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/anisette/remote_v3/websocket.rs zag-isideload/src/anisette/remote_v3/websocket.rs
+--- upstream/src/anisette/remote_v3/websocket.rs	2026-11-19 20:33:59
++++ zag-isideload/src/anisette/remote_v3/websocket.rs	2026-11-19 20:33:59
 @@ -1,103 +1,59 @@
  use futures::{SinkExt, StreamExt};
 +use reqwest::Url;
@@ -336,7 +346,7 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
 +    /// Upstream's relay option is removed.
 +    pub async fn connect(url: &str, anisette_url: &str) -> Result<Self, Report> {
 +        let target = Url::parse(url).map_err(|_| report!(net_policy::PolicyError::InvalidUrl))?;
-+        net_policy::permit(&target, &[net_policy::host_of(anisette_url)?], "wss")?;
++        net_policy::permit_observed(&target, &[net_policy::host_of(anisette_url)?], "wss", "GET")?;
  
 -        #[cfg(not(feature = "wasm"))]
 -        {
@@ -425,9 +435,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
      }
  }
 Only in upstream/src/assets: AppleWWDRCAG3.cer
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/apple_account.rs zag-isideload/src/auth/apple_account.rs
---- upstream/src/auth/apple_account.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/auth/apple_account.rs	2026-11-18 17:57:10
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/auth/apple_account.rs zag-isideload/src/auth/apple_account.rs
+--- upstream/src/auth/apple_account.rs	2026-11-19 20:33:59
++++ zag-isideload/src/auth/apple_account.rs	2026-11-19 20:33:59
 @@ -1,4 +1,14 @@
 +// Provenance note (Zag Store fork): parts of this file closely match code in
 +// SideStore/apple-private-apis (icloud-auth/src/client.rs), which is licensed under the
@@ -532,9 +542,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
              .context("Failed to compute SRP proof")?;
  
          let req2 = plist!(dict {
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/builder.rs zag-isideload/src/auth/builder.rs
---- upstream/src/auth/builder.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/auth/builder.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/auth/builder.rs zag-isideload/src/auth/builder.rs
+--- upstream/src/auth/builder.rs	2026-11-19 20:33:59
++++ zag-isideload/src/auth/builder.rs	2026-11-19 20:33:59
 @@ -5,15 +5,13 @@
  
  use crate::util::callbacks::TwoFactorCallback;
@@ -624,10 +634,10 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
              self.err_429_retries,
          )
          .await
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/grandslam.rs zag-isideload/src/auth/grandslam.rs
---- upstream/src/auth/grandslam.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/auth/grandslam.rs	2026-11-18 17:57:10
-@@ -1,22 +1,25 @@
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/auth/grandslam.rs zag-isideload/src/auth/grandslam.rs
+--- upstream/src/auth/grandslam.rs	2026-11-19 20:33:59
++++ zag-isideload/src/auth/grandslam.rs	2026-11-19 20:33:59
+@@ -1,24 +1,27 @@
 -use super::middleware::WasmProxyMiddleware;
 +// Provenance note (Zag Store fork): parts of this file closely match code in
 +// SideStore/apple-private-apis (icloud-auth/src/client.rs), which is licensed under the
@@ -656,11 +666,14 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
 -use crate::sideload::cert_identity::APPLE_ROOT;
  use crate::{SideloadError, anisette::AnisetteClientInfo, util::plist::PlistDataExtract};
  
+-const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 +const APPLE_ROOT: &[u8] = include_bytes!("../assets/apple_root.cer");
-+
- const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
  
++pub(crate) const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
++
  pub struct GrandSlam {
+     pub client: reqwest_middleware::ClientWithMiddleware,
+     pub client_info: AnisetteClientInfo,
 @@ -32,11 +35,8 @@
      /// - `client`: The reqwest client to use for requests
      pub async fn new(
@@ -723,17 +736,17 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  }
  
 Only in upstream/src/auth: middleware.rs
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/auth/mod.rs zag-isideload/src/auth/mod.rs
---- upstream/src/auth/mod.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/auth/mod.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/auth/mod.rs zag-isideload/src/auth/mod.rs
+--- upstream/src/auth/mod.rs	2026-11-19 20:33:59
++++ zag-isideload/src/auth/mod.rs	2026-11-19 20:33:59
 @@ -1,4 +1,3 @@
  pub mod apple_account;
  pub mod builder;
  pub mod grandslam;
 -pub mod middleware;
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/app_groups.rs zag-isideload/src/dev/app_groups.rs
---- upstream/src/dev/app_groups.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/dev/app_groups.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/dev/app_groups.rs zag-isideload/src/dev/app_groups.rs
+--- upstream/src/dev/app_groups.rs	2026-11-19 20:33:59
++++ zag-isideload/src/dev/app_groups.rs	2026-11-19 20:33:59
 @@ -8,7 +8,6 @@
  use plist_macro::plist;
  use rootcause::prelude::*;
@@ -752,9 +765,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  pub trait AppGroupsApi {
      fn developer_session(&mut self) -> &mut DeveloperSession;
  
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/app_ids.rs zag-isideload/src/dev/app_ids.rs
---- upstream/src/dev/app_ids.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/dev/app_ids.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/dev/app_ids.rs zag-isideload/src/dev/app_ids.rs
+--- upstream/src/dev/app_ids.rs	2026-11-19 20:33:59
++++ zag-isideload/src/dev/app_ids.rs	2026-11-19 20:33:59
 @@ -52,8 +52,7 @@
      pub is_free_provisioning_profile: Option<bool>,
  }
@@ -765,9 +778,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  pub trait AppIdsApi {
      fn developer_session(&mut self) -> &mut DeveloperSession;
  
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/certificates.rs zag-isideload/src/dev/certificates.rs
---- upstream/src/dev/certificates.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/dev/certificates.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/dev/certificates.rs zag-isideload/src/dev/certificates.rs
+--- upstream/src/dev/certificates.rs	2026-11-19 20:33:59
++++ zag-isideload/src/dev/certificates.rs	2026-11-19 20:33:59
 @@ -71,8 +71,7 @@
      }
  }
@@ -778,9 +791,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  pub trait CertificatesApi {
      fn developer_session(&mut self) -> &mut DeveloperSession;
  
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/developer_session.rs zag-isideload/src/dev/developer_session.rs
---- upstream/src/dev/developer_session.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/dev/developer_session.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/dev/developer_session.rs zag-isideload/src/dev/developer_session.rs
+--- upstream/src/dev/developer_session.rs	2026-11-19 20:33:59
++++ zag-isideload/src/dev/developer_session.rs	2026-11-19 20:33:59
 @@ -5,7 +5,6 @@
  use reqwest::header::{HeaderMap, HeaderValue};
  use rootcause::prelude::*;
@@ -789,9 +802,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  use uuid::Uuid;
  
  use crate::{
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/devices.rs zag-isideload/src/dev/devices.rs
---- upstream/src/dev/devices.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/dev/devices.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/dev/devices.rs zag-isideload/src/dev/devices.rs
+--- upstream/src/dev/devices.rs	2026-11-19 20:33:59
++++ zag-isideload/src/dev/devices.rs	2026-11-19 20:33:59
 @@ -9,7 +9,6 @@
  use plist_macro::plist;
  use rootcause::prelude::*;
@@ -810,9 +823,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  pub trait DevicesApi {
      fn developer_session(&mut self) -> &mut DeveloperSession;
  
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/dev/teams.rs zag-isideload/src/dev/teams.rs
---- upstream/src/dev/teams.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/dev/teams.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/dev/teams.rs zag-isideload/src/dev/teams.rs
+--- upstream/src/dev/teams.rs	2026-11-19 20:33:59
++++ zag-isideload/src/dev/teams.rs	2026-11-19 20:33:59
 @@ -14,8 +14,7 @@
      pub status: Option<String>,
  }
@@ -823,9 +836,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  pub trait TeamsApi {
      fn developer_session(&mut self) -> &mut DeveloperSession;
  
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/lib.rs zag-isideload/src/lib.rs
---- upstream/src/lib.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/lib.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/lib.rs zag-isideload/src/lib.rs
+--- upstream/src/lib.rs	2026-11-19 20:33:59
++++ zag-isideload/src/lib.rs	2026-11-19 20:33:59
 @@ -1,13 +1,15 @@
 -use idevice::IdeviceError;
  use rootcause::{
@@ -856,9 +869,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
 Only in zag-isideload/src: net_policy.rs
 Only in zag-isideload/src: quiet.rs
 Only in upstream/src: sideload
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/callbacks.rs zag-isideload/src/util/callbacks.rs
---- upstream/src/util/callbacks.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/util/callbacks.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/util/callbacks.rs zag-isideload/src/util/callbacks.rs
+--- upstream/src/util/callbacks.rs	2026-11-19 20:33:59
++++ zag-isideload/src/util/callbacks.rs	2026-11-19 20:33:59
 @@ -1,10 +1,4 @@
 -use std::pin::Pin;
 -
@@ -927,9 +940,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
 Only in upstream/src/util: device.rs
 Only in upstream/src/util: fs_storage.rs
 Only in upstream/src/util: keyring_storage.rs
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/mod.rs zag-isideload/src/util/mod.rs
---- upstream/src/util/mod.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/util/mod.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/util/mod.rs zag-isideload/src/util/mod.rs
+--- upstream/src/util/mod.rs	2026-11-19 20:33:59
++++ zag-isideload/src/util/mod.rs	2026-11-19 20:33:59
 @@ -1,8 +1,3 @@
  pub mod callbacks;
 -pub mod device;
@@ -939,9 +952,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
 -pub mod keyring_storage;
  pub mod plist;
  pub mod storage;
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/plist.rs zag-isideload/src/util/plist.rs
---- upstream/src/util/plist.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/util/plist.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/util/plist.rs zag-isideload/src/util/plist.rs
+--- upstream/src/util/plist.rs	2026-11-19 20:33:59
++++ zag-isideload/src/util/plist.rs	2026-11-19 20:33:59
 @@ -2,7 +2,6 @@
  use plist_macro::pretty_print_dictionary;
  use rootcause::prelude::*;
@@ -950,9 +963,9 @@ diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE
  
  pub struct SensitivePlistAttachment {
      pub plist: Dictionary,
-diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff upstream/src/util/storage.rs zag-isideload/src/util/storage.rs
---- upstream/src/util/storage.rs	2026-10-28 14:42:44
-+++ zag-isideload/src/util/storage.rs	2026-11-18 17:20:23
+diff -ru --exclude=Cargo.lock --exclude=target --exclude=tests --exclude=LICENSE* --exclude=LICENCE* --exclude=PROVENANCE.md --exclude=README.md --exclude=upstream-changes.diff --exclude=.gitignore upstream/src/util/storage.rs zag-isideload/src/util/storage.rs
+--- upstream/src/util/storage.rs	2026-11-19 20:33:59
++++ zag-isideload/src/util/storage.rs	2026-11-19 20:33:59
 @@ -25,24 +25,8 @@
      }
  }

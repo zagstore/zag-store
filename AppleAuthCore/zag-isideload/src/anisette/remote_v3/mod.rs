@@ -278,7 +278,9 @@ impl RemoteV3AnisetteProvider {
         debug!("Connected to provisioning socket");
 
         loop {
-            let Some(msg) = ws.next().await else { continue };
+            // Zag Store fork: an ended stream returns None at once, every
+            // time; continuing would spin without yielding (uncancellable).
+            let Some(msg) = ws.next().await else { bail!("Provisioning socket ended unexpectedly") };
             let msg = msg?;
 
             let text = match msg {

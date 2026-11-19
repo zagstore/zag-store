@@ -52,6 +52,11 @@ check_absent 'keyring|fs_storage|apple-codesign|p12-keystore|isideload-vfs|idevi
 grep -q '^default = \[\]' Cargo.toml && pass "live-network is off by default" || fail "default features not empty"
 grep -q 'redirect(redirect::Policy::none())' src/net_policy.rs \
 	&& pass "redirects are not followed" || fail "redirect policy not found"
+# An ended socket stream yields None at once, every time (tokio-tungstenite):
+# looping on it spins without yielding, so cancellation never takes effect.
+check_absent '\.next\(\)\.await else \{ *continue' "loops that continue on an ended stream"
+grep -q 'ws.next().await else { bail!("Provisioning socket ended unexpectedly") }' src/anisette/remote_v3/mod.rs \
+	&& pass "the provisioning socket ending is an error" || fail "provisioning loop does not end on an ended socket"
 
 # Dependencies.
 python3 -I - Cargo.lock LICENCE-INVENTORY.tsv <<'PY' || FAILED=1
