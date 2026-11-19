@@ -1,6 +1,6 @@
 # G4: security review package for the Apple Account bridge
 
-Status 19 November 2026 (revised the same day for review readiness; remediation for issue #33 in section 12): **implementation ready for an independent security review. Not reviewed. No live Apple service has been contacted.** The author of the bridge has not reviewed it independently. G4 stays open until a reviewer independent of the implementation records the decision in section 10.
+Status 19 November 2026 (revised the same day for review readiness; remediation for issue #33 in section 12; closeout of the re-review's four issues in section 13): **implementation ready for an independent security review. Not reviewed. No live Apple service has been contacted.** The author of the bridge has not reviewed it independently. G4 stays open until a reviewer independent of the implementation records the decision in section 10.
 
 ## 1. What is under review
 
@@ -252,6 +252,8 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 - [ ] Cancellation is per operation in Swift (`ZagBridgeSlot.cancel(_:)`): it reaches the bridge only while that operation is still the one running in its slot. Overlapping operations in a slot are refused as `busy` in Swift and again in Rust (#34).
 - [ ] The authenticator refuses calls that arrive while another call waits for an event (actor reentrancy).
 - [ ] A cancellation that races a completed certificate request reports the request's real outcome; a cancelled request whose outcome is unknown stays unconfirmed (section 12).
+- [ ] A cancelled operation whose terminal event does not arrive within the slot's grace period (5 s) is abandoned by Swift: readers get `cancelled` once, the slot is freed, late events are ignored. `zag_bridge_cancel` is called without the slot lock held; no operation starts in the slot during that call (section 13).
+- [ ] An operation cancelled while it waits for its account and team's turn in the provisioner leaves at once, runs nothing and leaves no waiter (section 13).
 
 ### F. Credential lifetime
 - [ ] The password is never stored; Rust's copy is zeroised on every path, including cancellation.
@@ -399,10 +401,158 @@ The suites not run are the three that need arguments or the owner's certificate 
 ### 12.6 Remaining limitations and unresolved risks
 
 - **Live behaviour is untested.** None of this has run against Apple or an anisette server.
-- **A bridge that never sends a terminal event:** Swift reclaims the operation only when its slot closes. The authenticator's drain after cancelling (`signIn`) and a portal call's reader would still wait. That needs a Rust defect, and Rust tests cover every path to a terminal event.
+- ~~**A bridge that never sends a terminal event:** Swift reclaims the operation only when its slot closes. A waiting reader would still wait.~~ Resolved in section 13: a cancelled operation is abandoned after a grace period.
 - **Malformed messages while the bridge continues:** the slot is busy until the bridge's terminal event after Swift's cancellation, so an immediate new sign-in can be refused as `busy` (fail closed).
-- **Waiting is not cancellation-aware:** an operation waiting for the scope (12.3) waits until the running one finishes, bounded by the operation deadline. `currentStep` is shared across scopes, so a failure's reported step can be wrong while two teams provision at once. This affects reporting only.
+- ~~**Waiting is not cancellation-aware.**~~ Resolved in section 13.
+- `currentStep` is shared across scopes, so a failure's reported step can be wrong while two teams provision at once. This affects reporting only.
 - **Residual secrets in memory:** the token and code in Swift `String` and `NSString` copies (`JSONSerialization`), `Data` copies returned by the Keychain, and the fork's heap memory (question 1).
 - **Key exportability:** software RSA keys can be exported by the app's own process. `kSecAttrIsExtractable` is not enforced for them, and the Secure Enclave cannot hold RSA-2048.
 - **Apple-side state:** whether the live listing includes certificate content is unknown. Without it, a lost response stays unresolved until the user abandons it, which may leave an issued certificate occupying a slot (never revoked by Zag Store).
 - **Independence:** this remediation was written by the implementer. G4 stays open until the independent reviewer completes section 10 against the remediation head.
+
+## 13. Closeout of the re-review's four issues (for re-review)
+
+The independent re-review of #35 at `fc509858` raised four concurrency and lifecycle issues. Each was investigated against that commit before anything changed.
+
+**Summary:**
+
+| # | Issue | Classification |
+|---|---|---|
+| 1 | Missing terminal callback and slot destruction | **Confirmed defect, fixed and regression-tested** |
+| 2 | Cancellation while waiting for exclusive provisioning access | **Confirmed defect, fixed and regression-tested** |
+| 3 | Callback delivery racing slot teardown | **Not reproducible**, with evidence; regression tests added |
+| 4 | Lock reentrancy during cancellation | **Potential risk, mitigated and tested.** Not reachable with the current Rust code. |
+
+### 13.1 Missing terminal callback and slot destruction (issue 1)
+
+**Finding:** Every real caller holds its slot while it waits:
+- `portal(slot:)` receives the slot as a parameter;
+- the portal struct and the authenticator own one.
+
+So the slot cannot deinitialise while one of its operations is outstanding, and the "slot close abandons the operation" fallback from section 12 never ran for them. A cancelled caller whose bridge sent no terminal event waited forever. It kept the slot, the operation and its registry entry alive. Cancellation did not help, because it too waits for the terminal event, and so did the callers' deadlines, because `ZagDeadline`'s task group awaits its child.
+
+**Reproduced at `fc509858`** with a scratch harness:
+- a reader holding the slot, a fake operation with no terminal event, and the task cancelled;
+- after 8 s the reader was still waiting, the slot was alive, and 1 operation was registered.
+
+**Fix:**
+- A cancellation that reaches the bridge starts the slot's grace period (`cancellationGrace`, 5 s). If no terminal event has arrived by then, Swift abandons the operation:
+  - `ZagBridgeOperations.abandon` removes the registry entry;
+  - `ZagBridgeEvents.abandoned` frees the slot and delivers `cancelled`. Delivery happens at most once because of the `finished` flag, so a reader that already has its terminal event gets nothing more.
+- A terminal event within the grace period wins, and the timer then changes nothing.
+- Late events for an abandoned operation find no registry entry and are ignored. They cannot reach a newer operation, which has its own token.
+- If the bridge is still running the abandoned operation, it refuses a new one in that slot as `busy` (Rust slot exclusivity, #34). This fails closed.
+
+**Evidence:**
+- After the fix, the same harness gets `failed(cancelled)`; the slot is released and 0 operations are registered.
+- Bridge checks:
+  - a cancelled caller holding its slot gets `cancelled` after the grace period;
+  - the slot is then released and the operation unregistered;
+  - a late terminal event is ignored;
+  - exactly one event, then nil;
+  - the slot starts a new operation afterwards;
+  - the abandoned operation's late event does not reach the new one;
+  - a result after cancelling is reported once, as the result.
+- Mutant: with the abandonment removed, the bridge suite fails at "missing terminal: a cancelled caller holding its slot gets `cancelled` after the grace period".
+
+### 13.2 Cancellation while waiting for exclusive provisioning access (issue 2)
+
+**Finding:**
+- `exclusively()` queued plain `CheckedContinuation`s with no cancellation handling. A cancelled operation waited for the running one to finish (unbounded if that one hung), then entered and failed at its first portal call.
+- Releasing the scope woke only the first waiter. A woken waiter that left without taking the scope would have left the rest asleep.
+- No certificate was ever issued by a cancelled waiter, because `call()` checks cancellation before sending.
+
+**Reproduced at `fc509858`:** "queue: an operation cancelled while waiting for its team returns at once as cancelled, while the other still runs" failed.
+
+**Fix:**
+- Each waiter has a ticket. A cancellation handler removes and resumes that waiter on the actor. It is resumed exactly once, by whichever of the cancellation and the release removes it first.
+- A cancelled caller throws `CancellationError` before taking the scope and runs nothing.
+- A release resumes every waiter: one takes the scope, cancelled ones leave, and the rest wait again.
+- Outcomes when cancelled while waiting:
+  - provisioning: `cancelled`;
+  - Check Again and Abandon: `checkFailed(.cancelled)`, with nothing changed;
+  - the unresolved-request query: nil.
+
+**Evidence:** strict integration checks, 64 → 73:
+- a cancelled waiter returns at once while the holder still runs, and leaves no waiter;
+- another account's scope is not delayed;
+- the holder and both remaining waiters complete;
+- Apple was asked once;
+- no continuation is left;
+- a task cancelled before it waits sends nothing;
+- the next signing proceeds and reuses the certificate;
+- 24 waiters with half cancelled: 13 done, 12 cancelled, one request, no waiter left.
+
+### 13.3 Callback delivery racing slot teardown (issue 3)
+
+**Finding:** no defect.
+- Terminal delivery, slot closure, registry removal, cancellation and abandonment all converge on `ZagBridgeEvents.deliver`. Its `finished` flag, under the lock, passes one terminal event; waiters are resumed outside the lock.
+- The registry entry is removed by exactly one of the terminal callback and the abandonment.
+- A weak load of a slot that is deinitialising returns nil, and a strong reference taken by a callback prevents the slot from deinitialising.
+- No lock is held while Swift calls Rust or resumes a continuation (since 13.4), so there is no lock cycle.
+
+**Evidence at `fc509858`, before any closeout change:**
+- five fixed orderings of terminal, close and cancel;
+- 400 stress rounds, with terminal delivery, slot closure and cancellation run at once on three threads (`concurrentPerform`).
+- Over three runs: orderings 5/5 and stress 1,200/1,200 exactly-once, with 0 operations left registered.
+
+**Regression tests added:**
+- the same five orderings, deterministic;
+- the 400-round stress run with a 0.05 s grace. In this run: 10 results and 390 cancellations, every reader exactly once, none lost, nothing registered.
+- A double resume of a `CheckedContinuation` would crash the test process; none occurred.
+
+### 13.4 Lock reentrancy during cancellation (issue 4)
+
+**Finding:**
+- `ZagBridgeSlot.cancel` called `zag_bridge_cancel` while holding the slot's `NSLock`. The terminal event's path (`received` → `slot.ended`) takes the same lock. A bridge answering a cancellation on the calling thread would deadlock.
+- **The current Rust does not:**
+  - `slot::cancel` only sends on `oneshot` channels and drops the answer sender while holding its own mutex;
+  - every terminal event is emitted by a spawned runtime task after that mutex is released, or inline only by the start functions;
+  - the start functions run outside Swift's lock.
+- So this is not reachable today, but it was one Rust change away from a deadlock.
+
+**Reproduced** with an injected cancel function that delivers the terminal event synchronously: the cancel never returned (a deadlock).
+
+**Fix:**
+- The slot marks a cancellation in progress under the lock, then calls the bridge without the lock, then clears the mark.
+- While the mark is set, `start` refuses as `busy`, so the slot-wide cancellation still cannot reach an operation started after the one being cancelled.
+
+**Evidence:**
+- bridge checks: no deadlock; the operation ends once, and an operation started during the bridge's cancel call is refused; the slot works normally afterwards;
+- mutants: with the call made under the lock, the suite fails at "does not deadlock"; without the start guard, it fails at "nothing can start in the slot during the bridge's cancel call".
+
+### 13.5 Verification
+
+**Commits:**
+- `6b26c6a9`: bridge, issues 1 and 4, with tests for 1, 3 and 4.
+- `86268e66`: provisioner, issue 2, with tests.
+
+**Test counts:**
+
+| Suite | Section 12 | Now |
+|---|---|---|
+| Bridge Swift | 94 | 110 |
+| Bridge Rust, default/mock/live | 4/14/7 | 4/14/7 |
+| Strict integration | 64 | 73 |
+
+**Mutation:** the three new bridge mutants each fail the suite. The issue 2 test failed on the unfixed code.
+
+**Full regression:** run sequentially on code commit `86268e66` (macOS, Xcode 26.5, iOS 26.5 simulator). Everything is clean:
+- all 44 `scripts/test-zag-*.sh` suites pass, including:
+  - `apple-bridge`: Rust 4, 14 and 7; Swift 110;
+  - `zsign-branch`: 86 strict, 73 integration, 3 DER;
+  - `apple-accounts`: 95;
+  - `apple-accounts-ui` walkthrough;
+  - `isideload-fork`;
+  - `install-control-taps`: 8 of 8;
+- the Release build succeeds, and the Release scan passes;
+- package guard: 16;
+- the canonical IPA is unchanged (`67d1a79b`).
+
+As before, the suites not run are the three that need arguments or the owner's certificate.
+
+### 13.6 Remaining limitations
+- **A deliberate design choice:** after the grace period, an operation the bridge still runs is abandoned by Swift. The slot stays busy in Rust until the bridge ends it.
+  - For a certificate request, provisioning reports `cancelled`, and the request stays unconfirmed: settled from the listing, or by the user. It is never sent again blindly.
+- **An uncancelled reader** whose bridge never sends a terminal event waits until its caller cancels it. Every production caller has a deadline: the authenticator's `operationTimeout` and the provisioner's `ZagDeadline`.
+- **Section 12.6 still applies** except where struck through: live behaviour untested, residual secrets in memory, exportable software keys, unknown listing content, and that the implementer wrote this.
