@@ -127,7 +127,7 @@ fn send(emit: &Emit, value: Value) {
 
 /// Starts a sign-in. `emit` receives zero or more `codeRequired` events and
 /// then exactly one `signedIn` or `failed` event.
-pub fn sign_in(id: u64, email: String, password: Zeroizing<String>, emit: Emit) {
+pub fn sign_in(id: u64, anisette_scope: String, email: String, password: Zeroizing<String>, emit: Emit) {
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel();
     let (answers_tx, answers_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -160,7 +160,7 @@ pub fn sign_in(id: u64, email: String, password: Zeroizing<String>, emit: Emit) 
     let task = runtime().spawn(async move {
         let prompter = Prompter { prompts: prompts_tx, answers: tokio::sync::Mutex::new(answers_rx) };
         let result = tokio::select! {
-            result = backend.sign_in(&email, password, &prompter) => result,
+            result = backend.sign_in(&anisette_scope, &email, password, &prompter) => result,
             _ = cancel_rx => Err(FailureKind::Cancelled.into()),
         };
         drop(prompter);

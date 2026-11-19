@@ -38,8 +38,10 @@ func team(_ id: String) -> [String: Any] { ["identifier": id, "name": "Personal 
 
 let script: [String: Any] = ["accounts": [
 	["email": "one@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC1", "teams": [team("BRTEAM0001")],
-	 "issuedCertificate": issuedCertificate.base64EncodedString()],
-	["email": "two@bridge.invalid", "password": passwordTwo, "accountIdentifier": "BRIDGEACC2", "teams": [team("BRTEAM0002")]],
+	 "issuedCertificate": issuedCertificate.base64EncodedString(),
+	 "anisetteScope": ZagIsideloadBridge.anisetteScope(forAppleID: "one@bridge.invalid")],
+	["email": "two@bridge.invalid", "password": passwordTwo, "accountIdentifier": "BRIDGEACC2", "teams": [team("BRTEAM0002")],
+	 "anisetteScope": ZagIsideloadBridge.anisetteScope(forAppleID: "two@bridge.invalid")],
 	["email": "codes@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC3", "twoFactor": "trustedDevice",
 	 "code": deviceCode, "smsCode": smsCode, "teams": [team("BRTEAM0003")]],
 	["email": "offline@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC4", "signInFailure": "network"],
@@ -114,6 +116,20 @@ struct ZagAppleBridgeTests {
 		if case .signedIn(let session) = firstState {
 			check(session.team.identifier == "BRTEAM0001" && session.team.kind == .personalFree, "sign-in: the Personal Team is selected")
 		}
+
+		// Anisette state is kept per Apple Account: the scripted backend refuses a
+		// sign-in whose anisette scope is not that account's own.
+		check(storedOne != nil, "anisette: the account signs in with its own anisette scope")
+		let scopeOne = ZagIsideloadBridge.anisetteScope(forAppleID: "one@bridge.invalid")
+		check(scopeOne == ZagIsideloadBridge.anisetteScope(forAppleID: " One@Bridge.INVALID\n")
+			  && scopeOne != ZagIsideloadBridge.anisetteScope(forAppleID: "two@bridge.invalid"),
+			  "anisette: one scope per Apple Account (case and spaces ignored), different for another account")
+		check(scopeOne.count == 33 && scopeOne.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) } && !scopeOne.contains("bridge"),
+			  "anisette: the scope is a hash, never the address")
+		let scoped = await directory.newSignIn()
+		let scopedState = await scoped.signIn(appleID: "two@bridge.invalid", password: ZagEphemeralSecret(passwordTwo))
+		check(signedInAccount(scopedState) != nil && signedInAccount(scopedState) != accountOne,
+			  "anisette: a second account signs in with its own, different anisette scope")
 
 		// Wrong password and network failure.
 		let wrong = await directory.newSignIn()

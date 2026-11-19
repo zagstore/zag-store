@@ -69,8 +69,26 @@ fn classify(report: &Report) -> BridgeError {
 }
 
 /// The anisette provider's device state, in Swift's this-device-only
-/// Keychain. One device state is shared by all accounts, as on a real device.
-struct KeychainStorage(ZagBridgeStorage);
+/// Keychain, kept per account: every key is prefixed with the account's
+/// anisette scope, so no account reads or writes another's device state
+/// (owner decision, 19 Nov: per-account isolation).
+pub(crate) struct KeychainStorage {
+    storage: ZagBridgeStorage,
+    scope: String,
+}
+
+impl KeychainStorage {
+    pub(crate) fn new(storage: ZagBridgeStorage, scope: &str) -> Result<Self, Report> {
+        if !crate::backend::valid_anisette_scope(scope) {
+            return Err(rootcause::report!("anisette scope"));
+        }
+        Ok(Self { storage, scope: scope.to_string() })
+    }
+
+    fn scoped(&self, key: &str) -> Result<CString, Report> {
+        CString::new(format!("{}/{key}", self.scope)).map_err(|_| rootcause::report!("storage key"))
+    }
+}
 
 impl SideloadingStorage for KeychainStorage {
     fn store(&self, key: &str, value: &str) -> Result<(), Report> {
@@ -82,28 +100,28 @@ impl SideloadingStorage for KeychainStorage {
     }
 
     fn store_data(&self, key: &str, value: &[u8]) -> Result<(), Report> {
-        let key = CString::new(key).map_err(|_| rootcause::report!("storage key"))?;
-        match (self.0.store)(self.0.context, key.as_ptr(), value.as_ptr(), value.len()) {
+        let key = self.scoped(key)?;
+        match (self.storage.store)(self.storage.context, key.as_ptr(), value.as_ptr(), value.len()) {
             0 => Ok(()),
             _ => Err(rootcause::report!("storage")),
         }
     }
 
     fn retrieve_data(&self, key: &str) -> Result<Option<Vec<u8>>, Report> {
-        let key = CString::new(key).map_err(|_| rootcause::report!("storage key"))?;
+        let key = self.scoped(key)?;
         let mut pointer = std::ptr::null_mut();
         let mut length = 0usize;
-        if (self.0.retrieve)(self.0.context, key.as_ptr(), &mut pointer, &mut length) != 0 || pointer.is_null() {
+        if (self.storage.retrieve)(self.storage.context, key.as_ptr(), &mut pointer, &mut length) != 0 || pointer.is_null() {
             return Ok(None);
         }
         let data = unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec();
-        (self.0.release)(self.0.context, pointer, length);
+        (self.storage.release)(self.storage.context, pointer, length);
         Ok(Some(data))
     }
 
     fn delete(&self, key: &str) -> Result<(), Report> {
-        let key = CString::new(key).map_err(|_| rootcause::report!("storage key"))?;
-        (self.0.delete_item)(self.0.context, key.as_ptr());
+        let key = self.scoped(key)?;
+        (self.storage.delete_item)(self.storage.context, key.as_ptr());
         Ok(())
     }
 }
@@ -133,8 +151,9 @@ impl IsideloadBackend {
         Ok(Self { anisette_url: anisette_url.to_string(), device_serial: device_serial.to_string(), storage })
     }
 
-    fn provider(&self) -> Result<RemoteV3AnisetteProvider, Report> {
-        RemoteV3AnisetteProvider::new(&self.anisette_url, Box::new(KeychainStorage(self.storage)), self.device_serial.clone())
+    /// A provider over one account's anisette device state.
+    fn provider(&self, scope: &str) -> Result<RemoteV3AnisetteProvider, Report> {
+        RemoteV3AnisetteProvider::new(&self.anisette_url, Box::new(KeychainStorage::new(self.storage, scope)?), self.device_serial.clone())
     }
 }
 
@@ -142,6 +161,9 @@ impl IsideloadBackend {
 /// session, and nothing more.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredToken {
+    /// The account's anisette scope: portal sessions reopen with the same
+    /// device state the sign-in used.
+    anisette_scope: String,
     adsid: String,
     token: String,
     duration: u64,
@@ -183,8 +205,8 @@ fn to_team(team: &DeveloperTeam) -> Team {
 
 #[async_trait]
 impl Backend for IsideloadBackend {
-    async fn sign_in(&self, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> BridgeResult<SignedIn> {
-        let provider = self.provider().map_err(|r| classify(&r))?;
+    async fn sign_in(&self, anisette_scope: &str, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> BridgeResult<SignedIn> {
+        let provider = self.provider(anisette_scope).map_err(|_| BridgeError::new(FailureKind::InvalidInput))?;
         let mut account = AppleAccount::builder(email)
             .anisette_provider(provider)
             .build()
@@ -245,7 +267,13 @@ impl Backend for IsideloadBackend {
             .ok_or(BridgeError::new(FailureKind::Malformed))?;
         let mut session = DeveloperSession::new(token.clone(), adsid.clone(), account.grandslam_client.clone(), account.anisette_generator.clone());
         let teams = session.list_teams().await.map_err(|r| classify(&r))?.iter().map(to_team).collect();
-        let stored = StoredToken { adsid: adsid.clone(), token: token.token.clone(), duration: token.duration, expiry: token.expiry };
+        let stored = StoredToken {
+            anisette_scope: anisette_scope.to_string(),
+            adsid: adsid.clone(),
+            token: token.token.clone(),
+            duration: token.duration,
+            expiry: token.expiry,
+        };
         let opaque = Zeroizing::new(STANDARD.encode(Zeroizing::new(serde_json::to_vec(&stored).map_err(|_| BridgeError::new(FailureKind::Malformed))?)));
         Ok(SignedIn {
             credential: Credential {
@@ -266,7 +294,8 @@ impl Backend for IsideloadBackend {
         if stored.adsid != credential.account_identifier {
             return Err(FailureKind::InvalidInput.into());
         }
-        let generator = AnisetteDataGenerator::new(Arc::new(tokio::sync::RwLock::new(self.provider().map_err(|r| classify(&r))?)));
+        let provider = self.provider(&stored.anisette_scope).map_err(|_| BridgeError::new(FailureKind::InvalidInput))?;
+        let generator = AnisetteDataGenerator::new(Arc::new(tokio::sync::RwLock::new(provider)));
         let client_info = generator.get_client_info().await.map_err(|r| classify(&r))?;
         let grandslam = GrandSlam::new(client_info).await.map_err(|r| classify(&r))?;
         let token = AppToken { token: stored.token.clone(), duration: stored.duration, expiry: stored.expiry };
@@ -428,6 +457,64 @@ mod tests {
         assert_eq!(expiry_seconds(3600, NOW), None, "a duration, not a time");
         assert_eq!(expiry_seconds(0, NOW), None);
         assert_eq!(expiry_seconds(u64::MAX, NOW), None);
+    }
+
+    mod memory {
+        use std::collections::HashMap;
+        use std::ffi::{CStr, c_char, c_void};
+        use std::sync::Mutex;
+
+        pub static ITEMS: Mutex<Option<HashMap<String, Vec<u8>>>> = Mutex::new(None);
+
+        fn key(k: *const c_char) -> String {
+            unsafe { CStr::from_ptr(k) }.to_str().unwrap().to_string()
+        }
+        pub extern "C" fn store(_: *mut c_void, k: *const c_char, v: *const u8, n: usize) -> i32 {
+            let value = unsafe { std::slice::from_raw_parts(v, n) }.to_vec();
+            ITEMS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key(k), value);
+            0
+        }
+        pub extern "C" fn retrieve(_: *mut c_void, k: *const c_char, v: *mut *mut u8, n: *mut usize) -> i32 {
+            let Some(value) = ITEMS.lock().unwrap().get_or_insert_with(HashMap::new).get(&key(k)).cloned() else { return 1 };
+            let boxed = value.into_boxed_slice();
+            unsafe {
+                *n = boxed.len();
+                *v = Box::into_raw(boxed) as *mut u8;
+            }
+            0
+        }
+        pub extern "C" fn delete_item(_: *mut c_void, k: *const c_char) -> i32 {
+            ITEMS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&key(k));
+            0
+        }
+        pub extern "C" fn release(_: *mut c_void, v: *mut u8, n: usize) {
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(v, n)) });
+        }
+    }
+
+    #[test]
+    fn anisette_state_is_kept_per_account() {
+        let storage = ZagBridgeStorage {
+            context: std::ptr::null_mut(),
+            store: memory::store,
+            retrieve: memory::retrieve,
+            delete_item: memory::delete_item,
+            release: memory::release,
+        };
+        let first = KeychainStorage::new(storage, "a0123456789abcdef").unwrap();
+        let second = KeychainStorage::new(storage, "bfedcba9876543210").unwrap();
+        first.store("adi.pb", "first device").unwrap();
+        assert_eq!(second.retrieve("adi.pb").unwrap(), None, "another account never reads this account's state");
+        second.store("adi.pb", "second device").unwrap();
+        assert_eq!(first.retrieve("adi.pb").unwrap().as_deref(), Some("first device"));
+        assert_eq!(second.retrieve("adi.pb").unwrap().as_deref(), Some("second device"));
+        second.delete("adi.pb").unwrap();
+        assert_eq!(first.retrieve("adi.pb").unwrap().as_deref(), Some("first device"), "deleting one account's state leaves the other's");
+        let keys: Vec<String> = memory::ITEMS.lock().unwrap().as_ref().unwrap().keys().cloned().collect();
+        assert_eq!(keys, vec!["a0123456789abcdef/adi.pb".to_string()], "every stored key carries its account's scope");
+        for scope in ["", "has space", "a/b", &"a".repeat(65)] {
+            assert!(KeychainStorage::new(storage, scope).is_err(), "scope {scope:?} is refused");
+        }
     }
 
     #[test]

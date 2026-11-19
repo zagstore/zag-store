@@ -56,7 +56,7 @@ Results flow back as JSON events: `codeRequired`, `signedIn`, `result` or `faile
 | Apple Account password | Swift `ZagEphemeralSecret`, then copied into a Rust `Zeroizing<String>`; the fork borrows it as `&str` | One sign-in, including the wait for a code | Swift wipes it when the operation ends. Rust's copy is zeroised when the sign-in future ends or is cancelled. The fork's derived buffers are zeroised (`PROVENANCE.md`). **Never stored.** |
 | Verification code | Swift `String`, then Rust `Zeroizing<String>`, then the fork | One answer | Rust's copy is zeroised. **Residual:** the fork passes the code by value into an HTTP header, which cannot be wiped. |
 | Session (credential) | A token Swift stores in the this-device-only Keychain (`ZagFreeAccountSecretKind.session`). The bridge's token is opaque base64 of `{adsid, developer-services token, duration, expiry}`. | Until it expires, the user signs out, or the account is removed | The bridge zeroises its event buffers after delivery, and its copy of the credential when the cached session is dropped. Swift zeroes the JSON it sends. **Residual:** Swift `String` copies of the token cannot be wiped. |
-| Anisette device state | The Keychain (`ZagStore.anisette.bridge`), `AfterFirstUnlockThisDeviceOnly`, never synchronised | Device lifetime | One device state is shared by all accounts, as on a real Apple device. Opaque to Zag Store. |
+| Anisette device state | The Keychain (`ZagStore.anisette.bridge`), `AfterFirstUnlockThisDeviceOnly`, never synchronised; each item is named `<account's anisette scope>/<key>` | Device lifetime (not yet removed with the account: see section 4) | **One device state per Apple Account** (owner decision, 19 Nov). Opaque to Zag Store. |
 | Signing key | A Keychain key item per account and team (PR #28), `AfterFirstUnlockThisDeviceOnly`, not synchronised | Until the account is removed (its key items are deleted then), or replaced when a new certificate is needed | Zag Store never exports it: it is used only through `SecKeyCreateSignature`. **Not hardware-enforced:** iOS does not enforce `kSecAttrIsExtractable: false` for software RSA keys, and the Secure Enclave cannot hold RSA-2048. Code in the app's process could export it. The exporting test factory is `DEBUG`-only, and the release scan checks it is absent. |
 
 **Not kept anywhere:**
@@ -76,14 +76,29 @@ Results flow back as JSON events: `codeRequired`, `signedIn`, `result` or `faile
 - **Cached session.** A portal session is reused only for the identical token. An expired session is dropped and reported as `sessionExpired`.
 - **Teams.** Portal operations name the team. Signing authorisations are scoped by account and team (`ZagSigningScope`), as before.
 - **One sign-in at a time per slot.** A second one gets `busy`.
-- **Shared state.** The only state shared between slots is the configured backend, and in `live` the anisette device state.
+- **Anisette state, per account (owner decision, 19 Nov).**
+  - `zag_bridge_sign_in` takes a required anisette scope. Swift derives it as `"a"` plus 32 hex digits of SHA-256 of the address entered (trimmed, lower-cased), so it is never the address.
+  - Every key the anisette provider stores is prefixed with that scope, so no account reads or writes another's device state.
+  - The scope is kept inside the session token, so portal sessions reopen with the device state their sign-in used.
+  - A missing or malformed scope is refused. There is no shared default.
+- **What is still shared.**
+  - **The backend configuration.** One anisette provider URL and **one device serial** for all accounts. If the serial is unique to this device, it links the accounts to each other at the provider and possibly at Apple. G3 must choose a value that identifies nobody (for example a common value), or make it per account.
+  - **The client's network identity.** The IP address is the same for every account.
+- **Stop condition (owner, 19 Nov).** If the chosen provider requires one device identity shared by all accounts, this is a privacy trade-off. It comes back to the owner before the experiment.
+- **Not yet done.**
+  - A removed account's anisette items are not deleted. The account directory (#28) does not know the scope. Wiring this needs #28 and #29 together, for example by recording the scope in the account's ownership record.
+  - Anisette items of an earlier installation are not listed by the orphan cleanup either.
 
 **Tests (Swift):**
 - two accounts in one directory;
 - the second account does not see the first account's device;
-- a portal bound to one account refuses the other account's session.
+- a portal bound to one account refuses the other account's session;
+- each account signs in with its own anisette scope (the scripted backend refuses another's); the scope is a hash, the same for the same address in any case.
 
 **Tests (Rust):** the same checks, plus rebinding.
+- A sign-in without a scope, with a malformed one, or with another account's is refused.
+- Two accounts sign in at once with their own scopes.
+- Unit test, live build: two scopes never see, overwrite or delete each other's keys, and every stored key carries its scope.
 
 ## 5. Logging and diagnostics
 
@@ -165,7 +180,7 @@ None of these can be settled without Apple's services. Each is marked `EXPERIMEN
    - the code in an HTTP header;
    - the token in ordinary heap memory inside the fork while a session object exists.
 2. Should the anisette host be pinned?
-3. Is a shared anisette device state across accounts acceptable, or should each account have its own?
+3. *(Decided by the owner, 19 Nov: per-account anisette state, implemented.)* Is the remaining shared configuration acceptable? That is the one device serial and the one provider (section 4).
 4. Is the binding rule (first use binds a restored slot) sufficient? Should a portal also check the credential against the directory's account record?
 5. Anything in sections 2–8 to change before the experiment build is made?
 
@@ -194,7 +209,7 @@ Tick each item, or record a finding. File references are to the bridge PR (#29) 
 - [ ] One slot per authenticator (`Configuration.makeService`) and per portal instance.
 - [ ] A bound slot refuses another account's credential. Rebinding drops the cached session (`slot.rs` `finish_sign_in`, `portal`).
 - [ ] Portal operations stay within the account's teams. Signing needs `ZagSigningAuthorization` for exactly one account and team (#28).
-- [ ] The only shared state is the backend and the anisette device state. Question 3 below asks whether the latter is acceptable.
+- [ ] Anisette state is per account: the scope is required, prefixed to every storage key, and carried in the token (`live.rs` `KeychainStorage`, `StoredToken`). The remaining shared configuration is in question 3.
 
 ### C. Keychain accessibility and key exportability (#28)
 - [ ] Every item is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and not synchronised: sessions and identities (`ZagKeychainFreeAccountSecretStore`), signing keys (`ZagKeychainSigningKeys`) and anisette state (`ZagBridgeAnisetteKeychain`).

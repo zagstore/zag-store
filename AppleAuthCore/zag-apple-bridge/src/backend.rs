@@ -183,7 +183,9 @@ pub struct Certificate {
 /// Opens portal sessions and signs in.
 #[async_trait]
 pub trait Backend: Send + Sync {
-    async fn sign_in(&self, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> BridgeResult<SignedIn>;
+    /// `anisette_scope` names the account's own anisette device state: each
+    /// Apple Account gets its own, never another account's.
+    async fn sign_in(&self, anisette_scope: &str, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> BridgeResult<SignedIn>;
     async fn open_session(&self, credential: &Credential) -> BridgeResult<Box<dyn PortalSession>>;
 }
 
@@ -194,3 +196,8 @@ pub trait PortalSession: Send {
     async fn call(&mut self, request: PortalRequest) -> BridgeResult<serde_json::Value>;
 }
 
+
+/// An anisette scope: 1–64 ASCII letters, digits or hyphens.
+pub fn valid_anisette_scope(scope: &str) -> bool {
+    !scope.is_empty() && scope.len() <= 64 && scope.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}

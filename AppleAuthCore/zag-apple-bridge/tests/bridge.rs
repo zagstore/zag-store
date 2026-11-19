@@ -32,9 +32,18 @@ impl Events {
     }
 }
 
+/// Each address gets its own anisette scope, as Swift does (there a hash).
+fn scope_of(email: &str) -> std::ffi::CString {
+    std::ffi::CString::new(email.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>()).unwrap()
+}
+
 fn sign_in(slot: u64, email: &str, password: &str, events: &Events) {
+    sign_in_scoped(slot, &scope_of(email), email, password, events)
+}
+
+fn sign_in_scoped(slot: u64, scope: &std::ffi::CStr, email: &str, password: &str, events: &Events) {
     unsafe {
-        zag_bridge_sign_in(slot, email.as_ptr(), email.len(), password.as_ptr(), password.len(), events.context(), collect)
+        zag_bridge_sign_in(slot, scope.as_ptr(), email.as_ptr(), email.len(), password.as_ptr(), password.len(), events.context(), collect)
     }
 }
 
@@ -80,8 +89,10 @@ mod scripted {
         let guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let team = |id: &str| json!({ "identifier": id, "name": "Personal Team", "kind": "personalFree" });
         let script = json!({ "accounts": [
-            { "email": "first@zag.test", "password": "pw-one", "accountIdentifier": "ACC1", "teams": [team("TEAMONE001")] },
-            { "email": "second@zag.test", "password": "pw-two", "accountIdentifier": "ACC2", "teams": [team("TEAMTWO002")] },
+            { "email": "first@zag.test", "password": "pw-one", "accountIdentifier": "ACC1", "teams": [team("TEAMONE001")],
+              "anisetteScope": "first-zag-test" },
+            { "email": "second@zag.test", "password": "pw-two", "accountIdentifier": "ACC2", "teams": [team("TEAMTWO002")],
+              "anisetteScope": "second-zag-test" },
             { "email": "device@zag.test", "password": "pw", "accountIdentifier": "ACC3", "twoFactor": "trustedDevice",
               "code": "123456", "smsCode": "654321", "teams": [team("TEAMTRE003")] },
             { "email": "offline@zag.test", "password": "pw", "accountIdentifier": "ACC4", "signInFailure": "network" },
@@ -259,11 +270,39 @@ mod scripted {
     }
 
     #[test]
+    fn each_account_signs_in_with_its_own_anisette_scope() {
+        let _guard = configure();
+        let (one, two) = (zag_bridge_open_slot(), zag_bridge_open_slot());
+        // No scope, or a malformed one: refused, never a shared default.
+        let events = Events::new();
+        unsafe { zag_bridge_sign_in(one, std::ptr::null(), b"first@zag.test".as_ptr(), 14, b"pw-one".as_ptr(), 6, events.context(), collect) };
+        assert_eq!(events.next(), json!({ "event": "failed", "kind": "invalidInput" }));
+        for scope in [c"", c"has space", c"a/b"] {
+            let events = Events::new();
+            sign_in_scoped(one, scope, "first@zag.test", "pw-one", &events);
+            assert_eq!(events.next(), json!({ "event": "failed", "kind": "invalidInput" }), "{scope:?}");
+        }
+        // Another account's scope is not this account's.
+        let events = Events::new();
+        sign_in_scoped(one, c"second-zag-test", "first@zag.test", "pw-one", &events);
+        assert_eq!(events.next(), json!({ "event": "failed", "kind": "invalidInput" }));
+        // Two accounts at once, each with its own scope.
+        let (first, second) = (Events::new(), Events::new());
+        sign_in(one, "first@zag.test", "pw-one", &first);
+        sign_in(two, "second@zag.test", "pw-two", &second);
+        assert_eq!(first.next()["event"], "signedIn");
+        assert_eq!(second.next()["event"], "signedIn");
+        zag_bridge_close_slot(one);
+        zag_bridge_close_slot(two);
+    }
+
+    #[test]
     fn malformed_inputs_are_refused() {
         let _guard = configure();
         let slot = zag_bridge_open_slot();
         let events = Events::new();
-        unsafe { zag_bridge_sign_in(slot, std::ptr::null(), 0, b"pw".as_ptr(), 2, events.context(), collect) };
+        let scope = c"some-scope";
+        unsafe { zag_bridge_sign_in(slot, scope.as_ptr(), std::ptr::null(), 0, b"pw".as_ptr(), 2, events.context(), collect) };
         assert_eq!(events.next(), json!({ "event": "failed", "kind": "invalidInput" }));
         let credential = json!({ "accountIdentifier": "ACC1", "token": "t", "expiresAt": 1 });
         assert_eq!(portal(slot, &credential, json!({ "op": "deleteEverything" })), json!({ "event": "failed", "kind": "invalidInput" }));

@@ -49,6 +49,9 @@ pub struct MockAccount {
     /// The sign-in panics (checks that a terminal event still arrives).
     #[serde(default)]
     pub panics: bool,
+    /// The anisette scope this account must be signed in with, if any.
+    #[serde(default)]
+    pub anisette_scope: Option<String>,
 }
 
 fn none() -> String {
@@ -97,12 +100,17 @@ impl MockBackend {
 
 #[async_trait]
 impl Backend for MockBackend {
-    async fn sign_in(&self, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> BridgeResult<SignedIn> {
+    async fn sign_in(&self, anisette_scope: &str, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> BridgeResult<SignedIn> {
         let account = self
             .accounts
             .iter()
             .find(|a| a.email.eq_ignore_ascii_case(email))
             .ok_or(BridgeError::new(FailureKind::Rejected))?;
+        // A scripted account can require its own anisette scope, so tests
+        // check that each account is signed in with its own device state.
+        if account.anisette_scope.as_deref().is_some_and(|expected| expected != anisette_scope) {
+            return Err(FailureKind::InvalidInput.into());
+        }
         if account.delay_milliseconds > 0 {
             tokio::time::sleep(Duration::from_millis(account.delay_milliseconds)).await;
         }

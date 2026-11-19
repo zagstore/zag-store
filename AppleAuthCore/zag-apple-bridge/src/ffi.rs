@@ -138,14 +138,18 @@ pub extern "C" fn zag_bridge_close_slot(slot_id: u64) {
 }
 
 /// Starts a sign-in in `slot_id`. The password is copied into a zeroising
-/// buffer; Swift wipes its own copy when this returns.
+/// buffer; Swift wipes its own copy when this returns. `anisette_scope`
+/// names the account's own anisette device state (1–64 letters, digits or
+/// hyphens); there is no shared default.
 ///
 /// # Safety
-/// The pointers are readable for their lengths; `callback` and `context`
-/// stay valid until the terminal event.
+/// `anisette_scope` is a NUL-terminated string; the other pointers are
+/// readable for their lengths; `callback` and `context` stay valid until the
+/// terminal event.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zag_bridge_sign_in(
     slot_id: u64,
+    anisette_scope: *const c_char,
     email: *const u8,
     email_length: usize,
     password: *const u8,
@@ -154,12 +158,17 @@ pub unsafe extern "C" fn zag_bridge_sign_in(
     callback: EventCallback,
 ) {
     let emit = emitter(context, callback);
+    let scope = (!anisette_scope.is_null())
+        .then(|| unsafe { std::ffi::CStr::from_ptr(anisette_scope) }.to_str().ok())
+        .flatten()
+        .filter(|s| crate::backend::valid_anisette_scope(s))
+        .map(str::to_owned);
     let email = unsafe { bytes(email, email_length) }.and_then(|b| std::str::from_utf8(b).ok()).map(str::to_owned);
     let password = unsafe { bytes(password, password_length) }
         .and_then(|b| std::str::from_utf8(b).ok())
         .map(|p| Zeroizing::new(p.to_owned()));
-    match (email, password) {
-        (Some(email), Some(password)) => slot::sign_in(slot_id, email, password, emit),
+    match (scope, email, password) {
+        (Some(scope), Some(email), Some(password)) => slot::sign_in(slot_id, scope, email, password, emit),
         _ => emit(br#"{"event":"failed","kind":"invalidInput"}"#),
     }
 }

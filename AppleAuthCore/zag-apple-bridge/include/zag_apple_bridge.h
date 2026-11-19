@@ -39,7 +39,7 @@ int32_t zag_bridge_configure_mock(const uint8_t *json, size_t length);
 uint64_t zag_bridge_open_slot(void);
 void zag_bridge_close_slot(uint64_t slot);
 
-void zag_bridge_sign_in(uint64_t slot, const uint8_t *email, size_t email_length,
+void zag_bridge_sign_in(uint64_t slot, const char *anisette_scope, const uint8_t *email, size_t email_length,
 						const uint8_t *password, size_t password_length,
 						void *context, zag_bridge_event_callback callback);
 int32_t zag_bridge_answer(uint64_t slot, int32_t action, const uint8_t *code, size_t code_length);

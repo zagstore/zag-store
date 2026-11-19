@@ -1,4 +1,5 @@
 #if ZAG_APPLE_BRIDGE
+import CryptoKit
 import Foundation
 import Security
 
@@ -160,11 +161,23 @@ enum ZagIsideloadBridge {
 	}
 	#endif
 
+	/// The anisette scope of an Apple Account: each account has its own
+	/// anisette device state (owner decision, 19 Nov), named by a hash of the
+	/// address entered, never the address. The same address in any case gets
+	/// the same scope, so later sign-ins and portal sessions reuse it.
+	static func anisetteScope(forAppleID appleID: String) -> String {
+		let normalised = appleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+		return "a" + SHA256.hash(data: Data(normalised.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
+	}
+
 	static func signIn(slot: ZagBridgeSlot, appleID: String, password: ZagEphemeralSecret) throws -> ZagBridgeEvents {
 		let email = Array(appleID.utf8)
+		let scope = anisetteScope(forAppleID: appleID)
 		return try password.withBytes { secret in
 			ZagBridgeEvents.start { context, callback in
-				zag_bridge_sign_in(slot.id, email, email.count, secret.bindMemory(to: UInt8.self).baseAddress, secret.count, context, callback)
+				scope.withCString { scope in
+					zag_bridge_sign_in(slot.id, scope, email, email.count, secret.bindMemory(to: UInt8.self).baseAddress, secret.count, context, callback)
+				}
 			}
 		}
 	}
@@ -425,7 +438,8 @@ struct ZagBridgeAnisetteSource: ZagAnisetteSource {
 }
 
 /// The anisette provider's device state in the this-device-only Keychain,
-/// never synchronised. Values are opaque to Zag Store.
+/// never synchronised. Values are opaque to Zag Store. The bridge names each
+/// item `<account's anisette scope>/<key>`, so accounts never share one.
 enum ZagBridgeAnisetteKeychain {
 	static let service = "ZagStore.anisette.bridge"
 
