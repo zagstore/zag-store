@@ -135,8 +135,11 @@ Keys are never retagged. The macOS file keychain reports success for a tag updat
   - It looks only at this app's own items: the secret store's own service, and this namespace's key labels.
   - It marks each as "recoverable by signing in" (has a record, with the masked address if known) or "unowned" (no record).
 - Nothing is removed at launch.
-- `removeOrphanedItems(_:)` removes exactly the accounts the user confirmed, and only those still orphaned when it runs. An account recovered by a sign-in in the meantime is kept.
-- It removes key items first, then secrets.
+- `removeOrphanedItems(_:)` removes exactly what the user confirmed, checking each item again immediately before deleting it:
+  - An account is removed only if it is still orphaned **and** its ownership is unchanged since the confirmation (still recoverable or not, same masked address). Otherwise it is reported as skipped and kept.
+  - It removes key items first, then the account's local (anisette) state, then its secrets, the ownership record among them. An interrupted cleanup therefore leaves the record, and the next listing shows the account again.
+  - The result reports removed, skipped and failed items separately. A failure is never hidden, and the cleanup can be repeated.
+- Local anisette state that no account's record names is listed too (see "Account removal and local state" below).
 
 **Enumeration used.** `SecItemCopyMatching` with `kSecMatchLimitAll` and `kSecReturnAttributes`, through the documented API only, over:
 - the generic-password items of Zag Store's own service;
@@ -144,7 +147,79 @@ Keys are never retagged. The macOS file keychain reports success for a tag updat
 
 It does not assume what other apps can see, or that items survive deletion.
 
-**Not yet decided: UI.** No screen offers the cleanup yet. Where to offer it (for example Settings → Apple Accounts → "Data from an earlier installation") is a product decision.
+**UI (20 Nov, Debug only).** Settings → Apple Accounts → **Stored Account Data**:
+- It lists items in three groups: "Recoverable" (with the masked address), "Not Recoverable" and "Anisette State".
+- It removes one item, or all listed, only after a confirmation dialog. Removing a recoverable account warns that its keys cannot then be recovered by signing in.
+- It reports skipped and failed items, and never runs by itself.
+- Like the rest of the Apple Accounts screen it is compiled only in Debug. Offering it in Release is an owner decision.
+- The simulator walkthrough covers it: step 10 and 2 of the 13 in-app checks.
+
+### Certificate request recovery (20 Nov)
+
+A certificate request can be granted by Apple while its response is lost (network failure, timeout, app stopped). The certificate then exists, counts against the team's limit, and nobody holds a record of it. Retrying blindly would consume further slots.
+
+**Write-ahead marker.**
+- Before each certificate request is sent, the pending-key journal is marked `submissionUnconfirmed`.
+- The mark is cleared only when Apple has definitely not issued a certificate: it refused with the certificate limit, a rate limit or a rejected session.
+- A crash while the request is out leaves the mark set.
+
+**Preflight inventory.** When the journal is marked, the next provisioning attempt checks the team's certificate listing (already fetched for reuse) before requesting anything:
+- **Issued.** A listed certificate's public key belongs to the pending key (proof of possession, as for any issued certificate). It is adopted, published through the same journal path, and nothing is requested.
+- **Not issued.** Every listed certificate includes its data and none belongs to the pending key. The same request is sent once more (bounded by the existing three attempts).
+- **Unknown.** Otherwise: the listing omits certificate data, the pending key is missing, or a match has expired. Provisioning stops with `certificateRequestUnresolved`.
+  - Nothing more is requested, however often provisioning is retried.
+  - Background refresh treats it as a signing failure and does not retry.
+- **Continuing after "unknown".** Only the user's decision continues, through `abandonUnresolvedCertificateRequest(accountID:team:)`. It discards the pending key and journal, and the next attempt makes one new request with a new key.
+
+**Never revoked.** The portal interface has no revoke operation at all. An uncertain certificate stays in the team's listing until it expires or the user revokes it elsewhere.
+
+**Portal data.** Whether Apple's live listing (`listAllDevelopmentCerts`) fills each certificate's content is not established.
+- The bridge passes it when present (#29).
+- If it is absent, every lost response ends as "unknown", which is the safe outcome.
+
+**Evidence.** 7 strict integration checks ("recovery: …"):
+- a lost response is marked;
+- with listing data, the certificate is found and used with no new request;
+- without listing data, three retries make no request, and the job stops;
+- abandoning makes exactly one new request;
+- a refusal is marked "not issued" and is resent;
+- the mark is written before sending, and a full listing showing nothing issued resends once.
+
+A further accounts check covers the refresh mapping.
+
+### Account removal and local state (20 Nov)
+
+**Ownership record.** It now also lists:
+- the hashes of the addresses the account signed in with (`addressKeys`, SHA-256 of the trimmed, lower-cased address; the address itself is never stored);
+- the scopes of local state kept for it outside its own items (`localStateScopes`).
+
+For local state, the bridge's per-account anisette state is the only kind.
+
+**Removal order.** Removing an account deletes:
+1. its key items;
+2. each recorded local state scope;
+3. its secrets, the record among them.
+
+**If a local state scope cannot be removed:**
+- removal fails with `localStateNotRemoved`;
+- the account stays registered with its record and its other secrets;
+- removing it again finishes the job.
+
+The local state store is a protocol (`ZagAccountLocalState`) configured on the directory; the bridge provides it in #29.
+
+### Apple Account aliases (20 Nov)
+
+**What the protocol offers.**
+- The identifier Apple returns at sign-in (`adsid`) comes from the SPD, which is decrypted with the SRP session key after the server proof (M2) has been verified. So it is authenticated by Apple's sign-in.
+- Whether every alias (a second email or phone number) of one Apple Account yields the same `adsid` has not been observed. Zag Store cannot contact Apple to test it.
+
+**Rule (fail closed).**
+- Each account records the hashes of the addresses it signed in with.
+- A sign-in that Apple accepts for a known account through an address never recorded for it is refused with `addressNotRecognised`: nothing is stored, nothing is merged, and no second account is created.
+- The user signs in with the address first used.
+- Accounts recorded before this change accept their next address as the first one.
+
+**Owner decision.** Reconciling aliases needs the identity semantics to be established first, for example in the supervised experiment.
 
 ### Exportability
 

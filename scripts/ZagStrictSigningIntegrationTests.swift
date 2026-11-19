@@ -395,22 +395,67 @@ extension Tests {
 		// identity's key is removed first, so a new certificate is needed.)
 		try? keys.delete(account: account, team: team, slot: third.keySlot)
 		portal.loseNext(1)
+		let issuedBeforeLoss = portal.issuedCount
+		let lost = await provision()
+		let afterLoss = portal.submitted.count
+		check(lost == nil && secrets.pending(account, team)?.submissionUnconfirmed == true,
+			  "recovery: a request whose response is lost is marked unconfirmed")
+		guard let recovered = await provision(), let fourth = secrets.identity(account, team) else { return check(false, "after a lost response") }
+		check(recovered.changes.createdCertificate && portal.submitted.count == afterLoss && works(fourth) && fourth.serialNumber != third.serialNumber
+			  && secrets.pending(account, team) == nil && portal.issuedCount == issuedBeforeLoss + 1,
+			  "recovery: the certificate issued for the lost response is found in the listing by its key and used; none is requested again")
+
+		// The same, but the listing has no certificate data: the outcome cannot be
+		// established, so nothing more is requested and nothing is revoked.
+		try? keys.delete(account: account, team: team, slot: fourth.keySlot)
+		portal.hidesCertificateData = true
+		portal.loseNext(1)
 		_ = await provision()
-		let unissued = portal.submitted.count
-		guard await provision() != nil, let fourth = secrets.identity(account, team) else { return check(false, "after a lost response") }
-		check(portal.submitted.count == unissued + 1 && portal.submitted[unissued] == portal.submitted[unissued - 1]
-			  && fourth.serialNumber != third.serialNumber && works(fourth),
-			  "L2: after a lost response the same request is retried; the certificate Apple issued unseen is not used (it counts against the limit until it expires)")
+		let unresolvedFrom = portal.submitted.count, issuedBefore = portal.issuedCount
+		for _ in 0..<3 {
+			let result = await provisioner.provision(request, authorization: authorization)
+			guard case .failure(let failure) = result, failure.kind == .certificateRequestUnresolved else { return check(false, "unresolved: \(result)") }
+		}
+		check(portal.submitted.count == unresolvedFrom && portal.issuedCount == issuedBefore && secrets.pending(account, team)?.submissionUnconfirmed == true,
+			  "recovery: with no certificate data in the listing, provisioning stops (certificateRequestUnresolved) and requests nothing more, however often it is retried")
+		// Only the user's decision starts a new request; nothing is revoked (the
+		// portal interface has no revoke operation at all).
+		await provisioner.abandonUnresolvedCertificateRequest(accountID: account, team: team)
+		guard await provision() != nil, let fifth = secrets.identity(account, team) else { return check(false, "after abandoning") }
+		check(portal.submitted.count == unresolvedFrom + 1 && works(fifth) && portal.submitted.last != portal.submitted[unresolvedFrom - 1],
+			  "recovery: after the user abandons the unresolved request, one new request is made with a new key")
+
+		// A refusal from Apple (rate limit) means nothing was issued: the next
+		// attempt does not need the listing to proceed.
+		try? keys.delete(account: account, team: team, slot: fifth.keySlot)
+		portal.refuseNext(1)
+		_ = await provision()
+		check(secrets.pending(account, team)?.submissionUnconfirmed == false, "recovery: a request Apple refused is marked as not issued")
+		let refusedAt = portal.submitted.count
+		guard await provision() != nil, let sixth = secrets.identity(account, team) else { return check(false, "after a refusal") }
+		check(portal.submitted.count == refusedAt + 1 && portal.submitted.last == portal.submitted[refusedAt - 1] && works(sixth),
+			  "recovery: after a refusal the same request is sent again, even when the listing has no certificate data")
+		portal.hidesCertificateData = false
+
+		// The app stops while a request is out (the journal is written ahead).
+		try? keys.delete(account: account, team: team, slot: sixth.keySlot)
+		portal.failNext(1)
+		_ = await provision()
+		check(secrets.pending(account, team)?.submissionUnconfirmed == true, "recovery: a request is marked unconfirmed before it is sent")
+		let crashAt = portal.submitted.count
+		guard await provision() != nil, let latest = secrets.identity(account, team) else { return check(false, "after an unsent request") }
+		check(portal.submitted.count == crashAt + 1 && portal.submitted.last == portal.submitted[crashAt - 1] && works(latest),
+			  "recovery: when the full listing shows nothing was issued, the same request is sent once more")
 
 		// Pending keys belong to one account and team.
 		let other = UUID()
 		defer { try? keys.deleteAll(account: other) }
 		_ = try? keys.create(account: other, team: team, slot: "PENDING1", commonName: "Other")
-		check((try? keys.slots(account: account, team: team)) == [fourth.keySlot] && (try? keys.slots(account: other, team: team)) == ["PENDING1"]
-			  && works(fourth),
+		check((try? keys.slots(account: account, team: team)) == [latest.keySlot] && (try? keys.slots(account: other, team: team)) == ["PENDING1"]
+			  && works(latest),
 			  "L2: another account's key for the same team is separate and never touches this account's keys")
 		try? keys.deleteAll(account: other)
-		check((try? keys.slots(account: other, team: team))?.isEmpty == true && works(fourth), "L2: removing an account removes all its keys, pending ones included")
+		check((try? keys.slots(account: other, team: team))?.isEmpty == true && works(latest), "L2: removing an account removes all its keys, pending ones included")
 	}
 }
 
@@ -420,11 +465,16 @@ extension Tests {
 final class ScriptedCertificatePortal: ZagDeveloperPortalService, @unchecked Sendable {
 	let inner: ZagDeveloperPortalService
 	private let lock = NSLock()
-	private var failures = 0, losses = 0
+	private var failures = 0, losses = 0, refusals = 0
 	private(set) var submitted: [Data] = []
+	/// Certificates Apple issued (including those whose response was lost).
+	private(set) var issuedCount = 0
+	/// The listing leaves out every certificate's data (as a portal might).
+	var hidesCertificateData = false
 	init(inner: ZagDeveloperPortalService) { self.inner = inner }
 	func failNext(_ count: Int) { lock.withLock { failures = count } }
 	func loseNext(_ count: Int) { lock.withLock { losses = count } }
+	func refuseNext(_ count: Int) { lock.withLock { refusals = count } }
 	func devices(team: String) async throws -> [ZagRegisteredDevice] { try await inner.devices(team: team) }
 	func registerDevice(udid: String, name: String, team: String) async throws -> ZagRegisteredDevice { try await inner.registerDevice(udid: udid, name: name, team: team) }
 	func appIDs(team: String) async throws -> [ZagRegisteredAppID] { try await inner.appIDs(team: team) }
@@ -432,16 +482,23 @@ final class ScriptedCertificatePortal: ZagDeveloperPortalService, @unchecked Sen
 	func appGroups(team: String) async throws -> [ZagRegisteredAppGroup] { try await inner.appGroups(team: team) }
 	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup { try await inner.registerAppGroup(identifier, team: team) }
 	func assignAppGroups(_ groups: [String], to appID: ZagRegisteredAppID, team: String) async throws { try await inner.assignAppGroups(groups, to: appID, team: team) }
-	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] { try await inner.certificates(team: team) }
+	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] {
+		let listed = try await inner.certificates(team: team)
+		guard hidesCertificateData else { return listed }
+		return listed.map { var certificate = $0; certificate.data = nil; return certificate }
+	}
 	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
-		let (fail, lose): (Bool, Bool) = lock.withLock {
+		let (fail, lose, refuse): (Bool, Bool, Bool) = lock.withLock {
 			submitted.append(request.data)
-			if failures > 0 { failures -= 1; return (true, false) }
-			if losses > 0 { losses -= 1; return (false, true) }
-			return (false, false)
+			if refusals > 0 { refusals -= 1; return (false, false, true) }
+			if failures > 0 { failures -= 1; return (true, false, false) }
+			if losses > 0 { losses -= 1; return (false, true, false) }
+			return (false, false, false)
 		}
+		if refuse { throw ZagPortalError.rateLimited }
 		if fail { throw ZagPortalError.network }
 		let issued = try await inner.submitCertificateRequest(request, team: team)
+		lock.withLock { issuedCount += 1 }
 		if lose { throw ZagPortalError.network }
 		return issued
 	}

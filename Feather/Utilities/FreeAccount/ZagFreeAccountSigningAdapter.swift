@@ -524,7 +524,8 @@ struct ZagFreeAccountLifecycle: Sendable {
 		case .appIDCapacityExhausted: return .appIDCapacity
 		case .installSlotsFull: return .installSlots
 		case .cancelled: return .cancelled
-		case .invalidRequest, .deviceLimitReached, .identifierUnavailable, .certificateMustBeRevoked, .invalidProfile, .keyStorage:
+		// An unresolved certificate request waits for the user; never retried.
+		case .invalidRequest, .deviceLimitReached, .identifierUnavailable, .certificateMustBeRevoked, .certificateRequestUnresolved, .invalidProfile, .keyStorage:
 			return .signingFailed
 		}
 	}

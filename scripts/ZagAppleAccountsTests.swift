@@ -84,6 +84,10 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 		await removal()
 		await reinstall()
 		await ambiguousRecords()
+		await aliases()
+		await localStateLifecycle()
+		await cleanupRevalidation()
+		unresolvedCertificateIsNotRetried()
 		ledgerOwnership()
 		limits()
 		print("SUCCESS: \(passed) multi-account checks passed")
@@ -335,7 +339,8 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 			  && (try? keys.key(account: owner, team: "SIMTEAM001")) != nil,
 			  "signing in again to the same Apple Account recovers its account ID, identity and signing key")
 		let removed = try! await fresh.removeOrphanedItems(plan)
-		check(removed.contains(other) && !removed.contains(owner) && !removed.contains(paid), "cleanup removes only accounts still orphaned when it runs")
+		check(removed.removed.contains(other) && !removed.removed.contains(owner) && !removed.removed.contains(paid) && removed.skipped.contains(owner),
+			  "cleanup removes only accounts still orphaned when it runs; one recovered meanwhile is reported as skipped")
 		check(world.secrets.keys(of: other).isEmpty && !world.secrets.hasRecord(other) && world.secrets.keys(of: owner).count == 2
 			  && world.secrets.keys(of: paid).count == 1,
 			  "cleanup leaves recovered and registered accounts' items untouched")
@@ -375,6 +380,118 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 		let orphans = try! await fresh.orphanedItems().accounts.map(\.id)
 		check(orphans.contains(other) && orphans.contains(copy) && !orphans.contains(session!.accountID),
 			  "a sign-in in progress is never listed as orphaned")
+	}
+
+	// MARK: Aliases (fail closed)
+
+	/// The simulation answers an unknown address with the tester's account, as
+	/// an alias of it would be answered.
+	static func aliases() async {
+		let world = World()
+		let tester = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: world.directory)!
+		let alias = await world.directory.newSignIn()
+		let state = await alias.signIn(appleID: "alias\(ZagFreeAccountSimulation.accountDomain)", password: ZagEphemeralSecret(ZagFreeAccountSimulation.password))
+		let count = await world.directory.registry.accounts.count
+		let adopted = try? await world.directory.adopt(alias)
+		if case .failed(let failure) = state {
+			check(failure.kind == .addressNotRecognised && count == 1 && adopted == nil && world.secrets.keys(of: tester) == ["\(tester.uuidString).session"]
+				  && Set(world.secrets.items.keys.compactMap { UUID(uuidString: String($0.prefix(36))) }) == [tester],
+				  "aliases: a known Apple Account reached through an unrecorded address is refused, not merged, and nothing is stored")
+		} else {
+			check(false, "aliases: \(state)")
+		}
+		let again = await SimulatedAccounts.signIn(" TESTER\(ZagFreeAccountSimulation.accountDomain.uppercased())", to: world.directory)
+		check(again == tester, "aliases: the recorded address, in any case and with spaces, still signs in to the same account")
+		let record = try! ZagAccountKeyIndex.record(of: tester, in: world.secrets)
+		check(record?.addressKeys == [ZagAccountOwnershipRecord.addressKey(for: SimulatedAccounts.tester)]
+			  && !(String(data: world.secrets.items["\(tester.uuidString).accountRecord"]!, encoding: .utf8)!.contains("tester")),
+			  "aliases: the record keeps a hash of the address, never the address")
+	}
+
+	// MARK: Local (anisette) state, removed with the account
+
+	final class FakeLocalState: ZagAccountLocalState, @unchecked Sendable {
+		private let lock = NSLock()
+		private var stored: Set<String> = []
+		var failRemovals = false
+		func scope(forAppleID appleID: String) -> String { "s" + ZagAccountOwnershipRecord.addressKey(for: appleID).prefix(16) }
+		func create(_ scope: String) { lock.withLock { _ = stored.insert(scope) } }
+		func has(_ scope: String) -> Bool { lock.withLock { stored.contains(scope) } }
+		func scopes() throws -> Set<String> { lock.withLock { stored } }
+		func remove(scope: String) throws {
+			try lock.withLock {
+				if failRemovals { throw ZagAccountError.storage }
+				stored.remove(scope)
+			}
+		}
+	}
+
+	static func localStateLifecycle() async {
+		let clock = TestClock(), secrets = MemorySecrets(), state = FakeLocalState()
+		let (directory, _) = SimulatedAccounts.directory(now: { clock.now }, secrets: secrets, localState: state)
+		let scope = state.scope(forAppleID: SimulatedAccounts.tester)
+		state.create(scope) // as the bridge does while signing in
+		let tester = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: directory)!
+		let paid = await SimulatedAccounts.signIn(SimulatedAccounts.paid, to: directory)!
+		let paidScope = state.scope(forAppleID: SimulatedAccounts.paid)
+		state.create(paidScope)
+		check(try! ZagAccountKeyIndex.record(of: tester, in: secrets)?.localStateScopes == [scope],
+			  "local state: the account's anisette scope is recorded with it at sign-in")
+		let stray = "sSTRAY0000000000"
+		state.create(stray)
+		let orphans = try! await directory.orphanedItems()
+		check(orphans.localStateScopes == [stray], "local state: only state no account's record names is listed as orphaned")
+
+		var ledger = ZagRefreshLedger()
+		state.failRemovals = true
+		let plan = try! await directory.removalPlan(for: tester, ledger: ledger)
+		do {
+			try await directory.remove(plan.confirm(.forgetRecords), ledger: &ledger)
+			check(false, "local state: removal with a failing anisette store")
+		} catch {
+			let still = await directory.registry.account(tester)
+			check(error as? ZagAccountError == .localStateNotRemoved && still != nil && secrets.hasRecord(tester) && state.has(scope),
+				  "local state: if its anisette state cannot be removed, removal is reported as failed and the account and its record stay")
+		}
+		state.failRemovals = false
+		try! await directory.remove(plan.confirm(.forgetRecords), ledger: &ledger)
+		let gone = await directory.registry.account(tester)
+		check(gone == nil && !state.has(scope) && !secrets.hasRecord(tester) && state.has(paidScope) && state.has(stray),
+			  "local state: removing the account again finishes it: its anisette state goes, another account's stays")
+
+		let result = try! await directory.removeOrphanedItems(ZagOrphanedAccountItems(accounts: [], localStateScopes: [stray, paidScope]))
+		check(result.removedLocalState == [stray] && state.has(paidScope) && !state.has(stray),
+			  "local state: cleanup removes confirmed orphaned state, never state an account's record names")
+		_ = paid
+	}
+
+	// MARK: Cleanup revalidates ownership before deleting
+
+	static func cleanupRevalidation() async {
+		let world = World()
+		let changing = UUID(), failing = UUID()
+		try! world.secrets.save(Data("x".utf8), kind: .session, account: changing, team: nil)
+		try! world.secrets.save(Data("y".utf8), kind: .session, account: failing, team: nil)
+		let plan = try! await world.directory.orphanedItems()
+		check(plan.accounts.contains { $0.id == changing && !$0.isRecoverable }, "revalidation: an unowned account is listed")
+		// Its ownership changes after the user saw the plan.
+		let record = try! JSONEncoder().encode(ZagAccountOwnershipRecord(accountKey: "k", maskedAppleID: "t•••@example.invalid"))
+		try! world.secrets.save(record, kind: .accountRecord, account: changing, team: nil)
+		world.secrets.failDeletes = true
+		let result = try! await world.directory.removeOrphanedItems(plan)
+		check(result.skipped.contains(changing) && world.secrets.keys(of: changing).count == 1,
+			  "revalidation: an account whose ownership changed since confirmation is skipped, not deleted")
+		check(result.failed.contains(failing) && world.secrets.keys(of: failing).count == 1,
+			  "revalidation: a deletion the Keychain refuses is reported as failed and the items stay")
+		world.secrets.failDeletes = false
+		let retry = try! await world.directory.removeOrphanedItems(try! await world.directory.orphanedItems())
+		check(retry.removed.contains(failing) && retry.removed.contains(changing) && world.secrets.keys(of: failing).isEmpty,
+			  "revalidation: a later, newly confirmed cleanup finishes what failed")
+	}
+
+	static func unresolvedCertificateIsNotRetried() {
+		check(ZagFreeAccountLifecycle.reason(for: .certificateRequestUnresolved) == .signingFailed,
+			  "recovery: an unresolved certificate request is never retried automatically by background refresh")
 	}
 
 	static func ledgerOwnership() {

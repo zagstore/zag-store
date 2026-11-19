@@ -161,6 +161,9 @@ struct ZagDevelopmentCertificate: Codable, Equatable, Sendable {
 	let name: String
 	let machineName: String?
 	let expiresAt: Date
+	/// The certificate (DER), when the portal's listing includes it. Only then
+	/// can a certificate whose issue response was lost be recognised by its key.
+	var data: Data? = nil
 }
 
 /// Whether to reuse a certificate or create one. Creating a certificate is
