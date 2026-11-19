@@ -288,6 +288,12 @@ enum ZagIsideloadBridge {
 	/// every live switch is on, which needs the owner's approval of G1–G6;
 	/// none is on.
 	static func configureLive(anisetteURL: URL, deviceSerial: String) -> Bool {
+		#if ZAG_LIVE_EXPERIMENT
+		// C5: an experiment build never has a live backend without the
+		// campaign's time window (configured, not yet verified); unconfigured,
+		// the bridge's gate would have no effect.
+		guard zag_bridge_time_gate_status() == 2 else { return false }
+		#endif
 		guard ZagLiveAuthentication.isEnabled, ZagLivePortal.isEnabled, ZagAnisetteLive.isEnabled, liveCompiled,
 			  anisetteURL.scheme == "https" else { return false }
 		var storage = ZagBridgeStorage(

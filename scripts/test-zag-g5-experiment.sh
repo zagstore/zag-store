@@ -38,6 +38,60 @@ callers = sorted({p.name for p, t in swift.items() if re.search(r"\.submitCertif
 assert callers == ["ZagFreeAccountProvisioner.swift"], callers
 print("PASS: T11 one submission path: the op string once, consume once and before the send, the budget only in ZagCertificateBudget")
 
+# G4 network invariants the experiment relies on (C5): every Apple request
+# goes through the guarded client, which follows no redirects, and an
+# experiment build never has a live backend without the time window.
+import re
+def production(path):
+    text = path.read_text()
+    cut = text.find("#[cfg(test)]\nmod tests")
+    text = text if cut < 0 else text[:cut]
+    # Code only: comment lines (upstream's disabled relay, docs) do not count.
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
+rust = {p.relative_to(root).as_posix(): production(p)
+        for crate in ["AppleAuthCore/zag-isideload/src", "AppleAuthCore/zag-apple-bridge/src"]
+        for p in sorted((root / crate).rglob("*.rs"))}
+policy = "AppleAuthCore/zag-isideload/src/net_policy.rs"
+for pattern in [r"reqwest::Client(?!Builder|\w)", r"Client::new\(", r"Client::builder\(", r"reqwest::get\(", r"reqwest::blocking",
+                r"\bureq\b", r"\bisahc\b", r"\bsurf::", r"hyper::Client", r"std::net::", r"UdpSocket"]:
+    hits = [f for f, t in rust.items() if re.search(pattern, t)]
+    assert not hits, (pattern, hits)
+builders = sorted(f for f, t in rust.items() if "ClientBuilder::new()" in t)
+assert builders == ["AppleAuthCore/zag-isideload/src/anisette/remote_v3/mod.rs", "AppleAuthCore/zag-isideload/src/auth/grandslam.rs"], builders
+assert all("net_policy::guarded_client(" in rust[f] for f in builders), builders
+assert [f for f, t in rust.items() if "MwClientBuilder::new(" in t or ".redirect(" in t] == [policy]
+src = rust[policy]
+guarded = src[src.index("pub fn guarded_client("):src.index("struct Guard")]
+assert src.count("MwClientBuilder::new(") == 1 and src.count(".redirect(") == 1
+for needle in [".https_only(true)", ".redirect(redirect::Policy::none())", ".with(Guard { allowed })"]:
+    assert needle in guarded, needle
+handle = src[src.index("impl Middleware for Guard"):src.index("pub fn permit_observed")]
+order = [handle.index(n) for n in ["permit_observed(", "time_gate::before_request(", "next.run(", "time_gate::after_response("]]
+assert order == sorted(order), order
+assert [f for f, t in rust.items() if "connect_async(" in t] == ["AppleAuthCore/zag-isideload/src/anisette/remote_v3/websocket.rs"]
+ws = rust["AppleAuthCore/zag-isideload/src/anisette/remote_v3/websocket.rs"]
+assert ws.index("net_policy::permit_observed(") < ws.index("connect_async(")
+assert 'time_gate::before_request(' not in "".join(t for f, t in rust.items() if f != policy)
+print("PASS: G4 network: only guarded_client builds HTTP clients (https only, no redirects, Guard with the time gate around each request); the anisette socket checks the policy first; no other client or socket")
+
+app_swift = {p.relative_to(root).as_posix(): p.read_text() for p in sorted((root / "Feather").rglob("*.swift"))}
+bridge_file = "Feather/Utilities/FreeAccount/ZagIsideloadBridge.swift"
+assert [f for f, t in app_swift.items() if "zag_bridge_configure_live(" in t] == [bridge_file]
+bridge = app_swift[bridge_file]
+live = bridge[bridge.index("static func configureLive("):bridge.index("static func configureFromCampaign(")]
+assert "zag_bridge_configure_live(" in live and bridge.count("zag_bridge_configure_live(") == 1
+assert live.index("#if ZAG_LIVE_EXPERIMENT\n\t\t// C5") < live.index("guard zag_bridge_time_gate_status() == 2 else { return false }") < live.index("#endif") < live.index("zag_bridge_configure_live(")
+callers = [f for f, t in app_swift.items() if re.search(r"\bconfigureLive\(anisetteURL:", t.replace("static func configureLive(anisetteURL:", ""))]
+assert callers == [bridge_file], callers
+campaign_cfg = bridge[bridge.index("static func configureFromCampaign("):bridge.index("static func takePolicyDecisions(")]
+assert campaign_cfg.count("configureLive(anisetteURL:") == 1
+window = campaign_cfg.index("guard zag_bridge_configure_time_window(")
+assert window < campaign_cfg.index("Int64(ZagCampaignConstants.maximumSkew)) == 0 else { return false }") < campaign_cfg.index("configureLive(anisetteURL:")
+assert [f for f, t in app_swift.items() if "configureFromCampaign(" in t] == ["Feather/Utilities/FreeAccount/ZagIsideloadBridge.swift", "Feather/Views/Settings/FreeAccount/ZagLiveExperimentView.swift"]
+assert not [f for f, t in app_swift.items() if re.search(r"ZagURLSessionTransport\(", t) and not f.endswith("ZagFreeAccountTransport.swift")]
+assert not [f for f, t in app_swift.items() if re.search(r"gsa\.apple\.com|developerservices2\.apple\.com", t) and not f.endswith("ZagExperimentLogger.swift")]
+print("PASS: C5 configuration: the live backend is configured only by configureFromCampaign, after the window is accepted; configureLive refuses an unconfigured gate in experiment builds; no Swift HTTP client reaches Apple")
+
 # L7: outside the experiment the provisioner's hooks do nothing, so the
 # event names passed to them are inert in production (and, as Swift small
 # strings, not scannable in the binary).
