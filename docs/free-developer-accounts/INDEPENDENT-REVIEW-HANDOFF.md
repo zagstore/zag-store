@@ -1,6 +1,6 @@
 # Independent review hand-off: G2 (licence) and G4 (security)
 
-Prepared 20 Nov 2026. The functional changes are **frozen** at the commits below. Reviewers record their findings in the packages' own decision tables. **Zag Store does not mark G2 or G4 complete.**
+Prepared 20 Nov 2026 and refreshed after PR #32 merged. The functional changes are **frozen** at the commits below. Reviewers record their findings in the packages' own decision tables. **Zag Store does not mark G2 or G4 complete.**
 
 ## 1. Commits under review
 
@@ -10,9 +10,11 @@ Prepared 20 Nov 2026. The functional changes are **frozen** at the commits below
 | #28 | `claude-keychain-signing` | `64de6694` | Keychain signing keys and account lifecycle (L1, L2), certificate request recovery, recovery screens |
 | #29 | `claude-isideload-bridge` | `c6ce0750` | The Rust bridge and Swift integration. It contains #26 and #28 through merge commits only. |
 
+**`main`:** `5beb0801`, the merge of the test-only PR #32 (section 6) on top of `e077cf04`.
+
 **History**
-- #28 branches from `main` `bcf30a9f`.
-- `main` is now `e077cf04`. It adds only #30's documentation, and #28 merges into it without conflicts.
+- #28 branches from `main` `bcf30a9f`. `main` has since gained only #30's documentation (`e077cf04`) and #32's two test-harness files (`5beb0801`).
+- Each frozen head merges into `main` `5beb0801` without conflicts (checked with `git merge-tree`).
 - Merge order, if approved after both reviews: #26, then #28, then #29. All three stay draft until then.
 
 **Getting the commits**
@@ -25,6 +27,12 @@ git merge-base --is-ancestor 4b1a6984 HEAD && git merge-base --is-ancestor 64de6
 ```
 
 A branch that has moved past its frozen head is not what was reviewed. Review the hashes above.
+
+The repository is public. The packages at the frozen commit:
+- G2: https://github.com/zagstore/zag-store/blob/c6ce0750f13b0ab4899f172dc6c7985dc3154567/docs/free-developer-accounts/G2-LICENCE-REVIEW.md
+- G4: https://github.com/zagstore/zag-store/blob/c6ce0750f13b0ab4899f172dc6c7985dc3154567/docs/free-developer-accounts/G4-SECURITY-REVIEW.md
+- Signing keys and lifecycle: https://github.com/zagstore/zag-store/blob/c6ce0750f13b0ab4899f172dc6c7985dc3154567/docs/free-developer-accounts/SIGNING-KEY-SECURITY.md
+- Fork provenance: https://github.com/zagstore/zag-store/blob/c6ce0750f13b0ab4899f172dc6c7985dc3154567/AppleAuthCore/zag-isideload/PROVENANCE.md
 
 ## 2. The packages
 
@@ -76,19 +84,25 @@ scripts/test-zag-package-guard.sh /tmp/zag-release/Applications/Feather.app \
 
 Simulator suites accept `SIMULATOR_ID=<udid>`.
 
-## 4. Results at the frozen heads (20 Nov)
+## 4. Results (20 Nov)
 
-Run sequentially on `c6ce0750`:
+**On `main` `5beb0801`, after #32:** clean.
+- All 42 suites that exist on `main` pass. The bridge and fork suites exist only on #26 and #29.
+- `install-control-taps` passes 8 of 8.
+- The Release build succeeds, and the Release scan passes.
+- Package guard: 16 pass.
+- Canonical IPA: unchanged (`67d1a79b`).
+
+**On the frozen #29 head `c6ce0750`**, run sequentially before #32:
 - **Suites:** 43 of 44 pass.
 - **Release build:** succeeds. The Release scan passes, including the Apple Accounts gate and entry-placement checks.
 - **Package guard:** 16 pass.
 - **Canonical IPA:** unchanged (`67d1a79b`).
 
-**Outstanding failure: `install-control-taps`**
-- Only `testShrinkingPillStaysTappableThenReleasesItsArea` fails; the other 7 tests pass. Section 6 has the details.
-- It is outside both reviews' scope:
-  - Its five inputs (the install control's three sources, its harness and its test) are byte-identical on `main`, #28 and #29.
-  - None of the three PRs touches them.
+**The one failure there was `install-control-taps`,** in `testShrinkingPillStaysTappableThenReleasesItsArea`; the other 7 tests passed. It is a test-harness defect, now fixed on `main` (section 6).
+- It is outside both reviews' scope: none of #26, #28 or #29 touches the install control or its test.
+- The frozen heads still carry the old harness. So that one test can still fail there when a tap lands more than a second after the morph.
+- When a reviewer sees that failure at the frozen heads, it is this known defect, not a finding against the reviewed code. Running the suite from `main` `5beb0801` uses the fixed harness.
 
 ## 5. Known limitations (for both reviewers)
 
@@ -113,21 +127,29 @@ Run sequentially on `c6ce0750`:
   - The certificate recovery *view* is removed from the Release build because nothing in Release links to it yet. Enabling the feature needs a Release Apple Accounts screen that links to it.
 - **G2 open items:** decisions A–D, including MPL-2.0 coverage of four files and the Sideloader-reference concern. These are the reviewer's to decide.
 
-## 6. The install-button test failure (separate from the reviews)
+## 6. The install-button test failure (resolved on `main`; separate from the reviews)
 
 **Root cause:** a test-harness defect, shown with a deterministic reproduction.
 - The harness displays elapsed milliseconds with a locale-formatted `Text`, so 1550 ms reads `1,550`.
 - The test parses it with `Int(label) ?? -1`. Any tap recorded a second or more after the morph therefore reports `-1` and fails, although the app recorded exactly the right event.
 - A touch held across the hit-area shrink is not swallowed; that hypothesis was ruled out.
 
-**Fix:** test-only draft PR #32 (`claude-install-tap-investigation`, `d7199fc6`).
+**Fix:** test-only PR #32 (`d7199fc6`), **merged** into `main` as `5beb0801` with the owner's approval. It changes two files in `scripts/` only.
 - The label is shown verbatim, and the test waits for the tap's event before reading it.
 - The assertions are unchanged, and a mutant control still fails the test.
-- With the fix, the suite passes 8 of 8 twice.
+
+**Evidence:** preserved in a comment on #32: https://github.com/zagstore/zag-store/pull/32#issuecomment-7007768207
+- the instrumented late-tap reproduction (label `1,516` parses as `nil`; the row opened once);
+- the ruled-out press-across-shrink case;
+- the fixed test passing a 1499 ms tap;
+- the mutant failing;
+- the diagnostic diffs.
+
+**Results:** the suite passed 8 of 8 at `d7199fc6` before the merge, and 8 of 8 in the full regression on `main`.
 
 **Production impact found:** none.
 
-**Open question:** what delayed the tap past one second in the full regression is not established. Synthetic CPU load did not reproduce it.
+**Not investigated further (owner, 20 Nov):** what delayed the tap past one second in the earlier regression. Synthetic CPU load did not reproduce it. It is reopened only if the problem recurs or shows a broader issue.
 
 ## 7. For reviewers: what not to do
 
