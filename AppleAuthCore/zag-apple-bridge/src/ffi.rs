@@ -252,6 +252,24 @@ pub extern "C" fn zag_bridge_last_apple_date() -> i64 {
     isideload::net_policy::observe::last_apple_date()
 }
 
+/// G5 (C5, enforcing): sets the authorised window and the allowed skew of
+/// Apple's `Date` against the device clock, before sign-in. From then on the
+/// only Apple request allowed before a verified Date is the URL-bag lookup,
+/// and a failed check refuses every later Apple request in the process.
+/// Returns 0 when set (or already set to the same window), 1 if refused.
+#[unsafe(no_mangle)]
+pub extern "C" fn zag_bridge_configure_time_window(not_before: i64, not_after: i64, max_skew: i64) -> i32 {
+    let window = isideload::net_policy::time_gate::Window { not_before, not_after, max_skew };
+    if isideload::net_policy::time_gate::configure(window) { 0 } else { 1 }
+}
+
+/// G5 (C5): 0 not configured, 1 verified, 2 not yet verified, 3 missing
+/// Date, 4 malformed, 5 before the window, 6 after it, 7 skew, 8 refused.
+#[unsafe(no_mangle)]
+pub extern "C" fn zag_bridge_time_gate_status() -> i32 {
+    isideload::net_policy::time_gate::status()
+}
+
 /// G5 (observation only): delivers every network-policy decision recorded
 /// since the last call, as one JSON array, synchronously through `callback`
 /// (the bytes are valid only during the call). Entries carry the host, the

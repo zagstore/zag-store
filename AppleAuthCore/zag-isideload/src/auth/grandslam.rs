@@ -20,7 +20,7 @@ use crate::{SideloadError, anisette::AnisetteClientInfo, util::plist::PlistDataE
 
 const APPLE_ROOT: &[u8] = include_bytes!("../assets/apple_root.cer");
 
-const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
+pub(crate) const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 
 pub struct GrandSlam {
     pub client: reqwest_middleware::ClientWithMiddleware,

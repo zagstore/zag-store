@@ -347,3 +347,16 @@ fn observation_exports_answer_without_network_activity() {
     unsafe { zag_bridge_take_policy_decisions(events.context(), collect) };
     assert_eq!(events.next(), json!([]));
 }
+
+#[test]
+fn time_window_exports_configure_once_and_report_pending() {
+    // This test binary's only time-gate test (the gate is process-wide).
+    assert_eq!(zag_bridge_time_gate_status(), 0);
+    assert_eq!(zag_bridge_configure_time_window(10, 5, 600), 1, "an empty window is refused");
+    assert_eq!(zag_bridge_configure_time_window(1_000, 2_000, -1), 1, "a negative skew is refused");
+    assert_eq!(zag_bridge_time_gate_status(), 0);
+    assert_eq!(zag_bridge_configure_time_window(1_000, 2_000, 600), 0);
+    assert_eq!(zag_bridge_configure_time_window(1_000, 2_000, 600), 0);
+    assert_eq!(zag_bridge_configure_time_window(1_000, 3_000, 600), 1, "a second, different window is refused");
+    assert_eq!(zag_bridge_time_gate_status(), 2);
+}

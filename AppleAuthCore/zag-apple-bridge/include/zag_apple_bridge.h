@@ -54,4 +54,11 @@ void zag_bridge_portal(uint64_t slot, const uint8_t *credential, size_t credenti
 int64_t zag_bridge_last_apple_date(void);
 void zag_bridge_take_policy_decisions(void *context, zag_bridge_event_callback callback);
 
+// G5, C5 (enforcing): the authorised window and maximum skew, in seconds,
+// set before sign-in (0 set, 1 refused); and the time gate's state (0 not
+// configured, 1 verified, 2 pending, 3 missing, 4 malformed, 5 premature,
+// 6 expired, 7 skew, 8 refused).
+int32_t zag_bridge_configure_time_window(int64_t not_before, int64_t not_after, int64_t max_skew);
+int32_t zag_bridge_time_gate_status(void);
+
 #endif
