@@ -46,6 +46,10 @@ let script: [String: Any] = ["accounts": [
 	["email": "slow@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC5", "delayMilliseconds": 30_000],
 	["email": "brief@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC6", "sessionLifetime": 1, "teams": [team("BRTEAM0006")]],
 	["email": "flaky@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC7", "portalFailure": "network", "teams": [team("BRTEAM0007")]],
+	["email": "teams@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC8",
+	 "teams": [["identifier": "BRTEAM0008", "name": "Team A", "kind": "unknown"], ["identifier": "BRTEAM0009", "name": "Team B", "kind": "unknown"]]],
+	["email": "oneteam@bridge.invalid", "password": passwordOne, "accountIdentifier": "BRIDGEACC9",
+	 "teams": [["identifier": "BRTEAM0010", "name": "Team", "kind": "unknown"]]],
 ]]
 
 func makeDirectory(secrets: MemorySecrets, diagnostics: ZagFreeAccountDiagnostics) -> ZagAccountDirectory {
@@ -74,7 +78,7 @@ struct ZagAppleBridgeTests {
 	static func main() async {
 		// Gates first: nothing in this build can go live.
 		check(!ZagIsideloadBridge.liveCompiled, "gate: the linked bridge has no network access (built without `live`)")
-		check(!ZagIsideloadBridge.configureLive(anisetteURL: URL(string: "https://anisette.invalid")!),
+		check(!ZagIsideloadBridge.configureLive(anisetteURL: URL(string: "https://anisette.invalid")!, deviceSerial: "C02ZAGTEST01"),
 			  "gate: configuring the live backend is refused while the live switches are off")
 		do {
 			_ = try await ZagBridgeAnisetteSource().anisetteData()
@@ -118,6 +122,17 @@ struct ZagAppleBridgeTests {
 		let offline = await directory.newSignIn()
 		check(failure(await offline.signIn(appleID: "offline@bridge.invalid", password: ZagEphemeralSecret(passwordOne))) == .network,
 			  "failure: a network failure is reported as such")
+
+		// The Personal Team is never guessed among several unidentified teams.
+		let ambiguous = await directory.newSignIn()
+		check(failure(await ambiguous.signIn(appleID: "teams@bridge.invalid", password: ZagEphemeralSecret(passwordOne))) == .unexpectedResponse,
+			  "fail closed: with several teams of unknown kind, sign-in stops instead of choosing one")
+		let single = await directory.newSignIn()
+		if case .signedIn(let session) = await single.signIn(appleID: "oneteam@bridge.invalid", password: ZagEphemeralSecret(passwordOne)) {
+			check(session.team.kind == .unknown && session.team.hasFreeLimits, "fail closed: a single unidentified team gets the free (strictest) limits")
+		} else {
+			check(false, "single unknown team")
+		}
 
 		// Two-factor: a wrong code, a switch to SMS, then the right code.
 		let codes = await directory.newSignIn()

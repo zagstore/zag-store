@@ -67,21 +67,28 @@ pub extern "C" fn zag_bridge_live_compiled() -> i32 {
     crate::LIVE as i32
 }
 
-/// Configures the live backend once, with the approved anisette server.
+/// Configures the live backend once, with the approved anisette server and
+/// the device serial chosen with it (no default exists).
 /// Returns `ZAG_BRIDGE_DISABLED` in a build without the `live` feature.
 ///
 /// # Safety
-/// `anisette_url` is a NUL-terminated string; `storage` points to a valid
-/// `ZagBridgeStorage` whose functions stay valid for the process lifetime.
+/// `anisette_url` and `device_serial` are NUL-terminated strings; `storage`
+/// points to a valid `ZagBridgeStorage` whose functions stay valid for the
+/// process lifetime.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zag_bridge_configure_live(anisette_url: *const c_char, storage: *const ZagBridgeStorage) -> i32 {
+pub unsafe extern "C" fn zag_bridge_configure_live(
+    anisette_url: *const c_char,
+    device_serial: *const c_char,
+    storage: *const ZagBridgeStorage,
+) -> i32 {
     #[cfg(feature = "live")]
     {
-        if anisette_url.is_null() || storage.is_null() || slot::backend_is_set() {
+        if anisette_url.is_null() || device_serial.is_null() || storage.is_null() || slot::backend_is_set() {
             return ZAG_BRIDGE_INVALID;
         }
         let Ok(url) = unsafe { std::ffi::CStr::from_ptr(anisette_url) }.to_str() else { return ZAG_BRIDGE_INVALID };
-        match crate::live::IsideloadBackend::new(url, unsafe { *storage }) {
+        let Ok(serial) = unsafe { std::ffi::CStr::from_ptr(device_serial) }.to_str() else { return ZAG_BRIDGE_INVALID };
+        match crate::live::IsideloadBackend::new(url, serial, unsafe { *storage }) {
             Ok(backend) => {
                 slot::set_backend(std::sync::Arc::new(backend));
                 ZAG_BRIDGE_OK
@@ -91,7 +98,7 @@ pub unsafe extern "C" fn zag_bridge_configure_live(anisette_url: *const c_char, 
     }
     #[cfg(not(feature = "live"))]
     {
-        let _ = (anisette_url, storage);
+        let _ = (anisette_url, device_serial, storage);
         ZAG_BRIDGE_DISABLED
     }
 }

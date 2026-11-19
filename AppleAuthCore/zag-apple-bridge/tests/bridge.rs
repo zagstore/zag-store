@@ -57,7 +57,7 @@ fn portal(slot: u64, credential: &Value, request: Value) -> Value {
 fn without_live_or_mock_everything_is_disabled() {
     assert_eq!(zag_bridge_live_compiled(), 0);
     let url = c"https://anisette.invalid";
-    assert_eq!(unsafe { zag_bridge_configure_live(url.as_ptr(), std::ptr::null()) }, ZAG_BRIDGE_DISABLED);
+    assert_eq!(unsafe { zag_bridge_configure_live(url.as_ptr(), c"C02ZAGTEST01".as_ptr(), std::ptr::null()) }, ZAG_BRIDGE_DISABLED);
     assert_eq!(unsafe { zag_bridge_configure_mock(b"{}".as_ptr(), 2) }, ZAG_BRIDGE_UNSUPPORTED);
     let slot = zag_bridge_open_slot();
     let events = Events::new();
@@ -284,7 +284,13 @@ fn live_build_refuses_insecure_configuration_and_runs_nothing_unconfigured() {
     extern "C" fn release(_: *mut c_void, _: *mut u8, _: usize) {}
     let storage = ZagBridgeStorage { context: std::ptr::null_mut(), store, retrieve, delete_item: delete, release };
     for url in [c"http://anisette.invalid", c"not a url", c"ftp://anisette.invalid"] {
-        assert_eq!(unsafe { zag_bridge_configure_live(url.as_ptr(), &storage) }, ZAG_BRIDGE_INVALID);
+        assert_eq!(unsafe { zag_bridge_configure_live(url.as_ptr(), c"C02ZAGTEST01".as_ptr(), &storage) }, ZAG_BRIDGE_INVALID);
+    }
+    // No device serial, or a malformed one: refused, never defaulted.
+    let https = c"https://anisette.invalid";
+    assert_eq!(unsafe { zag_bridge_configure_live(https.as_ptr(), std::ptr::null(), &storage) }, ZAG_BRIDGE_INVALID);
+    for serial in [c"", c"0 0", c"serial-with-dash"] {
+        assert_eq!(unsafe { zag_bridge_configure_live(https.as_ptr(), serial.as_ptr(), &storage) }, ZAG_BRIDGE_INVALID);
     }
     let slot = zag_bridge_open_slot();
     let events = Events::new();

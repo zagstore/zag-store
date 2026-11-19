@@ -134,10 +134,11 @@ enum ZagIsideloadBridge {
 	/// True only when the linked bridge library was built with `live`.
 	static var liveCompiled: Bool { zag_bridge_live_compiled() == 1 }
 
-	/// Configures the live backend with the approved anisette server. Refused
-	/// unless every live switch is on, which needs the owner's approval of
-	/// G1–G6; none is on.
-	static func configureLive(anisetteURL: URL) -> Bool {
+	/// Configures the live backend with the approved anisette server and the
+	/// device serial decided with it (G3; there is no default). Refused unless
+	/// every live switch is on, which needs the owner's approval of G1–G6;
+	/// none is on.
+	static func configureLive(anisetteURL: URL, deviceSerial: String) -> Bool {
 		guard ZagLiveAuthentication.isEnabled, ZagLivePortal.isEnabled, ZagAnisetteLive.isEnabled, liveCompiled,
 			  anisetteURL.scheme == "https" else { return false }
 		var storage = ZagBridgeStorage(
@@ -147,7 +148,9 @@ enum ZagIsideloadBridge {
 			delete_item: { _, key in ZagBridgeAnisetteKeychain.delete(key) },
 			release: { _, value, length in ZagBridgeAnisetteKeychain.release(value, length) }
 		)
-		return anisetteURL.absoluteString.withCString { zag_bridge_configure_live($0, &storage) } == ZAG_BRIDGE_OK
+		return anisetteURL.absoluteString.withCString { url in
+			deviceSerial.withCString { serial in zag_bridge_configure_live(url, serial, &storage) }
+		} == ZAG_BRIDGE_OK
 	}
 
 	#if DEBUG
@@ -261,6 +264,11 @@ actor ZagIsideloadAuthenticationService: ZagAppleAuthenticationService {
 			if afterCode && retry { throw ZagAuthenticationServiceError.twoFactorRejected }
 			return .twoFactorRequired(challenge)
 		case .signedIn(let session):
+			// EXPERIMENT: which team is the Personal Team is not inferred. With
+			// several teams of unknown kind, none is chosen: signing on the wrong
+			// team (an organisation's) would have side effects there.
+			let identified = session.teams.contains { $0.kind != .unknown }
+			guard session.teams.count == 1 || identified else { throw ZagAuthenticationServiceError.malformedResponse }
 			return .authenticated(session)
 		case .failed(let failure):
 			throw Self.error(for: failure)

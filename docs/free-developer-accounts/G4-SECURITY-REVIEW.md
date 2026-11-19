@@ -1,6 +1,6 @@
 # G4: security review package for the Apple Account bridge
 
-Status 19 November 2026: **implementation ready for an independent security review. Not reviewed. No live Apple service has been contacted.** The author of the bridge has not reviewed it independently. G4 stays open until a reviewer independent of the implementation records the decision in section 10.
+Status 19 November 2026 (revised the same day for review readiness): **implementation ready for an independent security review. Not reviewed. No live Apple service has been contacted.** The author of the bridge has not reviewed it independently. G4 stays open until a reviewer independent of the implementation records the decision in section 10.
 
 ## 1. What is under review
 
@@ -57,7 +57,7 @@ Results flow back as JSON events: `codeRequired`, `signedIn`, `result` or `faile
 | Verification code | Swift `String`, then Rust `Zeroizing<String>`, then the fork | One answer | Rust's copy is zeroised. **Residual:** the fork passes the code by value into an HTTP header, which cannot be wiped. |
 | Session (credential) | A token Swift stores in the this-device-only Keychain (`ZagFreeAccountSecretKind.session`). The bridge's token is opaque base64 of `{adsid, developer-services token, duration, expiry}`. | Until it expires, the user signs out, or the account is removed | The bridge zeroises its event buffers after delivery, and its copy of the credential when the cached session is dropped. Swift zeroes the JSON it sends. **Residual:** Swift `String` copies of the token cannot be wiped. |
 | Anisette device state | The Keychain (`ZagStore.anisette.bridge`), `AfterFirstUnlockThisDeviceOnly`, never synchronised | Device lifetime | One device state is shared by all accounts, as on a real Apple device. Opaque to Zag Store. |
-| Signing key | A Keychain key item per account and team (PR #28) | Until the account or team is removed | Never exported. Signing goes through the key reference only. |
+| Signing key | A Keychain key item per account and team (PR #28), `AfterFirstUnlockThisDeviceOnly`, not synchronised | Until the account is removed (its key items are deleted then), or replaced when a new certificate is needed | Zag Store never exports it: it is used only through `SecKeyCreateSignature`. **Not hardware-enforced:** iOS does not enforce `kSecAttrIsExtractable: false` for software RSA keys, and the Secure Enclave cannot hold RSA-2048. Code in the app's process could export it. The exporting test factory is `DEBUG`-only, and the release scan checks it is absent. |
 
 **Not kept anywhere:**
 - the password;
@@ -140,14 +140,22 @@ All three clients in the live build verify TLS. The fork has no switch to turn t
 | Release binary markers | Bridge types, `zag_bridge_open_slot` and the anisette Keychain service must be absent | `test-zag-free-account-release-binary.sh` |
 | `mock` backend | A test feature only; `configureMock` exists only in `DEBUG` Swift | Rust tests, default build |
 
-## 9. Points the supervised experiment must confirm (marked `EXPERIMENT` in `live.rs`)
+## 9. Unresolved live assumptions: each fails closed
 
-These concern the meaning of values. They are not protocol messages; those stay inside the fork.
-1. **Token expiry unit.** Milliseconds is assumed when the value is too large to be seconds. A wrong unit would fail the session's validation: the expiry must be between 1 minute and 400 days away. It cannot silently extend a session.
-2. **Team kind.** The bridge reports `unknown` for every team, and Zag Store applies the free limits, the strictest.
-3. **Locating a newly issued certificate.** It is found by the request's identifier, as upstream does. If it is not found, the result is `malformed`.
-4. **Certificate request format.** The request is sent as PEM, as upstream's own requests were.
-5. **Anisette device serial.** `"0"`, as upstream.
+None of these can be settled without Apple's services. Each is marked `EXPERIMENT` in the code. Each has been checked to **refuse** when the assumption is wrong, never to proceed on a guessed value.
+
+| # | Assumption | What happens if it is wrong | Check |
+|---|---|---|---|
+| 1 | **Unit of the token's expiry** (seconds or milliseconds) | `expiry_seconds` accepts a value only if **exactly one** reading falls between 1 minute and 400 days from now. It refuses past values, durations, values that both readings or neither reading would accept, 0 and the maximum, ending the sign-in as `malformed`. Swift's `validated(now:)` applies the same bounds again. | Rust unit test `expiry_unit_is_never_guessed` (live build) |
+| 2 | **Which team is the Personal Team** | The bridge reports every team as `unknown`. With **one** team, Zag Store applies the free limits, the strictest. With **several** teams and none identified, sign-in stops (`unexpectedResponse`) instead of choosing one, because signing on an organisation's team would have side effects there. | Swift: "fail closed: with several teams…", "…a single unidentified team gets the free limits" |
+| 3 | **Finding a newly issued certificate by its request's identifier** | Not found: `malformed`, and nothing is stored. Found but wrong: the provisioner's proof-of-possession check (the certificate's public key must verify a signature made by this account and team's Keychain key) fails, so nothing is stored. A listing with any certificate lacking a serial or expiry now fails as a whole: dropping it would hide a certificate from the certificate plan and could waste the quota. | `ZagKeychainSigningKeyFactory.check`; PR #28 strict integration (wrong certificate refused); `live.rs` certificates listing |
+| 4 | **Certificate request format** (PEM, as upstream) | Apple refuses the request (`refused`), and nothing is created locally beyond the key, which is replaced on the next attempt. A certificate issued for anything else fails the possession check (3). | As in 3 |
+| 5 | **Anisette device serial** | **Changed:** there is no default any more (it was `"0"`). `configureLive(anisetteURL:deviceSerial:)` must be given a serial: 1–32 letters or digits, decided with the G3 provider. Missing or malformed: configuration is refused. | Rust live gate test (missing, empty and malformed serials refused); `valid_serial` unit test |
+
+**Fixed values that also fail closed:**
+- **Verification codes are 6 digits.** A code of another length is refused locally (`ZagTwoFactorPrompt.normalisedCode`), so a different length stops the sign-in.
+- **HTTP 401 means `sessionExpired`.** The user is asked to sign in again; nothing proceeds.
+- **App IDs without an expiry count as active.** For the free App ID limit, that is the conservative reading.
 
 ## 10. Questions and decision record (for the independent reviewer)
 
@@ -166,5 +174,57 @@ These concern the meaning of values. They are not protocol messages; those stay 
 | Reviewer (independent of the implementation) | |
 | Date | |
 | Commits reviewed (bridge PR head, PR #26 head, PR #28 head) | |
+| Checklist (section 11) completed | |
 | Findings and required changes | |
 | G4 complete | **No** |
+
+## 11. Reviewer checklist
+
+Tick each item, or record a finding. File references are to the bridge PR (#29) unless marked.
+
+### A. Swift/Rust boundary (FFI)
+- [ ] `src/ffi.rs`: every pointer is null-checked; lengths are capped (64 KiB; codes 16 bytes); UTF-8 is validated; no pointer is kept after a call returns.
+- [ ] `ZagBridgeStorage` callbacks: `retrieve` buffers are freed by `release` (zeroed first); keys are NUL-terminated; failures return non-zero.
+- [ ] The callback `context` is released exactly once, on the terminal event (`ZagBridgeEvents.start`). There is no use after release.
+- [ ] Each started operation delivers exactly one terminal event: on success, failure, cancellation, slot closure, malformed input and panic (`slot.rs`; Rust tests).
+- [ ] Events are delivered on a bridge thread. `ZagBridgeEvents` is lock-protected, and no Swift actor is entered from that thread.
+- [ ] The C header matches the exports (`test-zag-apple-bridge.sh`).
+
+### B. Account isolation
+- [ ] One slot per authenticator (`Configuration.makeService`) and per portal instance.
+- [ ] A bound slot refuses another account's credential. Rebinding drops the cached session (`slot.rs` `finish_sign_in`, `portal`).
+- [ ] Portal operations stay within the account's teams. Signing needs `ZagSigningAuthorization` for exactly one account and team (#28).
+- [ ] The only shared state is the backend and the anisette device state. Question 3 below asks whether the latter is acceptable.
+
+### C. Keychain accessibility and key exportability (#28)
+- [ ] Every item is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and not synchronised: sessions and identities (`ZagKeychainFreeAccountSecretStore`), signing keys (`ZagKeychainSigningKeys`) and anisette state (`ZagBridgeAnisetteKeychain`).
+- [ ] No release code path exports a private key. `ZagSecuritySigningKeyFactory` is `DEBUG`-only, and the release scan checks it. The only remaining `SecKeyCopyExternalRepresentation` calls are on public keys.
+- [ ] The limitation is accepted: software RSA keys are exportable by the app's own process (section 3).
+- [ ] Lifecycle (`SIGNING-KEY-SECURITY.md`, "Signing-key lifecycle review"): switching, sign-out, removal, missing key, reinstall (open finding L1), restore.
+
+### D. Two-factor handling
+- [ ] Codes are digits only, checked in Swift and again in Rust. Retries are limited to 3 (the authenticator). A code after the backend ends the sign-in does not sign in.
+- [ ] SMS shows at most the last two digits of the number.
+- [ ] Residual: the fork puts the code in an HTTP header as an ordinary string.
+
+### E. Cancellation
+- [ ] Task cancellation, `cancel()`, the deadline and slot closure all reach `zag_bridge_cancel` and drop the running future, including an in-flight request.
+- [ ] A sign-in abandoned at the code prompt is cancelled by the next sign-in.
+
+### F. Credential lifetime
+- [ ] The password is never stored; Rust's copy is zeroised on every path, including cancellation.
+- [ ] The session token is stored only in the Keychain. Bridge buffers are zeroised after delivery. Residuals: Swift `String` copies, and the fork's heap memory.
+- [ ] Session expiry is bounded (1 minute to 400 days) and the unit is not guessed (section 9, item 1).
+
+### G. TLS validation and destinations
+- [ ] No switch disables certificate verification (fork `PROVENANCE.md`; source check in `test-zag-isideload-fork.sh`).
+- [ ] The allowlist is Apple's two hosts plus the one configured anisette host; https or wss only; no redirects, proxies or ports.
+- [ ] The root store for each client is as in section 6. Question 2 below asks whether to pin.
+
+### H. Error propagation
+- [ ] Only `FailureKind` values cross the boundary; no upstream text (`classify`).
+- [ ] The Swift mappings are as in sections 7 and 9. No error is mapped to success. `isValid` returns `false` only for `sessionExpired`.
+- [ ] Unknown events and JSON are refused as `malformed`.
+
+### I. Gates
+- [ ] Section 8 holds on the commits reviewed. Run `scripts/test-zag-apple-bridge.sh`, `scripts/test-zag-free-account-release-binary.sh` on a Release build, and `scripts/test-zag-isideload-fork.sh`.

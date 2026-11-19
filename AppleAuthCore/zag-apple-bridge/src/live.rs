@@ -110,21 +110,31 @@ impl SideloadingStorage for KeychainStorage {
 
 pub struct IsideloadBackend {
     anisette_url: String,
+    /// The device serial the anisette provider reports. There is no default:
+    /// it is part of the G3 provider decision and is passed in by Swift.
+    device_serial: String,
     storage: ZagBridgeStorage,
 }
 
+/// 1–32 ASCII letters or digits.
+pub(crate) fn valid_serial(serial: &str) -> bool {
+    !serial.is_empty() && serial.len() <= 32 && serial.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 impl IsideloadBackend {
-    pub fn new(anisette_url: &str, storage: ZagBridgeStorage) -> Result<Self, Report> {
+    pub fn new(anisette_url: &str, device_serial: &str, storage: ZagBridgeStorage) -> Result<Self, Report> {
         // The provider accepts only an https URL; its host becomes its client's
         // only allowed host.
         isideload::net_policy::host_of(anisette_url)?;
+        if !valid_serial(device_serial) {
+            return Err(rootcause::report!("device serial"));
+        }
         let _ = rustls::crypto::ring::default_provider().install_default();
-        Ok(Self { anisette_url: anisette_url.to_string(), storage })
+        Ok(Self { anisette_url: anisette_url.to_string(), device_serial: device_serial.to_string(), storage })
     }
 
     fn provider(&self) -> Result<RemoteV3AnisetteProvider, Report> {
-        // EXPERIMENT: the device serial the provider reports; "0" as upstream.
-        RemoteV3AnisetteProvider::new(&self.anisette_url, Box::new(KeychainStorage(self.storage)), "0".into())
+        RemoteV3AnisetteProvider::new(&self.anisette_url, Box::new(KeychainStorage(self.storage)), self.device_serial.clone())
     }
 }
 
@@ -146,10 +156,21 @@ impl Drop for StoredToken {
     }
 }
 
-/// EXPERIMENT: the unit of the token's expiry (milliseconds is assumed when
-/// the value is too large to be seconds).
-fn expiry_seconds(expiry: u64) -> u64 {
-    if expiry > 100_000_000_000 { expiry / 1000 } else { expiry }
+/// EXPERIMENT: the token's expiry, in seconds since 1970, only when exactly
+/// one reading (seconds or milliseconds) gives a time between one minute and
+/// 400 days from now (Zag Store's own session bounds). Anything else is
+/// refused (`None`), so no unit is guessed.
+pub(crate) fn expiry_seconds(expiry: u64, now: u64) -> Option<u64> {
+    let plausible = |t: u64| t >= now.saturating_add(60) && t <= now.saturating_add(400 * 86_400);
+    match (plausible(expiry), plausible(expiry / 1000)) {
+        (true, false) => Some(expiry),
+        (false, true) => Some(expiry / 1000),
+        _ => None,
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX)
 }
 
 fn to_team(team: &DeveloperTeam) -> Team {
@@ -227,14 +248,17 @@ impl Backend for IsideloadBackend {
         let stored = StoredToken { adsid: adsid.clone(), token: token.token.clone(), duration: token.duration, expiry: token.expiry };
         let opaque = Zeroizing::new(STANDARD.encode(Zeroizing::new(serde_json::to_vec(&stored).map_err(|_| BridgeError::new(FailureKind::Malformed))?)));
         Ok(SignedIn {
-            credential: Credential { account_identifier: adsid, token: opaque, expires_at: expiry_seconds(token.expiry) },
+            credential: Credential {
+                account_identifier: adsid,
+                token: opaque,
+                expires_at: expiry_seconds(token.expiry, unix_now()).ok_or(BridgeError::new(FailureKind::Malformed))?,
+            },
             teams,
         })
     }
 
     async fn open_session(&self, credential: &Credential) -> BridgeResult<Box<dyn PortalSession>> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
-        if credential.expires_at <= now {
+        if credential.expires_at <= unix_now() {
             return Err(FailureKind::SessionExpired.into());
         }
         let decoded = Zeroizing::new(STANDARD.decode(credential.token.as_bytes()).map_err(|_| BridgeError::new(FailureKind::InvalidInput))?);
@@ -330,9 +354,11 @@ impl PortalSession for LiveSession {
             }
             PortalRequest::Certificates { team: t } => {
                 let certificates = self.session.list_ios_certs(&team(&t)).await.map_err(c)?;
-                value(&certificates
+                // A certificate without a serial or an expiry fails the whole
+                // listing: dropping it would hide it from the certificate plan.
+                let listed = certificates
                     .into_iter()
-                    .filter_map(|cert| {
+                    .map(|cert| {
                         Some(Certificate {
                             serial_number: cert.serial_number?,
                             name: cert.name.unwrap_or_default(),
@@ -341,7 +367,9 @@ impl PortalSession for LiveSession {
                             data: None,
                         })
                     })
-                    .collect::<Vec<_>>())
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(BridgeError::new(FailureKind::Malformed))?;
+                value(&listed)
             }
             PortalRequest::SubmitCertificateRequest { team: t, request, machine_name } => {
                 let developer_team = team(&t);
@@ -380,5 +408,33 @@ impl PortalSession for LiveSession {
                 Ok(json!({ "data": STANDARD.encode(AsRef::<[u8]>::as_ref(&profile.encoded_profile)) }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_795_000_000;
+
+    #[test]
+    fn expiry_unit_is_never_guessed() {
+        let in_a_day = NOW + 86_400;
+        assert_eq!(expiry_seconds(in_a_day, NOW), Some(in_a_day), "seconds");
+        assert_eq!(expiry_seconds(in_a_day * 1000, NOW), Some(in_a_day), "milliseconds");
+        assert_eq!(expiry_seconds(NOW - 10, NOW), None, "already past");
+        assert_eq!(expiry_seconds(NOW + 30, NOW), None, "under a minute");
+        assert_eq!(expiry_seconds(NOW + 401 * 86_400, NOW), None, "beyond 400 days");
+        assert_eq!(expiry_seconds(3600, NOW), None, "a duration, not a time");
+        assert_eq!(expiry_seconds(0, NOW), None);
+        assert_eq!(expiry_seconds(u64::MAX, NOW), None);
+    }
+
+    #[test]
+    fn device_serial_has_no_default_and_is_bounded() {
+        assert!(!valid_serial(""));
+        assert!(!valid_serial("has space"));
+        assert!(!valid_serial(&"A".repeat(33)));
+        assert!(valid_serial("C02ZAGTEST01"));
     }
 }

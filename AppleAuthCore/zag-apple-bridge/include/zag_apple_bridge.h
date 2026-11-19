@@ -33,7 +33,7 @@ typedef struct ZagBridgeStorage {
 } ZagBridgeStorage;
 
 int32_t zag_bridge_live_compiled(void);
-int32_t zag_bridge_configure_live(const char *anisette_url, const ZagBridgeStorage *storage);
+int32_t zag_bridge_configure_live(const char *anisette_url, const char *device_serial, const ZagBridgeStorage *storage);
 int32_t zag_bridge_configure_mock(const uint8_t *json, size_t length);
 
 uint64_t zag_bridge_open_slot(void);
