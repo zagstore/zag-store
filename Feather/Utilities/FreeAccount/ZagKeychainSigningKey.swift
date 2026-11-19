@@ -87,7 +87,10 @@ struct ZagKeychainSigningKeys {
 			kSecReturnRef: true
 		] as CFDictionary, &result)
 		switch status {
-		case errSecSuccess: return (result as! SecKey)
+		case errSecSuccess:
+			// Anything but a key reference is refused, never cast.
+			guard let result, CFGetTypeID(result) == SecKeyGetTypeID() else { throw Failure.keychain(errSecInternalError) }
+			return (result as! SecKey)
 		case errSecItemNotFound: return nil
 		default: throw Failure.keychain(status)
 		}

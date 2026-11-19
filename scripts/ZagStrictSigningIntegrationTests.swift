@@ -209,6 +209,8 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 		}
 		await keychainHeldKeys(intermediate: intermediate)
 		await pendingKeys()
+		await overlappingCertificateRequests()
+		await cancelledWhileQueued()
 		print("SUCCESS: \(passed) strict signing integration checks passed")
 	}
 
@@ -487,11 +489,16 @@ extension Tests {
 
 /// Records each certificate request; fails the next ones before Apple would
 /// see them (`failNext`), or after the certificate is issued (`loseNext`, the
-/// response is lost).
+/// response is lost or unreadable). `holdNext` pauses the next request before
+/// or after Apple issues its certificate, until `release`.
 final class ScriptedCertificatePortal: ZagDeveloperPortalService, @unchecked Sendable {
+	enum HoldPoint { case beforeIssue, afterIssue }
 	let inner: ZagDeveloperPortalService
 	private let lock = NSLock()
 	private var failures = 0, losses = 0, refusals = 0
+	private var lossError: Error = ZagPortalError.network
+	private var holdPoint: HoldPoint?
+	private var held: CheckedContinuation<Void, Never>?
 	private(set) var submitted: [Data] = []
 	/// Certificates Apple issued (including those whose response was lost).
 	private(set) var issuedCount = 0
@@ -499,7 +506,14 @@ final class ScriptedCertificatePortal: ZagDeveloperPortalService, @unchecked Sen
 	var hidesCertificateData = false
 	init(inner: ZagDeveloperPortalService) { self.inner = inner }
 	func failNext(_ count: Int) { lock.withLock { failures = count } }
-	func loseNext(_ count: Int) { lock.withLock { losses = count } }
+	func loseNext(_ count: Int, with error: Error = ZagPortalError.network) { lock.withLock { losses = count; lossError = error } }
+	func holdNext(_ point: HoldPoint) { lock.withLock { holdPoint = point } }
+	var isHolding: Bool { lock.withLock { held != nil } }
+	func release() {
+		let waiting: CheckedContinuation<Void, Never>? = lock.withLock { defer { held = nil }; return held }
+		waiting?.resume()
+	}
+	private func hold() async { await withCheckedContinuation { continuation in lock.withLock { held = continuation } } }
 	func refuseNext(_ count: Int) { lock.withLock { refusals = count } }
 	func devices(team: String) async throws -> [ZagRegisteredDevice] { try await inner.devices(team: team) }
 	func registerDevice(udid: String, name: String, team: String) async throws -> ZagRegisteredDevice { try await inner.registerDevice(udid: udid, name: name, team: team) }
@@ -514,18 +528,22 @@ final class ScriptedCertificatePortal: ZagDeveloperPortalService, @unchecked Sen
 		return listed.map { var certificate = $0; certificate.data = nil; return certificate }
 	}
 	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
-		let (fail, lose, refuse): (Bool, Bool, Bool) = lock.withLock {
+		let (fail, lose, refuse, point): (Bool, Bool, Bool, HoldPoint?) = lock.withLock {
 			submitted.append(request.data)
-			if refusals > 0 { refusals -= 1; return (false, false, true) }
-			if failures > 0 { failures -= 1; return (true, false, false) }
-			if losses > 0 { losses -= 1; return (false, true, false) }
-			return (false, false, false)
+			defer { holdPoint = nil }
+			let point = holdPoint
+			if refusals > 0 { refusals -= 1; return (false, false, true, point) }
+			if failures > 0 { failures -= 1; return (true, false, false, point) }
+			if losses > 0 { losses -= 1; return (false, true, false, point) }
+			return (false, false, false, point)
 		}
+		if point == .beforeIssue { await hold() }
 		if refuse { throw ZagPortalError.rateLimited }
 		if fail { throw ZagPortalError.network }
 		let issued = try await inner.submitCertificateRequest(request, team: team)
 		lock.withLock { issuedCount += 1 }
-		if lose { throw ZagPortalError.network }
+		if point == .afterIssue { await hold() }
+		if lose { throw lock.withLock { lossError } }
 		return issued
 	}
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile { try await inner.profile(for: appID, team: team) }
@@ -548,4 +566,261 @@ struct WrongKeyPortal: ZagDeveloperPortalService {
 		return try await inner.submitCertificateRequest(ZagCertificateRequest(data: substitute), team: team)
 	}
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile { try await inner.profile(for: appID, team: team) }
+}
+
+extension Tests {
+	/// G4: overlapping certificate operations for one account and team, and
+	/// responses that do not say whether Apple issued a certificate. Apple must
+	/// never be asked twice for the same request while its outcome is open,
+	/// whatever runs at the same time.
+	static func overlappingCertificateRequests() async {
+		let secrets = MemorySecrets()
+		let (directory, _) = SimulatedAccounts.directory(now: { Date() }, secrets: secrets)
+		guard let account = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: directory) else { return check(false, "sign-in") }
+		let keys = ZagKeychainSigningKeys(namespace: "ZagStore.test.\(UUID().uuidString)")
+		defer { try? keys.deleteAll(account: account) }
+		let factory = ZagKeychainSigningKeyFactory(keys: keys)
+		let simulated = ZagSimulatedDeveloperPortal(team: team, issuer: OpenSSLIssuer())
+		await simulated.setCertificateLimit(20)
+		let portal = ScriptedCertificatePortal(inner: simulated)
+		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: factory, secrets: secrets, account: account)
+		let authorization = try! await directory.authorize(ZagSigningScope(accountID: account, teamID: team))
+		let request = ZagProvisioningRequest(
+			accountID: account, team: team, deviceUDID: udid, deviceName: "Test iPhone",
+			app: component("com.example.notes", "Notes"), extensions: [], installedFreeAccountApps: []
+		)
+		func kind(of result: Result<ZagProvisioningResult, ZagProvisioningFailure>) -> ZagProvisioningFailure.Kind? {
+			if case .failure(let failure) = result { return failure.kind }
+			return nil
+		}
+		@Sendable func provision() async -> Result<ZagProvisioningResult, ZagProvisioningFailure> {
+			await provisioner.provision(request, authorization: authorization)
+		}
+		func works(_ identity: ZagSigningIdentity?) -> Bool {
+			guard let identity else { return false }
+			if case .matches = factory.check(certificate: identity.certificate, privateKey: identity.privateKey, account: account, team: team, keySlot: identity.keySlot) { return true }
+			return false
+		}
+		func waitUntilHeld() async -> Bool {
+			for _ in 0..<500 where !portal.isHolding { try? await Task.sleep(nanoseconds: 10_000_000) }
+			return portal.isHolding
+		}
+		/// The team needs a new certificate: the key in use is gone.
+		func loseKeyInUse() {
+			if let identity = secrets.identity(account, team) { try? keys.delete(account: account, team: team, slot: identity.keySlot) }
+		}
+
+		// Two signings of the same team at once, with a listing that includes
+		// certificate content: the second must not settle the first one's
+		// request from its own listing and send it again.
+		portal.holdNext(.beforeIssue)
+		let first = Task { await provision() }
+		guard await waitUntilHeld() else { return check(false, "overlap: first request held") }
+		let second = Task { await provision() }
+		try? await Task.sleep(nanoseconds: 400_000_000)
+		let whileHeld = portal.submitted.count
+		portal.release()
+		let outcomes = [await first.value, await second.value]
+		let identity = secrets.identity(account, team)
+		check(whileHeld == 1, "overlap: while one certificate request is out, a second signing of the team sends none (sent \(whileHeld))")
+		check(portal.submitted.count == 1 && portal.issuedCount == 1 && works(identity)
+			  && outcomes.allSatisfy { if case .success = $0 { return true }; return false },
+			  "overlap: both signings succeed with the one certificate issued; Apple was asked once")
+
+		// Cancelled while the request is out, after Apple issued the certificate.
+		loseKeyInUse()
+		let sentBefore = portal.submitted.count, issuedBefore = portal.issuedCount
+		portal.holdNext(.afterIssue)
+		let cancelled = Task { await provision() }
+		guard await waitUntilHeld() else { return check(false, "cancel: request held") }
+		cancelled.cancel()
+		portal.release()
+		let cancelledResult = await cancelled.value
+		check(kind(of: cancelledResult) == .cancelled && secrets.pending(account, team)?.submissionUnconfirmed == true,
+			  "cancel: cancelling while a request is out leaves it unconfirmed, not 'not issued'")
+		guard case .success = await provision() else { return check(false, "cancel: recovery") }
+		check(portal.submitted.count == sentBefore + 1 && portal.issuedCount == issuedBefore + 1 && works(secrets.identity(account, team)),
+			  "cancel: the certificate Apple issued meanwhile is found and used; the request is not sent again")
+
+		// Responses that do not say what happened: each leaves the request
+		// unconfirmed, and with no certificate content listed, nothing is sent
+		// again however often signing is retried.
+		let ambiguous: [(String, Error)] = [
+			("an unreadable response", ZagPortalError.malformedResponse),
+			("a timeout", ZagTransportError.timedOut),
+			("a dropped connection", ZagPortalError.network),
+			("a cancelled transport", ZagTransportError.cancelled),
+		]
+		for (name, error) in ambiguous {
+			loseKeyInUse()
+			portal.loseNext(1, with: error)
+			_ = await provision()
+			let sent = portal.submitted.count, issued = portal.issuedCount
+			check(secrets.pending(account, team)?.submissionUnconfirmed == true, "ambiguous: after \(name), the request is unconfirmed")
+			portal.hidesCertificateData = true
+			var stopped = 0
+			for _ in 0..<3 where kind(of: await provision()) == .certificateRequestUnresolved { stopped += 1 }
+			portal.hidesCertificateData = false
+			check(stopped == 3 && portal.submitted.count == sent, "ambiguous: after \(name), unresolved signing stops and sends nothing more")
+			guard case .success = await provision() else { return check(false, "ambiguous: \(name) recovery") }
+			check(portal.submitted.count == sent && portal.issuedCount == issued && works(secrets.identity(account, team)),
+				  "ambiguous: after \(name), the issued certificate is recovered from the listing; Apple was asked once")
+		}
+
+		// Check Again while a retry of the same request is out: it must not
+		// settle that request from a listing read before the response.
+		loseKeyInUse()
+		portal.failNext(1)
+		_ = await provision()
+		guard secrets.pending(account, team)?.submissionUnconfirmed == true else { return check(false, "check race: setup") }
+		let sentBeforeRace = portal.submitted.count, issuedBeforeRace = portal.issuedCount
+		portal.holdNext(.beforeIssue)
+		portal.loseNext(1)
+		let retry = Task { await provision() }
+		guard await waitUntilHeld() else { return check(false, "check race: retry held") }
+		let checkAgain = Task { await provisioner.checkUnresolvedCertificateRequest(accountID: account, team: team, authorization: authorization) }
+		try? await Task.sleep(nanoseconds: 300_000_000)
+		portal.release()
+		_ = await retry.value
+		let checked = await checkAgain.value
+		if case .recovered = checked {
+			check(true, "check race: Check Again waits for the request out and then recovers its certificate")
+		} else {
+			check(false, "check race: Check Again waits for the request out and then recovers its certificate (got \(checked))")
+		}
+		_ = await provision()
+		check(portal.submitted.count == sentBeforeRace + 1 && portal.issuedCount == issuedBeforeRace + 1 && works(secrets.identity(account, team)),
+			  "check race: the retried request was sent once, and nothing is sent again afterwards")
+
+		// Abandon and the unresolved-request view while a request is out.
+		loseKeyInUse()
+		portal.holdNext(.beforeIssue)
+		let running = Task { await provision() }
+		guard await waitUntilHeld() else { return check(false, "abandon race: held") }
+		let shown = Task { await provisioner.unresolvedCertificateRequest(accountID: account, team: team) }
+		let abandoned = Task { await provisioner.abandonUnresolvedCertificateRequest(accountID: account, team: team) }
+		try? await Task.sleep(nanoseconds: 300_000_000)
+		let keyWhileHeld = secrets.pending(account, team).map { factory.hasKey(account: account, team: team, keySlot: $0.keySlot) }
+		portal.release()
+		let ran = await running.value
+		check(keyWhileHeld == true, "abandon race: Abandon does not remove a request's key while that request is out")
+		if case .success = ran, await shown.value == nil, await abandoned.value == .nothingPending, works(secrets.identity(account, team)) {
+			check(true, "abandon race: the request completes; a request in progress is neither shown as unresolved nor abandoned")
+		} else {
+			check(false, "abandon race: the request completes; a request in progress is neither shown as unresolved nor abandoned")
+		}
+	}
+}
+
+final class WaitBox<T>: @unchecked Sendable {
+	let lock = NSLock()
+	var value: T?
+}
+
+extension Tests {
+	/// G4 closeout, issue 2: an operation waiting for its account and team's
+	/// turn can be cancelled. It returns at once, sends nothing, leaves no
+	/// waiter behind, and the operations queued after it still run.
+	static func cancelledWhileQueued() async {
+		let secrets = MemorySecrets()
+		let (directory, _) = SimulatedAccounts.directory(now: { Date() }, secrets: secrets)
+		guard let account = await SimulatedAccounts.signIn(SimulatedAccounts.tester, to: directory) else { return check(false, "sign-in") }
+		let keys = ZagKeychainSigningKeys(namespace: "ZagStore.test.\(UUID().uuidString)")
+		defer { try? keys.deleteAll(account: account) }
+		let factory = ZagKeychainSigningKeyFactory(keys: keys)
+		let simulated = ZagSimulatedDeveloperPortal(team: team, issuer: OpenSSLIssuer())
+		await simulated.setCertificateLimit(20)
+		let portal = ScriptedCertificatePortal(inner: simulated)
+		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: factory, secrets: secrets, account: account)
+		let authorization = try! await directory.authorize(ZagSigningScope(accountID: account, teamID: team))
+		let request = ZagProvisioningRequest(
+			accountID: account, team: team, deviceUDID: udid, deviceName: "Test iPhone",
+			app: component("com.example.notes", "Notes"), extensions: [], installedFreeAccountApps: []
+		)
+		@Sendable func provision() async -> Result<ZagProvisioningResult, ZagProvisioningFailure> {
+			await provisioner.provision(request, authorization: authorization)
+		}
+		func kind(of result: Result<ZagProvisioningResult, ZagProvisioningFailure>?) -> ZagProvisioningFailure.Kind? {
+			if case .failure(let failure)? = result { return failure.kind }
+			return nil
+		}
+		func succeeded(_ result: Result<ZagProvisioningResult, ZagProvisioningFailure>?) -> Bool {
+			if case .success? = result { return true }
+			return false
+		}
+		/// The task's value if it finishes within `seconds`.
+		func value<T: Sendable>(of task: Task<T, Never>, within seconds: Double) async -> T? {
+			let done = WaitBox<T>()
+			Task { let value = await task.value; done.lock.withLock { done.value = value } }
+			for _ in 0..<Int(seconds * 100) {
+				if let value = done.lock.withLock({ done.value }) { return value }
+				try? await Task.sleep(nanoseconds: 10_000_000)
+			}
+			return done.lock.withLock { done.value }
+		}
+		func waiting(_ count: Int) async -> Bool {
+			for _ in 0..<300 where await provisioner.waitingOperations != count { try? await Task.sleep(nanoseconds: 10_000_000) }
+			return await provisioner.waitingOperations == count
+		}
+		func loseKeyInUse() {
+			if let identity = secrets.identity(account, team) { try? keys.delete(account: account, team: team, slot: identity.keySlot) }
+		}
+
+		// One signing holds the team while its certificate request is out.
+		portal.holdNext(.beforeIssue)
+		let holder = Task { await provision() }
+		for _ in 0..<500 where !portal.isHolding { try? await Task.sleep(nanoseconds: 10_000_000) }
+		guard portal.isHolding else { return check(false, "queue: holder") }
+
+		// Three more wait; the first of them is cancelled while it waits.
+		let cancelled = Task { await provision() }
+		guard await waiting(1) else { return check(false, "queue: first waiter") }
+		let second = Task { await provision() }, third = Task { await provision() }
+		guard await waiting(3) else { return check(false, "queue: three waiters") }
+		cancelled.cancel()
+		let early = await value(of: cancelled, within: 2)
+		check(kind(of: early) == .cancelled && portal.isHolding,
+			  "queue: an operation cancelled while waiting for its team returns at once as cancelled, while the other still runs")
+		check(await waiting(2), "queue: the cancelled operation leaves no waiter behind")
+
+		// Another account's scope is never held up by this team's queue.
+		let otherScope = Task { await provisioner.unresolvedCertificateRequest(accountID: UUID(), team: team) }
+		check(await value(of: otherScope, within: 2) != nil, "queue: another account and team's operation does not wait for this one")
+
+		portal.release()
+		let results = [await value(of: holder, within: 10), await value(of: second, within: 10), await value(of: third, within: 10)]
+		check(results.allSatisfy(succeeded), "queue: after the cancellation, the holder and every operation queued behind it complete")
+		check(portal.submitted.count == 1 && portal.issuedCount == 1,
+			  "queue: Apple was asked for one certificate; the cancelled operation sent nothing")
+		check(await provisioner.waitingOperations == 0, "queue: no continuation is left waiting")
+
+		// Cancelled before it waits: nothing runs and the team stays usable.
+		let before = portal.submitted.count
+		let precancelled = Task { () -> Result<ZagProvisioningResult, ZagProvisioningFailure> in
+			withUnsafeCurrentTask { $0?.cancel() }
+			return await provision()
+		}
+		check(kind(of: await value(of: precancelled, within: 2)) == .cancelled && portal.submitted.count == before,
+			  "queue: an operation cancelled before it starts sends nothing")
+		check(succeeded(await value(of: Task { await provision() }, within: 10)) && portal.submitted.count == before,
+			  "queue: the next signing proceeds normally and reuses the certificate")
+
+		// Many cancellations racing the queue: no lost wake-up, no extra request.
+		portal.holdNext(.beforeIssue)
+		loseKeyInUse()
+		let racing = Task { await provision() }
+		for _ in 0..<500 where !portal.isHolding { try? await Task.sleep(nanoseconds: 10_000_000) }
+		let crowd = (0..<24).map { _ in Task { await provision() } }
+		try? await Task.sleep(nanoseconds: 50_000_000)
+		for (index, task) in crowd.enumerated() where index % 2 == 0 { task.cancel() }
+		portal.release()
+		var completed = 0, cancelledCount = 0
+		for task in [racing] + crowd {
+			let result = await value(of: task, within: 15)
+			if succeeded(result) { completed += 1 } else if kind(of: result) == .cancelled { cancelledCount += 1 }
+		}
+		let leftWaiting = await provisioner.waitingOperations
+		check(completed + cancelledCount == 25 && completed >= 13 && portal.submitted.count == before + 1 && leftWaiting == 0,
+			  "queue: with half of 24 waiting operations cancelled, every operation ends, one request is sent, and no waiter is left (\(completed) done, \(cancelledCount) cancelled)")
+	}
 }
