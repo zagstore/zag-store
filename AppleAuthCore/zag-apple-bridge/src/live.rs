@@ -142,6 +142,17 @@ pub(crate) fn valid_serial(serial: &str) -> bool {
 /// Reject unsafe anisette endpoints before constructing a provider, not only
 /// when its HTTP or WebSocket client attempts a connection.
 fn validate_anisette_url(raw: &str) -> Result<(), Report> {
+    // URL parsers normalize an explicit :443 away. Reject explicit authority
+    // ports from the raw input before parsing so the policy is unambiguous.
+    let authority = raw
+        .strip_prefix("https://")
+        .ok_or_else(|| rootcause::report!(PolicyError::NotSecure))?
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains(':') {
+        return Err(rootcause::report!(PolicyError::HostNotAllowed));
+    }
     let url = reqwest::Url::parse(raw)
         .map_err(|_| rootcause::report!(PolicyError::InvalidUrl))?;
     let host = isideload::net_policy::host_of(raw)?;
