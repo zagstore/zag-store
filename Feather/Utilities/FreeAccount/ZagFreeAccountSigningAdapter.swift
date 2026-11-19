@@ -77,16 +77,39 @@ enum ZagFreeAccountSigningError: Error, Equatable {
 	case staging
 	case signer(String)
 	case verification(String)
+	/// The identity's key is in the Keychain, and this build has no Keychain
+	/// signing (it needs ZAG_ZSIGN_STRICT).
+	case keychainSigningUnavailable
+	/// The identity's Keychain key item is missing or unreadable.
+	case keychainKeyMissing
+	/// The identity carries key bytes, and writing them for the signer is
+	/// not allowed (`allowsKeyFiles`).
+	case keyFilesNotAllowed
 }
 
-/// Signs one provisioned app with Zsign. The private key is written for the
-/// signer only, readable by this user alone, in a private folder that is
-/// removed (after overwriting the key) whether signing succeeds or not; see
-/// SIGNING-KEY-SECURITY.md for what deletion does and does not guarantee.
+/// Signs one provisioned app with Zsign.
+///
+/// An identity whose key is a Keychain key item (`keyIsInKeychain`) is signed
+/// through the key reference only, with Zsign's raw-signer callback; no key
+/// bytes leave the Keychain (ZagStrictComponentSigning.swift, compiled with
+/// ZAG_ZSIGN_STRICT). That is the only path for the supervised experiment.
+///
+/// The older path writes the key for the signer, readable by this user
+/// alone, in a private folder removed (after overwriting the key) whether
+/// signing succeeds or not; see SIGNING-KEY-SECURITY.md for what deletion
+/// does and does not guarantee. It is refused unless `allowsKeyFiles` is set,
+/// which only tests of that path do.
 struct ZagFreeAccountSigningAdapter: Sendable {
 	let signer: ZagCodeSigner
 	var workRoot = FileManager.default.temporaryDirectory
 	var gate = ZagFreeAccountSigningGate.production
+	/// The Keychain key items, for identities whose key is in the Keychain.
+	var keychainKeys: ZagKeychainSigningKeys?
+	var allowsKeyFiles = false
+	#if DEBUG
+	/// Tests only: a local test authority Zsign may chain to.
+	var testIntermediates: [Data] = []
+	#endif
 
 	func sign(
 		appAt app: URL,
@@ -100,6 +123,14 @@ struct ZagFreeAccountSigningAdapter: Sendable {
 			throw ZagFreeAccountSigningError.notAuthorized
 		}
 		guard identity.serialNumber == result.certificateSerial else { throw ZagFreeAccountSigningError.identityMismatch }
+		if identity.keyIsInKeychain {
+			#if ZAG_ZSIGN_STRICT
+			return try signWithKeychainKey(appAt: app, with: result, identity: identity, authorization: authorization, now: now)
+			#else
+			throw ZagFreeAccountSigningError.keychainSigningUnavailable
+			#endif
+		}
+		guard allowsKeyFiles else { throw ZagFreeAccountSigningError.keyFilesNotAllowed }
 
 		let found = Self.bundleIdentifier(of: app)
 		guard found == result.app.originalBundleIdentifier || found == result.app.bundleIdentifier else {
@@ -493,7 +524,8 @@ struct ZagFreeAccountLifecycle: Sendable {
 		case .appIDCapacityExhausted: return .appIDCapacity
 		case .installSlotsFull: return .installSlots
 		case .cancelled: return .cancelled
-		case .invalidRequest, .deviceLimitReached, .identifierUnavailable, .certificateMustBeRevoked, .invalidProfile, .keyStorage:
+		// An unresolved certificate request waits for the user; never retried.
+		case .invalidRequest, .deviceLimitReached, .identifierUnavailable, .certificateMustBeRevoked, .certificateRequestUnresolved, .invalidProfile, .keyStorage:
 			return .signingFailed
 		}
 	}

@@ -24,6 +24,9 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		case malformed
 		/// The call never answers (for timeouts and cancellation).
 		case noResponse
+		/// Certificate requests only, once: the certificate is issued, then the
+		/// answer is lost (a network failure after Apple acted).
+		case lostResponse
 	}
 
 	enum Operation: String, Sendable {
@@ -93,6 +96,8 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		case .noResponse:
 			try await Task.sleep(nanoseconds: 120_000_000_000)
 			throw ZagPortalError.network
+		case .lostResponse:
+			return
 		}
 	}
 
@@ -155,13 +160,22 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 
 	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
 		try await begin(.submitCertificateRequest, team: team)
+		if failures[.submitCertificateRequest] == .lostResponse {
+			failures[.submitCertificateRequest] = nil
+			_ = try await issue(request)
+			throw ZagPortalError.network
+		}
+		return try await issue(request)
+	}
+
+	private func issue(_ request: ZagCertificateRequest) async throws -> ZagIssuedCertificate {
 		guard !request.data.isEmpty else { throw ZagPortalError.malformedResponse }
 		guard validCertificates.count < certificateLimit else { throw ZagPortalError.certificateLimitReached }
 		let serial = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16))
 		if let issuer {
 			let data = try issuer.certificate(for: request, serialNumber: serial)
 			guard let inspection = ZagCertificateInspection(der: data) else { throw ZagPortalError.malformedResponse }
-			let certificate = ZagDevelopmentCertificate(serialNumber: inspection.serialNumber, name: "Zag Store", machineName: "Zag Store", expiresAt: inspection.expiresAt)
+			let certificate = ZagDevelopmentCertificate(serialNumber: inspection.serialNumber, name: "Zag Store", machineName: "Zag Store", expiresAt: inspection.expiresAt, data: data)
 			issuedCertificates.append(certificate)
 			certificateFiles[inspection.serialNumber] = data
 			return ZagIssuedCertificate(certificate: certificate, data: data)

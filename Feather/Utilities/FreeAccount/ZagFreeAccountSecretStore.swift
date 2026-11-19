@@ -15,6 +15,15 @@ enum ZagFreeAccountSecretKind: String, CaseIterable, Sendable {
 	case signingPrivateKey
 	/// Anisette provisioning state for this device, if the provider keeps any.
 	case anisetteProvisioning
+	/// Which Apple Account owns this account ID (`ZagAccountOwnershipRecord`:
+	/// the hashed account key and the masked address; nothing secret). It
+	/// lives beside the account's other items so that, after a reinstall has
+	/// cleared the preferences, a sign-in to the same Apple Account finds them.
+	case accountRecord
+	/// A team's certificate request in progress (`ZagPendingSigningKey`): the
+	/// new key stays pending until its certificate is issued, verified and
+	/// stored, so a failed request never replaces a working identity.
+	case pendingSigningKey
 }
 
 /// Secrets are owned by one account, and optionally by one of its teams
@@ -26,6 +35,9 @@ protocol ZagFreeAccountSecretStore: Sendable {
 	func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws
 	/// Removes every item of the account, of every kind and team (account removal).
 	func deleteAll(account: UUID) throws
+	/// The account IDs that own at least one item, for finding items no
+	/// registered account owns (after a reinstall).
+	func accountIDs() throws -> Set<UUID>
 }
 
 extension ZagFreeAccountSecretStore {
@@ -105,9 +117,9 @@ struct ZagKeychainFreeAccountSecretStore: ZagFreeAccountSecretStore {
 		guard status == errSecSuccess || status == errSecItemNotFound else { throw StoreError.keychain(status) }
 	}
 
-	/// Finds the account's items by name prefix (the Keychain has no wildcard
-	/// delete) and removes each one; other accounts' items are not touched.
-	func deleteAll(account: UUID) throws {
+	/// The names of this service's items: every match of the service, with
+	/// `kSecMatchLimitAll` and `kSecReturnAttributes`.
+	private func itemNames() throws -> [String] {
 		let query: [String: Any] = [
 			kSecClass as String: kSecClassGenericPassword,
 			kSecAttrService as String: service,
@@ -117,11 +129,21 @@ struct ZagKeychainFreeAccountSecretStore: ZagFreeAccountSecretStore {
 		]
 		var result: CFTypeRef?
 		let status = SecItemCopyMatching(query as CFDictionary, &result)
-		if status == errSecItemNotFound { return }
+		if status == errSecItemNotFound { return [] }
 		guard status == errSecSuccess else { throw StoreError.keychain(status) }
+		return ((result as? [[String: Any]]) ?? []).compactMap { $0[kSecAttrAccount as String] as? String }
+	}
+
+	func accountIDs() throws -> Set<UUID> {
+		Set(try itemNames().compactMap { UUID(uuidString: String($0.prefix(36))) })
+	}
+
+	/// Finds the account's items by name prefix (the Keychain has no wildcard
+	/// delete) and removes each one; other accounts' items are not touched.
+	func deleteAll(account: UUID) throws {
 		let prefix = "\(account.uuidString)."
-		for attributes in (result as? [[String: Any]]) ?? [] {
-			guard let name = attributes[kSecAttrAccount as String] as? String, name.hasPrefix(prefix) else { continue }
+		for name in try itemNames() {
+			guard name.hasPrefix(prefix) else { continue }
 			let item: [String: Any] = [
 				kSecClass as String: kSecClassGenericPassword,
 				kSecAttrService as String: service,
