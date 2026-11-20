@@ -384,6 +384,8 @@ fn main() {
 
 #[cfg(test)]
 mod session_worker;
+#[cfg(test)]
+mod session_supervisor;
 
 #[cfg(test)]
 mod tests {
