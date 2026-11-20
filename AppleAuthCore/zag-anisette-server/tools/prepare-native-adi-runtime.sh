@@ -54,13 +54,20 @@ stage=$(mktemp -d "$parent/.zag-adi-runtime.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 for name in libstoreservicescore.so libCoreADI.so; do
   member="lib/$abi/$name"
-  unzip -Z1 "$apk" | grep -Fxq "$member" || { echo "Missing APK member: $member" >&2; exit 1; }
+  # Avoid grep -q with pipefail: early pipe closure can misreport a valid APK.
+  if ! unzip -Z1 "$apk" | grep -Fx "$member" >/dev/null; then
+    echo "Missing APK member: $member" >&2; exit 1
+  fi
   mkdir -p "$stage/lib/$abi"
   unzip -p "$apk" "$member" > "$stage/lib/$abi/$name"
 done
 chmod -R go-rwx "$stage"
+# Validate before publishing the directory so a bad APK never leaves a
+# seemingly usable runtime at the destination.
+libdir="$stage/lib/$abi"
+verify
 mv -- "$stage" "$destination"
 trap - EXIT
-verify
+libdir="$destination/lib/$abi"
 echo "Runtime staged at: $destination"
 echo "No service was started; no native backend was activated."
