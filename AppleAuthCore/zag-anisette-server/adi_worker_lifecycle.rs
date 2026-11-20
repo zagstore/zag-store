@@ -107,6 +107,16 @@ pub fn execute_offline_worker(
             .map_err(|_| WorkerError::UnapprovedExecutable)?;
         (metadata.dev(), metadata.ino())
     };
+    // A worker controlled by the same unprivileged account can be modified
+    // without changing its inode. Require trusted ownership for deployment.
+    // Test fixtures intentionally remain user-owned in test builds.
+    #[cfg(all(unix, not(test)))]
+    if std::fs::metadata(approved)
+        .map_err(|_| WorkerError::UnapprovedExecutable)?
+        .uid() != 0
+    {
+        return Err(WorkerError::UnapprovedExecutable);
+    }
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
     let mut command = Command::new(approved);
     // Do not leak the HTTP process's credentials, proxy settings, dynamic
