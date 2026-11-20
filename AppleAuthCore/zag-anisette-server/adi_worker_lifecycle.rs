@@ -84,13 +84,19 @@ pub fn execute_offline_worker(
         }
         thread::sleep(Duration::from_millis(5));
     }
-    // Close pipes and reap even on malformed responses and timeouts.
-    // Killing an already-exited child is harmless.
-    let _ = child.kill();
+    // A response alone is not success: the worker must also exit zero.
+    // Allow it the remainder of the same deadline to finish normally.
+    let mut exited = child.try_wait().map_err(|_| WorkerError::Transport)?;
+    while exited.is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+        exited = child.try_wait().map_err(|_| WorkerError::Transport)?;
+    }
+    let timed_out = exited.is_none();
+    if timed_out { let _ = child.kill(); }
     let status = child.wait().map_err(|_| WorkerError::Transport)?;
     let write_result = writer.join().map_err(|_| WorkerError::Transport)?;
     reader.join().map_err(|_| WorkerError::Transport)?;
-    if result.is_none() { return Err(WorkerError::Timeout); }
+    if timed_out || result.is_none() { return Err(WorkerError::Timeout); }
     if write_result.is_err() { return Err(WorkerError::Transport); }
     let frame = result.unwrap().map_err(|_| WorkerError::Transport)?;
     if !status.success() { return Err(WorkerError::NonZeroExit); }
