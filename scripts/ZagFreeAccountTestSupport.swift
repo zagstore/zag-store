@@ -23,11 +23,12 @@ enum SimulatedAccounts {
 		now: @escaping @Sendable () -> Date,
 		secrets: ZagFreeAccountSecretStore,
 		preferences: TestPreferences = TestPreferences(),
-		service existing: ZagSimulatedAuthenticationService? = nil
+		service existing: ZagSimulatedAuthenticationService? = nil,
+		localState: ZagAccountLocalState? = nil
 	) -> (directory: ZagAccountDirectory, service: ZagSimulatedAuthenticationService) {
 		let clock = ZagSimulationClock(base: now)
 		let service = existing ?? ZagSimulatedAuthenticationService(scenario: .signInSucceeds, latency: 0, clock: clock)
-		return (ZagFreeAccountSimulation.makeDirectory(service: service, clock: clock, secrets: secrets, preferences: preferences), service)
+		return (ZagFreeAccountSimulation.makeDirectory(service: service, clock: clock, secrets: secrets, preferences: preferences, localState: localState), service)
 	}
 
 	/// Signs `appleID` in as a new (or known) account and adopts it.

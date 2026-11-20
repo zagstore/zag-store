@@ -59,8 +59,14 @@ final class ZagActivityReporter {
 
 	/// Called by ZagLaunchGate.finish(). Returns at once.
 	static func launchBecameInteractive() {
+		#if ZAG_LIVE_EXPERIMENT
+		// G5 (plan §3.2, checklist M12): the experiment build sends no
+		// analytics; `resume` and `send` need `start`, which only this calls.
+		return
+		#else
 		guard featureEnabled else { return }
 		shared.start()
+		#endif
 	}
 
 	/// Records the user's choice and applies it at once.

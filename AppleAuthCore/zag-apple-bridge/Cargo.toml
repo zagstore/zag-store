@@ -1,0 +1,34 @@
+[package]
+name = "zag-apple-bridge"
+version = "0.1.0"
+edition = "2024"
+license-file = "../../LICENSE"
+publish = false
+description = "Zag Store's bridge from its Swift Apple Account and developer-portal interfaces to zag-isideload. Network access is compiled out unless the `live` feature is enabled."
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# Compiles network access in (zag-isideload's live-network) and installs the
+# TLS crypto provider. Only the separately approved experiment build sets it.
+live = ["zag-isideload/live-network", "dep:rustls"]
+# Test-only scripted backend (never in app builds).
+mock = []
+
+[dependencies]
+zag-isideload = { path = "../zag-isideload" }
+async-trait = "0.1"
+base64 = "0.22"
+plist = "1.8"
+reqwest = { version = "0.13.2", default-features = false }
+rootcause = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "time", "macros"] }
+zeroize = { version = "1.8", features = ["serde"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time"] }

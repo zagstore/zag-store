@@ -194,7 +194,9 @@ for added in ['\t\t\t\t\t.zagPairingRepairPrompt()\n',
               '            // Connection status refreshes on its own; a reconnect re-checks\n',
               '            // pairing once if the last check could not reach the device.\n',
               '            .onReceive(ZagLocalVPNMonitor.shared.$model.map(\\.tunnel).removeDuplicates()) { tunnel in\n',
-              '                if tunnel == .operational { launch.connectionAvailable() }\n            }\n']:
+              '                if tunnel == .operational { launch.connectionAvailable() }\n            }\n',
+              # G5 experiment builds only (owner-approved launch hook; never in production).
+              '        #if ZAG_LIVE_EXPERIMENT\n        // G5 experiment builds only: the campaign\'s launch checks (E5, C1–C4, C7).\n        ZagLiveExperimentLaunch.run()\n        #endif\n']:
     assert newApp.count(added)==1, added
     newApp=newApp.replace(added,'',1)
 assert newApp == oldApp, 'FeatherApp changed beyond the pairing launch fix'

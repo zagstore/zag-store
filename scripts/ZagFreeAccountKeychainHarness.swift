@@ -55,6 +55,9 @@ import SwiftUI
 				  "removing an account deletes every secret of it, all teams included")
 			check(try store.load(.signingPrivateKey, account: b, team: "SIMTEAM001") == Data("b-team".utf8), "another account's team item is untouched")
 			check(try store.load(.session, account: b) == Data("other".utf8), "another account's secrets are untouched")
+			try store.save(Data("record".utf8), kind: .accountRecord, account: a)
+			check(try store.accountIDs() == [a, b], "the accounts owning items are found from the service's own items (L1)")
+			try store.deleteAll(account: a)
 			try store.deleteAll(account: b)
 			query[kSecAttrSynchronizable as String] = kSecAttrSynchronizableAny
 			check(SecItemCopyMatching(query as CFDictionary, nil) == errSecItemNotFound, "no test items are left behind")
@@ -115,9 +118,23 @@ import SwiftUI
 			do { _ = try keys.key(account: a, team: "bad.team*") } catch ZagKeychainSigningKeys.Failure.invalidTeam { badTeam = true }
 			check(badTeam, "a malformed team ID is refused")
 
+			// Slots: a new key beside the one in use, found again by label.
+			_ = try keys.create(account: a, team: "SIMTEAM001", slot: "SLOT1", commonName: "Zag Test")
+			_ = try keys.create(account: a, team: "SIMTEAM001", slot: "SLOT2", commonName: "Zag Test")
+			let teamSlots = Set(try keys.slots(account: a, team: "SIMTEAM001")), orgSlots = try keys.slots(account: a, team: "SIMORG0001")
+			check(teamSlots == [nil, "SLOT1", "SLOT2"] && orgSlots == [nil],
+				  "a team's keys in every slot are found from the account's label, and only that team's (L2)")
+			let inUse = try keys.key(account: a, team: "SIMTEAM001")
+			check(try keys.key(account: a, team: "SIMTEAM001", slot: "SLOT1") != nil && inUse.map { SecKeyCopyPublicKey($0).flatMap { SecKeyCopyExternalRepresentation($0, nil) as Data? } } == SecKeyCopyPublicKey(stored).flatMap { SecKeyCopyExternalRepresentation($0, nil) as Data? },
+				  "a key in a new slot leaves the key in use unchanged (L2)")
+			try keys.delete(account: a, team: "SIMTEAM001", slot: "SLOT1")
+			check(try keys.slots(account: a, team: "SIMTEAM001").count == 2, "one slot's key is deleted alone")
+			check(try keys.accountsWithKeys().isSuperset(of: [a, b]), "accounts with key items are found from this namespace's labels (L1)")
+
 			try keys.deleteAll(account: a)
-			check(try keys.key(account: a, team: "SIMTEAM001") == nil && keys.key(account: a, team: "SIMORG0001") == nil,
-				  "removing an account deletes all of its keys")
+			check(try keys.key(account: a, team: "SIMTEAM001") == nil && keys.key(account: a, team: "SIMORG0001") == nil
+				  && keys.slots(account: a, team: "SIMTEAM001").isEmpty,
+				  "removing an account deletes all of its keys, every team and slot")
 			check(try keys.key(account: b, team: "SIMTEAM001") != nil, "another account's key is untouched")
 			try keys.delete(account: b, team: "SIMTEAM001")
 			check(try keys.key(account: b, team: "SIMTEAM001") == nil, "a single key is deleted")

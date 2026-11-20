@@ -1,0 +1,76 @@
+#!/bin/bash
+# G5: the build check for a live-experiment build (G5-EXPERIMENT-BUILD-PLAN.md
+# §4.4, §5.2 E6; checklist S1). It never builds, signs or uploads anything.
+#
+#   zag-g5-build-check.sh check
+#       Refuses unless the conditions are exactly the experiment's (never
+#       DEBUG or ZAG_G5_TESTS), the ledger has one `authorised` row whose
+#       window has not passed and whose number is above every built, running
+#       or closed row, and the constants file is the placeholder or that row.
+#   zag-g5-build-check.sh constants [--out FILE]
+#       After `check`: writes the constants file from the authorised row with a
+#       new build nonce and the library SHAs, then makes the constants commit
+#       (only that file). `--out` writes elsewhere and commits nothing (tests).
+#   zag-g5-build-check.sh verify-constants-commit
+#       The HEAD commit changes only the constants file, in the expected form.
+#   zag-g5-build-check.sh link-settings LIB [existing-account]
+#       The xcodebuild settings for an experiment build linked with LIB (the
+#       iOS bridge library); the app's bridging header declares the bridge.
+#       existing-account adds ZAG_EXISTING_ACCOUNT_EXPERIMENT (issue #37).
+#
+# Inputs (environment): ZAG_G5_CONDITIONS (default: the three experiment
+# conditions), ZAG_G5_LEDGER, ZAG_G5_BRIDGE_LIB and ZAG_G5_ZSIGN_LIB (for the
+# SHAs), ZAG_G5_DEVICE_SERIAL (g3Fixed only; never stored in the ledger).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MODE="${1:-check}"
+CONSTANTS="Feather/Utilities/FreeAccount/ZagLiveExperimentCampaignConstants.swift"
+export ZAG_G5_LEDGER="${ZAG_G5_LEDGER:-$ROOT/docs/free-developer-accounts/G5-CAMPAIGNS.md}"
+export ZAG_G5_CONDITIONS="${ZAG_G5_CONDITIONS:-ZAG_APPLE_BRIDGE ZAG_ZSIGN_STRICT ZAG_LIVE_EXPERIMENT}"
+
+case "$MODE" in
+link-settings)
+	# The app's bridging header includes the bridge's declarations; an
+	# experiment build adds the conditions and links the bridge library for
+	# iOS. Without the library the link fails (undefined zag_bridge_*): there
+	# is no stub.
+	LIB="${2:?link-settings needs the iOS bridge library path}"
+	[ -f "$LIB" ] || { echo "REFUSED: no bridge library at $LIB" >&2; exit 1; }
+	EXTRA=""
+	case "${3:-}" in "") ;; existing-account) EXTRA=" ZAG_EXISTING_ACCOUNT_EXPERIMENT" ;; *) echo "REFUSED: unknown mode ${3}" >&2; exit 2 ;; esac
+	printf '%s\n' "SWIFT_ACTIVE_COMPILATION_CONDITIONS=\$(inherited) ZAG_APPLE_BRIDGE ZAG_ZSIGN_STRICT ZAG_LIVE_EXPERIMENT$EXTRA" \
+		"OTHER_LDFLAGS=\$(inherited) $LIB" "INFOPLIST_KEY_CFBundleDisplayName=Zag LIVE TEST"
+	exit 0
+	;;
+verify-constants-commit)
+	CHANGED=$(git -C "$ROOT" diff-tree --no-commit-id --name-only -r HEAD)
+	[ "$CHANGED" = "$CONSTANTS" ] || { echo "REFUSED: the constants commit changes more than the constants file: $CHANGED" >&2; exit 1; }
+	git -C "$ROOT" show HEAD:"$CONSTANTS" | python3 -I "$ROOT/scripts/zag-g5-constants.py" verify || exit 1
+	echo "OK: HEAD is a constants commit"
+	exit 0
+	;;
+check | constants) ;;
+*) echo "usage: $0 check | constants [--out FILE] | verify-constants-commit | link-settings LIB [existing-account]" >&2; exit 2 ;;
+esac
+
+python3 -I "$ROOT/scripts/zag-g5-constants.py" check < "$ROOT/$CONSTANTS"
+[ "$MODE" = check ] && exit 0
+
+OUT="$ROOT/$CONSTANTS"
+COMMIT=yes
+if [ "${2:-}" = --out ]; then OUT="${3:?--out needs a path}"; COMMIT=no; fi
+if [ "$COMMIT" = yes ]; then
+	[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ] || { echo "REFUSED: the working tree has changes; the constants commit must sit on the reviewed commit" >&2; exit 1; }
+fi
+sha() { [ -f "${1:-}" ] && shasum -a 256 "$1" | cut -d' ' -f1 || printf '%064d' 0; }
+ZAG_G5_NONCE=$(openssl rand -hex 16) ZAG_G5_BRANCH_SHA=$(git -C "$ROOT" rev-parse HEAD) \
+ZAG_G5_BRIDGE_SHA=$(sha "${ZAG_G5_BRIDGE_LIB:-}") ZAG_G5_ZSIGN_SHA=$(sha "${ZAG_G5_ZSIGN_LIB:-}") \
+	python3 -I "$ROOT/scripts/zag-g5-constants.py" write > "$OUT"
+if [ "$COMMIT" = yes ]; then
+	git -C "$ROOT" add "$CONSTANTS"
+	git -C "$ROOT" -c user.name="Petar Zagorski" -c user.email="zagorskey@users.noreply.github.com" \
+		commit --quiet -m "G5 constants commit: $(python3 -I "$ROOT/scripts/zag-g5-constants.py" id)"
+	echo "Constants commit $(git -C "$ROOT" rev-parse --short HEAD); record the SHA and nonce in the ledger row (state: built) after the build"
+else
+	echo "Wrote $OUT (no commit)"
+fi

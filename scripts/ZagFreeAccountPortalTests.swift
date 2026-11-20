@@ -13,6 +13,7 @@ final class TestClock: @unchecked Sendable {
 final class MemorySecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
 	private let lock = NSLock()
 	var items: [String: Data] = [:]
+	func accountIDs() throws -> Set<UUID> { lock.withLock { Set(items.keys.compactMap { UUID(uuidString: String($0.prefix(36))) }) } }
 	var failSaves = false
 	func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws {
 		if failSaves { throw ZagKeychainFreeAccountSecretStore.StoreError.keychain(-34018) }
@@ -149,7 +150,8 @@ extension Result where Failure == ZagProvisioningFailure {
 		check(value.expiresAt == h.clock.now + 7 * 86_400, "the profiles last 7 days")
 		let stored = h.storedIdentity
 		check(stored?.serialNumber == value.certificateSerial && stored?.privateKey.count == 32, "the signing key is kept in the Keychain store with its certificate")
-		check(Set(h.secrets.items.keys) == ["\(h.account).session", "\(h.account).signingPrivateKey.\(team)"], "besides the session, only the team's signing identity is stored")
+		check(Set(h.secrets.items.keys) == ["\(h.account).session", "\(h.account).accountRecord", "\(h.account).signingPrivateKey.\(team)"],
+			  "besides the session and the ownership record, only the team's signing identity is stored (no request left pending)")
 		let log = h.diagnostics.entries.map(\.message).joined(separator: "\n")
 		check(!log.contains(udid) && !log.contains("SIMULATED-CERTIFICATE") && !log.contains(stored?.privateKey.base64EncodedString() ?? "-"),
 			  "diagnostics hold no device ID, certificate or key")

@@ -1,0 +1,241 @@
+# Every registry crate in Cargo.lock: name, version, licence declared on crates.io (checked 18 Nov 2026), and whether it is compiled for aarch64-apple-ios.
+crate	version	licence	compiled_for_ios
+adler2	2.0.1	0BSD OR MIT OR Apache-2.0	yes
+aead	0.6.1	MIT OR Apache-2.0	yes
+aes	0.9.3	MIT OR Apache-2.0	yes
+aes-gcm	0.11.1	Apache-2.0 OR MIT	yes
+anyhow	1.0.104	MIT OR Apache-2.0	yes
+async-compression	0.4.51	MIT OR Apache-2.0	yes
+async-trait	0.1.92	MIT OR Apache-2.0	yes
+atomic-waker	1.1.2	Apache-2.0 OR MIT	yes
+autocfg	1.5.1	Apache-2.0 OR MIT	yes
+base16ct	1.0.0	Apache-2.0 OR MIT	no
+base64	0.22.1	MIT OR Apache-2.0	yes
+base64	0.23.1	MIT OR Apache-2.0	yes
+bitflags	2.13.2	MIT OR Apache-2.0	yes
+block-buffer	0.10.4	MIT OR Apache-2.0	yes
+block-buffer	0.12.1	MIT OR Apache-2.0	yes
+block-padding	0.4.2	MIT OR Apache-2.0	yes
+bumpalo	3.20.3	MIT OR Apache-2.0	no
+bytes	1.12.1	MIT	yes
+cbc	0.2.1	MIT OR Apache-2.0	yes
+cc	1.10.0	MIT OR Apache-2.0	no
+cfg-if	1.0.5	MIT OR Apache-2.0	yes
+cipher	0.5.2	MIT OR Apache-2.0	yes
+cmov	0.5.4	Apache-2.0 OR MIT	yes
+combine	4.6.9	MIT	no
+compression-codecs	0.4.46	MIT OR Apache-2.0	yes
+compression-core	0.4.34	MIT OR Apache-2.0	yes
+const-oid	0.10.2	Apache-2.0 OR MIT	yes
+core-foundation	0.10.1	MIT OR Apache-2.0	yes
+core-foundation-sys	0.8.7	MIT OR Apache-2.0	yes
+core_detect	1.0.0	MIT/Apache-2.0	no
+cpubits	0.1.1	MIT OR Apache-2.0	yes
+cpufeatures	0.2.17	MIT OR Apache-2.0	yes
+cpufeatures	0.3.1	MIT OR Apache-2.0	yes
+crc32fast	1.5.3	MIT OR Apache-2.0	yes
+crypto-bigint	0.7.10	Apache-2.0 OR MIT	yes
+crypto-common	0.1.7	MIT OR Apache-2.0	yes
+crypto-common	0.2.2	MIT OR Apache-2.0	yes
+ctr	0.10.1	MIT OR Apache-2.0	yes
+ctutils	0.4.6	Apache-2.0 OR MIT	yes
+data-encoding	2.11.1	MIT	yes
+deranged	0.5.9	MIT OR Apache-2.0	yes
+digest	0.10.7	MIT OR Apache-2.0	yes
+digest	0.11.3	MIT OR Apache-2.0	yes
+displaydoc	0.2.7	MIT OR Apache-2.0	yes
+encoding_rs	0.8.42	(Apache-2.0 OR MIT) AND BSD-3-Clause	yes
+equivalent	1.0.3	Apache-2.0 OR MIT	yes
+find-msvc-tools	0.1.15	MIT OR Apache-2.0	no
+flate2	1.1.10	MIT OR Apache-2.0	yes
+fnv	1.0.7	Apache-2.0 / MIT	yes
+form_urlencoded	1.2.2	MIT OR Apache-2.0	yes
+futures	0.3.34	MIT OR Apache-2.0	yes
+futures-channel	0.3.34	MIT OR Apache-2.0	yes
+futures-core	0.3.34	MIT OR Apache-2.0	yes
+futures-executor	0.3.34	MIT OR Apache-2.0	yes
+futures-io	0.3.34	MIT OR Apache-2.0	yes
+futures-macro	0.3.34	MIT OR Apache-2.0	yes
+futures-sink	0.3.34	MIT OR Apache-2.0	yes
+futures-task	0.3.34	MIT OR Apache-2.0	yes
+futures-util	0.3.34	MIT OR Apache-2.0	yes
+generic-array	0.14.7	MIT	yes
+getrandom	0.2.17	MIT OR Apache-2.0	yes
+getrandom	0.3.4	MIT OR Apache-2.0	yes
+getrandom	0.4.3	MIT OR Apache-2.0	yes
+ghash	0.6.0	Apache-2.0 OR MIT	yes
+h2	0.4.20	MIT	yes
+hashbrown	0.16.1	MIT OR Apache-2.0	yes
+hashbrown	0.17.1	MIT OR Apache-2.0	yes
+hex	0.4.3	MIT OR Apache-2.0	yes
+hmac	0.13.0	MIT OR Apache-2.0	yes
+http	1.5.0	MIT OR Apache-2.0	yes
+http-body	1.1.0	MIT	yes
+http-body-util	0.1.5	MIT	yes
+httparse	1.10.1	MIT OR Apache-2.0	yes
+hybrid-array	0.4.15	MIT OR Apache-2.0	yes
+hyper	1.12.0	MIT	yes
+hyper-rustls	0.27.10	Apache-2.0 OR ISC OR MIT	yes
+hyper-util	0.1.21	MIT	yes
+icu_collections	2.4.0	Unicode-3.0	yes
+icu_locale_core	2.4.0	Unicode-3.0	yes
+icu_normalizer	2.4.0	Unicode-3.0	yes
+icu_normalizer_data	2.4.0	Unicode-3.0	yes
+icu_properties	2.4.0	Unicode-3.0	yes
+icu_properties_data	2.4.0	Unicode-3.0	yes
+icu_provider	2.4.0	Unicode-3.0	yes
+idna	1.1.0	MIT OR Apache-2.0	yes
+idna_adapter	1.2.2	Apache-2.0 OR MIT	yes
+indexmap	2.14.2	Apache-2.0 OR MIT	yes
+inout	0.2.5	MIT OR Apache-2.0	yes
+ipnet	2.12.2	MIT OR Apache-2.0	yes
+itoa	1.0.18	MIT OR Apache-2.0	yes
+jni	0.22.4	MIT OR Apache-2.0	no
+jni-macros	0.22.4	MIT OR Apache-2.0	no
+jni-sys	0.4.1	MIT OR Apache-2.0	no
+jni-sys-macros	0.4.1	MIT OR Apache-2.0	no
+js-sys	0.3.106	MIT OR Apache-2.0	no
+libc	0.2.191	MIT OR Apache-2.0	yes
+litemap	0.8.3	Unicode-3.0	yes
+log	0.4.34	MIT OR Apache-2.0	yes
+memchr	2.8.3	Unlicense OR MIT	yes
+mime	0.3.17	MIT OR Apache-2.0	yes
+miniz_oxide	0.9.1	MIT OR Zlib OR Apache-2.0	yes
+mio	1.2.4	MIT	yes
+multiversion_no_op	1.0.0	Apache-2.0 OR MIT	yes
+num-conv	0.2.2	MIT OR Apache-2.0	yes
+num-traits	0.2.19	MIT OR Apache-2.0	yes
+once_cell	1.21.4	MIT OR Apache-2.0	yes
+openssl-probe	0.2.2	MIT OR Apache-2.0	no
+pbkdf2	0.13.0	MIT OR Apache-2.0	yes
+percent-encoding	2.3.2	MIT OR Apache-2.0	yes
+pin-project-lite	0.2.17	Apache-2.0 OR MIT	yes
+plist	1.10.3	MIT	yes
+plist-macro	0.1.6	MIT	yes
+polyval	0.7.3	Apache-2.0 OR MIT	yes
+potential_utf	0.1.6	Unicode-3.0	yes
+powerfmt	0.2.1	MIT OR Apache-2.0	yes
+ppv-lite86	0.2.21	MIT OR Apache-2.0	yes
+proc-macro2	1.0.107	MIT OR Apache-2.0	yes
+quick-xml	0.42.0	MIT	yes
+quote	1.0.47	MIT OR Apache-2.0	yes
+r-efi	5.3.0	MIT OR Apache-2.0 OR LGPL-2.1-or-later	no
+r-efi	6.0.0	MIT OR Apache-2.0 OR LGPL-2.1-or-later	no
+rand	0.8.8	MIT OR Apache-2.0	yes
+rand	0.9.5	MIT OR Apache-2.0	yes
+rand_chacha	0.3.1	MIT OR Apache-2.0	yes
+rand_chacha	0.9.0	MIT OR Apache-2.0	yes
+rand_core	0.10.1	MIT OR Apache-2.0	yes
+rand_core	0.6.4	MIT OR Apache-2.0	yes
+rand_core	0.9.5	MIT OR Apache-2.0	yes
+reqwest	0.13.5	MIT OR Apache-2.0	yes
+reqwest-middleware	0.5.2	MIT OR Apache-2.0	yes
+ring	0.17.14	Apache-2.0 AND ISC	no
+rootcause	0.12.1	MIT/Apache-2.0	yes
+rootcause-internals	0.12.1	MIT/Apache-2.0	yes
+rustc-hash	2.1.3	Apache-2.0 OR MIT	yes
+rustc_version	0.4.1	MIT OR Apache-2.0	no
+rustls	0.23.46	Apache-2.0 OR ISC OR MIT	yes
+rustls-native-certs	0.8.5	Apache-2.0 OR ISC OR MIT	no
+rustls-pki-types	1.15.1	MIT OR Apache-2.0	yes
+rustls-platform-verifier	0.7.1	MIT OR Apache-2.0	yes
+rustls-platform-verifier-android	0.2.0	MIT OR Apache-2.0	no
+rustls-webpki	0.103.16	ISC	yes
+rustversion	1.0.23	MIT OR Apache-2.0	yes
+same-file	1.0.6	Unlicense/MIT	no
+schannel	0.1.30	MIT	no
+scopeguard	1.2.0	MIT OR Apache-2.0	yes
+security-framework	3.7.0	MIT OR Apache-2.0	yes
+security-framework-sys	2.17.0	MIT OR Apache-2.0	yes
+semver	1.0.28	MIT OR Apache-2.0	no
+serde	1.0.229	MIT OR Apache-2.0	yes
+serde_core	1.0.229	MIT OR Apache-2.0	yes
+serde_derive	1.0.229	MIT OR Apache-2.0	yes
+serde_json	1.0.154	MIT OR Apache-2.0	yes
+serdect	0.4.3	Apache-2.0 OR MIT	no
+sha1	0.10.7	MIT OR Apache-2.0	yes
+sha2	0.11.1	MIT OR Apache-2.0	yes
+shlex	2.0.1	MIT OR Apache-2.0	no
+simd-adler32	0.3.10	MIT	yes
+simd_cesu8	1.2.0	Apache-2.0 OR MIT	no
+simdutf8	0.1.5	MIT OR Apache-2.0	yes
+slab	0.4.12	MIT	yes
+smallvec	1.16.4	MIT OR Apache-2.0	yes
+socket2	0.6.5	MIT OR Apache-2.0	yes
+srp	0.7.0-rc.3	MIT OR Apache-2.0	yes
+stable_deref_trait	1.2.1	MIT OR Apache-2.0	yes
+subtle	2.6.1	BSD-3-Clause	yes
+syn	2.0.119	MIT OR Apache-2.0	no
+syn	3.0.9	MIT OR Apache-2.0	yes
+sync_wrapper	1.0.2	Apache-2.0	yes
+synstructure	0.14.0	MIT	yes
+thiserror	2.0.21	MIT OR Apache-2.0	yes
+thiserror-impl	2.0.21	MIT OR Apache-2.0	yes
+time	0.3.55	MIT OR Apache-2.0	yes
+time-core	0.1.9	MIT OR Apache-2.0	yes
+time-macros	0.2.32	MIT OR Apache-2.0	no
+tinystr	0.8.5	Unicode-3.0	yes
+tokio	1.54.1	MIT	yes
+tokio-macros	2.7.2	MIT	no
+tokio-rustls	0.26.6	MIT OR Apache-2.0	yes
+tokio-tungstenite	0.29.0	MIT	yes
+tokio-util	0.7.20	MIT	yes
+tower	0.5.3	MIT	yes
+tower-http	0.6.11	MIT	yes
+tower-layer	0.3.3	MIT	yes
+tower-service	0.3.3	MIT	yes
+tracing	0.1.44	MIT	yes
+tracing-core	0.1.36	MIT	yes
+triomphe	0.1.17	MIT OR Apache-2.0	yes
+try-lock	0.2.5	MIT	yes
+tungstenite	0.29.0	MIT OR Apache-2.0	yes
+typenum	1.20.1	MIT OR Apache-2.0	yes
+unicode-ident	1.0.27	(MIT OR Apache-2.0) AND Unicode-3.0	yes
+universal-hash	0.6.1	MIT OR Apache-2.0	yes
+untrusted	0.9.0	ISC	yes
+url	2.5.8	MIT OR Apache-2.0	yes
+urlencoding	2.1.3	MIT	yes
+utf8_iter	1.0.4	Apache-2.0 OR MIT	yes
+uuid	1.29.0	Apache-2.0 OR MIT	yes
+version_check	0.9.5	MIT/Apache-2.0	yes
+walkdir	2.5.0	Unlicense/MIT	no
+want	0.3.2	MIT	yes
+wasi	0.11.1+wasi-snapshot-preview1	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	no
+wasip2	1.0.4+wasi-0.2.12	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	no
+wasm-bindgen	0.2.129	MIT OR Apache-2.0	no
+wasm-bindgen-futures	0.4.79	MIT OR Apache-2.0	no
+wasm-bindgen-macro	0.2.129	MIT OR Apache-2.0	no
+wasm-bindgen-macro-support	0.2.129	MIT OR Apache-2.0	no
+wasm-bindgen-shared	0.2.129	MIT OR Apache-2.0	no
+web-sys	0.3.106	MIT OR Apache-2.0	no
+web-time	1.1.0	MIT OR Apache-2.0	yes
+webpki-root-certs	1.0.11	CDLA-Permissive-2.0	no
+webpki-roots	0.26.11	CDLA-Permissive-2.0	yes
+webpki-roots	1.0.11	CDLA-Permissive-2.0	yes
+winapi-util	0.1.11	Unlicense OR MIT	no
+windows-link	0.2.1	MIT OR Apache-2.0	no
+windows-sys	0.52.0	MIT OR Apache-2.0	no
+windows-sys	0.61.2	MIT OR Apache-2.0	no
+windows-targets	0.52.6	MIT OR Apache-2.0	no
+windows_aarch64_gnullvm	0.52.6	MIT OR Apache-2.0	no
+windows_aarch64_msvc	0.52.6	MIT OR Apache-2.0	no
+windows_i686_gnu	0.52.6	MIT OR Apache-2.0	no
+windows_i686_gnullvm	0.52.6	MIT OR Apache-2.0	no
+windows_i686_msvc	0.52.6	MIT OR Apache-2.0	no
+windows_x86_64_gnu	0.52.6	MIT OR Apache-2.0	no
+windows_x86_64_gnullvm	0.52.6	MIT OR Apache-2.0	no
+windows_x86_64_msvc	0.52.6	MIT OR Apache-2.0	no
+wit-bindgen	0.57.1	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	no
+writeable	0.6.4	Unicode-3.0	yes
+yoke	0.8.4	Unicode-3.0	yes
+yoke-derive	0.8.4	Unicode-3.0	yes
+zerocopy	0.8.63	BSD-2-Clause OR Apache-2.0 OR MIT	yes
+zerocopy-derive	0.8.63	BSD-2-Clause OR Apache-2.0 OR MIT	no
+zerofrom	0.1.8	Unicode-3.0	yes
+zerofrom-derive	0.1.8	Unicode-3.0	yes
+zeroize	1.9.1	Apache-2.0 OR MIT	yes
+zerotrie	0.2.5	Unicode-3.0	yes
+zerovec	0.11.9	Unicode-3.0	yes
+zerovec-derive	0.11.7	Unicode-3.0	yes
+zlib-rs	0.6.8	Zlib	no
+zmij	1.0.23	MIT	yes

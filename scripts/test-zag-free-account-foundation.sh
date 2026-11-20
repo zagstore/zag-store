@@ -21,22 +21,31 @@ files = {p.name: p.read_text() for p in (root / "Feather/Utilities/FreeAccount")
 # No Apple endpoint exists in the code, nothing is logged, and only the
 # transport may open network connections (with the system's TLS validation).
 assert not re.search(r'"https?://[^"]*apple\.com', sources), "Apple service URL in code"
-for forbidden in ["print(", "Logger", "NSLog", "os_log", "serverTrust", "didReceive challenge", "allowsArbitraryLoads"]:
+for forbidden in ["print(", "NSLog", "os_log", "serverTrust", "didReceive challenge", "allowsArbitraryLoads"]:
     assert forbidden not in sources, forbidden
+# The system Logger (the G5 experiment's typed `ZagExperimentLogger` writes a
+# local file only, and only in the experiment build).
+assert not re.search(r"(?<![A-Za-z])Logger\b", sources), "Logger"
 assert [name for name, text in files.items() if "URLSession" in text] == ["ZagFreeAccountTransport.swift"]
 print("PASS: no Apple endpoints, no logging; only the transport touches the network")
 # Live sign-in, live anisette and the free-account UI all stay off.
-for flag in ["static let freeAccountEnabled = false", "enum ZagLiveAuthentication {\n\t/// Live Apple Account authentication is not implemented or enabled.\n\tstatic let isEnabled = false",
-             "static let isEnabled = false\n}\n\n/// Stands in for every configured provider"]:
-    assert flag in sources, flag
-assert "enum ZagLivePortal {\n\t/// The live developer-portal service is not implemented or enabled.\n\tstatic let isEnabled = false" in sources
+# Each live switch is false unless the G5 experiment build's exact condition
+# holds (plan §3.2); DEBUG never satisfies it.
+assert "static let freeAccountEnabled = false" in sources
+experiment = (re.escape("\t#if ZAG_LIVE_EXPERIMENT && ZAG_APPLE_BRIDGE && ZAG_ZSIGN_STRICT && !DEBUG\n\t/// G5 experiment build only (plan §3.2): ")
+              + r"[^\n]*\n" + re.escape("\tstatic let isEnabled = true\n\t#else\n"))
+for switch in [r"enum ZagLiveAuthentication \{\n" + experiment + r"\t/// Live Apple Account authentication is not implemented or enabled\.\n\tstatic let isEnabled = false\n\t#endif\n\}",
+               r"enum ZagLivePortal \{\n" + experiment + r"\t/// The live developer-portal service is not implemented or enabled\.\n\tstatic let isEnabled = false\n\t#endif\n\}",
+               experiment + r"\tstatic let isEnabled = false\n\t#endif\n\}\n\n/// Stands in for every configured provider"]:
+    assert re.search(switch, sources), switch
+assert sources.count("static let isEnabled = true") == sources.count("#if ZAG_LIVE_EXPERIMENT && ZAG_APPLE_BRIDGE && ZAG_ZSIGN_STRICT && !DEBUG\n\t/// G5 experiment build only")
 print("PASS: live sign-in, live anisette, live portal and free-account UI are disabled")
 # Release builds have no free-account UI; the simulated screen is Debug-only
 # (checked in detail by test-zag-free-account-sign-in.sh).
 debug_screen = root / "Feather/Views/Settings/FreeAccount/ZagFreeAccountDebugSignInView.swift"
 views = "\n".join(p.read_text() for p in (root / "Feather/Views").rglob("*.swift") if p != debug_screen)
 assert "freeAppleAccount" not in views
-assert re.sub(r"#if DEBUG.*?#endif", "", views, flags=re.S).count("ZagFreeAccount") == 0
+assert re.sub(r"#if (DEBUG|ZAG_LIVE_EXPERIMENT|DEBUG \|\| ZAG_LIVE_EXPERIMENT)\n.*?\n#endif", "", views, flags=re.S).count("ZagFreeAccount") == 0
 assert debug_screen.read_text().startswith("#if DEBUG")
 print("PASS: no free-account UI in release builds")
 # The entitlement matcher was moved, not copied.

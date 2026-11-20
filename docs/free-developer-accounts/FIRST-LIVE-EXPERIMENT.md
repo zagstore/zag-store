@@ -52,3 +52,26 @@ The target is one app: a tiny test app with no extensions, frameworks or capabil
 | **G6 Account readiness** | None yet | **Open:** the owner creates a dedicated Apple Account (no payment method, recovery confirmed); never the personal account |
 
 **Outstanding before the experiment, besides the gates:** the extension test. It needs per-extension profiles, so it is deferred until after the first single-app installation.
+
+## G6: read-only account readiness procedure (owner only)
+
+Nobody else, and nothing on this Mac, signs in to the account. Record only "yes" or "no" for each item, here; never the address, phone number or any detail.
+
+1. **A1.** Create the account new, for this experiment, on the web (account.apple.com) or on a device that is not signed into it afterwards. Never use the personal account. The account must never be added to Xcode, used on developer.apple.com or signed in on this Mac: those sign-ins create Apple-side state (devices, certificates, agreements) that the experiment must find empty.
+2. **A2.** On account.apple.com, "Payment Methods" shows none. Do not enrol in the Apple Developer Program.
+3. **A3.** On account.apple.com, "Sign-In and Security":
+   - two-factor authentication is on;
+   - a trusted phone number you control is listed (codes for this account arrive by SMS, since no Apple device is signed into it; the bridge supports SMS codes);
+   - account recovery is confirmed.
+   Sign out afterwards.
+4. **A4.** Keep the address and password on paper only, never in a file, chat or screenshot.
+5. **A5. Empty account: checked by the app, not by hand.** A free account has no web view of certificates, App IDs or devices. Any other reader would have to sign in, and might add state. The experiment's E4 check reads all three lists after sign-in and before any change, and stops the campaign unless all are zero. A1 is what makes zero expected.
+6. **A6.** Used only on the owner's iPhone, in campaign `G5-C1` only.
+
+| Item | Yes or no |
+|---|---|
+| A1 new, dedicated, never in Xcode, developer.apple.com or this Mac | |
+| A2 no payment method, not enrolled | |
+| A3 2FA on, SMS number controlled, recovery confirmed | |
+| A4 details on paper only | |
+| A6 one device, one campaign | |

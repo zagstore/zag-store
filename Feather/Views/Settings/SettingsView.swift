@@ -614,6 +614,14 @@ extension SettingsView {
             NavigationLink(destination: ZagExperimentalSigningView().zagSettingsDestinationAvatar()) {
 				Label("Signing", systemImage: "signature")
 			}
+			// Apple Accounts: shown only when the feature is enabled (off in
+			// this version). Debug builds use the simulated screen below.
+			if ZagAppleAccountsFeature.isEnabled {
+				NavigationLink(destination: ZagStoredAccountDataScreen().zagSettingsDestinationAvatar()) {
+					Label("Apple Accounts: Stored Account Data", systemImage: "externaldrive.badge.person.crop")
+				}
+				.accessibilityIdentifier("settings.appleAccounts.storedData")
+			}
 			#if DEBUG
 			NavigationLink(destination: ZagFreeAccountDebugSignInView().zagSettingsDestinationAvatar()) {
 				Label("Apple Account (Simulated)", systemImage: "person.badge.key")
@@ -621,8 +629,16 @@ extension SettingsView {
 			NavigationLink(destination: ZagAppleAccountsDebugView().zagSettingsDestinationAvatar()) {
 				Label("Apple Accounts (Simulated)", systemImage: "person.2.badge.key")
 			}
+			#endif
+			#if DEBUG || ZAG_LIVE_EXPERIMENT
 			NavigationLink(destination: ZagInstalledProfilesDebugView().zagSettingsDestinationAvatar()) {
 				Label("Installed Profiles (Read Only)", systemImage: "lock.doc")
+			}
+			#endif
+			#if ZAG_LIVE_EXPERIMENT
+			// G5 (checklist M13): the experiment build's one live screen.
+			NavigationLink(destination: ZagLiveExperimentView().zagSettingsDestinationAvatar()) {
+				Label("Live Test", systemImage: "flask")
 			}
 			#endif
 		} header: {

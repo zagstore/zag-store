@@ -279,3 +279,7 @@ It must be validated against Apple's real responses; mocks alone don't count.
 - `DEVICE-TEST-PHASE7.md`: the installed-profiles (PR #25) and Zsign branch device tests.
 - `WEBSITE-INSTALL-FEASIBILITY.md`: installing from zagstore.app with a visitor's free account.
 - The trimmed isideload fork and its provenance evidence: PR #26, `AppleAuthCore/zag-isideload/PROVENANCE.md`.
+
+**G4 working documents (19 Nov 2026; not reviewed).**
+- `G4-SECURITY-REVIEW.md`: the bridge (`AppleAuthCore/zag-apple-bridge`) for the independent security review. Covers network destinations, the credential lifecycle, session isolation, logging, TLS, failure handling and feature gates.
+- `G2-LICENCE-REVIEW.md`: the reproducible licence-review package for the retained isideload sources (`scripts/zag-g2-reproduce.sh`).

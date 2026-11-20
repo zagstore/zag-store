@@ -6,10 +6,11 @@ import ZsignSwift
 
 // Signing the app and each extension with its own profile and entitlements,
 // by a key that stays in its key store (Zsign's raw-signer callback), with
-// every signed binary verified by Zsign before success. Needs the Zsign
-// branch zag-free-account-signing (draft PR zagorskey/Zsign-Zag#1), so it is
-// compiled only with ZAG_ZSIGN_STRICT, by scripts/test-zag-zsign-branch.sh,
-// until the owner approves the branch and the submodule update.
+// every signed binary verified by Zsign before success. Zsign f34e51a
+// provides the entry point; this path is compiled only with
+// ZAG_ZSIGN_STRICT (tests and the supervised experiment build, never the
+// Xcode project's configurations) until the live workflow is reviewed and
+// approved.
 
 extension ZagFreeAccountSigningAdapter {
 	/// Extensions in the app (PlugIns/ and Extensions/), by bundle ID.
@@ -23,6 +24,58 @@ extension ZagFreeAccountSigningAdapter {
 			}
 		}
 		return paths
+	}
+
+	/// Signs with the Keychain key item of the authorised account and the
+	/// result's team; the key never leaves the Keychain.
+	func signWithKeychainKey(
+		appAt app: URL,
+		with result: ZagProvisioningResult,
+		identity: ZagSigningIdentity,
+		authorization: ZagSigningAuthorization,
+		now: Date
+	) throws -> ZagSignedAppRecord {
+		guard identity.keyIsInKeychain, let keychainKeys,
+			  let key = try? keychainKeys.key(account: authorization.scope.accountID, team: result.team, slot: identity.keySlot) else {
+			throw ZagFreeAccountSigningError.keychainKeyMissing
+		}
+		var intermediates: [Data] = []
+		#if DEBUG
+		intermediates = testIntermediates
+		#endif
+		#if ZAG_LIVE_EXPERIMENT
+		// G5 (logging spec §4.7, plan §7.3): what the key is, as requested at
+		// creation, and whether signing left any key file behind.
+		let logger = ZagLiveExperiment.logger
+		logger?.record("cert.key", fields: [
+			"keyClass": .string("softwareRSA2048"), "permanent": .bool(true), "synchronizable": .bool(false),
+			"accessibility": .string("afterFirstUnlockThisDeviceOnly"), "extractableAttributeRequested": .bool(false),
+			"privateKeyExportCalls": .int(logger?.privateKeyExportCalls ?? 0),
+		])
+		logger?.record("sign.start", outcome: "started", fields: ["componentCount": .int(min(64, 1 + result.extensions.count)), "path": .string("strictKeychain")])
+		let before = ZagExperimentKeyFileScan.keyFiles()
+		let signed: ZagSignedAppRecord
+		do {
+			signed = try signComponents(appAt: app, with: result, identity: identity, signer: ZagKeychainSigningKeys.signer(key),
+										authorization: authorization, now: now, extraIntermediates: intermediates)
+		} catch {
+			let written = !ZagExperimentKeyFileScan.keyFiles().subtracting(before).isEmpty
+			logger?.record("sign.verify", outcome: "failed", failure: "sign.failed", fields: ["zsignVerify": .string("failed"), "keyFileWritten": .bool(written)])
+			ZagLiveExperiment.campaign.halt(written ? .keyFileWritten : .signingFailed)
+			throw error
+		}
+		let written = !ZagExperimentKeyFileScan.keyFiles().subtracting(before).isEmpty
+		logger?.record("sign.verify", outcome: written ? "failed" : "ok", failure: written ? "sign.failed" : nil,
+					   fields: ["zsignVerify": .string("ok"), "keyFileWritten": .bool(written)])
+		if written {
+			ZagLiveExperiment.campaign.halt(.keyFileWritten)
+			throw ZagFreeAccountSigningError.keyFilesNotAllowed
+		}
+		return signed
+		#else
+		return try signComponents(appAt: app, with: result, identity: identity, signer: ZagKeychainSigningKeys.signer(key),
+								  authorization: authorization, now: now, extraIntermediates: intermediates)
+		#endif
 	}
 
 	func signComponents(
