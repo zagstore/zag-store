@@ -174,7 +174,7 @@ mod tests {
         let input = b"{\"type\":\"start\",\"identifier\":\"id\",\"spim\":\"spim\"}\nnot-json\n";
         let mut output = Vec::new();
         assert!(serve_mock(&input[..], &mut output).is_err());
-        let first: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(first["type"], "started");
     }
     #[test]
