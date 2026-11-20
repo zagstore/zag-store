@@ -321,12 +321,8 @@ pub fn run_mock_session_cancellable(
     if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
     let mut child = cmd.spawn().map_err(|_| SessionError::Spawn)?;
     // Any early error after spawn must still terminate and reap the child.
-    let pid = child.id();
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        #[cfg(unix)]
-        kill_group(pid);
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_and_reap(&mut child);
         return Err(SessionError::Transport);
     };
     let (write_tx, write_rx) = mpsc::channel();
