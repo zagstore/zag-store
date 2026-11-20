@@ -70,7 +70,12 @@ pub fn execute_offline_worker(
     }
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
     let mut command = Command::new(approved);
-    command.stdin(Stdio::piped())
+    // Do not leak the HTTP process's credentials, proxy settings, dynamic
+    // loader configuration, or working directory into a worker.
+    // Future worker dependencies must be added through an explicit allowlist.
+    command.env_clear()
+        .current_dir("/")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(unix)]
