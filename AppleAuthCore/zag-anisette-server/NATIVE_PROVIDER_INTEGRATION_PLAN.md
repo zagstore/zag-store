@@ -26,6 +26,36 @@ Sources:
 - https://github.com/Dadoum/Provision/tree/7717ce1f7b3c9779fe9982005d07b6665071a239
 - https://github.com/Dadoum/anisette-v3-server/issues/61
 
+## Pinned native interface comparison (source inspected)
+
+**Dadoum/Provision**, commit `7717ce1f7b3c9779fe9982005d07b6665071a239`:
+`lib/provision/adi.d` declares `extern(C)` function pointer types for
+`ADIProvisioningStart` (returns a native session id via `uint*`),
+`ADIProvisioningEnd` (takes that session id and PTM/TK buffers), and
+`ADIProvisioningDestroy` (releases the session). It also resolves
+obfuscated symbols dynamically from `libstoreservicescore.so` using
+`AndroidLibrary`, and configures an on-disk provisioning path. These
+declarations are **specific to the Android library build**; they are
+not evidence of a stable, supported cross-platform Apple ABI.
+
+**SideStore/apple-private-apis**, master commit
+`03beb1aa42991ccdad6214dee77e72282bef461f`, is a separate Rust
+source candidate whose repository declares MPL-2.0. Its code and native
+dependency chain still require a detailed API/license audit. An MPL-2.0
+source license does not license Apple's proprietary runtime libraries.
+
+**Integration choice:** retain the Rust worker and its typed Start/Finish
+boundary. Do not port Android D function pointers directly into Rust or
+assume they work on macOS. Evaluate the SideStore Rust implementation's
+native loader and session lifetime first, while keeping the Dadoum
+implementation as a compatibility reference. Any implementation must
+preserve the same native session handle and provider instance in one child.
+
+References:
+- https://github.com/Dadoum/Provision/blob/7717ce1f7b3c9779fe9982005d07b6665071a239/lib/provision/adi.d
+- https://github.com/Dadoum/Provision/blob/7717ce1f7b3c9779fe9982005d07b6665071a239/docs/ADI.md
+- https://github.com/SideStore/apple-private-apis/tree/03beb1aa42991ccdad6214dee77e72282bef461f
+
 ## Implementation milestones
 
 1. Introduce a generic typed two-phase session driver with strict Start/Finish transitions, bounded frames and no mock-success logic in release code. Test with a stateful in-memory backend and failure injection.
