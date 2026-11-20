@@ -1,6 +1,5 @@
 //! Standalone offline ADI worker skeleton. No native ADI library is loaded.
 //! One bounded framed request in, one generic unavailable response out.
-#[cfg(test)]
 mod adi_worker_wire_v2;
 use std::io::{self, Read, Write};
 
@@ -452,21 +451,90 @@ fn run<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
     output.flush()
 }
 
+/// Production-compiled v2 provider boundary. The release executable only
+/// supplies DisabledV2Backend until a real native implementation is available.
+trait V2NativeBackend {
+    fn start(&mut self, identifier: &str, spim: &[u8]) -> io::Result<Vec<u8>>;
+    fn finish(&mut self, ptm: &[u8], tk: &[u8]) -> io::Result<Vec<u8>>;
+    fn abort(&mut self) {}
+}
+
+struct DisabledV2Backend;
+impl V2NativeBackend for DisabledV2Backend {
+    fn start(&mut self, _: &str, _: &[u8]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "native ADI backend unavailable"))
+    }
+    fn finish(&mut self, _: &[u8], _: &[u8]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "native ADI backend unavailable"))
+    }
+}
+
+struct V2Session<B: V2NativeBackend>(B);
+impl<B: V2NativeBackend> Drop for V2Session<B> {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
+fn run_v2_native_session<R: Read, W: Write, B: V2NativeBackend>(
+    input: &mut R, output: &mut W, backend: B,
+) -> io::Result<()> {
+    use adi_worker_wire_v2::{Request, Response};
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid v2 worker frame");
+    let mut session = V2Session(backend);
+    let first = adi_worker_framing_v2_read(input)?;
+    let Request::Start { identifier, spim } = adi_worker_wire_v2::decode_request(&first).map_err(|_| invalid())? else {
+        return Err(invalid());
+    };
+    let cpim = session.0.start(&identifier, &spim)?;
+    let started = adi_worker_wire_v2::encode_response(&Response::Started(cpim)).map_err(|_| invalid())?;
+    adi_worker_framing_v2_write(output, &started)?;
+    let second = adi_worker_framing_v2_read(input)?;
+    let Request::Finish { ptm, tk } = adi_worker_wire_v2::decode_request(&second).map_err(|_| invalid())? else {
+        return Err(invalid());
+    };
+    let state = session.0.finish(&ptm, &tk)?;
+    let finished = adi_worker_wire_v2::encode_response(&Response::Finished(state)).map_err(|_| invalid())?;
+    let mut extra = [0u8; 1];
+    if input.read(&mut extra)? != 0 { return Err(invalid()); }
+    adi_worker_framing_v2_write(output, &finished)
+}
+
+fn adi_worker_framing_v2_read<R: Read>(input: &mut R) -> io::Result<Vec<u8>> {
+    let mut header = [0u8; 4];
+    input.read_exact(&mut header)?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > adi_worker_wire_v2::MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid v2 frame size"));
+    }
+    let mut frame = vec![0u8; length];
+    input.read_exact(&mut frame)?;
+    Ok(frame)
+}
+
+fn adi_worker_framing_v2_write<W: Write>(output: &mut W, frame: &[u8]) -> io::Result<()> {
+    if frame.is_empty() || frame.len() > adi_worker_wire_v2::MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid v2 frame size"));
+    }
+    output.write_all(&(frame.len() as u32).to_be_bytes())?;
+    output.write_all(frame)?;
+    output.flush()
+}
+
 fn main() {
     // Explicit offline session mode is not connected to the HTTP listener.
     // No native backend is loaded in either mode.
     let mut args = std::env::args_os();
     let _executable = args.next();
     let mode = match (args.next(), args.next()) {
-        (None, None) => false,
-        (Some(flag), None) if flag == "--offline-session" => true,
+        (None, None) => 0,
+        (Some(flag), None) if flag == "--offline-session" => 1,
+        (Some(flag), None) if flag == "--offline-v2-session" => 2,
         _ => std::process::exit(2),
     };
     // Fail closed without emitting secret-bearing diagnostics or stdout text.
-    let result = if mode {
-        run_session(&mut io::stdin().lock(), &mut io::stdout().lock())
-    } else {
-        run(&mut io::stdin().lock(), &mut io::stdout().lock())
+    let result = match mode {
+        1 => run_session(&mut io::stdin().lock(), &mut io::stdout().lock()),
+        2 => run_v2_native_session(&mut io::stdin().lock(), &mut io::stdout().lock(), DisabledV2Backend),
+        _ => run(&mut io::stdin().lock(), &mut io::stdout().lock()),
     };
     if result.is_err() { std::process::exit(1); }
 }
