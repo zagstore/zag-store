@@ -98,6 +98,15 @@ pub fn execute_offline_worker(
             return Err(WorkerError::UnapprovedExecutable);
         }
     }
+    // Revalidate the executable's identity immediately before spawn. This
+    // narrows but does NOT close the verification-to-execution race; only
+    // descriptor-bound execution or immutable trusted deployment can do so.
+    #[cfg(unix)]
+    let checked_identity = {
+        let metadata = std::fs::metadata(approved)
+            .map_err(|_| WorkerError::UnapprovedExecutable)?;
+        (metadata.dev(), metadata.ino())
+    };
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
     let mut command = Command::new(approved);
     // Do not leak the HTTP process's credentials, proxy settings, dynamic
@@ -110,6 +119,14 @@ pub fn execute_offline_worker(
         .stderr(Stdio::null());
     #[cfg(unix)]
     command.process_group(0);
+    #[cfg(unix)]
+    {
+        let metadata = std::fs::metadata(approved)
+            .map_err(|_| WorkerError::UnapprovedExecutable)?;
+        if (metadata.dev(), metadata.ino()) != checked_identity {
+            return Err(WorkerError::UnapprovedExecutable);
+        }
+    }
     let mut child = command.spawn().map_err(|_error| {
         // Error kind and OS code only; never print executable arguments,
         // provisioning payloads, paths, or environment values.
