@@ -56,6 +56,63 @@ References:
 - https://github.com/Dadoum/Provision/blob/7717ce1f7b3c9779fe9982005d07b6665071a239/docs/ADI.md
 - https://github.com/SideStore/apple-private-apis/tree/03beb1aa42991ccdad6214dee77e72282bef461f
 
+## Zag Store differentiated architecture proposal (review gate)
+
+**Goal:** build a provider-agnostic, isolated ADI subsystem rather than cloning
+another project's HTTP service. These are proposed design improvements, not
+claims of measured superiority.
+
+### Provider contract and isolation
+
+- Keep the network-facing HTTP/WebSocket layer separate from the worker and
+  native libraries. The public layer never accepts worker executable paths,
+  library paths, or native session handles.
+- Use a typed `AdiEngine` interface with explicit `start`, `finish`, and
+  `abort` semantics. A provider is selected from an operator-approved,
+  version-pinned allowlist; never from client input. Native handles stay inside
+  one supervised child.
+- Define a strict `SessionId` internal identifier and a monotonic state
+  machine: `Created -> Starting -> AwaitingFinish -> Finishing -> Completed`,
+  with terminal `Aborted` on errors or cancellation. Enforce one Finish,
+  no replay, and one response per phase.
+- Treat provisioning blobs as secrets: bound sizes, never log contents, avoid
+  persistence by default, clear buffers where practical, and document limits
+  on memory erasure across FFI boundaries.
+- Preserve offline fail-closed builds and a kill switch. No mock-success mode
+  in release binaries.
+
+### Hardening beyond the current prototype
+
+- Authenticate and scope any local IPC transport; the current supervisor's
+  anonymous stdin/stdout is only appropriate for a directly launched child.
+- Review Linux and macOS separately for descriptor-bound executable launch,
+  filesystem and native-library integrity, sandbox profiles, process limits,
+  seccomp where applicable, and crash-dump restrictions. A process group alone
+  is not sandboxing.
+- Apply per-session deadlines and bounded global concurrency, with a
+  per-identifier admission policy and explicit cancellation at every phase.
+  Never assume that an asynchronous cancellation can interrupt a blocking
+  native call without terminating its process.
+- Maintain structured **non-sensitive** telemetry: phase, duration bucket,
+  generic error category, provider revision, and count of aborted sessions.
+  No identifiers, SPIM/PTM/TK, CPIM, adi.pb, or native stack traces.
+- Add deterministic failure-injection tests for crash, timeout, malformed
+  output, duplicate Finish, provider mismatch, and worker replacement; compare
+  behavior on both supported operating systems.
+
+### Proposed acceptance metrics
+
+1. No successful response from the disabled provider, including malformed
+   and replayed requests.
+2. One provider instance per session; no native handle crosses process
+   boundaries; all terminal paths clean up the child.
+3. Bounded memory, time, message size, and active sessions under adversarial
+   tests, with OS-specific enforcement documented.
+4. Reproducible dependency revisions and explicit review of upstream and
+   proprietary library licensing.
+5. Successful real-provider integration tests **only** in a separately
+   approved isolated environment; production remains disabled until reviewed.
+
 ## Implementation milestones
 
 1. Introduce a generic typed two-phase session driver with strict Start/Finish transitions, bounded frames and no mock-success logic in release code. Test with a stateful in-memory backend and failure injection.
