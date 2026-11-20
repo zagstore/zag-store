@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hooks.insert("umask".to_string(), libc::umask as *const () as usize);
     hooks.insert("write".to_string(), libc::write as *const () as usize);
     hook_manager::add_hooks(hooks);
-    ereport!("Loading {} (no provisioning calls)", dir.join("libstoreservicescore.so").display());
+    eprintln!("Loading {} (no provisioning calls)", dir.join("libstoreservicescore.so").display());
     let lib = AndroidLibrary::load(dir.join("libstoreservicescore.so").to_str().ok_or("non-UTF8 runtime path")?)?;
     let symbols = [
         ("load_core_adi", "kq56gsgHG6"),
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::mem::transmute(lib.get_symbol("kq56gsgHG6").ok_or("missing CoreADI initializer")?)
         };
         let native_dir = CString::new(dir.to_str().ok_or("non-UTF8 native directory")?)?;
-        ereport!("Initializing CoreADI from {} (no provisioning)", dir.display());
+        eprintln!("Initializing CoreADI from {} (no provisioning)", dir.display());
         let status = init(native_dir.as_ptr().cast());
         report!("CoreADI initialization status: {status}");
         if status != 0 { return Err(format!("CoreADI initialization failed: {status}").into()); }
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let set_path: sysv64_type!(fn(*const u8) -> i32) = unsafe {
                 std::mem::transmute(lib.get_symbol("nf92ngaK92").ok_or("missing set_provisioning_path")?)
             };
-            ereport!("Configuring isolated native state path: {}", state.display());
+            eprintln!("Configuring isolated native state path: {}", state.display());
             let path_status = set_path(state_cstr.as_ptr().cast());
             report!("ADI provisioning path status: {path_status}");
             if path_status != 0 { return Err(format!("native state path rejected: {path_status}").into()); }
