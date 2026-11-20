@@ -24,13 +24,14 @@ Unchanged in both:
 
 - **Calls:** it sees the portal only through `ZagPortalReader`: certificates, devices and App IDs, nothing else. Profiles have no read-only listing (the portal's profile call creates or renews one), so a profile is always an approved change.
 - **Failures:** a listing that fails, is refused, is malformed or is cancelled is **unknown**, never empty. An unknown inventory decides nothing and is not accepted.
+- **Local signing state:** a stored identity or key that is genuinely absent means "not possessed". A Keychain or secret-store read error, a record that does not decode, or a key that does not match its stored certificate is **blocked** (`signingKeysUnreadable`), never read as absent, so an unexpected failure cannot lead to a new certificate.
 - **Reuse of a certificate:** only when this app holds its private key in this iPhone's Keychain, for this account and team, proven to match the certificate (and, when the listing includes the certificate itself, identical to the stored one), with at least 7 days left.
 - **Other certificates:** those made elsewhere (Xcode, other sideloaders, other Macs) are counted and left alone.
 - **Device:** identified by the UDID the paired iPhone reported over its verified pairing.
 - **Decision:** one of the following:
   - reuse possible (only the profile needed);
   - needs new assets (the list);
-  - blocked: not a Personal Team, more than one team, no device identity, this iPhone registered twice, the device list full, the test App ID twice, no App ID capacity, a duplicated certificate serial, or an earlier certificate request with an unknown outcome;
+  - blocked: not a Personal Team, more than one team, no device identity, this iPhone registered twice, the device list full, the test App ID twice, no App ID capacity, a duplicated certificate serial, an earlier certificate request with an unknown outcome, or local signing keys that could not be read;
   - unknown (which listing).
 - **Report:** redacted. It shows counts, booleans and days left only; no UDID, serial, bundle identifier, address or team ID.
 
@@ -81,9 +82,9 @@ Any stop rule ends the campaign. A new attempt needs a new campaign number and a
 
 - `scripts/test-zag-existing-account.sh`:
   - static checks;
-  - D1–D12 (decision rules), J1–J10 (journal) and X1–X15 (end to end through the real provisioner, bridge adapter, budget and campaign over a simulated, previously used team);
+  - D1–D12 (decision rules), K1–K13 (local signing state: Keychain failures, missing keys, corrupted identities), J1–J10 (journal) and X1–X16 (end to end through the real provisioner, bridge adapter, budget and campaign over a simulated, previously used team);
   - S1 mode matching;
-  - two mutants that must fail: the journal bypassed, and a preflight that writes.
+  - three mutants that must fail: the journal bypassed, a preflight that writes, and Keychain errors read as absent keys.
 - `scripts/test-zag-g5-experiment.sh`: the empty-account campaign, unchanged.
 - `scripts/test-zag-g5-experiment-link.sh existing-account`: links the mode for iOS (placeholder constants, no live network) and scans it.
 - The release scan: forbids this path's markers in production.

@@ -10,7 +10,8 @@ import Security
 // unchanged) and the real campaign, with the bridge replaced below the
 // adapter by the scripted transport (scripts/ZagG5TestHarness.swift) over a
 // simulated team seeded as a previously used account. D1–D12 test the
-// decision rules directly. Nothing contacts Apple or an anisette provider.
+// decision rules directly; K1–K13 the local signing state (Keychain and
+// secret-store failures, missing keys, corrupted records). Nothing contacts Apple or an anisette provider.
 
 @main struct Tests {
 	nonisolated(unsafe) static var passed = 0
@@ -29,6 +30,7 @@ import Security
 	static func main() async {
 		setvbuf(stdout, nil, _IOLBF, 0)
 		decisionTests()
+		keyStateTests()
 		await approvalTests()
 		await flowTests()
 		print("RESULT: \(passed) passed, \(failed.count) failed")
@@ -73,12 +75,12 @@ import Security
 	}
 
 	static func preflight(_ rig: Rig, _ campaign: ZagLiveExperimentCampaign, _ approvals: ZagExistingAccountApprovals,
-						  udid: String = deviceUDID) async -> Result<ZagExistingAccountPreflight.Assessment, Error> {
+						  udid: String = deviceUDID, secrets: ZagFreeAccountSecretStore? = nil) async -> Result<ZagExistingAccountPreflight.Assessment, Error> {
 		let teams = await rig.directory.registry.account(rig.account)!.teams
 		do {
 			return .success(try await ZagExistingAccountPreflight.run(
 				reader: ZagReadOnlyPortal(rig.adapter), team: teams[0], teamCount: teams.count, accountKey: rig.accountKey,
-				account: rig.account, secrets: rig.secrets, keys: ZagKeychainSigningKeyFactory(keys: rig.keys),
+				account: rig.account, secrets: secrets ?? rig.secrets, keys: ZagKeychainSigningKeyFactory(keys: rig.keys),
 				bundleIdentifier: mapped(rig), deviceUDID: udid, campaign: campaign, approvals: approvals
 			))
 		} catch {
@@ -195,6 +197,108 @@ import Security
 		check(!text.contains(deviceUDID) && !text.lowercased().contains(deviceUDID.lowercased()) && !text.contains("A1") && !text.contains("MINE")
 			  && !text.contains(app) && !text.contains("@") && !text.contains(personal.identifier),
 			  "D12: the report holds no UDID, serial, bundle identifier, address or team identifier")
+	}
+
+	// MARK: - K1–K13: the local signing state
+
+	/// A secret store whose reads of one kind fail (a Keychain error).
+	final class FailingSecrets: ZagFreeAccountSecretStore, @unchecked Sendable {
+		let base: ZagFreeAccountSecretStore
+		let failing: ZagFreeAccountSecretKind
+		init(_ base: ZagFreeAccountSecretStore, failing: ZagFreeAccountSecretKind) {
+			self.base = base
+			self.failing = failing
+		}
+		func save(_ secret: Data, kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { try base.save(secret, kind: kind, account: account, team: team) }
+		func load(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws -> Data? {
+			if kind == failing { throw NSError(domain: NSOSStatusErrorDomain, code: Int(errSecInteractionNotAllowed)) }
+			return try base.load(kind, account: account, team: team)
+		}
+		func delete(_ kind: ZagFreeAccountSecretKind, account: UUID, team: String?) throws { try base.delete(kind, account: account, team: team) }
+		func deleteAll(account: UUID) throws { try base.deleteAll(account: account) }
+		func accountIDs() throws -> Set<UUID> { try base.accountIDs() }
+	}
+
+	struct StubLookup: ZagSigningKeyLookup {
+		enum Mode { case absent, present, fails }
+		let mode: Mode
+		func key(account: UUID, team: String, slot: String?) throws -> SecKey? {
+			switch mode {
+			case .absent: return nil
+			case .fails: throw NSError(domain: NSOSStatusErrorDomain, code: Int(errSecInteractionNotAllowed))
+			case .present:
+				return SecKeyCreateRandomKey([kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits: 2048] as CFDictionary, nil)
+			}
+		}
+	}
+
+	struct StubFactory: ZagSigningKeyFactory {
+		let result: ZagIssuedCertificateCheck
+		func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest) { throw CocoaError(.featureUnsupported) }
+		func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck { result }
+	}
+
+	static func keyStateTests() {
+		let account = UUID(), team = personal.identifier
+		let identity = ZagSigningIdentity(serialNumber: "MINE", certificate: Data([1, 2, 3]), privateKey: Data(), expiresAt: now.addingTimeInterval(30 * 86_400), keySlot: "s1")
+		let matches = StubFactory(result: .matches(serialNumber: "MINE", expiresAt: identity.expiresAt))
+		func store(identity value: Data? = nil, pending: Data? = nil) -> MemorySecrets {
+			let secrets = MemorySecrets()
+			if let value { try? secrets.save(value, kind: .signingPrivateKey, account: account, team: team) }
+			if let pending { try? secrets.save(pending, kind: .pendingSigningKey, account: account, team: team) }
+			return secrets
+		}
+		let stored = try! JSONEncoder().encode(identity)
+		func local(_ secrets: ZagFreeAccountSecretStore, _ lookup: StubLookup.Mode, _ factory: ZagSigningKeyFactory = matches) -> ZagExistingAccountPreflight.LocalKeys {
+			ZagExistingAccountPreflight.localKeys(secrets: secrets, keys: factory, lookup: StubLookup(mode: lookup), account: account, team: team)
+		}
+		let registered = ZagRegisteredDevice(udid: deviceUDID, name: "iPhone")
+		let appID = ZagRegisteredAppID(identifier: "X", bundleIdentifier: "\(personal.identifier).\(app)", expiresAt: now.addingTimeInterval(86_400))
+		let listed = inventory(certificates: .complete([certificate("MINE", days: 30, data: identity.certificate)]), devices: .complete([registered]), appIDs: .complete([appID]))
+		func blocked(_ value: ZagExistingAccountPreflight.LocalKeys) -> Bool {
+			let assessment = evaluate(listed, local: value)
+			return assessment.decision == .blocked(.signingKeysUnreadable) && assessment.required.isEmpty && !assessment.decision.allowsProvisioning
+		}
+
+		// Genuinely absent: not possessed, readable, a certificate is needed.
+		let nothing = local(store(), .absent)
+		check(nothing.unreadable == nil && nothing.possessedSerial == nil && evaluate(listed, local: nothing).decision == .needsNewAssets([.certificate, .profile]),
+			  "K1: no stored identity is absent (a new certificate may be approved)")
+		let keyGone = local(store(identity: stored), .absent)
+		check(keyGone.unreadable == nil && keyGone.possessedSerial == nil && evaluate(listed, local: keyGone).required.contains(.certificate),
+			  "K2: a stored identity whose key item is absent is not possessed (a new certificate may be approved)")
+		let held = local(store(identity: stored), .present)
+		check(held.unreadable == nil && held.possessedSerial == "MINE" && evaluate(listed, local: held).decision == .reusePossible,
+			  "K3: a readable identity with its key present and matching is reused")
+
+		// Read failures block; they never become "absent".
+		let identityFails = local(FailingSecrets(store(identity: stored), failing: .signingPrivateKey), .present)
+		check(identityFails.unreadable == .secretStore && blocked(identityFails), "K4: a Keychain error reading the identity blocks (no certificate requested)")
+		let pendingFails = local(FailingSecrets(store(identity: stored), failing: .pendingSigningKey), .present)
+		check(pendingFails.unreadable == .secretStore && blocked(pendingFails), "K5: a Keychain error reading the pending request blocks")
+		let lookupFails = local(store(identity: stored), .fails)
+		check(lookupFails.unreadable == .keyStore && blocked(lookupFails), "K6: a Keychain error looking up the key blocks")
+		let emptyAndFailing = local(FailingSecrets(store(), failing: .signingPrivateKey), .absent)
+		check(emptyAndFailing.unreadable == .secretStore && evaluate(inventory(), local: emptyAndFailing).decision == .blocked(.signingKeysUnreadable),
+			  "K7: a Keychain error on an otherwise empty account blocks rather than asking for a certificate")
+
+		// Corrupted records block.
+		let garbage = Data("not json".utf8)
+		check(local(store(identity: garbage), .present).unreadable == .corruptedRecord && blocked(local(store(identity: garbage), .present)),
+			  "K8: a stored identity that does not decode blocks")
+		check(local(store(identity: Data()), .present).unreadable == .corruptedRecord, "K8: an empty stored identity blocks")
+		check(local(store(identity: stored, pending: garbage), .present).unreadable == .corruptedRecord && blocked(local(store(identity: stored, pending: garbage), .present)),
+			  "K9: a pending request that does not decode blocks")
+		let mismatch = local(store(identity: stored), .present, StubFactory(result: .mismatch))
+		check(mismatch.unreadable == .identityMismatch && blocked(mismatch), "K10: a present key that does not match its certificate blocks")
+		let otherSerial = local(store(identity: stored), .present, StubFactory(result: .matches(serialNumber: "OTHER", expiresAt: identity.expiresAt)))
+		check(otherSerial.unreadable == .identityMismatch && blocked(otherSerial), "K11: a certificate whose serial differs from the stored identity blocks")
+		let exported = ZagSigningIdentity(serialNumber: "MINE", certificate: identity.certificate, privateKey: Data([7]), expiresAt: identity.expiresAt)
+		check(local(store(identity: try! JSONEncoder().encode(exported)), .present).unreadable == .identityMismatch, "K12: an identity with exported key bytes is never reused; it blocks")
+
+		// The report says so, and stays redacted.
+		let report = evaluate(listed, local: lookupFails).report.lines.joined(separator: "\n")
+		check(report.contains("could not be read (blocked)") && !report.contains("MINE") && !report.contains(deviceUDID), "K13: the report states the keys could not be read, with nothing identifying")
 	}
 
 	// MARK: - The approval journal
@@ -340,7 +444,8 @@ import Security
 				  "X4: with the private key gone the certificate counts as foreign and a new one is needed")
 
 			// X5: a key of another team is not this team's.
-			let local = ZagExistingAccountPreflight.localKeys(secrets: rig.secrets, keys: ZagKeychainSigningKeyFactory(keys: rig.keys), account: rig.account, team: "ZZZZZ99999")
+			let local = ZagExistingAccountPreflight.localKeys(secrets: rig.secrets, keys: ZagKeychainSigningKeyFactory(keys: rig.keys), lookup: rig.keys,
+															  account: rig.account, team: "ZZZZZ99999")
 			check(local.possessedSerial == nil, "X5: another team's identity is not possession for this team")
 			rig.cleanUp()
 		}
@@ -505,6 +610,24 @@ import Security
 			check(!lines.isEmpty && !text.contains("FOREIGN") && !text.lowercased().contains(deviceUDID.lowercased()) && !text.contains(rig.team) && !text.contains("@"),
 				  "X15: the report shows counts only")
 			print(lines.map { "  | \($0)" }.joined(separator: "\n"))
+			rig.cleanUp()
+		}
+
+		// X16: a Keychain read failure, end to end: the inventory is refused,
+		// nothing is created (no certificate request), the campaign not halted.
+		do {
+			let device = Device()
+			let (campaign, approvals) = armed(device)
+			let rig = await Rig.make(campaign)
+			await seedPopulated(rig)
+			let result = await preflight(rig, campaign, approvals, secrets: FailingSecrets(rig.secrets, failing: .signingPrivateKey))
+			check((try? result.get()) == nil && approvals.journal?.accountKey == nil && !approve(approvals, rig, [.certificate]),
+				  "X16: a Keychain error refuses the inventory; no certificate can be approved")
+			let provisioned = await rig.provision()
+			let p = await seen(rig)
+			check((try? provisioned.get()) == nil && rig.counter.value == 0 && p.mutations.isEmpty && p.count(.profile) == 0,
+				  "X16: and provisioning creates nothing")
+			check(device.registryValue?.campaigns["G5-C1"]?.state == .armed, "X16: the campaign stays armed (a refusal, not a stop)")
 			rig.cleanUp()
 		}
 	}

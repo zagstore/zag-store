@@ -1,10 +1,10 @@
 #!/bin/bash
 # G5 existing-account path (issue #37), offline: static checks, then
-# scripts/ZagExistingAccountTests.swift (D1–D12, J1–J10, X1–X15) compiled with
-# ZAG_EXISTING_ACCOUNT_EXPERIMENT over the bridge's mock backend, the strict
-# Zsign branch and a local test authority, then two mutants that must fail:
-# the approval journal bypassed, and the preflight made able to register a
-# device. Nothing contacts Apple or an anisette provider. The empty-account
+# scripts/ZagExistingAccountTests.swift (D1–D12, K1–K13, J1–J10, X1–X16)
+# compiled with ZAG_EXISTING_ACCOUNT_EXPERIMENT over the bridge's mock
+# backend, the strict Zsign branch and a local test authority, then three
+# mutants that must fail: the approval journal bypassed, the preflight made
+# able to register a device, and Keychain errors read as absent keys. Nothing contacts Apple or an anisette provider. The empty-account
 # G5 campaign is tested, unchanged, by test-zag-g5-experiment.sh.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -130,4 +130,12 @@ p = sys.argv[1] + "/ZagExistingAccountPreflight.swift"; s = open(p).read()
 a = "\tfunc devices(team: String) async throws -> [ZagRegisteredDevice] { try await portal.devices(team: team) }\n\tfunc appIDs"
 b = "\tfunc devices(team: String) async throws -> [ZagRegisteredDevice] { _ = try? await portal.registerDevice(udid: \"00000000-SIMULATED000000\", name: \"x\", team: team); return try await portal.devices(team: team) }\n\tfunc appIDs"
 assert s.count(a) == 1; open(p, "w").write(s.replace(a, b))'
+# Keychain and secret-store errors swallowed: read as "no key", which would
+# lead to a new certificate (the defect fixed after 64711e52).
+mutant swallowed-keychain-errors '
+import sys; p = sys.argv[1] + "/ZagExistingAccountPreflight.swift"; s = open(p).read()
+for case in ["secretStore", "keyStore"]:
+    a = "\t\t\tlocal.unreadable = ." + case + "\n"
+    assert a in s; s = s.replace(a, "")
+open(p, "w").write(s)'
 echo "SUCCESS: G5 existing-account path"

@@ -3,6 +3,7 @@
 #error("The existing-account experiment is a mode of the G5 live experiment")
 #endif
 import Foundation
+import Security
 
 // G5 existing-account path (issue #37): a read-only inventory of an Apple
 // Account that has signed apps before, and the decision it supports. It
@@ -31,6 +32,14 @@ enum ZagExistingAccountMutation: String, Codable, CaseIterable, Comparable, Send
 }
 
 /// The portal's read-only listings: what the inventory may call.
+/// The Keychain key lookup the preflight needs: `nil` when the key item is
+/// absent, a thrown error when the Keychain could not be read.
+protocol ZagSigningKeyLookup {
+	func key(account: UUID, team: String, slot: String?) throws -> SecKey?
+}
+
+extension ZagKeychainSigningKeys: ZagSigningKeyLookup {}
+
 protocol ZagPortalReader: Sendable {
 	func devices(team: String) async throws -> [ZagRegisteredDevice]
 	func appIDs(team: String) async throws -> [ZagRegisteredAppID]
@@ -74,11 +83,29 @@ enum ZagExistingAccountPreflight {
 		var possessedCertificate: Data?
 		/// A certificate request whose outcome is not known yet.
 		var unresolvedRequest = false
+		/// The local signing state could not be read or is inconsistent: it
+		/// blocks, so an unexpected failure never leads to a new certificate.
+		var unreadable: Unreadable?
+	}
+
+	/// Why the local signing state is not known. Only a genuinely absent
+	/// identity or key means "not possessed".
+	enum Unreadable: String, Equatable, Sendable {
+		/// The secret store failed to read the pending request or the identity.
+		case secretStore
+		/// A stored pending request or identity does not decode.
+		case corruptedRecord
+		/// The Keychain failed to look up the identity's key.
+		case keyStore
+		/// The stored identity's key is present but does not match its
+		/// certificate, or holds exported key bytes.
+		case identityMismatch
 	}
 
 	enum Blocker: String, Equatable, Sendable {
 		case notPersonalTeam, teamCountNotOne, missingIdentity, ambiguousDevice, deviceLimit
 		case ambiguousAppID, appIDCapacity, duplicateCertificate, unresolvedCertificateRequest
+		case signingKeysUnreadable
 	}
 
 	enum Unknown: String, Equatable, Sendable {
@@ -125,6 +152,7 @@ enum ZagExistingAccountPreflight {
 		var appIDs: Int?
 		var testAppIDRegistered: Bool?
 		var unresolvedCertificateRequest = false
+		var signingKeysReadable = true
 
 		var lines: [String] {
 			func value<T>(_ v: T?) -> String { v.map { "\($0)" } ?? "unknown" }
@@ -135,6 +163,7 @@ enum ZagExistingAccountPreflight {
 				"Devices: \(value(devices)) registered; this iPhone \(thisDeviceRegistered.map { $0 ? "registered" : "not registered" } ?? "unknown")",
 				"App IDs: \(value(appIDs)) active; the test app's \(testAppIDRegistered.map { $0 ? "registered" : "not registered" } ?? "unknown")",
 				"Earlier certificate request with unknown outcome: \(unresolvedCertificateRequest ? "yes" : "no")",
+				"Signing keys on this iPhone: \(signingKeysReadable ? "read" : "could not be read (blocked)")",
 				"Profiles: not listed (a profile is requested only with approval)",
 			]
 		}
@@ -160,21 +189,58 @@ enum ZagExistingAccountPreflight {
 
 	/// What the Keychain holds for this account and team: the stored identity
 	/// counts only if its key is present and proven to match its certificate.
-	static func localKeys(secrets: ZagFreeAccountSecretStore, keys: ZagSigningKeyFactory, account: UUID, team: String) -> LocalKeys {
+	static func localKeys(secrets: ZagFreeAccountSecretStore, keys: ZagSigningKeyFactory, lookup: ZagSigningKeyLookup,
+						  account: UUID, team: String) -> LocalKeys {
 		var local = LocalKeys()
-		if let data = try? secrets.load(.pendingSigningKey, account: account, team: team),
-		   let pending = try? JSONDecoder().decode(ZagPendingSigningKey.self, from: data),
-		   pending.certificate == nil, pending.submissionUnconfirmed == true {
-			local.unresolvedRequest = true
+		let pendingData: Data?
+		do {
+			pendingData = try secrets.load(.pendingSigningKey, account: account, team: team)
+		} catch {
+			local.unreadable = .secretStore
+			return local
 		}
-		guard let data = try? secrets.load(.signingPrivateKey, account: account, team: team),
-			  let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: data) else { return local }
-		if case .matches(let serial, _) = keys.check(certificate: identity.certificate, privateKey: identity.privateKey,
-													  account: account, team: team, keySlot: identity.keySlot),
-		   serial == identity.serialNumber {
-			local.possessedSerial = serial
-			local.possessedCertificate = identity.certificate
+		if let pendingData {
+			guard let pending = try? JSONDecoder().decode(ZagPendingSigningKey.self, from: pendingData) else {
+				local.unreadable = .corruptedRecord
+				return local
+			}
+			if pending.certificate == nil, pending.submissionUnconfirmed == true { local.unresolvedRequest = true }
 		}
+		let identityData: Data?
+		do {
+			identityData = try secrets.load(.signingPrivateKey, account: account, team: team)
+		} catch {
+			local.unreadable = .secretStore
+			return local
+		}
+		// No stored identity: genuinely nothing possessed.
+		guard let identityData else { return local }
+		guard let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: identityData) else {
+			local.unreadable = .corruptedRecord
+			return local
+		}
+		// Exported key bytes are never reused (live builds keep keys in the Keychain).
+		guard identity.keyIsInKeychain else {
+			local.unreadable = .identityMismatch
+			return local
+		}
+		let key: SecKey?
+		do {
+			key = try lookup.key(account: account, team: team, slot: identity.keySlot)
+		} catch {
+			local.unreadable = .keyStore
+			return local
+		}
+		// The key item is gone (deleted, or the Keychain was reset): not possessed.
+		guard key != nil else { return local }
+		guard case .matches(let serial, _) = keys.check(certificate: identity.certificate, privateKey: identity.privateKey,
+														  account: account, team: team, keySlot: identity.keySlot),
+			  serial == identity.serialNumber else {
+			local.unreadable = .identityMismatch
+			return local
+		}
+		local.possessedSerial = serial
+		local.possessedCertificate = identity.certificate
 		return local
 	}
 
@@ -186,6 +252,7 @@ enum ZagExistingAccountPreflight {
 		report.teamIsPersonal = inventory.team.kind == .personalFree
 		report.teamCount = inventory.teamCount
 		report.unresolvedCertificateRequest = local.unresolvedRequest
+		report.signingKeysReadable = local.unreadable == nil
 		let certificates = inventory.certificates.items, devices = inventory.devices.items, appIDs = inventory.appIDs.items
 		let active = appIDs?.filter { $0.isActive(at: now) }
 		let valid = certificates?.filter { $0.expiresAt > now }
@@ -215,6 +282,7 @@ enum ZagExistingAccountPreflight {
 		guard ZagDeveloperTeam.isValidIdentifier(inventory.team.identifier), !bundleIdentifier.isEmpty, !deviceUDID.isEmpty else {
 			return result(.blocked(.missingIdentity))
 		}
+		guard local.unreadable == nil else { return result(.blocked(.signingKeysUnreadable)) }
 		guard let certificates else { return result(.unknown(.certificates)) }
 		guard let devices, let matchingDevices else { return result(.unknown(.devices)) }
 		guard let active, let matchingAppIDs else { return result(.unknown(.appIDs)) }
@@ -247,13 +315,13 @@ enum ZagExistingAccountPreflight {
 	/// (which then accepts approvals for exactly the required mutations).
 	/// Nothing is sent to Apple except the three listings.
 	static func run(reader: ZagPortalReader, team: ZagDeveloperTeam, teamCount: Int, accountKey: String, account: UUID,
-					secrets: ZagFreeAccountSecretStore, keys: ZagSigningKeyFactory, bundleIdentifier: String, deviceUDID: String,
+					secrets: ZagFreeAccountSecretStore, keys: ZagKeychainSigningKeyFactory, bundleIdentifier: String, deviceUDID: String,
 					campaign: ZagLiveExperimentCampaign, approvals: ZagExistingAccountApprovals,
 					limits: ZagTeamLimits = .free, now: @Sendable () -> Date = { Date() }) async throws -> Assessment {
 		try campaign.checkAccount(accountKey)
 		try campaign.authorize(.portalRead)
 		let inventory = await read(reader, team: team, teamCount: teamCount)
-		let local = localKeys(secrets: secrets, keys: keys, account: account, team: team.identifier)
+		let local = localKeys(secrets: secrets, keys: keys, lookup: keys.keys, account: account, team: team.identifier)
 		let assessment = evaluate(inventory, local: local, bundleIdentifier: bundleIdentifier, deviceUDID: deviceUDID, limits: limits, now: now())
 		try campaign.acceptExistingAccountPreflight(accountKey: accountKey, team: team.identifier, assessment: assessment)
 		try approvals.recordPreflight(accountKey: accountKey, team: team.identifier, required: assessment.required)
