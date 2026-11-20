@@ -142,6 +142,20 @@ mod tests {
         assert_eq!(result, Err(SessionError::Timeout));
     }
     #[test]
+    fn rejects_noncanonical_worker_path() {
+        let result = run_mock_session(Path::new("/definitely/not/a/worker"), &[],
+            "{\"type\":\"start\"}\n", "{\"type\":\"finish\"}\n", Duration::from_secs(1));
+        assert_eq!(result, Err(SessionError::Spawn));
+    }
+    #[test]
+    fn rejects_zero_or_excessive_deadlines_before_spawn() {
+        for timeout in [Duration::ZERO, Duration::from_secs(11)] {
+            let result = run_mock_session(Path::new("/definitely/not/a/worker"), &[],
+                "{\"type\":\"start\"}\n", "{\"type\":\"finish\"}\n", timeout);
+            assert_eq!(result, Err(SessionError::InvalidTimeout));
+        }
+    }
+    #[test]
     fn unexpected_response_fails_closed() {
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
             &["-c", "read a; echo '{\"type\":\"finished\"}'"],
