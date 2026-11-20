@@ -253,6 +253,25 @@ mod tests {
         assert_eq!(result, Err(SessionError::Timeout));
     }
     #[test]
+    fn malformed_worker_frame_fails_closed() {
+        let script = "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\000\\000'";
+        let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
+            &["-c", script],
+            r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+            r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+            Duration::from_secs(1));
+        assert_eq!(result, Err(SessionError::InvalidResponse));
+    }
+    #[test]
+    fn worker_exit_before_start_reply_fails_closed() {
+        let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
+            &["-c", "exit 0"],
+            r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+            r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+            Duration::from_secs(1));
+        assert!(matches!(result, Err(SessionError::Transport) | Err(SessionError::InvalidResponse)));
+    }
+    #[test]
     fn rejects_noncanonical_worker_path() {
         let result = run_mock_session(Path::new("/definitely/not/a/worker"), &[],
             "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_secs(1));
