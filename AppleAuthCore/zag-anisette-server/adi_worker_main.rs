@@ -243,11 +243,11 @@ fn encode_native_bytes(bytes: &[u8]) -> io::Result<String> {
 /// Reject malformed, noncanonical and oversized material before native calls.
 #[cfg(test)]
 fn decode_native_bytes(encoded: &str) -> io::Result<Vec<u8>> {
-    if encoded.is_empty() || encoded.len() % 2 != 0 || encoded.len() > MAX_MESSAGE_BYTES - 128 {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) || encoded.len() > MAX_MESSAGE_BYTES - 128 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid encoded material length"));
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    for pair in encoded.as_bytes().as_chunks::<2>().0 {
         let digit = |byte: u8| -> Option<u8> {
             match byte {
                 b'0'..=b'9' => Some(byte - b'0'),
