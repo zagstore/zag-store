@@ -224,6 +224,8 @@ pub fn provision_with_worker(
     let start_reply = http.post(start_url.as_str(), &start_body, end)?;
     let spim = decoded_field(dictionary_field(&start_reply, "Response")?, "spim")?;
 
+    // Do not start a native worker once the Apple exchange budget has expired.
+    remaining(end)?;
     let mut child = Command::new(worker_binary)
         .arg(runtime_root)
         .arg("--native-v2-session")
@@ -239,7 +241,9 @@ pub fn provision_with_worker(
     let mut stdin = Some(child.stdin.take().ok_or_else(transport)?);
     let mut stdout = child.stdout.take().ok_or_else(transport)?;
     let abort = Arc::new(AtomicBool::new(false));
-    let supervisor = supervise_child(child, WORKER_DEADLINE, Arc::clone(&abort));
+    // The native worker cannot outlive the remaining exchange budget.
+    let worker_budget = WORKER_DEADLINE.min(remaining(end)?);
+    let supervisor = supervise_child(child, worker_budget, Arc::clone(&abort));
     let result = (|| {
         let start = Request::Start { identifier: "-2".into(), spim };
         remaining(end)?;
@@ -249,6 +253,7 @@ pub fn provision_with_worker(
             Response::Started(data) => data,
             _ => return Err(invalid("worker rejected Start")),
         };
+        remaining(end)?;
         let body = finish_request(&cpim)?;
         let finish_reply = http.post(finish_url.as_str(), &body, end)?;
         let reply = dictionary_field(&finish_reply, "Response")?;
@@ -263,6 +268,7 @@ pub fn provision_with_worker(
             Response::Finished(data) => data,
             _ => return Err(invalid("worker rejected Finish")),
         };
+        remaining(end)?;
         let mut extra = [0u8; 1];
         if stdout.read(&mut extra)? != 0 { return Err(invalid("worker trailing output")); }
         Ok(adi_pb)
@@ -273,6 +279,7 @@ pub fn provision_with_worker(
     let (status, timed_out) = supervisor.join().map_err(|_| transport())??;
     if timed_out { return Err(io::Error::new(io::ErrorKind::TimedOut, "native worker deadline exceeded")); }
     if !status.success() { return Err(transport()); }
+    remaining(end)?;
     result
 }
 
@@ -306,6 +313,14 @@ mod tests {
         let (status, timed_out) = worker.join().unwrap().unwrap();
         assert!(status.success());
         assert!(!timed_out);
+    }
+
+    #[test]
+    fn worker_budget_is_never_longer_than_exchange_budget() {
+        let end = Instant::now() + Duration::from_millis(500);
+        let budget = WORKER_DEADLINE.min(remaining(end).unwrap());
+        assert!(budget <= Duration::from_millis(500));
+        assert!(budget <= WORKER_DEADLINE);
     }
 
     #[test]
