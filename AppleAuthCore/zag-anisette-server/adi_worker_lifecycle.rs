@@ -145,6 +145,26 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn worker_leaving_stdout_open_cannot_block_past_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        // The parent process exits promptly, but its child retains the
+        // stdout descriptor. No IPC frame is produced.
+        let dir = std::env::temp_dir().join(format!("zag-adi-lifecycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&script).unwrap().permissions();
+        mode.set_mode(0o700);
+        std::fs::set_permissions(&script, mode).unwrap();
+        let started = Instant::now();
+        let result = execute_offline_worker(&script, &script, &request(), Duration::from_millis(100));
+        assert!(result.is_err(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "worker deadline exceeded");
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
     fn nonzero_worker_cannot_produce_success() {
         let result = execute_offline_worker(Path::new("/usr/bin/false"), Path::new("/usr/bin/false"), &request(), Duration::from_secs(1));
         assert!(result.is_err());
