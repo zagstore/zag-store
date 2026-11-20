@@ -6,7 +6,8 @@ Status: **review-only; NOT approved for production**. The HTTP listener remains 
 
 - Exact approved absolute canonical executable path; no symlink at the executable.
 - Unix executable must not be group/world writable, and its ancestors are checked for writable permissions (with a root-owned sticky-directory exception).
-- Non-test Unix builds require a root-owned executable. Tests use disposable user-owned fixtures.
+- Non-test Unix builds require a root-owned executable and root-owned ancestor directories. Tests use disposable user-owned fixtures.
+- On macOS, temporary test paths must be canonicalized because `/var` resolves through `/private/var`; validation intentionally rejects aliases.
 - Executable device/inode is rechecked immediately before spawn.
 - Child receives an empty environment and a fixed working directory; IPC is bounded and requires one complete response followed by EOF.
 - Child process group is killed on completion or timeout. This is not a sandbox: descendants can create new sessions or otherwise evade group cleanup.
