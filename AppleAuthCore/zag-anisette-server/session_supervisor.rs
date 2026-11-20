@@ -26,23 +26,28 @@ fn kill_group(pid: u32) {
     }
 }
 
-/// Test-only admission control shared by all mock sessions in this process.
-/// The counter is released by RAII on every return path, including failures.
-static ACTIVE_MOCK_SESSIONS: AtomicUsize = AtomicUsize::new(0);
-const MAX_MOCK_SESSIONS: usize = 32;
-
-struct SessionPermit;
-impl SessionPermit {
-    fn acquire() -> Result<Self, SessionError> {
-        ACTIVE_MOCK_SESSIONS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-            |active| (active < MAX_MOCK_SESSIONS).then_some(active + 1))
+/// Offline-only admission limiter. Test-local instances permit deterministic
+/// saturation tests without competing with Rust's parallel test runner.
+struct SessionLimiter {
+    active: AtomicUsize,
+    maximum: usize,
+}
+impl SessionLimiter {
+    const fn new(maximum: usize) -> Self {
+        Self { active: AtomicUsize::new(0), maximum }
+    }
+    fn acquire(&self) -> Result<SessionPermit<'_>, SessionError> {
+        self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |active| (active < self.maximum).then_some(active + 1))
             .map_err(|_| SessionError::Busy)?;
-        Ok(Self)
+        Ok(SessionPermit(self))
     }
 }
-impl Drop for SessionPermit {
+static MOCK_SESSION_LIMITER: SessionLimiter = SessionLimiter::new(32);
+struct SessionPermit<'a>(&'a SessionLimiter);
+impl Drop for SessionPermit<'_> {
     fn drop(&mut self) {
-        ACTIVE_MOCK_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -104,7 +109,7 @@ pub fn run_mock_session_cancellable(
     cancel: &AtomicBool,
 ) -> Result<(serde_json::Value, serde_json::Value), SessionError> {
     if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
-    let _permit = SessionPermit::acquire()?;
+    let _permit = MOCK_SESSION_LIMITER.acquire()?;
     if timeout.is_zero() || timeout > Duration::from_secs(10) {
         return Err(SessionError::InvalidTimeout);
     }
@@ -253,6 +258,20 @@ pub fn decode_session_frame<R: std::io::Read>(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn local_admission_limiter_rejects_excess_and_recovers() {
+        let limiter = SessionLimiter::new(2);
+        let first = limiter.acquire().unwrap();
+        let second = limiter.acquire().unwrap();
+        assert!(matches!(limiter.acquire(), Err(SessionError::Busy)));
+        drop(first);
+        let third = limiter.acquire().unwrap();
+        assert!(matches!(limiter.acquire(), Err(SessionError::Busy)));
+        drop(second);
+        drop(third);
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+        assert!(limiter.acquire().is_ok());
+    }
     #[test]
     fn strict_frames_roundtrip_in_phase_order() {
         let start = serde_json::json!({"type":"started","cpim":"mock"});
