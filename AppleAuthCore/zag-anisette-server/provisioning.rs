@@ -211,6 +211,44 @@ pub fn process_text_frame<B: ProvisioningBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn offline_worker_adapter_completes_both_provisioning_phases() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "zag-adi-adapter-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        // The shell fixture consumes framed IPC and selects a response by
+        // request phase; no Apple provisioning or network access occurs.
+        let body = r#"#!/bin/sh
+input=$(cat)
+case "$input" in
+  *'"type":"finish"'*) printf '\000\000\000\061%s' '{"version":1,"type":"finished","adi_pb":"adi_pb"}' ;;
+  *'"type":"start"'*) printf '\000\000\000\054%s' '{"version":1,"type":"started","cpim":"cpim"}' ;;
+  *) exit 1 ;;
+esac
+"#;
+        std::fs::write(&script, body).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let provider = OfflineWorkerAdiProvider::new(
+            script.clone(), std::time::Duration::from_secs(2),
+        );
+        let mut session = Session::new(AdiBackend::new(provider));
+        assert_eq!(session.receive(ClientMessage::Identifier("device".into())),
+            Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("spim".into())),
+            Ok(ServerMessage::GiveEndProvisioningData { cpim: "cpim".into() }));
+        assert_eq!(session.receive(ClientMessage::Finish { ptm: "ptm".into(), tk: "tk".into() }),
+            Ok(ServerMessage::ProvisioningSuccess { adi_pb: "adi_pb".into() }));
+        assert_eq!(session.phase(), Phase::Complete);
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
     #[test] fn offline_worker_adapter_fails_closed_without_approved_executable() {
         let provider = OfflineWorkerAdiProvider::new(
             std::path::PathBuf::from("/nonexistent/zag-adi-worker"),
