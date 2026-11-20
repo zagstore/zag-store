@@ -60,5 +60,6 @@ mod tests {
     #[test] fn get_cannot_provision() { assert!(String::from_utf8(route(b"GET /v3/get_headers HTTP/1.1\r\n")).unwrap().contains("405 Method Not Allowed")); }
     #[test] fn client_info_is_offline() { assert!(String::from_utf8(route(b"GET /v3/client_info HTTP/1.1\r\n")).unwrap().contains("503 Service Unavailable")); }
     #[test] fn websocket_upgrade_is_disabled() { assert!(String::from_utf8(route(b"GET /v3/provisioning_session HTTP/1.1\r\n")).unwrap().contains("503 Service Unavailable")); }
+    #[test] fn client_info_post_is_rejected() { assert!(String::from_utf8(route(b"POST /v3/client_info HTTP/1.1\\r\\n")).unwrap().contains("405 Method Not Allowed")); }
     #[test] fn no_public_routes() { assert!(String::from_utf8(route(b"GET / HTTP/1.1\r\n")).unwrap().contains("404 Not Found")); }
 }
