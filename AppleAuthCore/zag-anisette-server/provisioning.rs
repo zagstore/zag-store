@@ -75,6 +75,36 @@ impl<B: ProvisioningBackend> Session<B> {
         }
     }
 }
+
+/// Decodes only the messages expected from Zag's existing v3 client.
+/// The session state machine separately rejects out-of-order messages.
+pub fn decode_client_message(text: &str) -> Result<ClientMessage, ProtocolError> {
+    if text.len() > 65536 { return Err(ProtocolError::InvalidField); }
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| ProtocolError::InvalidField)?;
+    let object = value.as_object().ok_or(ProtocolError::InvalidField)?;
+    let read = |key: &str| -> Result<String, ProtocolError> {
+        let s = object.get(key).and_then(serde_json::Value::as_str).ok_or(ProtocolError::InvalidField)?;
+        if !field_ok(s) { return Err(ProtocolError::InvalidField); }
+        Ok(s.to_owned())
+    };
+    match object.len() {
+        1 if object.contains_key("identifier") => Ok(ClientMessage::Identifier(read("identifier")?)),
+        1 if object.contains_key("spim") => Ok(ClientMessage::Spim(read("spim")?)),
+        2 if object.contains_key("ptm") && object.contains_key("tk") => Ok(ClientMessage::Finish { ptm: read("ptm")?, tk: read("tk")? }),
+        _ => Err(ProtocolError::InvalidField),
+    }
+}
+
+/// Exact JSON result tags expected by remote_v3/mod.rs.
+pub fn encode_server_message(msg: &ServerMessage) -> String {
+    match msg {
+        ServerMessage::GiveIdentifier => serde_json::json!({"result":"GiveIdentifier"}).to_string(),
+        ServerMessage::GiveStartProvisioningData => serde_json::json!({"result":"GiveStartProvisioningData"}).to_string(),
+        ServerMessage::GiveEndProvisioningData { cpim } => serde_json::json!({"result":"GiveEndProvisioningData","cpim":cpim}).to_string(),
+        ServerMessage::ProvisioningSuccess { adi_pb } => serde_json::json!({"result":"ProvisioningSuccess","adi_pb":adi_pb}).to_string(),
+    }
+}
+
 // Intentionally not wired to HTTP or WebSocket: no mock data may be returned
 // as valid Apple provisioning output.
 #[cfg(test)]
@@ -107,6 +137,21 @@ mod tests {
         assert_eq!(session.receive(ClientMessage::Finish { ptm: "ptm".into(), tk: "tk".into() }), Ok(ServerMessage::ProvisioningSuccess { adi_pb: "adi_pb".into() }));
         assert_eq!(session.phase(), Phase::Complete);
         assert_eq!(session.receive(ClientMessage::Identifier("id".into())), Err(ProtocolError::InvalidTransition));
+    }
+    #[test] fn wire_messages_match_client() {
+        assert_eq!(encode_server_message(&ServerMessage::GiveIdentifier), r#"{"result":"GiveIdentifier"}"#);
+        assert_eq!(encode_server_message(&ServerMessage::GiveStartProvisioningData), r#"{"result":"GiveStartProvisioningData"}"#);
+        let cpim: serde_json::Value = serde_json::from_str(&encode_server_message(&ServerMessage::GiveEndProvisioningData { cpim: "test".into() })).unwrap();
+        assert_eq!(cpim["result"], "GiveEndProvisioningData");
+        assert_eq!(cpim["cpim"], "test");
+        assert_eq!(decode_client_message(r#"{"identifier":"abc"}"#), Ok(ClientMessage::Identifier("abc".into())));
+        assert_eq!(decode_client_message(r#"{"spim":"xyz"}"#), Ok(ClientMessage::Spim("xyz".into())));
+        assert_eq!(decode_client_message(r#"{"ptm":"p","tk":"t"}"#), Ok(ClientMessage::Finish { ptm: "p".into(), tk: "t".into() }));
+    }
+    #[test] fn invalid_wire_messages_fail_closed() {
+        for message in [r#"{}"#, r#"[]"#, r#"{"spim":null}"#, r#"{"spim":""}"#, r#"{"identifier":"x","extra":1}"#, r#"{"ptm":"x"}"#, r#"{"ptm":"x","tk":"y","identifier":"z"}"#] {
+            assert_eq!(decode_client_message(message), Err(ProtocolError::InvalidField), "{message}");
+        }
     }
     #[test] fn out_of_order_rejected() {
         let mut session = Session::new(OfflineBackend);
