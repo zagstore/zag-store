@@ -2,7 +2,9 @@
 //! Owns the child handle and reaps it on deadline; never signals a raw PID.
 //! Not wired to the production service or a live provisioning CLI.
 use std::io;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
+#[cfg(test)]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use std::thread;
 
