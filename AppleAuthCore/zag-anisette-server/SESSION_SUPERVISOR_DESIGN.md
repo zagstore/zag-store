@@ -1,6 +1,6 @@
 # Offline session supervisor — implementation contract
 
-Status: **design gate; not implemented or production approved** (2026-11-20).
+Status: **offline test-only supervisor prototype implemented; not production approved** (2026-11-20).
 
 ## Existing protections to reuse
 
@@ -18,12 +18,37 @@ Status: **design gate; not implemented or production approved** (2026-11-20).
 6. Bound simultaneous workers, session lifetime and memory; never log identifier, SPIM, PTM, TK, CPIM or adi.pb. No persistence or filesystem access in the mock. For a native backend, provision per-session private storage and ensure it is deleted after both success and failure.
 7. Provide deterministic Linux/macOS tests: Start→Finish success; cancellation; idle input; hung Start; hung Finish; truncated frame; extra frame; worker exit; child descendant holding stdout open; and a session attempting to cross-talk with another.
 
-## Unresolved before implementation
+## Current implementation status
 
-- The prototype currently uses `serde_json::Value` and a newline-delimited format, while the existing worker uses strict versioned length framing. Avoid adding a third production wire format.
-- On Unix, process groups are cleanup aids, **not** a sandbox. A malicious child can escape its group; production isolation needs a separate review.
-- A verified executable path is not race-free execution. Root-controlled immutable deployment or descriptor-bound execution remains necessary.
-- MacOS and Linux native library availability, licensing and native state destruction have not been approved.
+`session_supervisor.rs` now provides an offline, test-only, single-child
+Start→Started→Finish→Finished supervisor. It uses the existing four-byte
+big-endian bounded framing and the canonical v1 worker request/response
+decoder, a parent monotonic deadline, separate read/write threads,
+process-group termination, and leader reaping. Both phases share one child.
+The mock fixture is a shell subprocess; it is **not** the native ADI backend.
+
+The original `session_worker.rs` remains a separate test-only mock with
+newline framing; it is not an alternative production wire protocol.
+
+The one-shot and session launchers now recheck executable device/inode
+identity immediately before spawning. This narrows, but does not close,
+path-to-execution races.
+
+## Remaining blocking requirements
+
+- Provide a real long-lived native worker and a session-scoped private
+  native handle; the current standalone `zag-adi-worker` intentionally
+  returns `backend_unavailable` and is one-request-only.
+- Implement cancellation/disconnect propagation, worker concurrency caps,
+  and a bounded native session storage lifecycle.
+- Extend subprocess regression coverage to hung Finish, extra frames,
+  inherited stdout from descendants, and session cross-talk.
+- Review descriptor-bound execution or immutable root-controlled deployment;
+  process groups alone are not sandboxing.
+- Verify native library availability, redistribution/licensing, cleanup,
+  and OS-specific isolation on macOS and Linux.
+- The latest identity and deadline changes require green CI before the
+  prototype can be treated as a stable offline handoff.
 
 ## Release gate
 
