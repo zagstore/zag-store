@@ -6,11 +6,14 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use plist::{Dictionary, Value};
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::thread;
 use url::Url;
 
 const LOOKUP: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 const MAX_HTTP_BYTES: usize = 128 * 1024;
+const WORKER_DEADLINE: Duration = Duration::from_secs(45);
 const MAX_BINARY_BYTES: usize = 12 * 1024;
 const MAX_FRAME: usize = wire::MAX_FRAME;
 
@@ -179,6 +182,23 @@ pub fn provision_with_worker(
         .stdin(Stdio::piped()).stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn().map_err(|_| transport())?;
+    // A native library or pipe read can block indefinitely. Keep the child
+    // in a separate process group, and terminate it on a hard deadline.
+    // The watchdog is joined before the process handle is released.
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog_finished = Arc::clone(&finished);
+    let child_pid = child.id();
+    let watchdog = thread::spawn(move || {
+        let deadline = Instant::now() + WORKER_DEADLINE;
+        while !watchdog_finished.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                // Child remains owned by the caller until watchdog joins.
+                unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    });
     let result = (|| {
         let mut stdin = child.stdin.take().ok_or_else(transport)?;
         let mut stdout = child.stdout.take().ok_or_else(transport)?;
@@ -211,6 +231,8 @@ pub fn provision_with_worker(
         let _ = child.kill();
         let _ = child.wait();
     }
+    finished.store(true, Ordering::Release);
+    let _ = watchdog.join();
     result
 }
 
