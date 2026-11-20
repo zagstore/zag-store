@@ -98,15 +98,6 @@ pub(crate) fn verify_worker_executable(
             return Err(WorkerError::UnapprovedExecutable);
         }
     }
-    // Revalidate the executable's identity immediately before spawn. This
-    // narrows but does NOT close the verification-to-execution race; only
-    // descriptor-bound execution or immutable trusted deployment can do so.
-    #[cfg(unix)]
-    let checked_identity = {
-        let metadata = std::fs::metadata(approved)
-            .map_err(|_| WorkerError::UnapprovedExecutable)?;
-        (metadata.dev(), metadata.ino())
-    };
     // A worker controlled by the same unprivileged account can be modified
     // without changing its inode. Require trusted ownership for deployment.
     // Test fixtures intentionally remain user-owned in test builds.
