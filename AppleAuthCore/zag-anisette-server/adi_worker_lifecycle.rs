@@ -80,8 +80,8 @@ pub fn execute_offline_worker(
         return Err(WorkerError::UnapprovedExecutable);
     }
     // Audit every ancestor, not just the immediate parent. A root-owned
-    // sticky directory (such as /tmp) cannot have another user's entries
-    // renamed by an unprivileged peer; all other writable ancestors fail.
+    // sticky directory (such as /tmp) protects entries from other
+    // unprivileged users; all other writable ancestors fail.
     // This is still a path-based check, not race-free file-descriptor exec.
     #[cfg(unix)]
     for ancestor in approved.ancestors().skip(1) {
@@ -93,7 +93,7 @@ pub fn execute_offline_worker(
         let mode = metadata.mode();
         let writable = mode & 0o022 != 0;
         let trusted_sticky = metadata.uid() == 0 && mode & 0o1000 != 0
-            && mode & 0o002 != 0 && mode & 0o020 == 0;
+            && mode & 0o002 != 0;
         if writable && !trusted_sticky {
             return Err(WorkerError::UnapprovedExecutable);
         }
