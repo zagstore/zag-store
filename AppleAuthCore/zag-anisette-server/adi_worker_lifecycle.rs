@@ -207,9 +207,9 @@ mod tests {
         let script = dir.join("worker.sh");
         let marker = dir.join("escaped");
         let body = format!(
-            "#!/bin/sh\\n(sleep 0.3; echo escaped > '{}') &\\nsleep 5\\n",
+            "#!/bin/sh\n(sleep 0.3; echo escaped > '{}') &\nsleep 5\n",
             marker.display()
-        ).replace("\\\\n", "\\n");
+        );
         std::fs::write(&script, body).unwrap();
         let mut mode = std::fs::metadata(&script).unwrap().permissions();
         mode.set_mode(0o700);
