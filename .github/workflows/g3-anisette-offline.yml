@@ -151,6 +151,11 @@ jobs:
                   child.kill()
                   child.wait(timeout=5)
           PY
+      - name: Compile and test isolated native ABI/v2 probe (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --manifest-path tools/native-adi-loader-probe/Cargo.toml
+          cargo test --manifest-path tools/native-adi-loader-probe/Cargo.toml
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Offline provisioning adapter against compiled worker
