@@ -208,6 +208,36 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn writable_grandparent_directory_is_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "zag-adi-ancestor-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        let nested = root.join("protected");
+        std::fs::create_dir_all(&nested).unwrap();
+        let script = nested.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut executable = std::fs::metadata(&script).unwrap().permissions();
+        executable.set_mode(0o700);
+        std::fs::set_permissions(&script, executable).unwrap();
+        let mut parent = std::fs::metadata(&nested).unwrap().permissions();
+        parent.set_mode(0o700);
+        std::fs::set_permissions(&nested, parent).unwrap();
+        let mut ancestor = std::fs::metadata(&root).unwrap().permissions();
+        ancestor.set_mode(0o777);
+        std::fs::set_permissions(&root, ancestor).unwrap();
+        assert_eq!(
+            execute_offline_worker(&script, &script, &request(), Duration::from_secs(1)),
+            Err(WorkerError::UnapprovedExecutable)
+        );
+        let mut ancestor = std::fs::metadata(&root).unwrap().permissions();
+        ancestor.set_mode(0o700);
+        std::fs::set_permissions(&root, ancestor).unwrap();
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(nested).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
     fn writable_worker_directory_is_rejected() {
         let dir = std::env::temp_dir().join(format!(
             "zag-adi-dir-perms-{}-{:?}", std::process::id(), std::thread::current().id()
