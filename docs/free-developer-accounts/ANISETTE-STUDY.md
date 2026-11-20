@@ -109,3 +109,45 @@ Deployment constraints:
 - Run offline/static tests, HTTPS and transport checks first. Any v3 provisioning compatibility test that contacts Apple is separately gated; no live test or campaign authorisation is implied.
 - Pin the approved host in the experiment allowlist, without changing production defaults. Record deployment configuration, rollback and health checks without secrets.
 - G3 remains **open** until compatibility, privacy and operational review are documented and the owner approves the exact HTTPS endpoint. G2 and G4 remain separate gates.
+
+## Self-hosting assessment, 20 November 2026 (not deployed)
+
+The owner's direction above was followed until it reached the blockers below. **Nothing was installed or changed on `zagstore-prod-01`, and nothing contacted Apple. G3 stays open.**
+
+### Server and DNS (read-only inspection)
+
+- **Server:** `zagstore-prod-01` runs Ubuntu 26.04.1 with 2 vCPUs. It has about 2.1 GB of memory available and 15 GB of disk free.
+- **Installed tools:** Docker, Nginx (active), certbot and ufw.
+- **Existing sites:** `zagstore.app`, `preview.zagstore.app` (Let's Encrypt), `push.zagstore.app` (Cloudflare origin certificate) and a local `zagstore-preview` on 127.0.0.1:8443.
+- **Access:** the deploying user has no passwordless sudo and is not in the `docker` group, and `/etc/nginx/ssl` and `/etc/letsencrypt/live` are root-only. Every install step is the owner's, as with earlier deployments.
+- **DNS:** `anisette.zagstore.app` does **not** exist. The Cloudflare authoritative server returns no answer, and there is no wildcard. The zone is on Cloudflare.
+
+### Candidates
+
+| Candidate | Source checked | Licence | Activity | v3 protocol |
+|---|---|---|---|---|
+| `Dadoum/anisette-v3-server` (D, vibe.d) | `source/app.d` at `684895737aaf` | **none** (no licence file: no grant to copy, run or modify) | last commit 23 Sep 2026 | matches the fork's client: the same endpoints and `result` tags |
+| `Dadoum/Provision` (its ADI library) | repository | LGPL-2.0 (`COPYING-LGPLv2`) | 23 Jun 2025 | — |
+| `SideStore/omnisette-server` (Rust) | README, `Cargo.toml` at `243933525a0d` | **none** | 17 Apr 2026 | v3 (not traced) |
+| `SideStore/apple-private-apis` (its omnisette library) | repository | MPL-2.0 | 14 Nov 2024 | — |
+
+Protocol messages that do not decode in the fork's client (`Timeout`, `InvalidIdentifier`, `StartProvisioningError`) end the attempt as a stop. That is fail-closed.
+
+### Blockers
+
+1. **No licensed server.** Neither maintained v3 server carries a licence, so deploying or modifying either needs the author's permission. That is a G2 question, not an infrastructure one.
+2. **Apple's proprietary libraries.** Every v3 server needs `libCoreADI.so` and `libstoreservicescore.so` from Apple's Android Apple Music APK, downloaded from `apps.mzstatic.com`. Whether they may be used this way is a G2 question under Apple's terms. Obtaining them contacts Apple.
+3. **`anisette-v3-server` contacts Apple at every first start.** It downloads the APK, then provisions a server-side v1 machine (`provisioningSession.provision`, with failures swallowed). This cannot be turned off without changing the code, which blocker 1 prevents. It is Apple provisioning, which this step forbids.
+4. **Privacy defects in that server as published:**
+   - it logs each client's anisette identifier (`Correct identifier (%s)`);
+   - it logs the full v1 header set;
+   - it serves an unauthenticated v1 endpoint at `/` that provisions with Apple on demand.
+
+   Discarding stdout and proxying only `/v3/*` would contain these without code changes. The `adi.pb` it receives is written to a per-request folder and deleted (`rmdirRecurse` in `finally`); nothing else persists per client.
+5. **DNS and TLS (owner).** The record must be created in Cloudflare. Proxied ("orange cloud") means Cloudflare terminates TLS and sees every request, including `adi_pb` and the identifier. DNS-only with a Let's Encrypt certificate on the origin keeps that between the iPhone and the server. This is a privacy decision for the owner.
+
+### What would unblock it
+
+- **G2:** written permission or a licence from the server's author, and a decision on Apple's libraries. Alternatively, a server written for Zag Store; that is new implementation and needs its own approval, and it would still need Apple's libraries.
+- **Separate approval** for the one-time library download from Apple, and for the server's own provisioning, if a server that does it is chosen.
+- **Owner:** the DNS record (proxied or DNS-only), and root for the service, Nginx site, certificate and firewall.
