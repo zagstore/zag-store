@@ -183,6 +183,13 @@ fn write_material<W: Write>(output: &mut W, material: SessionMaterial) -> io::Re
 
 /// Reusable typed session driver. This is not reachable from the release
 /// executable until native provider provenance and launch security are reviewed.
+fn validate_material(value: &str) -> io::Result<()> {
+    if value.is_empty() || value.len() > MAX_MESSAGE_BYTES || value.chars().any(char::is_control) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid provider material"));
+    }
+    Ok(())
+}
+
 fn run_typed_session<R: Read, W: Write, B: StatefulMaterialBackend>(
     input: &mut R, output: &mut W, mut backend: B,
 ) -> io::Result<()> {
@@ -192,6 +199,7 @@ fn run_typed_session<R: Read, W: Write, B: StatefulMaterialBackend>(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Start required"));
     };
     let cpim = backend.start(&identifier, &spim)?;
+    validate_material(&cpim)?;
     write_material(output, SessionMaterial::Started { cpim })?;
     let second = read_session_request(input)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing Finish"))?;
@@ -199,6 +207,7 @@ fn run_typed_session<R: Read, W: Write, B: StatefulMaterialBackend>(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Finish required"));
     };
     let adi_pb = backend.finish(&ptm, &tk)?;
+    validate_material(&adi_pb)?;
     let mut extra = [0u8; 1];
     if input.read(&mut extra)? != 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "extra input"));
