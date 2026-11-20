@@ -533,7 +533,17 @@ fn main() {
     // Fail closed without emitting secret-bearing diagnostics or stdout text.
     let result = match mode {
         1 => run_session(&mut io::stdin().lock(), &mut io::stdout().lock()),
-        2 => run_v2_native_session(&mut io::stdin().lock(), &mut io::stdout().lock(), DisabledV2Backend),
+        2 => {
+            let mut output = io::stdout().lock();
+            match run_v2_native_session(&mut io::stdin().lock(), &mut output, DisabledV2Backend) {
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    let reply = adi_worker_wire_v2::encode_response(&adi_worker_wire_v2::Response::Failed)
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid v2 failure response"));
+                    reply.and_then(|bytes| adi_worker_framing_v2_write(&mut output, &bytes))
+                }
+                result => result,
+            }
+        },
         _ => run(&mut io::stdin().lock(), &mut io::stdout().lock()),
     };
     if result.is_err() { std::process::exit(1); }
