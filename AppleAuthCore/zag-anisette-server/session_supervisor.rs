@@ -163,6 +163,33 @@ mod v2_boundary_tests {
     }
 
     #[test]
+    fn supervised_v2_cancels_while_child_is_blocked() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!("zag-v2-midcancel-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("v2-midcancel-fixture");
+        assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        let executable = std::fs::canonicalize(&executable).unwrap();
+        let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
+        let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let signal = std::sync::Arc::clone(&cancelled);
+        let notifier = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            signal.store(true, Ordering::Release);
+        });
+        let result = run_v2_session_cancellable(
+            &executable, &["--v2-stall"], &start, &finish,
+            Duration::from_secs(3), &cancelled,
+        );
+        notifier.join().unwrap();
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+        assert_eq!(result, Err(SessionError::Cancelled));
+    }
+
+    #[test]
     fn supervised_v2_times_out_and_reaps_stalled_child() {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/session_worker_fixture.rs");
