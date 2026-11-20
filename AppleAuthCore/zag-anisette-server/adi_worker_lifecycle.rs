@@ -248,7 +248,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writable_grandparent_directory_is_rejected() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "zag-adi-ancestor-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         let nested = root.join("protected");
@@ -278,7 +278,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writable_worker_directory_is_rejected() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "zag-adi-dir-perms-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -305,7 +305,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn group_or_world_writable_worker_is_rejected() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "zag-adi-permissions-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -336,7 +336,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // The parent process exits promptly, but its child retains the
         // stdout descriptor. No IPC frame is produced.
-        let dir = std::env::temp_dir().join(format!("zag-adi-lifecycle-{}", std::process::id()));
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("zag-adi-lifecycle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("worker.sh");
         std::fs::write(&script, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
@@ -356,7 +356,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // A background helper inherits the worker's process group. If only
         // the direct child is killed, the helper creates the marker later.
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "zag-adi-descendants-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn worker_does_not_inherit_environment_or_working_directory() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "zag-adi-env-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -416,7 +416,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn framed_worker_roundtrip_and_trailing_output_rejection() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "zag-adi-roundtrip-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
