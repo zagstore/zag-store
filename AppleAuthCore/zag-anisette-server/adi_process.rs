@@ -8,6 +8,7 @@ use std::{process::{Command, Stdio}, time::{Duration, Instant}};
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessError {
     Spawn,
+    UnapprovedExecutable,
     Timeout,
     NonZeroExit,
     UnexpectedOutput,
@@ -16,6 +17,27 @@ pub enum ProcessError {
 /// Run a fixed, caller-selected local test executable with no shell and no
 /// inherited stdin. Production integration requires a separate security review.
 /// Output is intentionally discarded: never expose provisioning secrets in logs.
+/// Production-facing policy boundary: only the explicitly configured absolute
+/// executable path can be probed. Never accept a request-supplied command.
+pub fn probe_approved_executable(
+    approved: &std::path::Path,
+    requested: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), ProcessError> {
+    if !approved.is_absolute() || !requested.is_absolute() || approved != requested {
+        return Err(ProcessError::UnapprovedExecutable);
+    }
+    let canonical_approved = approved.canonicalize().map_err(|_| ProcessError::UnapprovedExecutable)?;
+    if canonical_approved != approved {
+        return Err(ProcessError::UnapprovedExecutable);
+    }
+    let metadata = std::fs::symlink_metadata(approved).map_err(|_| ProcessError::UnapprovedExecutable)?;
+    if !metadata.file_type().is_file() {
+        return Err(ProcessError::UnapprovedExecutable);
+    }
+    probe_local_executable(approved.to_str().ok_or(ProcessError::UnapprovedExecutable)?, timeout)
+}
+
 pub fn probe_local_executable(executable: &str, timeout: Duration) -> Result<(), ProcessError> {
     if timeout.is_zero() || timeout > Duration::from_secs(10) {
         return Err(ProcessError::Timeout);
@@ -50,6 +72,27 @@ pub fn probe_local_executable(executable: &str, timeout: Duration) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn arbitrary_worker_path_is_rejected() {
+        use std::path::Path;
+        assert_eq!(
+            probe_approved_executable(Path::new("/usr/bin/true"), Path::new("/usr/bin/false"), Duration::from_secs(1)),
+            Err(ProcessError::UnapprovedExecutable)
+        );
+        assert_eq!(
+            probe_approved_executable(Path::new("true"), Path::new("true"), Duration::from_secs(1)),
+            Err(ProcessError::UnapprovedExecutable)
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn approved_local_worker_can_run() {
+        use std::path::Path;
+        assert_eq!(
+            probe_approved_executable(Path::new("/usr/bin/true"), Path::new("/usr/bin/true"), Duration::from_secs(1)),
+            Ok(())
+        );
+    }
     #[test]
     fn missing_executable_fails_closed() {
         assert_eq!(probe_local_executable("/nonexistent/zag-adi-provider", Duration::from_secs(1)), Err(ProcessError::Spawn));
