@@ -377,6 +377,60 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn typed_session_cleans_up_after_success_and_finish_failure() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct Tracked {
+            cleaned: Arc<AtomicUsize>,
+            fail_finish: bool,
+        }
+        impl StatefulMaterialBackend for Tracked {
+            fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
+                Ok("cpim".into())
+            }
+            fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
+                if self.fail_finish { Err(io::Error::other("finish failure")) }
+                else { Ok("adi".into()) }
+            }
+            fn abort(&mut self) { self.cleaned.fetch_add(1, Ordering::SeqCst); }
+        }
+        for fail_finish in [false, true] {
+            let cleaned = Arc::new(AtomicUsize::new(0));
+            let mut input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+            input.extend(frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#));
+            let mut output = Vec::new();
+            let result = run_typed_session(
+                &mut input.as_slice(), &mut output,
+                Tracked { cleaned: cleaned.clone(), fail_finish },
+            );
+            assert_eq!(result.is_err(), fail_finish);
+            assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+            let frames = output.windows(10).filter(|w| *w == b"\"type\":\"").count();
+            assert!(frames >= 1);
+        }
+    }
+
+    #[test]
+    fn typed_session_cleans_up_after_finish_first() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct Tracked(Arc<AtomicUsize>);
+        impl StatefulMaterialBackend for Tracked {
+            fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
+                panic!("invalid phase")
+            }
+            fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
+                panic!("invalid phase")
+            }
+            fn abort(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let input = frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#);
+        let mut output = Vec::new();
+        assert!(run_typed_session(&mut input.as_slice(), &mut output, Tracked(cleaned.clone())).is_err());
+        assert!(output.is_empty());
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn typed_session_cleans_up_provider_after_start_failure() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         struct Fail(Arc<AtomicUsize>);
