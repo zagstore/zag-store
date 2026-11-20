@@ -226,7 +226,8 @@ pub fn provision_with_worker(
 
     // Do not start a native worker once the Apple exchange budget has expired.
     let worker_budget = WORKER_DEADLINE.min(remaining(end)?);
-    let mut child = Command::new(worker_binary)
+    let mut worker_command = Command::new(worker_binary);
+    worker_command
         .arg(runtime_root)
         .arg("--native-v2-session")
         .arg(fresh_state_dir)
@@ -234,8 +235,28 @@ pub fn provision_with_worker(
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::piped()).stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn().map_err(|_| transport())?;
+        .stderr(Stdio::null());
+    // On Linux, the kernel kills the native worker if the isolated coordinator
+    // dies (including an external watchdog SIGKILL). No raw PID signaling or
+    // PID-reuse-sensitive cleanup is needed. Parent identity is rechecked after
+    // prctl to close the fork-to-prctl parent-exit race.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let coordinator_pid = unsafe { libc::getpid() };
+        unsafe {
+            worker_command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != coordinator_pid {
+                    return Err(io::Error::new(io::ErrorKind::Other, "coordinator exited"));
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = worker_command.spawn().map_err(|_| transport())?;
     // Extract pipes before transferring exclusive Child ownership to the
     // supervisor. All process termination/reaping occurs in that thread.
     let mut stdin = Some(child.stdin.take().ok_or_else(transport)?);
