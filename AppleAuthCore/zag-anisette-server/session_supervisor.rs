@@ -151,6 +151,38 @@ mod v2_boundary_tests {
     }
 
     #[test]
+    fn supervised_v2_rejects_pre_cancelled_session_without_spawning() {
+        let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
+        let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
+        let cancelled = AtomicBool::new(true);
+        let result = run_v2_session_cancellable(
+            Path::new("/definitely/not/a/worker"), &[], &start, &finish,
+            Duration::from_secs(1), &cancelled,
+        );
+        assert_eq!(result, Err(SessionError::Cancelled));
+    }
+
+    #[test]
+    fn supervised_v2_times_out_and_reaps_stalled_child() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!("zag-v2-supervised-stall-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("v2-supervised-stall-fixture");
+        assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
+        let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
+        let cancel = AtomicBool::new(false);
+        let result = run_v2_session_cancellable(
+            &std::fs::canonicalize(&executable).unwrap(), &["--v2-stall"],
+            &start, &finish, Duration::from_millis(200), &cancel,
+        );
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+        assert_eq!(result, Err(SessionError::Timeout));
+    }
+
+    #[test]
     fn v2_duplicate_response_fields_from_child_are_rejected() {
         use std::io::Write;
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
