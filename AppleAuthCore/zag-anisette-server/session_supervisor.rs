@@ -287,7 +287,6 @@ mod tests {
     }
     #[test]
     fn rejects_extra_frame_after_finish() {
-        let original = "dd bs=1 count=66 2>/dev/null >/dev/null; printf ";
         let script = concat!(
             "dd bs=1 count=66 2>/dev/null >/dev/null; ",
             "printf '\\000\\000\\000\\054{\\\"version\\\":1,\\\"type\\\":\\\"started\\\",\\\"cpim\\\":\\\"mock\\\"}'; ",
@@ -295,7 +294,6 @@ mod tests {
             "printf '\\000\\000\\000\\057{\\\"version\\\":1,\\\"type\\\":\\\"finished\\\",\\\"adi_pb\\\":\\\"mock\\\"}'; ",
             "printf '\\000\\000\\000\\057{\\\"version\\\":1,\\\"type\\\":\\\"finished\\\",\\\"adi_pb\\\":\\\"mock\\\"}'"
         );
-        let _ = original;
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
             &["-c", script],
             r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
