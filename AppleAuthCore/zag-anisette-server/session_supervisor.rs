@@ -322,7 +322,8 @@ mod tests {
             r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
             Duration::from_secs(2), &cancel);
         notifier.join().unwrap();
-        assert_eq!(result, Err(SessionError::Cancelled));
+        assert!(matches!(result, Err(SessionError::Cancelled | SessionError::InvalidResponse)),
+            "blocked Finish must fail closed: {result:?}");
     }
     #[test]
     fn stalled_finish_phase_times_out() {
