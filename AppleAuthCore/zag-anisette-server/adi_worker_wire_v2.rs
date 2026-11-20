@@ -8,7 +8,7 @@ use std::fmt;
 
 pub const VERSION: u64 = 2;
 pub const MAX_FRAME: usize = 64 * 1024;
-const MAX_BINARY: usize = (MAX_FRAME - 512) / 2;
+const MAX_BINARY: usize = (MAX_FRAME - 512) / 4;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WireError { Invalid, Oversized, Version, Phase }
@@ -55,7 +55,10 @@ fn material(obj: &BTreeMap<String, Value>, name: &str) -> Result<Vec<u8>, WireEr
 fn encode_hex(bytes: &[u8]) -> Result<String, WireError> {
     if bytes.is_empty() || bytes.len() > MAX_BINARY { return Err(WireError::Invalid); }
     let mut result = String::with_capacity(bytes.len() * 2);
-    for byte in bytes { result.push_str(&format!("{byte:02x}")); }
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut result, "{byte:02x}").map_err(|_| WireError::Invalid)?;
+    }
     Ok(result)
 }
 
