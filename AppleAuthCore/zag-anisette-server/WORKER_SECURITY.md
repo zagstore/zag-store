@@ -11,6 +11,7 @@ Status: **review-only; NOT approved for production**. The HTTP listener remains 
 - Executable device/inode is rechecked immediately before spawn.
 - Child receives an empty environment and a fixed working directory; IPC is bounded and requires one complete response followed by EOF.
 - Child process group is killed on completion or timeout. This is not a sandbox: descendants can create new sessions or otherwise evade group cleanup.
+- An opt-in `OfflineWorkerAdiProvider` now translates Start/Finish provisioning calls to worker IPC. It is not registered with the listener and returns `BackendUnavailable` on worker errors or unexpected replies.
 
 ## Critical unresolved risks
 
