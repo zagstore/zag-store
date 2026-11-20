@@ -143,21 +143,13 @@ fn write_unavailable<W: Write>(output: &mut W) -> io::Result<()> {
     output.flush()
 }
 
-/// Offline-only two-phase worker. The shared typed driver validates the
-/// phase sequence; the only configured provider always fails closed.
+/// Offline-only two-phase worker, using the same typed driver as a future
+/// native provider. The only configured provider always fails closed.
 fn run_session<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
-    // Do not convert protocol errors into a success-looking unavailable frame.
-    // A valid Start gets exactly one generic unavailable response.
-    let first = read_session_request(input)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::UnexpectedEof, "missing Start")
-    })?;
-    if !matches!(first, NativeRequest::Start { .. }) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Start required"));
+    match run_typed_session(input, output, DisabledMaterialBackend) {
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => write_unavailable(output),
+        result => result,
     }
-    // The disabled backend cannot emit CPIM or adi.pb. Re-encode the already
-    // validated Start for the shared driver without consuming more input.
-    let _ = first;
-    write_unavailable(output)
 }
 
 /// Typed output contract for an eventual reviewed native backend. The release
