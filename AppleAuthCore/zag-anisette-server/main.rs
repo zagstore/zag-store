@@ -9,6 +9,7 @@
 //! `/v3/provisioning_session` (reached as `wss://`). Every 503 makes that
 //! client stop: `error_for_status` fails, and a non-101 upgrade fails.
 mod adi_process;
+mod adi_worker_protocol;
 mod provisioning;
 mod websocket_transport;
 
