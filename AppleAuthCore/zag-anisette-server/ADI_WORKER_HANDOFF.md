@@ -36,3 +36,8 @@ The provider must reject invalid shapes, unknown versions, oversized frames, mal
 
 ## Suggested independent PR scope
 First PR: worker executable skeleton with strict IPC parsing and a disabled native-provider stub; full offline tests. Second PR: reviewed native ADI integration and session-state handling. Third PR: deployment hardening and explicit feature-gated listener integration. Do not collapse these gates into a production launch.
+
+## Existing Zag Store code and current boundary (reviewed 20 November 2026)
+- `Feather/Utilities/FreeAccount/ZagAnisetteProvider.swift` defines the Swift client-side anisette header validation and remote-provider settings. It is **not** a native ADI library or implementation.
+- `docs/free-developer-accounts/ANISETTE-STUDY.md` documents an availability-only study of a public remote provider. Its compatibility stage is explicitly not approved; do not treat this as native ADI validation.
+- No native ADI implementation or native ABI was identified in these inspected files. Before adding FFI, locate a concrete implementation with source provenance and review its licensing and state requirements.
