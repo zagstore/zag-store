@@ -225,7 +225,7 @@ pub fn provision_with_worker(
     let spim = decoded_field(dictionary_field(&start_reply, "Response")?, "spim")?;
 
     // Do not start a native worker once the Apple exchange budget has expired.
-    remaining(end)?;
+    let worker_budget = WORKER_DEADLINE.min(remaining(end)?);
     let mut child = Command::new(worker_binary)
         .arg(runtime_root)
         .arg("--native-v2-session")
@@ -242,7 +242,6 @@ pub fn provision_with_worker(
     let mut stdout = child.stdout.take().ok_or_else(transport)?;
     let abort = Arc::new(AtomicBool::new(false));
     // The native worker cannot outlive the remaining exchange budget.
-    let worker_budget = WORKER_DEADLINE.min(remaining(end)?);
     let supervisor = supervise_child(child, worker_budget, Arc::clone(&abort));
     let result = (|| {
         let start = Request::Start { identifier: "-2".into(), spim };
