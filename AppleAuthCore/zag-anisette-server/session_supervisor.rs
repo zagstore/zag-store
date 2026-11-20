@@ -138,28 +138,16 @@ mod v2_boundary_tests {
         std::fs::create_dir_all(&temp).unwrap();
         let executable = temp.join("v2-worker-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
-        let mut child = Command::new(std::fs::canonicalize(&executable).unwrap())
-            .arg("--v2").env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-            .spawn().unwrap();
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
         let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
-        let mut request = Vec::new();
-        crate::adi_worker_framing::write_frame(&mut request, &crate::adi_worker_wire_v2::encode_request(&start).unwrap()).unwrap();
-        stdin.write_all(&request).unwrap();
-        let started = crate::adi_worker_framing::read_frame(&mut stdout).unwrap();
-        request.clear();
-        crate::adi_worker_framing::write_frame(&mut request, &crate::adi_worker_wire_v2::encode_request(&finish).unwrap()).unwrap();
-        stdin.write_all(&request).unwrap();
-        drop(stdin);
-        let finished = crate::adi_worker_framing::read_frame(&mut stdout).unwrap();
-        let mut tail = Vec::new();
-        stdout.read_to_end(&mut tail).unwrap();
-        assert!(tail.is_empty(), "worker must emit exactly two frames");
-        assert!(child.wait().unwrap().success());
+        let cancel = AtomicBool::new(false);
+        let result = run_v2_session_cancellable(
+            &std::fs::canonicalize(&executable).unwrap(), &["--v2"],
+            &start, &finish, Duration::from_secs(5), &cancel,
+        );
         let _ = std::fs::remove_file(&executable);
         let _ = std::fs::remove_dir(&temp);
+        let (started, finished) = result.expect("supervised v2 exchange must complete");
         assert_eq!(validate_v2_exchange(&start, &started, &finish, &finished), Ok(()));
     }
 
