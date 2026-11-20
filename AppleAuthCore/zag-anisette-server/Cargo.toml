@@ -1,0 +1,15 @@
+[package]
+name = "zag-anisette-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "zag-anisette-server"
+path = "main.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
