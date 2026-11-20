@@ -36,6 +36,19 @@ fn run() -> io::Result<()> {
     }
     send(&mut output, r#"{"version":1,"type":"finished","adi_pb":"mock"}"#)
 }
+fn run_v2() -> io::Result<()> {
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    let start = read_frame(&mut input)?;
+    if start != r#"{"identifier":"-2","spim_hex":"00ff","type":"start","version":2}"# { return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 start")); }
+    send(&mut output, r#"{"version":2,"type":"started","cpim_hex":"00ff"}"#)?;
+    let finish = read_frame(&mut input)?;
+    if finish != r#"{"ptm_hex":"ff00","tk_hex":"80","type":"finish","version":2}"# { return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 finish")); }
+    let mut trailing = [0u8; 1];
+    if input.read(&mut trailing)? != 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 trailing")); }
+    send(&mut output, r#"{"version":2,"type":"finished","adi_pb_hex":"ff00"}"#)
+}
 fn main() {
-    if run().is_err() { std::process::exit(1); }
+    let result = if std::env::args().nth(1).as_deref() == Some("--v2") { run_v2() } else { run() };
+    if result.is_err() { std::process::exit(1); }
 }
