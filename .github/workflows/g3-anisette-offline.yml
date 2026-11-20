@@ -18,7 +18,11 @@ permissions:
 
 jobs:
   offline-rust:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 12
     defaults:
       run:
@@ -32,7 +36,7 @@ jobs:
       - name: Verify committed dependency lockfile
         run: |
           cargo metadata --locked --format-version 1 --no-deps > /dev/null
-          echo "7700574b51984624d6e2b8ad5585231ad08aabe2cf36f5d6792984a4e41b5c00  Cargo.lock" | sha256sum --check
+          test "$(shasum -a 256 Cargo.lock | awk '{print $1}')" = "7700574b51984624d6e2b8ad5585231ad08aabe2cf36f5d6792984a4e41b5c00"
       - name: Compile
         run: cargo build --release --locked
       - name: Test
