@@ -111,6 +111,14 @@ pub(crate) fn verify_worker_executable(
     Ok(())
 }
 
+/// Detect replacement of the approved worker between initial validation and
+/// the final pre-spawn check. This narrows but does not eliminate TOCTOU.
+#[cfg(unix)]
+pub(crate) fn worker_file_identity(path: &Path) -> Result<(u64, u64), WorkerError> {
+    let metadata = std::fs::metadata(path).map_err(|_| WorkerError::UnapprovedExecutable)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 /// Never accepts a command from the network or a request. Caller supplies a
 /// preapproved canonical absolute executable, checked again before launch.
 /// stderr is discarded and no payload or worker output is logged.
@@ -124,6 +132,8 @@ pub fn execute_offline_worker(
         return Err(WorkerError::InvalidTimeout);
     }
     verify_worker_executable(approved, requested)?;
+    #[cfg(unix)]
+    let initial_identity = worker_file_identity(approved)?;
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
     let mut command = Command::new(approved);
     // Do not leak the HTTP process's credentials, proxy settings, dynamic
@@ -137,6 +147,10 @@ pub fn execute_offline_worker(
     #[cfg(unix)]
     command.process_group(0);
     verify_worker_executable(approved, requested)?;
+    #[cfg(unix)]
+    if worker_file_identity(approved)? != initial_identity {
+        return Err(WorkerError::UnapprovedExecutable);
+    }
     let mut child = command.spawn().map_err(|_error| {
         // Error kind and OS code only; never print executable arguments,
         // provisioning payloads, paths, or environment values.
