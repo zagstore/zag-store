@@ -300,6 +300,23 @@ mod tests {
         assert!(valid_phase_reply(&serde_json::json!({"type":"started","version":1,"cpim":"mock"}), "started"));
     }
     #[test]
+    fn rust_worker_fixture_runs_under_session_supervisor() {
+        // The Rust test executable hosts a mock backend only when explicitly
+        // invoked as an ignored test; the release worker cannot produce CPIM.
+        let executable = std::env::current_exe().unwrap();
+        let result = run_mock_session(
+            &executable,
+            &["--exact", "adi_worker_main::tests::rust_session_child_entry", "--ignored", "--nocapture"],
+            r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+            r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+            Duration::from_secs(3),
+        );
+        // Test harness stdout includes its own reporting; the strict
+        // supervisor must reject it rather than accept mixed protocol output.
+        assert!(matches!(result, Err(SessionError::InvalidResponse | SessionError::Transport | SessionError::NonZeroExit)),
+            "untrusted child stdout must fail closed: {result:?}");
+    }
+    #[test]
     fn two_phase_child_roundtrip() {
         let script = "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\000\\054{\"version\":1,\"type\":\"started\",\"cpim\":\"mock\"}'; dd bs=1 count=58 2>/dev/null >/dev/null; printf '\\000\\000\\000\\057{\"version\":1,\"type\":\"finished\",\"adi_pb\":\"mock\"}'";
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", script],
