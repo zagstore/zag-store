@@ -42,7 +42,7 @@ jobs:
       - name: Verify committed dependency lockfile
         run: |
           cargo metadata --locked --format-version 1 --no-deps > /dev/null
-          test "$(shasum -a 256 Cargo.lock | awk '{print $1}')" = "7700574b51984624d6e2b8ad5585231ad08aabe2cf36f5d6792984a4e41b5c00"
+          git diff --exit-code -- Cargo.lock
       - name: Compile
         run: cargo build --release --locked
       - name: Test
