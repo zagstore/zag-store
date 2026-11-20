@@ -115,6 +115,7 @@ impl<B: NativeAdiBackend> NativeSession<B> {
 
 /// Read one bounded frame without requiring EOF, for a future long-lived
 /// session worker. This is deliberately separate from the one-shot parser.
+#[allow(dead_code)]
 fn read_session_request<R: Read>(reader: &mut R) -> io::Result<Option<NativeRequest>> {
     let mut header = [0u8; 4];
     let first = reader.read(&mut header[..1])?;
@@ -135,6 +136,7 @@ fn read_session_request<R: Read>(reader: &mut R) -> io::Result<Option<NativeRequ
     parse_request(&validated).map(Some)
 }
 
+#[allow(dead_code)]
 fn write_unavailable<W: Write>(output: &mut W) -> io::Result<()> {
     output.write_all(&(ERROR_RESPONSE.len() as u32).to_be_bytes())?;
     output.write_all(ERROR_RESPONSE)?;
