@@ -1,0 +1,39 @@
+name: G3 Anisette offline Rust validation
+
+on:
+  push:
+    branches:
+      - review/zag-anisette-server
+    paths:
+      - 'AppleAuthCore/zag-anisette-server/**'
+      - '.github/workflows/g3-anisette-offline.yml'
+  pull_request:
+    paths:
+      - 'AppleAuthCore/zag-anisette-server/**'
+      - '.github/workflows/g3-anisette-offline.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: AppleAuthCore/zag-anisette-server
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check dependency lockfile
+        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
+      - name: Compile
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
