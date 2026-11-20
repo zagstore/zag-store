@@ -88,3 +88,41 @@ impl AnisetteState {
         Uuid::from_bytes(self.keychain_identifier).to_string()
     }
 }
+
+#[cfg(test)]
+mod identity_contract_tests {
+    use super::*;
+
+    // Shared deterministic vector for the native ADI coordinator's identity
+    // contract. No Apple requests or real device identifiers are involved.
+    #[test]
+    fn identity_derivation_matches_native_coordinator_contract() {
+        let state = AnisetteState {
+            keychain_identifier: [
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            ],
+            adi_pb: None,
+        };
+        assert_eq!(state.get_device_id(), "00010203-0405-0607-0809-0a0b0c0d0e0f");
+        assert_eq!(
+            hex::encode(state.get_md_lu()),
+            "be45cb2605bf36bebde684841a28f0fd43c69850a3dce5fedba69928ee3a8991"
+        );
+        assert!(!state.is_provisioned());
+    }
+
+    #[test]
+    fn provisioning_material_does_not_change_identity() {
+        let mut state = AnisetteState {
+            keychain_identifier: [0x42; 16],
+            adi_pb: None,
+        };
+        let device_id = state.get_device_id();
+        let local_user = state.get_md_lu();
+        state.adi_pb = Some(vec![1, 2, 3]);
+        assert!(state.is_provisioned());
+        assert_eq!(state.get_device_id(), device_id);
+        assert_eq!(state.get_md_lu(), local_user);
+    }
+}
