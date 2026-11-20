@@ -88,8 +88,11 @@ mod tests {
     #[test]
     fn approved_local_worker_can_run() {
         use std::path::Path;
+        // /usr/bin/true is a symlink to /bin/true on many Linux runners.
+        // The production policy deliberately permits only canonical paths.
+        let path = Path::new("/usr/bin/true").canonicalize().unwrap();
         assert_eq!(
-            probe_approved_executable(Path::new("/usr/bin/true"), Path::new("/usr/bin/true"), Duration::from_secs(1)),
+            probe_approved_executable(&path, &path, Duration::from_secs(1)),
             Ok(())
         );
     }
