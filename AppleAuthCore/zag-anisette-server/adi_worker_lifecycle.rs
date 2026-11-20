@@ -238,6 +238,33 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn worker_does_not_inherit_environment_or_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "zag-adi-env-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        let marker = dir.join("isolated");
+        // HOME is set in GitHub runners and most shells. The worker should
+        // have neither HOME nor the caller's current working directory.
+        let body = format!(
+            "#!/bin/sh\nif [ -z \"\u0024{{HOME+x}}\" ] && [ \"\u0024PWD\" = / ]; then echo ok > '{}'; fi\n",
+            marker.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        let mut mode = std::fs::metadata(&script).unwrap().permissions();
+        mode.set_mode(0o700);
+        std::fs::set_permissions(&script, mode).unwrap();
+        let result = execute_offline_worker(&script, &script, &request(), Duration::from_secs(1));
+        assert!(result.is_err(), "{result:?}");
+        assert!(marker.exists(), "worker inherited environment or working directory");
+        std::fs::remove_file(marker).unwrap();
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
     fn nonzero_worker_cannot_produce_success() {
         let path = Path::new("/usr/bin/false").canonicalize().unwrap();
         let result = execute_offline_worker(&path, &path, &request(), Duration::from_secs(1));
