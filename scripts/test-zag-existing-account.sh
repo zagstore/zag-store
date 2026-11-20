@@ -47,6 +47,14 @@ submit = bridge[bridge.index("func submitCertificateRequest("):bridge.index("pri
 order = [submit.index(n) for n in ["approvals.check(.certificate", "ZagCertificateBudget.consume(", "approvals.consume(.certificate", "sendCertificateRequest(request"]]
 assert order == sorted(order), order
 print("PASS: every bridge mutation passes the approval journal; the certificate: approval check, budget, journal, then send")
+assert bridge.count("guard approvals.campaignID == campaign.constants.campaignID") == 2
+assert "guard approvals.campaignID == campaign.constants.campaignID" in run
+print("PASS: the bridge and the preflight refuse another campaign's approvals journal")
+
+live = (root / "AppleAuthCore/zag-apple-bridge/src/live.rs").read_text()
+arm = live[live.index("PortalRequest::Certificates { team: t } =>"):live.index("PortalRequest::SubmitCertificateRequest")]
+assert "list_all_development_certs(" in arm and "list_ios_certs(" not in arm and ".ok_or(BridgeError::new(FailureKind::Malformed))" in arm
+print("PASS: the certificate listing is unfiltered (no certificate dropped by platform) and one incomplete entry fails the whole listing")
 
 campaign = (fa / "ZagLiveExperimentCampaign.swift").read_text()
 verify = campaign[campaign.index("func verifyAccountState("):campaign.index("func needsAccountStateCheck(")]
@@ -114,7 +122,7 @@ mutant() { # name python-edit
 # The journal bypassed: changes are sent without approval.
 mutant no-approval '
 import sys; p = sys.argv[1] + "/ZagIsideloadBridge.swift"; s = open(p).read()
-start = s.index("\t\tdo {\n\t\t\ttry approvals.consume(mutation"); end = s.index("\t\t}\n", s.index("throw ZagPortalError.livePortalDisabled", start)) + 4
+start = s.index("\t\tdo {\n\t\t\t// The journal must be this campaign\x27s"); end = s.index("\t\t}\n", s.index("throw ZagPortalError.livePortalDisabled", start)) + 4
 open(p, "w").write(s[:start] + "\t\t_ = mutation // MUTANT\n" + s[end:])'
 # The preflight given a writable portal that registers this iPhone. The
 # bridge refuses any change before an accepted inventory (C8) and without an
@@ -124,7 +132,7 @@ mutant writing-preflight '
 import sys; p = sys.argv[1] + "/ZagIsideloadBridge.swift"; s = open(p).read()
 a = "\t\tthrow ZagLiveExperimentRefusal.check(\"C8\")\n\t\t#else"
 assert s.count(a) == 1; s = s.replace(a, "\t\treturn // MUTANT\n\t\t#else")
-start = s.index("\t\tdo {\n\t\t\ttry approvals.consume(mutation"); end = s.index("\t\t}\n", s.index("throw ZagPortalError.livePortalDisabled", start)) + 4
+start = s.index("\t\tdo {\n\t\t\t// The journal must be this campaign\x27s"); end = s.index("\t\t}\n", s.index("throw ZagPortalError.livePortalDisabled", start)) + 4
 open(p, "w").write(s[:start] + "\t\t_ = mutation // MUTANT\n" + s[end:])
 p = sys.argv[1] + "/ZagExistingAccountPreflight.swift"; s = open(p).read()
 a = "\tfunc devices(team: String) async throws -> [ZagRegisteredDevice] { try await portal.devices(team: team) }\n\tfunc appIDs"

@@ -404,7 +404,11 @@ impl PortalSession for LiveSession {
                 Ok(Value::Null)
             }
             PortalRequest::Certificates { team: t } => {
-                let certificates = self.session.list_ios_certs(&team(&t)).await.map_err(c)?;
+                // Every development certificate the endpoint lists:
+                // `list_ios_certs` drops those labelled with another platform,
+                // which would undercount an existing account (or make one look
+                // empty). The count is E4's, the inventory's and the budget's.
+                let certificates = self.session.list_all_development_certs(&team(&t), ios()).await.map_err(c)?;
                 // A certificate without a serial or an expiry fails the whole
                 // listing: dropping it would hide it from the certificate plan.
                 // Its content, when Apple includes it, lets a certificate whose

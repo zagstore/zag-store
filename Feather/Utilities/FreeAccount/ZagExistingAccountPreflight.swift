@@ -318,6 +318,8 @@ enum ZagExistingAccountPreflight {
 					secrets: ZagFreeAccountSecretStore, keys: ZagKeychainSigningKeyFactory, bundleIdentifier: String, deviceUDID: String,
 					campaign: ZagLiveExperimentCampaign, approvals: ZagExistingAccountApprovals,
 					limits: ZagTeamLimits = .free, now: @Sendable () -> Date = { Date() }) async throws -> Assessment {
+		// The approvals journal must be this campaign's (approvals never carry over).
+		guard approvals.campaignID == campaign.constants.campaignID else { throw ZagLiveExperimentRefusal.notArmed }
 		try campaign.checkAccount(accountKey)
 		try campaign.authorize(.portalRead)
 		let inventory = await read(reader, team: team, teamCount: teamCount)

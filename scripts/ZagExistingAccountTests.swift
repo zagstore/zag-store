@@ -630,5 +630,125 @@ import Security
 			check(device.registryValue?.campaigns["G5-C1"]?.state == .armed, "X16: the campaign stays armed (a refusal, not a stop)")
 			rig.cleanUp()
 		}
+
+		// X17 (G4 follow-up 1): the journal write fails after the certificate
+		// budget is spent. Nothing is sent, the campaign halts, and neither a
+		// retry, a relaunch nor a working journal can send it afterwards.
+		do {
+			let device = Device()
+			let store = MemoryCampaignRegistry()
+			let (campaign, approvals) = armed(device, store: store)
+			let rig = await Rig.make(campaign)
+			await seedPopulated(rig)
+			_ = await preflight(rig, campaign, approvals)
+			_ = approve(approvals, rig, [.certificate, .profile])
+			store.failWrites = true
+			let first = await rig.provision()
+			let record = device.registryValue?.campaigns["G5-C1"]
+			check((try? first.get()) == nil && rig.counter.value == 0, "X17: a journal write failure after the budget is spent sends no certificate request")
+			check(record?.submissions == 1 && record?.state == .halted, "X17: the budget stays spent and the campaign halts (a stop)")
+			check(approvals.journal?.sent[.certificate] == nil, "X17: the journal does not record a send that did not happen")
+			store.failWrites = false
+			_ = await rig.provision()
+			let (again, _) = device.launch(Device.constants(1))
+			let relaunched = rig.relaunched(again)
+			let after = await relaunched.provision()
+			let p = await seen(rig)
+			check((try? after.get()) == nil && rig.counter.value == 0 && relaunched.counter.value == 0 && !p.mutations.contains(.submitCertificateRequest),
+				  "X17: no retry: neither a second attempt nor a relaunch with a working journal sends a certificate request")
+			rig.cleanUp()
+		}
+
+		// X18 (G4 follow-up 2): a new campaign ID never inherits or revives
+		// approvals; each change needs the new campaign's own preflight and
+		// approval, and the old campaign can never send again.
+		do {
+			let device = Device()
+			let store = MemoryCampaignRegistry()
+			let (first, approvals1) = armed(device, store: store)
+			let rig = await Rig.make(first)
+			guard case .success(let a1) = await preflight(rig, first, approvals1) else { check(false, "X18: campaign 1 preflight accepted"); return }
+			_ = approve(approvals1, rig, a1.required)
+			check((try? (await rig.provision()).get()) != nil && approvals1.journal?.sent[.device] == .succeeded, "X18: campaign 1 sends its approved changes")
+			let base = await seen(rig)
+
+			let (second, approvals2) = armed(device, 2, store: store)
+			check(approvals2.journal?.approved == [] && approvals2.journal?.sent == [:] && approvals2.journal?.accountKey == nil,
+				  "X18: campaign 2's journal starts empty: nothing approved carries over")
+			let unprepared = await rig.relaunched(second).provision()
+			var now = await seen(rig)
+			check((try? unprepared.get()) == nil && now.mutations.count == base.mutations.count && now.count(.profile) == base.count(.profile),
+				  "X18: campaign 2 without its own preflight changes nothing (C8)")
+			let again = rig.relaunched(second)
+			_ = await preflight(again, second, approvals2)
+			let unapproved = await again.provision()
+			now = await seen(rig)
+			check((try? unapproved.get()) == nil && now.count(.profile) == base.count(.profile), "X18: campaign 2's preflight alone approves nothing; the profile is not requested")
+
+			// Campaign 1's journal with campaign 2's campaign: refused before sending.
+			let crossed = ZagIsideloadDeveloperPortal(account: rig.account, secrets: rig.secrets, campaign: second, approvals: approvals1,
+														transport: scriptedTransport(rig.portal, counter: rig.counter))
+			_ = try? await crossed.registerDevice(udid: "00000000-CROSSED000000000", name: "x", team: rig.team)
+			let crossedPreflight = try? await ZagExistingAccountPreflight.run(
+				reader: ZagReadOnlyPortal(crossed), team: ZagDeveloperTeam(identifier: rig.team, name: "Personal", kind: .personalFree), teamCount: 1,
+				accountKey: rig.accountKey, account: rig.account, secrets: rig.secrets, keys: ZagKeychainSigningKeyFactory(keys: rig.keys),
+				bundleIdentifier: mapped(rig), deviceUDID: deviceUDID, campaign: second, approvals: approvals1)
+			now = await seen(rig)
+			check(now.count(.registerDevice) == base.count(.registerDevice) && crossedPreflight == nil, "X18: another campaign's journal is refused (no send, no preflight)")
+
+			// Campaign 1 relaunched after campaign 2 is armed: C3 refuses everything.
+			let (old, _) = device.launch(Device.constants(1))
+			let oldRig = rig.relaunched(old)
+			let revived = await oldRig.provision()
+			let oldPreflight = await preflight(oldRig, old, ZagExistingAccountApprovals(campaignID: "G5-C1", store: store))
+			now = await seen(rig)
+			check((try? revived.get()) == nil && (try? oldPreflight.get()) == nil && now.mutations.count == base.mutations.count,
+				  "X18: the older campaign never sends again once a newer one is armed (C3)")
+			rig.cleanUp()
+		}
+
+		// X19 (G4 follow-up 3): listings that are malformed or incomplete at
+		// the bridge's JSON boundary are unknown, never an empty account; only
+		// a well-formed empty array is empty.
+		do {
+			let cases: [(String, String, String)] = [
+				("devices", "null", "null"), ("devices", "{}", "an object"), ("devices", "{\"devices\":[]}", "a wrapped list"),
+				("devices", "[{\"name\":\"x\"}]", "an entry without a UDID"), ("devices", "\"[]\"", "a string"),
+				("certificates", "[{\"name\":\"x\",\"expiresAt\":1}]", "a certificate without a serial"),
+				("certificates", "[{\"serialNumber\":\"A\",\"name\":\"x\"}]", "a certificate without an expiry"),
+				("appIds", "[{\"identifier\":\"X\"}]", "an App ID without a bundle identifier"), ("appIds", "", "an empty body"),
+			]
+			for (op, body, label) in cases {
+				let device = Device()
+				let (campaign, approvals) = armed(device)
+				let rig = await Rig.make(campaign)
+				let base = scriptedTransport(rig.portal, counter: rig.counter)
+				let transport: ZagIsideloadDeveloperPortal.Transport = { credential, json in
+					if let request = try? JSONSerialization.jsonObject(with: json) as? [String: Any], request["op"] as? String == op { return .result(Data(body.utf8)) }
+					return await base(credential, json)
+				}
+				let adapter = ZagIsideloadDeveloperPortal(account: rig.account, secrets: rig.secrets, campaign: campaign, approvals: approvals, transport: transport)
+				let result = try? await ZagExistingAccountPreflight.run(
+					reader: ZagReadOnlyPortal(adapter), team: ZagDeveloperTeam(identifier: rig.team, name: "Personal", kind: .personalFree), teamCount: 1,
+					accountKey: rig.accountKey, account: rig.account, secrets: rig.secrets, keys: ZagKeychainSigningKeyFactory(keys: rig.keys),
+					bundleIdentifier: mapped(rig), deviceUDID: deviceUDID, campaign: campaign, approvals: approvals)
+				let read = await ZagExistingAccountPreflight.read(ZagReadOnlyPortal(adapter), team: ZagDeveloperTeam(identifier: rig.team, name: "Personal", kind: .personalFree), teamCount: 1)
+				let unknown: Bool = switch op {
+				case "devices": read.devices.items == nil
+				case "certificates": read.certificates.items == nil
+				default: read.appIDs.items == nil
+				}
+				check(result == nil && unknown && approvals.journal?.accountKey == nil, "X19: \(op) as \(label) is unknown, not empty; the inventory is refused")
+				rig.cleanUp()
+			}
+			// The control: a well-formed empty listing is a genuinely empty one.
+			let device = Device()
+			let (campaign, approvals) = armed(device)
+			let rig = await Rig.make(campaign)
+			let assessment = try? (await preflight(rig, campaign, approvals)).get()
+			check(assessment?.report.certificates == 0 && assessment?.report.devices == 0 && assessment?.decision == .needsNewAssets([.certificate, .device, .appID, .profile]),
+				  "X19: a well-formed empty listing is empty (control)")
+			rig.cleanUp()
+		}
 	}
 }

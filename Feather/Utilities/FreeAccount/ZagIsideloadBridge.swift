@@ -699,6 +699,8 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		case .appGroup: throw ZagExistingAccountApprovals.Refusal.notRequired
 		}
 		do {
+			// The journal must be this campaign's: approvals never carry over.
+			guard approvals.campaignID == campaign.constants.campaignID else { throw ZagExistingAccountApprovals.Refusal.noPreflight }
 			try approvals.consume(mutation, accountKey: try accountKey(), team: team)
 		} catch {
 			// Not approved (or already sent): refused before sending, and not a
@@ -773,6 +775,7 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		// campaign refusal makes the provisioner settle its pending key as not
 		// issued (nothing was sent).
 		do {
+			guard approvals.campaignID == campaign.constants.campaignID else { throw ZagExistingAccountApprovals.Refusal.noPreflight }
 			try approvals.check(.certificate, accountKey: accountKey, team: team)
 		} catch {
 			throw ZagLiveExperimentRefusal.notArmed
