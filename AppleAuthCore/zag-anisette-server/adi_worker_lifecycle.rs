@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::{fs::{MetadataExt, PermissionsExt}, process::CommandExt};
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -79,18 +79,24 @@ pub fn execute_offline_worker(
     {
         return Err(WorkerError::UnapprovedExecutable);
     }
-    // The executable's containing directory must not permit another
-    // group member or user to replace its directory entry. A complete
-    // deployment audit must also validate ancestor directories.
+    // Audit every ancestor, not just the immediate parent. A root-owned
+    // sticky directory (such as /tmp) cannot have another user's entries
+    // renamed by an unprivileged peer; all other writable ancestors fail.
+    // This is still a path-based check, not race-free file-descriptor exec.
     #[cfg(unix)]
-    if std::fs::symlink_metadata(
-        approved.parent().ok_or(WorkerError::UnapprovedExecutable)?
-    )
-        .map_err(|_| WorkerError::UnapprovedExecutable)?
-        .permissions()
-        .mode() & 0o022 != 0
-    {
-        return Err(WorkerError::UnapprovedExecutable);
+    for ancestor in approved.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|_| WorkerError::UnapprovedExecutable)?;
+        if !metadata.file_type().is_dir() {
+            return Err(WorkerError::UnapprovedExecutable);
+        }
+        let mode = metadata.mode();
+        let writable = mode & 0o022 != 0;
+        let trusted_sticky = metadata.uid() == 0 && mode & 0o1000 != 0
+            && mode & 0o002 != 0 && mode & 0o020 == 0;
+        if writable && !trusted_sticky {
+            return Err(WorkerError::UnapprovedExecutable);
+        }
     }
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
     let mut command = Command::new(approved);
