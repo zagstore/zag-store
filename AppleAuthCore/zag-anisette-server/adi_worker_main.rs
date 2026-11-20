@@ -173,6 +173,38 @@ impl<B: StatefulMaterialBackend> Drop for MaterialSession<B> {
     fn drop(&mut self) { self.0.abort(); }
 }
 
+/// Owns an opaque native ADI session handle inside the worker process.
+/// The destroy callback must be the matching provider's native destroy API.
+/// No handle is serialized over IPC or shared with the parent process.
+struct NativeSessionHandle<F: FnMut(u32) -> io::Result<()>> {
+    handle: Option<u32>,
+    destroy: F,
+}
+
+impl<F: FnMut(u32) -> io::Result<()>> NativeSessionHandle<F> {
+    fn new(handle: u32, destroy: F) -> Self {
+        Self { handle: Some(handle), destroy }
+    }
+
+    fn id(&self) -> u32 {
+        self.handle.expect("native session already destroyed")
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        match self.handle.take() {
+            Some(handle) => (self.destroy)(handle),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<F: FnMut(u32) -> io::Result<()>> Drop for NativeSessionHandle<F> {
+    fn drop(&mut self) {
+        // Destructors must never panic or expose provider details in logs.
+        let _ = self.close();
+    }
+}
+
 fn write_material<W: Write>(output: &mut W, material: SessionMaterial) -> io::Result<()> {
     let payload = match material {
         SessionMaterial::Started { cpim } =>
