@@ -75,7 +75,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zag-adi-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("slow.sh");
-        std::fs::write(&script, "#!/bin/sh\\nsleep 3\\n").unwrap();
+        std::fs::write(&script, "#!/bin/sh\nsleep 3\n").unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(&script, permissions).unwrap();
