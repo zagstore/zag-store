@@ -173,10 +173,22 @@ fn run<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
 }
 
 fn main() {
+    // Explicit offline session mode is not connected to the HTTP listener.
+    // No native backend is loaded in either mode.
+    let mut args = std::env::args_os();
+    let _executable = args.next();
+    let mode = match (args.next(), args.next()) {
+        (None, None) => false,
+        (Some(flag), None) if flag == "--offline-session" => true,
+        _ => std::process::exit(2),
+    };
     // Fail closed without emitting secret-bearing diagnostics or stdout text.
-    if run(&mut io::stdin().lock(), &mut io::stdout().lock()).is_err() {
-        std::process::exit(1);
-    }
+    let result = if mode {
+        run_session(&mut io::stdin().lock(), &mut io::stdout().lock())
+    } else {
+        run(&mut io::stdin().lock(), &mut io::stdout().lock())
+    };
+    if result.is_err() { std::process::exit(1); }
 }
 
 #[cfg(test)]
