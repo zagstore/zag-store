@@ -239,6 +239,29 @@ fn encode_native_bytes(bytes: &[u8]) -> io::Result<String> {
     Ok(encoded)
 }
 
+/// Decode the test bridge's canonical lowercase hex representation.
+/// Reject malformed, noncanonical and oversized material before native calls.
+#[cfg(test)]
+fn decode_native_bytes(encoded: &str) -> io::Result<Vec<u8>> {
+    if encoded.is_empty() || encoded.len() % 2 != 0 || encoded.len() > MAX_MESSAGE_BYTES - 128 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid encoded material length"));
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let digit = |byte: u8| -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            }
+        };
+        let high = digit(pair[0]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid hex material"))?;
+        let low = digit(pair[1]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid hex material"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
 /// The subset of SideStore ADIProxy's native interface needed for a session.
 /// Network lookup, TLS, and Apple HTTP requests are intentionally excluded.
 #[cfg(test)]
@@ -264,12 +287,12 @@ impl<P: AdiProxyNativeCalls> NativeAdiEngine for SideStoreNativeBridge<P> {
     fn start_native(&mut self, identifier: &str, spim: &str) -> io::Result<(u32, String)> {
         let ds_id = identifier.parse::<i64>()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid ds_id"))?;
-        let (handle, cpim) = self.proxy.start_provisioning(ds_id, spim.as_bytes())?;
+        let (handle, cpim) = self.proxy.start_provisioning(ds_id, &decode_native_bytes(spim)?)?;
         let cpim = encode_native_bytes(&cpim)?;
         Ok((handle, cpim))
     }
     fn finish_native(&mut self, handle: u32, ptm: &str, tk: &str) -> io::Result<String> {
-        self.proxy.end_provisioning(handle, ptm.as_bytes(), tk.as_bytes())?;
+        self.proxy.end_provisioning(handle, &decode_native_bytes(ptm)?, &decode_native_bytes(tk)?)?;
         // Export is distinct from native Finish and must preserve arbitrary bytes.
         // This bridge's hex representation is test-only; production must agree
         // on a versioned encoding with the supervisor before activation.
