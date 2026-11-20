@@ -40,8 +40,9 @@ path-to-execution races.
   native handle; the current standalone `zag-adi-worker` intentionally
   returns `backend_unavailable` and is one-request-only.
 - Connect the now-implemented supervisor cancellation signal to HTTP client
-  disconnects; add worker concurrency caps and a bounded native session
-  storage lifecycle. Cancellation is tested during blocked Start and Finish.
+  disconnects; review the current 32-session offline admission cap for production,
+  and add a bounded native session storage lifecycle. Cancellation is tested
+  during blocked Start and Finish.
 - Extend subprocess regression coverage to inherited stdout from
   descendants and session cross-talk. Hung Finish
   and extra-frame tests are now included.
