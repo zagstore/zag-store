@@ -399,7 +399,7 @@ mod tests {
     fn websocket_key_is_canonical() {
         assert!(valid_websocket_key(KEY));
         assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAB=="));
-        assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAA=="));
+        assert!(valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAA=="));
         assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAA="));
         assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAA/=="));
         assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAA-=="));
