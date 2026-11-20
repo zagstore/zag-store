@@ -161,6 +161,40 @@ fn run_session<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<(
     Err(io::Error::new(io::ErrorKind::Unsupported, "native session disabled"))
 }
 
+/// Drive two phases over one stream with a backend instance retained across
+/// both requests. Only tests supply a successful mock backend; the executable
+/// continues to use DisabledNativeAdiBackend exclusively.
+#[cfg(test)]
+fn run_two_phase_test_session<R: Read, W: Write, B: NativeAdiBackend>(
+    input: &mut R, output: &mut W, backend: B,
+) -> io::Result<()> {
+    let mut session = NativeSession::new(backend);
+    let start = read_session_request(input)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing Start"))?;
+    if !matches!(start, NativeRequest::Start { .. }) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Start required"));
+    }
+    session.execute(start)?;
+    let started = br#"{"version":1,"type":"started","cpim":"mock"}"#;
+    output.write_all(&(started.len() as u32).to_be_bytes())?;
+    output.write_all(started)?;
+    output.flush()?;
+    let finish = read_session_request(input)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing Finish"))?;
+    if !matches!(finish, NativeRequest::Finish { .. }) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Finish required"));
+    }
+    session.execute(finish)?;
+    let mut extra = [0u8; 1];
+    if input.read(&mut extra)? != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "extra input"));
+    }
+    let finished = br#"{"version":1,"type":"finished","adi_pb":"mock"}"#;
+    output.write_all(&(finished.len() as u32).to_be_bytes())?;
+    output.write_all(finished)?;
+    output.flush()
+}
+
 fn run<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
     let request = read_request(input)?;
     // Parse into a typed request before invoking a future native backend.
@@ -226,6 +260,27 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, frame(ERROR_RESPONSE));
+    }
+    #[test]
+    fn rust_worker_two_frame_session_preserves_backend_instance() {
+        struct StatefulMock(u8);
+        impl NativeAdiBackend for StatefulMock {
+            fn execute(&mut self, request: NativeRequest) -> io::Result<()> {
+                match request {
+                    NativeRequest::Start { .. } if self.0 == 0 => self.0 = 1,
+                    NativeRequest::Finish { .. } if self.0 == 1 => self.0 = 2,
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "wrong phase")),
+                }
+                Ok(())
+            }
+        }
+        let mut input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        input.extend(frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#));
+        let mut output = Vec::new();
+        run_two_phase_test_session(&mut input.as_slice(), &mut output, StatefulMock(0)).unwrap();
+        let mut expected = frame(br#"{"version":1,"type":"started","cpim":"mock"}"#);
+        expected.extend(frame(br#"{"version":1,"type":"finished","adi_pb":"mock"}"#));
+        assert_eq!(output, expected);
     }
     #[test]
     fn mock_backend_retains_one_session_across_both_phases() {
