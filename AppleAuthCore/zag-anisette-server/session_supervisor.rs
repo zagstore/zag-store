@@ -300,6 +300,32 @@ mod tests {
         assert!(valid_phase_reply(&serde_json::json!({"type":"started","version":1,"cpim":"mock"}), "started"));
     }
     #[test]
+    fn standalone_rust_fixture_completes_supervised_two_phase_session() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!(
+            "zag-rust-session-fixture-{}-{:?}",
+            std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("session-fixture");
+        let compile = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&executable).arg(&source).status().unwrap();
+        assert!(compile.success(), "standalone fixture must compile");
+        let result = run_mock_session(
+            &executable, &[],
+            r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+            r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+            Duration::from_secs(5),
+        );
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+        let (started, finished) = result.expect("supervisor must complete both phases");
+        assert_eq!(started["cpim"], "mock");
+        assert_eq!(finished["adi_pb"], "mock");
+    }
+    #[test]
     fn rust_worker_fixture_runs_under_session_supervisor() {
         // The Rust test executable hosts a mock backend only when explicitly
         // invoked as an ignored test; the release worker cannot produce CPIM.
