@@ -211,6 +211,22 @@ pub fn process_text_frame<B: ProvisioningBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn offline_worker_adapter_fails_closed_without_approved_executable() {
+        let provider = OfflineWorkerAdiProvider::new(
+            std::path::PathBuf::from("/nonexistent/zag-adi-worker"),
+            std::time::Duration::from_millis(100),
+        );
+        let mut session = Session::new(AdiBackend::new(provider));
+        assert_eq!(
+            session.receive(ClientMessage::Identifier("device".into())),
+            Ok(ServerMessage::GiveStartProvisioningData)
+        );
+        assert_eq!(
+            session.receive(ClientMessage::Spim("spim".into())),
+            Err(ProtocolError::BackendUnavailable)
+        );
+        assert_eq!(session.phase(), Phase::Failed);
+    }
     #[test] fn disabled_adi_adapter_fails_closed() {
         let mut session = Session::new(AdiBackend::new(DisabledAdiProvider));
         assert_eq!(session.receive(ClientMessage::Identifier("id".into())), Ok(ServerMessage::GiveStartProvisioningData));
