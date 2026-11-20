@@ -513,6 +513,35 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn sidestore_bridge_exports_only_validated_material() {
+        struct Proxy { material: Vec<u8> }
+        impl AdiProxyNativeCalls for Proxy {
+            fn start_provisioning(&mut self, _: i64, _: &[u8]) -> io::Result<(u32, Vec<u8>)> {
+                Ok((8, b"cpim".to_vec()))
+            }
+            fn end_provisioning(&mut self, handle: u32, _: &[u8], _: &[u8]) -> io::Result<()> {
+                assert_eq!(handle, 8);
+                Ok(())
+            }
+            fn destroy_provisioning_session(&mut self, _: u32) -> io::Result<()> { Ok(()) }
+            fn export_adi_pb(&mut self) -> io::Result<Vec<u8>> { Ok(self.material.clone()) }
+        }
+        for (bytes, expected) in [
+            (b"valid-adi".to_vec(), None),
+            (vec![0xff, 0x00], Some(io::ErrorKind::InvalidData)),
+            (b"bad\nmaterial".to_vec(), Some(io::ErrorKind::InvalidData)),
+            (Vec::new(), Some(io::ErrorKind::InvalidData)),
+        ] {
+            let mut bridge = SideStoreNativeBridge { proxy: Proxy { material: bytes } };
+            let result = bridge.finish_native(8, "ptm", "tk");
+            match expected {
+                None => assert_eq!(result.unwrap(), "valid-adi"),
+                Some(kind) => assert_eq!(result.unwrap_err().kind(), kind),
+            }
+        }
+    }
+
+    #[test]
     fn sidestore_bridge_does_not_invent_native_adi_pb() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         struct Proxy(Arc<AtomicUsize>);
