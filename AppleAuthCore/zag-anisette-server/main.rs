@@ -1,6 +1,4 @@
 //! Zag-owned minimal anisette HTTP service scaffold.
-#[cfg(test)]
-mod adi_worker_wire_v2;
 //! Offline-only: provisioning endpoints deliberately return 503 until a reviewed backend exists.
 //! It never answers a WebSocket upgrade with 101, contacts nothing, stores
 //! nothing and logs no request data. No third-party server source code is used.
@@ -11,6 +9,8 @@ mod adi_worker_wire_v2;
 //! `/v3/provisioning_session` (reached as `wss://`). Every 503 makes that
 //! client stop: `error_for_status` fails, and a non-101 upgrade fails.
 mod adi_process;
+#[cfg(test)]
+mod adi_worker_wire_v2;
 mod adi_worker_protocol;
 mod adi_worker_framing;
 mod adi_worker_lifecycle;
