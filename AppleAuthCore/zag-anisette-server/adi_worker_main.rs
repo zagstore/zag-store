@@ -409,6 +409,40 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn native_handle_destroyed_once_on_drop_and_explicit_close() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let count = Arc::new(AtomicUsize::new(0));
+        for explicit in [false, true] {
+            let count_copy = count.clone();
+            let mut guard = NativeSessionHandle::new(42, move |handle| {
+                assert_eq!(handle, 42);
+                count_copy.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            assert_eq!(guard.id(), 42);
+            if explicit {
+                guard.close().unwrap();
+                guard.close().unwrap();
+            }
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn native_handle_destroy_failure_is_not_retried() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_copy = count.clone();
+        let mut guard = NativeSessionHandle::new(7, move |_| {
+            count_copy.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("native destroy failed"))
+        });
+        assert!(guard.close().is_err());
+        drop(guard);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn typed_session_cleans_up_after_success_and_finish_failure() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         struct Tracked {
