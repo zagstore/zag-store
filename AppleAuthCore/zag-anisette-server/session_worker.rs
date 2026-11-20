@@ -1,6 +1,7 @@
 //! Offline-only, session-scoped worker protocol prototype.
 //! No Apple APIs, native libraries, sockets, or credentials.
 use std::io::{self, BufRead, Read, Write};
+use std::time::{Duration, Instant};
 
 const MAX_FRAME: usize = 64 * 1024;
 
