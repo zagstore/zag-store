@@ -51,6 +51,15 @@ impl Drop for SessionPermit<'_> {
     }
 }
 
+/// Shared child cleanup for both the supervised v1 harness and offline v2 tests.
+/// Kill the process group before reaping to avoid leaving descendants running.
+fn terminate_and_reap(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    kill_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn remaining(deadline: Instant) -> Result<Duration, SessionError> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() { Err(SessionError::Timeout) } else { Ok(left) }
@@ -227,10 +236,7 @@ mod v2_boundary_tests {
             if Instant::now() >= deadline { break true; }
             thread::sleep(Duration::from_millis(5));
         };
-        #[cfg(unix)]
-        kill_group(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_and_reap(&mut child);
         let _ = std::fs::remove_file(&executable);
         let _ = std::fs::remove_dir(&temp);
         assert!(timed_out, "stalled child must reach the deadline before cleanup");
@@ -385,12 +391,8 @@ pub fn run_mock_session_cancellable(
         }
         Err(SessionError::Timeout)
     })();
-    // Always kill the isolated process group, even after success.
-    #[cfg(unix)]
-    kill_group(pid);
-    #[cfg(not(unix))]
-    { let _ = child.kill(); }
-    let _ = child.wait();
+    // Always terminate and reap the isolated process group, even after success.
+    terminate_and_reap(&mut child);
     result
 }
 
