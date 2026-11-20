@@ -133,6 +133,21 @@ mod tests {
         assert_eq!(decode_response(&encode_response(&finished).unwrap(), &finish), Ok(finished));
     }
     #[test]
+    fn rejects_wrong_phase_and_oversized_binary_material() {
+        let start = Request::Start { identifier: "-2".into(), spim: vec![1] };
+        let finish = Request::Finish { ptm: vec![1], tk: vec![2] };
+        let finished = encode_response(&Response::Finished(vec![0, 255])).unwrap();
+        assert_eq!(decode_response(&finished, &start), Err(WireError::Invalid));
+        let started = encode_response(&Response::Started(vec![0, 255])).unwrap();
+        assert_eq!(decode_response(&started, &finish), Err(WireError::Invalid));
+        assert_eq!(encode_request(&Request::Start {
+            identifier: "-2".into(), spim: vec![0; MAX_BINARY + 1]
+        }), Err(WireError::Invalid));
+        assert_eq!(encode_response(&Response::Finished(vec![0; MAX_BINARY + 1])), Err(WireError::Invalid));
+        assert_eq!(decode_request(br#"{\"version\":2,\"type\":\"finish\",\"ptm_hex\":\"00\",\"tk_hex\":\"\"}"#), Err(WireError::Invalid));
+    }
+
+    #[test]
     fn rejects_duplicate_unknown_and_invalid_hex() {
         for data in [
             r#"{"version":2,"version":2,"type":"start","identifier":"-2","spim_hex":"00"}"#,
