@@ -124,9 +124,59 @@ pub fn run_mock_session(
     result
 }
 
+
+/// Strict two-phase framing used by the future production session transport.
+/// Unlike the legacy mock line protocol, each message uses the existing
+/// four-byte big-endian length prefix and the shared 64KiB wire limit.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionFrameError { Framing, Json, WrongPhase }
+
+pub fn encode_session_frame(value: &serde_json::Value) -> Result<Vec<u8>, SessionFrameError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| SessionFrameError::Json)?;
+    let mut frame = Vec::new();
+    crate::adi_worker_framing::write_frame(&mut frame, &bytes)
+        .map_err(|_| SessionFrameError::Framing)?;
+    Ok(frame)
+}
+
+pub fn decode_session_frame<R: std::io::Read>(
+    reader: &mut R,
+    expected_type: &str,
+) -> Result<serde_json::Value, SessionFrameError> {
+    let bytes = crate::adi_worker_framing::read_frame(reader)
+        .map_err(|_| SessionFrameError::Framing)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| SessionFrameError::Json)?;
+    if value.as_object().and_then(|obj| obj.get("type"))
+        .and_then(serde_json::Value::as_str) != Some(expected_type) {
+        return Err(SessionFrameError::WrongPhase);
+    }
+    Ok(value)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn strict_frames_roundtrip_in_phase_order() {
+        let start = serde_json::json!({"type":"started","cpim":"mock"});
+        let finish = serde_json::json!({"type":"finished","adi_pb":"mock"});
+        let mut stream = encode_session_frame(&start).unwrap();
+        stream.extend(encode_session_frame(&finish).unwrap());
+        let mut input = stream.as_slice();
+        assert_eq!(decode_session_frame(&mut input, "started"), Ok(start));
+        assert_eq!(decode_session_frame(&mut input, "finished"), Ok(finish));
+        assert!(input.is_empty());
+    }
+    #[test]
+    fn strict_frames_reject_wrong_phase_and_invalid_header() {
+        let finish = serde_json::json!({"type":"finished"});
+        let frame = encode_session_frame(&finish).unwrap();
+        assert_eq!(decode_session_frame(&mut frame.as_slice(), "started"), Err(SessionFrameError::WrongPhase));
+        let oversized = ((crate::adi_worker_protocol::MAX_MESSAGE_BYTES + 1) as u32).to_be_bytes();
+        assert_eq!(decode_session_frame(&mut oversized.as_slice(), "started"), Err(SessionFrameError::Framing));
+        assert_eq!(decode_session_frame(&mut 0u32.to_be_bytes().as_slice(), "started"), Err(SessionFrameError::Framing));
+    }
     #[test]
     fn two_phase_child_roundtrip() {
         let script = "read a; echo '{\"type\":\"started\"}'; read b; echo '{\"type\":\"finished\"}'";
