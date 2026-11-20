@@ -6,7 +6,7 @@
 use std::{net::TcpStream, time::Duration};
 use tungstenite::{accept, Message};
 
-use crate::provisioning::{encode_server_message, process_text_frame, OfflineBackend, ProtocolError, ServerMessage, Session};
+use crate::provisioning::{encode_server_message, process_text_frame, OfflineBackend, ProtocolError, Session};
 
 const MAX_FRAME: usize = 64 * 1024;
 
@@ -64,7 +64,7 @@ mod tests {
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (mut ws, _) = tungstenite::client(format!("ws://{address}/v3/provisioning_session"), stream).unwrap();
         let first = ws.read().unwrap().into_text().unwrap();
-        assert_eq!(first.as_str(), encode_server_message(&ServerMessage::GiveIdentifier));
+        assert_eq!(first.as_str(), encode_server_message(&crate::provisioning::ServerMessage::GiveIdentifier));
         ws.send(Message::Text(r#"{"identifier":"test-id"}"#.into())).unwrap();
         let second: serde_json::Value = serde_json::from_str(&ws.read().unwrap().into_text().unwrap()).unwrap();
         assert_eq!(second["result"], "GiveStartProvisioningData");
