@@ -3,6 +3,57 @@
 ## Status and ownership
 This document is a scoped implementation brief, **not** evidence that a real ADI provider exists or that another agent has started work. Keep the real provider on a separate feature branch and submit a PR against `review/zag-anisette-server`. Do not merge or deploy without explicit approval.
 
+## November 20 implementation checkpoint: two-phase session is now the target
+
+**The one-shot contract below is legacy and is not sufficient for a native
+provider that keeps an in-memory ADI session.** Do not implement a production
+provider against independent Start and Finish subprocesses. The required
+architecture is one supervised child process per provisioning session:
+
+1. Supervisor launches one approved worker with bounded stdin/stdout, a single
+   absolute deadline, cancellation, admission limits and process-group cleanup.
+2. Child reads a strict framed Start request, retains its native provider
+   instance and native session handle, and emits exactly one Started frame.
+3. The *same child* reads strict framed Finish, consumes the retained handle,
+   writes Finished, closes stdout and exits successfully.
+4. Any malformed request, extra frame, premature EOF, native error, timeout,
+   cancellation, child crash, or unexpected output fails closed and destroys
+   the session. Never return mock CPIM or adi.pb from a release executable.
+
+**Verified offline:** the supervisor has a standalone Rust fixture at
+`tests/session_worker_fixture.rs` compiled only by tests; the supervisor
+test `standalone_rust_fixture_completes_supervised_two_phase_session` passed
+on Ubuntu and macOS at commit `0c8d3c82`. The release `zag-adi-worker`
+still uses `DisabledNativeAdiBackend`; `--offline-session` remains
+unavailable for real provisioning. Cancellation-boundary changes at
+`94724a18` require their own CI confirmation.
+
+**Implementation order for the independent native-provider branch:**
+
+- Review and pin the exact `SideStore/apple-private-apis` and `omnisette`
+  source revisions, feature flags, native dynamic-library requirements,
+  license obligations, and supported OS/architectures. The native interface
+  must be verified from source, not guessed.
+- Define an owned `NativeAdiSession` that holds the provider and native
+  session handle across both requests. Its Drop path must release native
+  resources and securely dispose of ephemeral state. Native error types
+  must be mapped to generic wire errors.
+- Replace the test-only session response path with a generic typed session
+  driver that is reusable by the disabled release backend and test backend.
+  The release binary must never include a mock-success switch.
+- Connect the real provider to the **supervised two-phase** path only after
+  independent FFI and process-isolation review. The HTTP/WebSocket server
+  stays 503 until a separate rollout approval.
+- Address descriptor-bound execution / path-to-exec race, OS-level resource
+  limits, and native-library loading trust before deployment.
+
+**Unresolved security caveat:** the existing executable validation compares
+canonical paths and file identity before spawn, but the subsequent
+path-based exec is not race-free. Unix process groups are cleanup tools, not
+a sandbox. Do not describe the current supervisor as production-secure.
+
+---
+
 ## Existing offline contract
 - `provisioning.rs`: `Session<AdiBackend<P>>`, `AdiProvider`, and the opt-in `OfflineWorkerAdiProvider`.
 - `adi_worker_protocol.rs`: JSON version 1, exact request/response fields, max 65536 bytes.
