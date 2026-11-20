@@ -261,6 +261,47 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, frame(ERROR_RESPONSE));
     }
+    #[cfg(unix)]
+    #[test]
+    fn rust_session_child_process_uses_same_backend_instance() {
+        use std::process::{Command, Stdio};
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("--exact").arg("tests::rust_session_child_entry")
+            .arg("--ignored").arg("--nocapture")
+            .stdin(Stdio::piped()).stdout(Stdio::piped())
+            .stderr(Stdio::null()).spawn().unwrap();
+        let mut input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        input.extend(frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#));
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success());
+        // Rust test harness emits text around the child fixture's frames;
+        // validate the exact framed protocol subsequence.
+        let mut expected = frame(br#"{"version":1,"type":"started","cpim":"mock"}"#);
+        expected.extend(frame(br#"{"version":1,"type":"finished","adi_pb":"mock"}"#));
+        assert!(result.stdout.windows(expected.len()).any(|w| w == expected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture invoked only by parent test"]
+    fn rust_session_child_entry() {
+        struct Mock(u8);
+        impl NativeAdiBackend for Mock {
+            fn execute(&mut self, request: NativeRequest) -> io::Result<()> {
+                match request {
+                    NativeRequest::Start { .. } if self.0 == 0 => self.0 = 1,
+                    NativeRequest::Finish { .. } if self.0 == 1 => self.0 = 2,
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "phase")),
+                }
+                Ok(())
+            }
+        }
+        run_two_phase_test_session(
+            &mut io::stdin().lock(), &mut io::stdout().lock(), Mock(0),
+        ).unwrap();
+    }
     #[test]
     fn rust_worker_two_frame_session_preserves_backend_instance() {
         struct StatefulMock(u8);
