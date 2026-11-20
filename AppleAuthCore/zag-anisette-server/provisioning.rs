@@ -188,6 +188,38 @@ mod tests {
         assert_eq!(session.receive(ClientMessage::Finish { ptm: "ptm".into(), tk: "tk".into() }), Ok(ServerMessage::ProvisioningSuccess { adi_pb: "adi_pb".into() }));
         assert_eq!(session.phase(), Phase::Complete);
     }
+    struct BadAdiProvider;
+    impl AdiProvider for BadAdiProvider {
+        fn start_provisioning(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+            Ok(String::new())
+        }
+        fn finish_provisioning(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+            panic!("finish must not run after invalid start")
+        }
+    }
+    #[test] fn invalid_adi_provider_output_terminates_session() {
+        let mut session = Session::new(AdiBackend::new(BadAdiProvider));
+        assert!(session.receive(ClientMessage::Identifier("id".into())).is_ok());
+        assert_eq!(session.receive(ClientMessage::Spim("spim".into())), Err(ProtocolError::InvalidField));
+        assert_eq!(session.phase(), Phase::Failed);
+        assert_eq!(session.receive(ClientMessage::Finish { ptm: "p".into(), tk: "t".into() }), Err(ProtocolError::InvalidTransition));
+    }
+    struct FinishErrorAdiProvider;
+    impl AdiProvider for FinishErrorAdiProvider {
+        fn start_provisioning(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+            Ok("cpim".into())
+        }
+        fn finish_provisioning(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+            Err(ProtocolError::BackendUnavailable)
+        }
+    }
+    #[test] fn adi_finish_failure_terminates_session() {
+        let mut session = Session::new(AdiBackend::new(FinishErrorAdiProvider));
+        assert!(session.receive(ClientMessage::Identifier("id".into())).is_ok());
+        assert!(session.receive(ClientMessage::Spim("spim".into())).is_ok());
+        assert_eq!(session.receive(ClientMessage::Finish { ptm: "p".into(), tk: "t".into() }), Err(ProtocolError::BackendUnavailable));
+        assert_eq!(session.phase(), Phase::Failed);
+    }
     #[test] fn offline_never_advances() {
         let mut session = Session::new(OfflineBackend);
         assert_eq!(session.initial(), ServerMessage::GiveIdentifier);
