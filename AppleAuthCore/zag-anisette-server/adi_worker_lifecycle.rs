@@ -1,0 +1,124 @@
+//! Offline-only ADI worker lifecycle: fixed executable, bounded IPC and deadline.
+//! Not connected to the HTTP listener. No worker is launched unless explicitly
+//! called by a future reviewed integration.
+#![allow(dead_code)]
+use std::{
+    path::Path,
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+use crate::{
+    adi_worker_framing::{read_frame, write_frame},
+    adi_worker_protocol::{decode_response, encode_request, WorkerRequest, WorkerResponse},
+};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerError {
+    UnapprovedExecutable,
+    InvalidTimeout,
+    InvalidRequest,
+    Spawn,
+    Transport,
+    Timeout,
+    NonZeroExit,
+    InvalidResponse,
+}
+
+/// Never accepts a command from the network or a request. Caller supplies a
+/// preapproved canonical absolute executable, checked again before launch.
+/// stderr is discarded and no payload or worker output is logged.
+pub fn execute_offline_worker(
+    approved: &Path,
+    requested: &Path,
+    request: &WorkerRequest,
+    timeout: Duration,
+) -> Result<WorkerResponse, WorkerError> {
+    if timeout.is_zero() || timeout > Duration::from_secs(10) {
+        return Err(WorkerError::InvalidTimeout);
+    }
+    if !approved.is_absolute() || approved != requested {
+        return Err(WorkerError::UnapprovedExecutable);
+    }
+    let canonical = approved.canonicalize().map_err(|_| WorkerError::UnapprovedExecutable)?;
+    if canonical != approved || !std::fs::symlink_metadata(approved)
+        .map_err(|_| WorkerError::UnapprovedExecutable)?
+        .file_type().is_file()
+    {
+        return Err(WorkerError::UnapprovedExecutable);
+    }
+    let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
+    let mut child = Command::new(approved)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| WorkerError::Spawn)?;
+    let mut stdin = child.stdin.take().ok_or(WorkerError::Transport)?;
+    let mut stdout = child.stdout.take().ok_or(WorkerError::Transport)?;
+    let (sender, receiver) = mpsc::channel();
+    let writer = thread::spawn(move || write_frame(&mut stdin, &payload));
+    let reader = thread::spawn(move || {
+        let result = read_frame(&mut stdout);
+        // Do not wait for EOF: the protocol is exactly one response frame.
+        let _ = sender.send(result);
+    });
+    let deadline = Instant::now() + timeout;
+    let mut result = None;
+    while Instant::now() < deadline {
+        match receiver.try_recv() {
+            Ok(frame) => { result = Some(frame); break; }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // The reader may still be draining bytes from a just-exited
+                // process. Wait for the channel, but never past the deadline.
+                result = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok();
+                break;
+            }
+            Err(_) => break,
+            Ok(None) => {}
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Close pipes and reap even on malformed responses and timeouts.
+    // Killing an already-exited child is harmless.
+    let _ = child.kill();
+    let status = child.wait().map_err(|_| WorkerError::Transport)?;
+    let write_result = writer.join().map_err(|_| WorkerError::Transport)?;
+    reader.join().map_err(|_| WorkerError::Transport)?;
+    if result.is_none() { return Err(WorkerError::Timeout); }
+    if write_result.is_err() { return Err(WorkerError::Transport); }
+    let frame = result.unwrap().map_err(|_| WorkerError::Transport)?;
+    if !status.success() { return Err(WorkerError::NonZeroExit); }
+    decode_response(&frame, request).map_err(|_| WorkerError::InvalidResponse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request() -> WorkerRequest {
+        WorkerRequest::Start { identifier: "device".into(), spim: "spim".into() }
+    }
+    #[test]
+    fn rejects_unapproved_path_and_timeout_before_spawn() {
+        assert_eq!(execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/false"), &request(), Duration::from_secs(1)), Err(WorkerError::UnapprovedExecutable));
+        assert_eq!(execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/true"), &request(), Duration::ZERO), Err(WorkerError::InvalidTimeout));
+        assert_eq!(execute_offline_worker(Path::new("relative"), Path::new("relative"), &request(), Duration::from_secs(1)), Err(WorkerError::UnapprovedExecutable));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn worker_with_no_response_fails_closed() {
+        let result = execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/true"), &request(), Duration::from_secs(1));
+        assert!(matches!(result, Err(WorkerError::Transport) | Err(WorkerError::NonZeroExit)));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_worker_cannot_produce_success() {
+        let result = execute_offline_worker(Path::new("/usr/bin/false"), Path::new("/usr/bin/false"), &request(), Duration::from_secs(1));
+        assert!(result.is_err());
+    }
+}
