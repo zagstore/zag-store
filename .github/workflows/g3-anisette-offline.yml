@@ -74,6 +74,40 @@ jobs:
           proc = subprocess.run([str(worker.resolve())], input=invalid, capture_output=True, timeout=5)
           assert proc.returncode != 0 and proc.stdout == b"" and proc.stderr == b""
           PY
+      - name: Offline session worker executable contract
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import struct
+          import subprocess
+
+          worker = pathlib.Path("target/release/zag-adi-worker").resolve()
+          unavailable = b'{"version":1,"type":"error","code":"backend_unavailable"}'
+          def frame(value):
+              payload = json.dumps(value, separators=(",", ":")).encode()
+              return struct.pack(">I", len(payload)) + payload
+
+          start = {"version": 1, "type": "start", "identifier": "device", "spim": "spim"}
+          finish = {"version": 1, "type": "finish", "ptm": "ptm", "tk": "tk"}
+          cases = (
+              (frame(start), 0, struct.pack(">I", len(unavailable)) + unavailable),
+              (frame(finish), 1, b""),
+              (frame({"version": 2, "type": "start", "identifier": "device", "spim": "spim"}), 1, b""),
+              (struct.pack(">I", 65537), 1, b""),
+              (b"", 1, b""),
+          )
+          for payload, status, expected in cases:
+              proc = subprocess.run([str(worker), "--offline-session"],
+                                    input=payload, capture_output=True, timeout=5)
+              assert proc.returncode == status, (proc.returncode, status)
+              assert proc.stdout == expected, (proc.stdout, expected)
+              assert proc.stderr == b""
+          for args in (("--offline-session", "unexpected"), ("--unknown",)):
+              proc = subprocess.run([str(worker), *args], input=frame(start),
+                                    capture_output=True, timeout=5)
+              assert proc.returncode != 0 and proc.stdout == b"" and proc.stderr == b""
+          PY
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Offline provisioning adapter against compiled worker
