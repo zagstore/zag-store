@@ -13,7 +13,6 @@ mod adi_worker_protocol;
 mod adi_worker_framing;
 mod adi_worker_lifecycle;
 mod provisioning;
-#[cfg(test)]
 mod session_worker;
 mod websocket_transport;
 
