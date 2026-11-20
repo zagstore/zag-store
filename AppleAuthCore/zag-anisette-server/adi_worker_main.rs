@@ -208,6 +208,56 @@ impl<F: FnMut(u32) -> io::Result<()>> Drop for NativeSessionHandle<F> {
     }
 }
 
+/// Native engine interface: Start yields a CPIM and a process-local handle;
+/// Finish consumes the same handle; Destroy is mandatory even after Finish.
+/// The concrete native loader is intentionally not present in release builds.
+#[cfg(test)]
+trait NativeAdiEngine {
+    fn start_native(&mut self, identifier: &str, spim: &str) -> io::Result<(u32, String)>;
+    fn finish_native(&mut self, handle: u32, ptm: &str, tk: &str) -> io::Result<String>;
+    fn destroy_native(&mut self, handle: u32) -> io::Result<()>;
+}
+
+/// Adapter ties the typed IPC contract to a single native handle. An Rc cell
+/// lets the handle guard invoke Destroy using the same engine instance.
+#[cfg(test)]
+struct NativeEngineAdapter<E: NativeAdiEngine + 'static> {
+    engine: std::rc::Rc<std::cell::RefCell<E>>,
+    session: Option<NativeSessionHandle<Box<dyn FnMut(u32) -> io::Result<()>>>>,
+}
+
+#[cfg(test)]
+impl<E: NativeAdiEngine + 'static> NativeEngineAdapter<E> {
+    fn new(engine: E) -> Self {
+        Self { engine: std::rc::Rc::new(std::cell::RefCell::new(engine)), session: None }
+    }
+}
+
+#[cfg(test)]
+impl<E: NativeAdiEngine + 'static> StatefulMaterialBackend for NativeEngineAdapter<E> {
+    fn start(&mut self, identifier: &str, spim: &str) -> io::Result<String> {
+        if self.session.is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate Start"));
+        }
+        let (handle, cpim) = self.engine.borrow_mut().start_native(identifier, spim)?;
+        let engine = self.engine.clone();
+        self.session = Some(NativeSessionHandle::new(handle, Box::new(move |id| {
+            engine.borrow_mut().destroy_native(id)
+        })));
+        Ok(cpim)
+    }
+    fn finish(&mut self, ptm: &str, tk: &str) -> io::Result<String> {
+        let session = self.session.as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing native session"))?;
+        self.engine.borrow_mut().finish_native(session.id(), ptm, tk)
+    }
+    fn abort(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            let _ = session.close();
+        }
+    }
+}
+
 fn write_material<W: Write>(output: &mut W, material: SessionMaterial) -> io::Result<()> {
     let payload = match material {
         SessionMaterial::Started { cpim } =>
