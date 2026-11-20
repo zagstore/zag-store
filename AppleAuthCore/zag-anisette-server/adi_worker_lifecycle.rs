@@ -90,6 +90,12 @@ pub fn execute_offline_worker(
         if !metadata.file_type().is_dir() {
             return Err(WorkerError::UnapprovedExecutable);
         }
+        // Production workers must live beneath root-controlled directories.
+        // Development tests use disposable directories owned by the runner.
+        #[cfg(not(test))]
+        if metadata.uid() != 0 {
+            return Err(WorkerError::UnapprovedExecutable);
+        }
         let mode = metadata.mode();
         let writable = mode & 0o022 != 0;
         let trusted_sticky = metadata.uid() == 0 && mode & 0o1000 != 0
