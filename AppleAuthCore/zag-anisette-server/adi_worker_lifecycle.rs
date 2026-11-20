@@ -208,7 +208,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("worker.sh");
-        std::fs::write(&script, "#!/bin/sh\\nexit 0\\n").unwrap();
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
         let mut executable = std::fs::metadata(&script).unwrap().permissions();
         executable.set_mode(0o700);
         std::fs::set_permissions(&script, executable).unwrap();
