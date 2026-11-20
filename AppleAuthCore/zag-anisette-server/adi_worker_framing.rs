@@ -10,6 +10,7 @@ pub enum FrameError {
     Io(io::ErrorKind),
     Empty,
     Oversized,
+    TrailingData,
 }
 
 pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> Result<(), FrameError> {
@@ -34,9 +35,46 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, FrameError> {
     Ok(payload)
 }
 
+/// A worker exchange must contain exactly one frame and then EOF.
+/// Rejects trailing bytes without allocating any additional response data.
+/// The caller's process deadline must bound a peer that never closes stdout.
+pub fn read_single_frame_to_eof<R: Read>(reader: &mut R) -> Result<Vec<u8>, FrameError> {
+    let payload = read_frame(reader)?;
+    let mut extra = [0u8; 1];
+    match reader.read(&mut extra) {
+        Ok(0) => Ok(payload),
+        Ok(_) => Err(FrameError::TrailingData),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            // Read::read may be interrupted; retry rather than treating an
+            // interrupted read as proof of EOF.
+            loop {
+                match reader.read(&mut extra) {
+                    Ok(0) => break Ok(payload),
+                    Ok(_) => break Err(FrameError::TrailingData),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => break Err(FrameError::Io(error.kind())),
+                }
+            }
+        }
+        Err(error) => Err(FrameError::Io(error.kind())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_frame_requires_eof_and_rejects_trailing_bytes() {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, b"reply").unwrap();
+        assert_eq!(read_single_frame_to_eof(&mut frame.as_slice()), Ok(b"reply".to_vec()));
+        frame.extend_from_slice(b"extra");
+        assert_eq!(read_single_frame_to_eof(&mut frame.as_slice()), Err(FrameError::TrailingData));
+        let mut frame2 = Vec::new();
+        write_frame(&mut frame2, b"reply").unwrap();
+        write_frame(&mut frame2, b"second").unwrap();
+        assert_eq!(read_single_frame_to_eof(&mut frame2.as_slice()), Err(FrameError::TrailingData));
+    }
     #[test]
     fn roundtrip_and_exact_maximum() {
         for size in [1, 100, MAX_MESSAGE_BYTES] {
