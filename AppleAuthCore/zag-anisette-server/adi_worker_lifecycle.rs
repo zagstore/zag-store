@@ -46,18 +46,12 @@ pub enum WorkerError {
     InvalidResponse,
 }
 
-/// Never accepts a command from the network or a request. Caller supplies a
-/// preapproved canonical absolute executable, checked again before launch.
-/// stderr is discarded and no payload or worker output is logged.
-pub fn execute_offline_worker(
+/// Shared policy for both one-shot and session-scoped offline worker launch.
+/// Identity must be rechecked immediately before spawn.
+pub(crate) fn verify_worker_executable(
     approved: &Path,
     requested: &Path,
-    request: &WorkerRequest,
-    timeout: Duration,
-) -> Result<WorkerResponse, WorkerError> {
-    if timeout.is_zero() || timeout > Duration::from_secs(10) {
-        return Err(WorkerError::InvalidTimeout);
-    }
+) -> Result<(), WorkerError> {
     if !approved.is_absolute() || approved != requested {
         return Err(WorkerError::UnapprovedExecutable);
     }
@@ -123,6 +117,22 @@ pub fn execute_offline_worker(
     {
         return Err(WorkerError::UnapprovedExecutable);
     }
+    Ok(())
+}
+
+/// Never accepts a command from the network or a request. Caller supplies a
+/// preapproved canonical absolute executable, checked again before launch.
+/// stderr is discarded and no payload or worker output is logged.
+pub fn execute_offline_worker(
+    approved: &Path,
+    requested: &Path,
+    request: &WorkerRequest,
+    timeout: Duration,
+) -> Result<WorkerResponse, WorkerError> {
+    if timeout.is_zero() || timeout > Duration::from_secs(10) {
+        return Err(WorkerError::InvalidTimeout);
+    }
+    verify_worker_executable(approved, requested)?;
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
     let mut command = Command::new(approved);
     // Do not leak the HTTP process's credentials, proxy settings, dynamic
@@ -135,14 +145,7 @@ pub fn execute_offline_worker(
         .stderr(Stdio::null());
     #[cfg(unix)]
     command.process_group(0);
-    #[cfg(unix)]
-    {
-        let metadata = std::fs::metadata(approved)
-            .map_err(|_| WorkerError::UnapprovedExecutable)?;
-        if (metadata.dev(), metadata.ino()) != checked_identity {
-            return Err(WorkerError::UnapprovedExecutable);
-        }
-    }
+    verify_worker_executable(approved, requested)?;
     let mut child = command.spawn().map_err(|_error| {
         // Error kind and OS code only; never print executable arguments,
         // provisioning payloads, paths, or environment values.
