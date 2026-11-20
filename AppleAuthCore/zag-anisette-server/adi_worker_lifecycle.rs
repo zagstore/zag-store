@@ -328,6 +328,9 @@ mod tests {
         let mut mode = std::fs::metadata(&script).unwrap().permissions();
         mode.set_mode(0o700);
         std::fs::set_permissions(&script, mode).unwrap();
+        // Linux runners can briefly report ETXTBSY immediately after
+        // creating an executable script. Settle the fixture before spawn.
+        std::thread::sleep(Duration::from_millis(50));
         let result = execute_offline_worker(&script, &script, &request(), Duration::from_secs(1));
         assert!(result.is_err(), "{result:?}");
         assert!(marker.exists(), "worker inherited environment or working directory");
