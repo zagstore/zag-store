@@ -64,8 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         missing |= !found;
     }
     if missing { return Err("required native symbols missing".into()); }
-    if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--initialize-core")) {
-        // Explicit opt-in native initialization; never invoke provisioning in this probe.
+    let mode = std::env::args_os().nth(2);
+    let mode = mode.as_deref().and_then(std::ffi::OsStr::to_str);
+    if mode == Some("--initialize-core") || mode == Some("--configure-state") {
+        // All calls are explicitly opt-in. Never initiate provisioning in this probe.
         let init: sysv64_type!(fn(*const u8) -> i32) = unsafe {
             std::mem::transmute(lib.get_symbol("kq56gsgHG6").ok_or("missing CoreADI initializer")?)
         };
@@ -75,6 +77,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("CoreADI initialization status: {status}");
         if status != 0 { return Err(format!("CoreADI initialization failed: {status}").into()); }
         println!("PASS: CoreADI initialized; no provisioning executed");
+
+        if mode == Some("--configure-state") {
+            // Use an absolute, private test directory. Never reuse production ADI state.
+            let state = root.join("probe-state");
+            std::fs::create_dir_all(&state)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let state = state.canonicalize()?;
+            let state_cstr = CString::new(state.to_str().ok_or("non-UTF8 state path")?)?;
+            let set_path: sysv64_type!(fn(*const u8) -> i32) = unsafe {
+                std::mem::transmute(lib.get_symbol("nf92ngaK92").ok_or("missing set_provisioning_path")?)
+            };
+            eprintln!("Configuring isolated native state path: {}", state.display());
+            let path_status = set_path(state_cstr.as_ptr().cast());
+            println!("ADI provisioning path status: {path_status}");
+            if path_status != 0 { return Err(format!("native state path rejected: {path_status}").into()); }
+
+            // Fixed probe-only identifier: not an Apple ID, device serial, or user credential.
+            let identifier = b"zagadi-probe0001";
+            let set_id: sysv64_type!(fn(*const u8, u32) -> i32) = unsafe {
+                std::mem::transmute(lib.get_symbol("Sph98paBcz").ok_or("missing set_android_id")?)
+            };
+            let id_status = set_id(identifier.as_ptr(), identifier.len() as u32);
+            println!("ADI Android identifier status: {id_status}");
+            if id_status != 0 { return Err(format!("native Android identifier rejected: {id_status}").into()); }
+            println!("PASS: isolated provisioning path and probe-only identifier configured; no provisioning executed");
+        }
     }
     println!("PASS: native StoreServicesCore loaded and required symbols resolved; no provisioning executed");
     Ok(())
