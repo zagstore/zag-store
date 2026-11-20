@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hooks.insert("umask".to_string(), libc::umask as *const () as usize);
     hooks.insert("write".to_string(), libc::write as *const () as usize);
     hook_manager::add_hooks(hooks);
-    eprintln!("Loading {} (no provisioning calls)", dir.join("libstoreservicescore.so").display());
+    eprintln!("Loading {}", dir.join("libstoreservicescore.so").display());
     let lib = AndroidLibrary::load(dir.join("libstoreservicescore.so").to_str().ok_or("non-UTF8 runtime path")?)?;
     let symbols = [
         ("load_core_adi", "kq56gsgHG6"),
@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let id_status = set_id(identifier.as_ptr(), identifier.len() as u32);
             report!("ADI Android identifier status: {id_status}");
             if id_status != 0 { return Err(format!("native Android identifier rejected: {id_status}").into()); }
-            report!("PASS: isolated provisioning path and probe-only identifier configured; no provisioning executed");
+            report!("PASS: isolated provisioning path and Android identifier configured");
             if mode == Some("--native-abi-preflight") || mode == Some("--native-v2-session") {
                 let _native = native_session::NativeFunctions::resolve(&lib)?;
                 if mode == Some("--native-v2-session") {
