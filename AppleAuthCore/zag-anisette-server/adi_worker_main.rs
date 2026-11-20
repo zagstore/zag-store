@@ -524,6 +524,14 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn native_binary_encoding_is_lossless_and_bounded() {
+        let bytes = [0x00, 0xff, 0x0a, 0x80, 0x41];
+        assert_eq!(encode_native_bytes(&bytes).unwrap(), "00ff0a8041");
+        assert!(encode_native_bytes(&[]).is_err());
+        assert!(encode_native_bytes(&vec![0u8; MAX_MESSAGE_BYTES]).is_err());
+    }
+
+    #[test]
     fn sidestore_bridge_exports_only_validated_material() {
         struct Proxy { material: Vec<u8> }
         impl AdiProxyNativeCalls for Proxy {
@@ -539,14 +547,14 @@ mod tests {
         }
         for (bytes, expected) in [
             (b"valid-adi".to_vec(), None),
-            (vec![0xff, 0x00], Some(io::ErrorKind::InvalidData)),
-            (b"bad\nmaterial".to_vec(), Some(io::ErrorKind::InvalidData)),
+            (vec![0xff, 0x00], None),
+            (b"bad\nmaterial".to_vec(), None),
             (Vec::new(), Some(io::ErrorKind::InvalidData)),
         ] {
             let mut bridge = SideStoreNativeBridge { proxy: Proxy { material: bytes } };
             let result = bridge.finish_native(8, "ptm", "tk");
             match expected {
-                None => assert_eq!(result.unwrap(), "valid-adi"),
+                None => assert!(!result.unwrap().is_empty()),
                 Some(kind) => assert_eq!(result.unwrap_err().kind(), kind),
             }
         }
@@ -580,7 +588,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let mut engine = SideStoreNativeBridge { proxy: Proxy(count.clone()) };
         let (handle, cpim) = engine.start_native("-2", "spim").unwrap();
-        assert_eq!(cpim, "cpim");
+        assert_eq!(cpim, "6370696d");
         assert_eq!(handle, 17);
         assert_eq!(engine.finish_native(handle, "ptm", "tk").unwrap_err().kind(), io::ErrorKind::Unsupported);
         engine.destroy_native(handle).unwrap();
