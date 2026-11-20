@@ -132,6 +132,16 @@ mod tests {
         assert_eq!(output.stdout, frame(ERROR_RESPONSE));
     }
     #[test]
+    fn native_backend_is_explicitly_disabled_for_both_phases() {
+        let mut backend = DisabledNativeAdiBackend;
+        assert!(backend.execute(NativeRequest::Start {
+            identifier: "id".into(), spim: "spim".into(),
+        }).is_err());
+        assert!(backend.execute(NativeRequest::Finish {
+            ptm: "ptm".into(), tk: "tk".into(),
+        }).is_err());
+    }
+    #[test]
     fn malformed_trailing_and_oversized_input_fail_without_output() {
         for request in [
             frame(br#"{"version":1,"type":"start","identifier":"id"}"#),
