@@ -17,6 +17,15 @@ const MAX_FRAME: usize = wire::MAX_FRAME;
 /// Only known Apple GrandSlam provisioning hosts may be used. Deliberately
 /// refuse redirects and credential-bearing URLs. Any host additions require review.
 fn validated_endpoint(input: &str) -> io::Result<Url> {
+    // Check the raw authority before URL normalization: url::Url intentionally
+    // drops an explicit default HTTPS port (":443"), which would otherwise
+    // defeat the no-explicit-port policy.
+    let authority = input.strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or_else(|| invalid("invalid provisioning URL"))?;
+    if !matches!(authority, "gsa.apple.com" | "gsas.apple.com") {
+        return Err(invalid("unapproved raw provisioning authority"));
+    }
     let url = Url::parse(input).map_err(|_| invalid("invalid provisioning URL"))?;
     if url.scheme() != "https" || url.port().is_some() || !url.username().is_empty()
         || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
