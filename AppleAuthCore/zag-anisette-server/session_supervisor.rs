@@ -149,6 +149,7 @@ pub fn run_mock_session_cancellable(
         .map_err(|_| SessionError::Spawn)? != initial_identity {
         return Err(SessionError::Spawn);
     }
+    if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
     let mut child = cmd.spawn().map_err(|_| SessionError::Spawn)?;
     // Any early error after spawn must still terminate and reap the child.
     let pid = child.id();
@@ -180,6 +181,7 @@ pub fn run_mock_session_cancellable(
         }
     });
     let result = (|| {
+        if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
         command_tx.send(start_frame).map_err(|_| SessionError::Transport)?;
         if !receive(&write_rx, deadline, cancel)? { return Err(SessionError::Transport); }
         let started = receive(&read_rx, deadline, cancel)?.ok_or(SessionError::InvalidResponse)?;
@@ -191,6 +193,7 @@ pub fn run_mock_session_cancellable(
         if !valid_phase_reply(&started, "started") {
             return Err(SessionError::InvalidResponse);
         }
+        if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
         command_tx.send(finish_frame).map_err(|_| SessionError::Transport)?;
         if !receive(&write_rx, deadline, cancel)? { return Err(SessionError::Transport); }
         drop(command_tx);
@@ -208,7 +211,10 @@ pub fn run_mock_session_cancellable(
         while Instant::now() < deadline {
             if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
             match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok((started, finished)),
+                Ok(Some(status)) if status.success() => {
+                    if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
+                    return Ok((started, finished));
+                },
                 Ok(Some(_)) => return Err(SessionError::NonZeroExit),
                 Ok(None) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => return Err(SessionError::Transport),
