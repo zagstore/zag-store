@@ -206,11 +206,6 @@ fn run_typed_session<R: Read, W: Write, B: StatefulMaterialBackend>(
     write_material(output, SessionMaterial::Finished { adi_pb })
 }
 
-// Keep the provider-independent contract compiled in release builds while
-// preventing unused-code warnings. The release CLI has no route to this driver.
-const _: fn(&mut &[u8], &mut Vec<u8>, DisabledMaterialBackend) -> io::Result<()> =
-    run_typed_session::<&[u8], Vec<u8>, DisabledMaterialBackend>;
-
 struct DisabledMaterialBackend;
 impl StatefulMaterialBackend for DisabledMaterialBackend {
     fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
