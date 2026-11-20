@@ -131,7 +131,6 @@ mod v2_boundary_tests {
     use crate::adi_worker_wire_v2::{encode_response, Request, Response};
     #[test]
     fn v2_child_process_exchanges_binary_frames() {
-        use std::io::{Read, Write};
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/session_worker_fixture.rs");
         let temp = std::env::temp_dir().join(format!("zag-v2-fixture-{}-{:?}", std::process::id(), std::thread::current().id()));
