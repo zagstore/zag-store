@@ -39,8 +39,50 @@ fn read_request<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum NativeRequest {
+    Start { identifier: String, spim: String },
+    Finish { ptm: String, tk: String },
+}
+
+fn parse_request(bytes: &[u8]) -> io::Result<NativeRequest> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid request"))?;
+    let read = |name: &str| -> io::Result<String> {
+        value.get(name).and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid field"))
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("start") => Ok(NativeRequest::Start {
+            identifier: read("identifier")?, spim: read("spim")?,
+        }),
+        Some("finish") => Ok(NativeRequest::Finish {
+            ptm: read("ptm")?, tk: read("tk")?,
+        }),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid type")),
+    }
+}
+
+trait NativeAdiBackend {
+    fn execute(&mut self, request: NativeRequest) -> io::Result<()>;
+}
+
+/// Explicitly disabled until a separately reviewed native implementation is
+/// available. Never returns cpim or adi_pb, including for valid requests.
+struct DisabledNativeAdiBackend;
+impl NativeAdiBackend for DisabledNativeAdiBackend {
+    fn execute(&mut self, _request: NativeRequest) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "backend unavailable"))
+    }
+}
+
 fn run<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
-    let _request = read_request(input)?;
+    let request = read_request(input)?;
+    // Parse into a typed request before invoking a future native backend.
+    // The disabled backend must never synthesize provisioning material.
+    let request = parse_request(&request)?;
+    let _ = DisabledNativeAdiBackend.execute(request);
     output.write_all(&(ERROR_RESPONSE.len() as u32).to_be_bytes())?;
     output.write_all(ERROR_RESPONSE)?;
     output.flush()
