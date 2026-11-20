@@ -108,6 +108,48 @@ jobs:
                                     capture_output=True, timeout=5)
               assert proc.returncode != 0 and proc.stdout == b"" and proc.stderr == b""
           PY
+      - name: Stateful two-phase offline fixture subprocess
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import struct
+          import subprocess
+          import sys
+
+          fixture = pathlib.Path("tests/offline_session_fixture.py").resolve()
+          def frame(obj):
+              data = json.dumps(obj, separators=(",", ":")).encode()
+              return struct.pack(">I", len(data)) + data
+          def read_frame(pipe):
+              header = pipe.read(4)
+              assert len(header) == 4
+              size = struct.unpack(">I", header)[0]
+              assert 0 < size <= 65536
+              payload = pipe.read(size)
+              assert len(payload) == size
+              return json.loads(payload)
+
+          child = subprocess.Popen([sys.executable, str(fixture)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+          try:
+              child.stdin.write(frame({"version": 1, "type": "start",
+                                       "identifier": "device", "spim": "spim"}))
+              child.stdin.flush()
+              assert read_frame(child.stdout) == {"version": 1, "type": "started", "cpim": "mock"}
+              assert child.poll() is None, "worker must remain alive for Finish"
+              child.stdin.write(frame({"version": 1, "type": "finish", "ptm": "ptm", "tk": "tk"}))
+              child.stdin.close()
+              assert read_frame(child.stdout) == {"version": 1, "type": "finished", "adi_pb": "mock"}
+              assert child.stdout.read() == b"", "unexpected extra output"
+              assert child.wait(timeout=5) == 0
+              assert child.stderr.read() == b""
+          finally:
+              if child.poll() is None:
+                  child.kill()
+                  child.wait(timeout=5)
+          PY
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Offline provisioning adapter against compiled worker
