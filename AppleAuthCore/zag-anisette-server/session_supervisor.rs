@@ -286,6 +286,24 @@ mod tests {
         assert_eq!(result, Err(SessionError::Timeout));
     }
     #[test]
+    fn rejects_extra_frame_after_finish() {
+        let original = "dd bs=1 count=66 2>/dev/null >/dev/null; printf ";
+        let script = concat!(
+            "dd bs=1 count=66 2>/dev/null >/dev/null; ",
+            "printf '\\000\\000\\000\\054{\\\"version\\\":1,\\\"type\\\":\\\"started\\\",\\\"cpim\\\":\\\"mock\\\"}'; ",
+            "dd bs=1 count=58 2>/dev/null >/dev/null; ",
+            "printf '\\000\\000\\000\\057{\\\"version\\\":1,\\\"type\\\":\\\"finished\\\",\\\"adi_pb\\\":\\\"mock\\\"}'; ",
+            "printf '\\000\\000\\000\\057{\\\"version\\\":1,\\\"type\\\":\\\"finished\\\",\\\"adi_pb\\\":\\\"mock\\\"}'"
+        );
+        let _ = original;
+        let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
+            &["-c", script],
+            r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+            r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+            Duration::from_secs(2));
+        assert_eq!(result, Err(SessionError::InvalidResponse));
+    }
+    #[test]
     fn malformed_worker_frame_fails_closed() {
         let script = "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\000\\000'";
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
