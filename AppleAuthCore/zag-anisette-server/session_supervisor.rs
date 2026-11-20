@@ -277,6 +277,24 @@ mod tests {
         assert_eq!(result, Err(SessionError::Timeout));
     }
     #[test]
+    fn descendant_holding_stdout_cannot_extend_deadline() {
+        // The shell exits after sending both frames, but a background
+        // descendant inherits stdout and keeps the pipe open.
+        let script = concat!(
+            "dd bs=1 count=66 2>/dev/null >/dev/null; ",
+            "printf '\\000\\000\\000\\054{\\\"version\\\":1,\\\"type\\\":\\\"started\\\",\\\"cpim\\\":\\\"mock\\\"}'; ",
+            "dd bs=1 count=58 2>/dev/null >/dev/null; ",
+            "printf '\\000\\000\\000\\057{\\\"version\\\":1,\\\"type\\\":\\\"finished\\\",\\\"adi_pb\\\":\\\"mock\\\"}'; ",
+            "sleep 5 & exit 0"
+        );
+        let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
+            &["-c", script],
+            r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+            r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+            Duration::from_millis(200));
+        assert_eq!(result, Err(SessionError::Timeout));
+    }
+    #[test]
     fn worker_that_never_replies_times_out() {
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
             &["-c", "sleep 5"],
