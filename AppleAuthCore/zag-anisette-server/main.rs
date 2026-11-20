@@ -20,8 +20,8 @@ fn route(request: &[u8]) -> Vec<u8> {
         return response("200 OK", r#"{"status":"offline_only"}"#);
     }
     // Exact, method-restricted routes only: never expose a wildcard proxy to Apple.
-    if matches!(path, "/v3/getHeaders" | "/v3/provisioning") {
-        if method != "POST" { return response("405 Method Not Allowed", r#"{"error":"method_not_allowed"}"#); }
+    if matches!(path, "/v3/client_info" | "/v3/get_headers" | "/v3/provisioning_session") {
+        if (path == "/v3/client_info" && method != "GET") || (path == "/v3/get_headers" && method != "POST") { return response("405 Method Not Allowed", r#"{"error":"method_not_allowed"}"#); }
         return response("503 Service Unavailable", r#"{"error":"provisioning_backend_not_enabled"}"#);
     }
     if path.starts_with("/v3/") { return response("404 Not Found", r#"{"error":"not_found"}"#); }
@@ -55,8 +55,10 @@ fn main() -> std::io::Result<()> {
 mod tests {
     use super::*;
     #[test] fn health() { assert!(String::from_utf8(route(b"GET /healthz HTTP/1.1\r\n")).unwrap().contains("200 OK")); }
-    #[test] fn never_provisions() { assert!(String::from_utf8(route(b"POST /v3/provisioning HTTP/1.1\r\n")).unwrap().contains("503 Service Unavailable")); }
+    #[test] fn never_provisions() { assert!(String::from_utf8(route(b"POST /v3/get_headers HTTP/1.1\r\n")).unwrap().contains("503 Service Unavailable")); }
     #[test] fn unknown_v3_is_not_proxied() { assert!(String::from_utf8(route(b"POST /v3/unknown HTTP/1.1\r\n")).unwrap().contains("404 Not Found")); }
-    #[test] fn get_cannot_provision() { assert!(String::from_utf8(route(b"GET /v3/getHeaders HTTP/1.1\r\n")).unwrap().contains("405 Method Not Allowed")); }
+    #[test] fn get_cannot_provision() { assert!(String::from_utf8(route(b"GET /v3/get_headers HTTP/1.1\r\n")).unwrap().contains("405 Method Not Allowed")); }
+    #[test] fn client_info_is_offline() { assert!(String::from_utf8(route(b"GET /v3/client_info HTTP/1.1\r\n")).unwrap().contains("503 Service Unavailable")); }
+    #[test] fn websocket_upgrade_is_disabled() { assert!(String::from_utf8(route(b"GET /v3/provisioning_session HTTP/1.1\r\n")).unwrap().contains("503 Service Unavailable")); }
     #[test] fn no_public_routes() { assert!(String::from_utf8(route(b"GET / HTTP/1.1\r\n")).unwrap().contains("404 Not Found")); }
 }
