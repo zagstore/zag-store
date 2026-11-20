@@ -70,6 +70,9 @@ pub fn run_mock_session(
     }
     crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
         .map_err(|_| SessionError::Spawn)?;
+    #[cfg(unix)]
+    let initial_identity = crate::adi_worker_lifecycle::worker_file_identity(executable)
+        .map_err(|_| SessionError::Spawn)?;
     let start_frame = encode_session_frame(&serde_json::from_str::<serde_json::Value>(start)
         .map_err(|_| SessionError::InvalidResponse)?)
         .map_err(|_| SessionError::InvalidResponse)?;
@@ -93,6 +96,11 @@ pub fn run_mock_session(
     cmd.process_group(0);
     crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
         .map_err(|_| SessionError::Spawn)?;
+    #[cfg(unix)]
+    if crate::adi_worker_lifecycle::worker_file_identity(executable)
+        .map_err(|_| SessionError::Spawn)? != initial_identity {
+        return Err(SessionError::Spawn);
+    }
     let mut child = cmd.spawn().map_err(|_| SessionError::Spawn)?;
     // Any early error after spawn must still terminate and reap the child.
     let pid = child.id();
