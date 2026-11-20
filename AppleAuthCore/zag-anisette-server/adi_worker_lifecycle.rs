@@ -249,7 +249,7 @@ mod tests {
         // HOME is set in GitHub runners and most shells. The worker should
         // have neither HOME nor the caller's current working directory.
         let body = format!(
-            "#!/bin/sh\nif [ -z \"\u0024{{HOME+x}}\" ] && [ \"\u0024PWD\" = / ]; then echo ok > '{}'; fi\n",
+            "#!/bin/sh\nif [ -z \"${{HOME+x}}\" ] && [ \"$PWD\" = / ]; then echo ok > '{}'; fi\n",
             marker.display()
         );
         std::fs::write(&script, body).unwrap();
