@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -65,6 +65,17 @@ pub fn execute_offline_worker(
     if canonical != approved || !std::fs::symlink_metadata(approved)
         .map_err(|_| WorkerError::UnapprovedExecutable)?
         .file_type().is_file()
+    {
+        return Err(WorkerError::UnapprovedExecutable);
+    }
+    // Reject mutable-by-other-users executables. This does not eliminate
+    // path replacement races: trusted deployment must also protect every
+    // parent directory and eventually bind launch to a verified file handle.
+    #[cfg(unix)]
+    if std::fs::metadata(approved)
+        .map_err(|_| WorkerError::UnapprovedExecutable)?
+        .permissions()
+        .mode() & 0o022 != 0
     {
         return Err(WorkerError::UnapprovedExecutable);
     }
@@ -175,6 +186,27 @@ mod tests {
         assert_eq!(execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/false"), &request(), Duration::from_secs(1)), Err(WorkerError::UnapprovedExecutable));
         assert_eq!(execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/true"), &request(), Duration::ZERO), Err(WorkerError::InvalidTimeout));
         assert_eq!(execute_offline_worker(Path::new("relative"), Path::new("relative"), &request(), Duration::from_secs(1)), Err(WorkerError::UnapprovedExecutable));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_writable_worker_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "zag-adi-permissions-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\\nexit 0\\n".replace("\\\\n", "\\n")).unwrap();
+        for mode in [0o722, 0o702, 0o777] {
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&script, perms).unwrap();
+            assert_eq!(
+                execute_offline_worker(&script, &script, &request(), Duration::from_secs(1)),
+                Err(WorkerError::UnapprovedExecutable)
+            );
+        }
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
     #[cfg(unix)]
     #[test]
