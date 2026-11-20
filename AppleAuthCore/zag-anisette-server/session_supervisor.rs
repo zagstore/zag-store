@@ -4,7 +4,7 @@
 //! No network integration, native libraries, or Apple provisioning.
 #![allow(dead_code)]
 use std::{
-    io::{Read, Write},
+    io::Write,
     path::Path,
     process::{Command, Stdio},
     sync::mpsc,
