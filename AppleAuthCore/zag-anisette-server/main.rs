@@ -242,6 +242,10 @@ fn read_before(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> std
     stream.read(buf)
 }
 
+fn offline_socket_enabled() -> bool {
+    std::env::var("ZAG_ANISETTE_OFFLINE_WS_TEST").ok().as_deref() == Some("1")
+}
+
 fn handle(mut stream: TcpStream) -> std::io::Result<()> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -268,6 +272,27 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
         None => (reply("431 Request Header Fields Too Large", r#"{"error":"header_limit"}"#), 0),
         Some(i) => respond(&buf[..i]),
     };
+    // Opt-in local protocol harness only. No Apple backend is reachable.
+    // The ordinary service remains fail-closed (503) without this setting.
+    if offline_socket_enabled()
+        && matches!(end, Some(_))
+        && response.status == "503 Service Unavailable"
+        && buf[..end.unwrap_or(0)].starts_with(b"GET /v3/provisioning_session HTTP/1.1\\r\\n")
+    {
+        let parsed = parse(&buf[..end.unwrap_or(0)]);
+        if let Ok(head) = parsed {
+            if head.path == "/v3/provisioning_session" && is_websocket_upgrade(&head) {
+                // Preserve all bytes already read: the HTTP parser may have
+                // buffered the first WebSocket frame with the handshake.
+                // Refuse that case rather than silently losing data.
+                if count == end.unwrap_or(0) + 4 {
+                    buf.fill(0);
+                    return crate::websocket_transport::serve_offline_socket(stream)
+                        .map_err(std::io::Error::other);
+                }
+            }
+        }
+    }
     // Drain (and discard) the declared body so the client reads the response
     // rather than a reset. Nothing of it is kept.
     let mut left = body.saturating_sub(count - end.map_or(count, |i| i + 4));
