@@ -9,7 +9,19 @@ license = "GPL-3.0-only"
 name = "zag-anisette-server"
 path = "main.rs"
 
+[[bin]]
+name = "zag-adi-worker"
+path = "adi_worker_main.rs"
+
 [profile.release]
 panic = "abort"
 lto = true
 codegen-units = 1
+
+[dependencies]
+serde_json = "1.0"
+tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
+
+# Test-only: the WebSocket client library (and version) the fork's v3 client
+# uses, to check the upgrade is refused as that client sees it.
+
