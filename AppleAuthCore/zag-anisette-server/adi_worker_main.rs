@@ -367,6 +367,23 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn typed_session_rejects_invalid_native_material_without_output() {
+        struct Bad;
+        impl StatefulMaterialBackend for Bad {
+            fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
+                Ok("bad\\nmaterial".into())
+            }
+            fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
+                panic!("finish must not run")
+            }
+        }
+        let input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        let mut output = Vec::new();
+        assert!(run_typed_session(&mut input.as_slice(), &mut output, Bad).is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn typed_session_rejects_finish_first_without_invoking_backend() {
         struct Never;
         impl StatefulMaterialBackend for Never {
