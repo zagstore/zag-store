@@ -51,6 +51,11 @@ fn run_v2() -> io::Result<()> {
 fn main() {
     let result = match std::env::args().nth(1).as_deref() {
         Some("--v2") => run_v2(),
+        Some("--v2-duplicate") => {
+            let mut input = io::stdin().lock();
+            let mut output = io::stdout().lock();
+            read_frame(&mut input).and_then(|_| send(&mut output, r#"{"version":2,"type":"started","cpim_hex":"00ff","cpim_hex":"00ff"}"#))
+        },
         Some("--v2-wrong-phase") => {
             let mut input = io::stdin().lock();
             let mut output = io::stdout().lock();
