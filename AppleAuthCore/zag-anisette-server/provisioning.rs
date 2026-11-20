@@ -105,6 +105,18 @@ pub fn encode_server_message(msg: &ServerMessage) -> String {
     }
 }
 
+/// Drives a single decoded WebSocket text frame through the provisioning
+/// state machine. A future transport adapter must enforce its own frame-size,
+/// session deadline and close-on-error policy.
+pub fn process_text_frame<B: ProvisioningBackend>(
+    session: &mut Session<B>,
+    frame: &str,
+) -> Result<String, ProtocolError> {
+    let incoming = decode_client_message(frame)?;
+    let outgoing = session.receive(incoming)?;
+    Ok(encode_server_message(&outgoing))
+}
+
 // Intentionally not wired to HTTP or WebSocket: no mock data may be returned
 // as valid Apple provisioning output.
 #[cfg(test)]
@@ -152,6 +164,46 @@ mod tests {
         for message in [r#"{}"#, r#"[]"#, r#"{"spim":null}"#, r#"{"spim":""}"#, r#"{"identifier":"x","extra":1}"#, r#"{"ptm":"x"}"#, r#"{"ptm":"x","tk":"y","identifier":"z"}"#] {
             assert_eq!(decode_client_message(message), Err(ProtocolError::InvalidField), "{message}");
         }
+    }
+    #[test] fn frame_adapter_matches_existing_client_protocol() {
+        let mut session = Session::new(FakeBackend);
+        assert_eq!(encode_server_message(&session.initial()), r#"{"result":"GiveIdentifier"}"#);
+        let step1: serde_json::Value = serde_json::from_str(
+            &process_text_frame(&mut session, r#"{"identifier":"id"}"#).unwrap()
+        ).unwrap();
+        assert_eq!(step1["result"], "GiveStartProvisioningData");
+        let step2: serde_json::Value = serde_json::from_str(
+            &process_text_frame(&mut session, r#"{"spim":"spim"}"#).unwrap()
+        ).unwrap();
+        assert_eq!(step2["result"], "GiveEndProvisioningData");
+        assert_eq!(step2["cpim"], "cpim");
+        let step3: serde_json::Value = serde_json::from_str(
+            &process_text_frame(&mut session, r#"{"ptm":"ptm","tk":"tk"}"#).unwrap()
+        ).unwrap();
+        assert_eq!(step3["result"], "ProvisioningSuccess");
+        assert_eq!(step3["adi_pb"], "adi_pb");
+        assert_eq!(session.phase(), Phase::Complete);
+        assert_eq!(
+            process_text_frame(&mut session, r#"{"identifier":"id"}"#),
+            Err(ProtocolError::InvalidTransition)
+        );
+    }
+    #[test] fn offline_backend_cannot_produce_provisioning_output() {
+        let mut session = Session::new(OfflineBackend);
+        assert!(process_text_frame(&mut session, r#"{"identifier":"id"}"#).is_ok());
+        assert_eq!(
+            process_text_frame(&mut session, r#"{"spim":"spim"}"#),
+            Err(ProtocolError::BackendUnavailable)
+        );
+        assert_eq!(session.phase(), Phase::AwaitStart);
+    }
+    #[test] fn rejected_frame_does_not_advance_session() {
+        let mut session = Session::new(FakeBackend);
+        assert_eq!(
+            process_text_frame(&mut session, r#"{"identifier":"id","unknown":true}"#),
+            Err(ProtocolError::InvalidField)
+        );
+        assert_eq!(session.phase(), Phase::AwaitIdentifier);
     }
     #[test] fn out_of_order_rejected() {
         let mut session = Session::new(OfflineBackend);
