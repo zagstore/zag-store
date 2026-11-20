@@ -1,0 +1,10 @@
+[package]
+name = "zag-native-adi-loader-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+android-loader = { git = "https://github.com/Dadoum/android-loader", rev = "dfa86501afca7caa23d5ce15322ac7260d857485" }
+libc = "0.2"
+rand = "0.8"
