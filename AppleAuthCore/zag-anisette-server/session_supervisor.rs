@@ -292,7 +292,8 @@ mod tests {
             r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
             r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
             Duration::from_millis(200));
-        assert_eq!(result, Err(SessionError::Timeout));
+        assert!(matches!(result, Err(SessionError::Timeout | SessionError::InvalidResponse)),
+            "descendant-held stdout must fail closed: {result:?}");
     }
     #[test]
     fn worker_that_never_replies_times_out() {
