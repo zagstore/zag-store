@@ -138,7 +138,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_with_no_response_fails_closed() {
-        let result = execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/true"), &request(), Duration::from_secs(1));
+        let path = Path::new("/usr/bin/true").canonicalize().unwrap();
+        let result = execute_offline_worker(&path, &path, &request(), Duration::from_secs(1));
         assert!(matches!(result, Err(WorkerError::Transport) | Err(WorkerError::NonZeroExit)));
     }
     #[cfg(unix)]
@@ -164,7 +165,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nonzero_worker_cannot_produce_success() {
-        let result = execute_offline_worker(Path::new("/usr/bin/false"), Path::new("/usr/bin/false"), &request(), Duration::from_secs(1));
+        let path = Path::new("/usr/bin/false").canonicalize().unwrap();
+        let result = execute_offline_worker(&path, &path, &request(), Duration::from_secs(1));
         assert!(result.is_err());
     }
 }
