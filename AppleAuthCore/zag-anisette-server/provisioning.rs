@@ -220,6 +220,60 @@ mod tests {
         assert_eq!(session.receive(ClientMessage::Finish { ptm: "p".into(), tk: "t".into() }), Err(ProtocolError::BackendUnavailable));
         assert_eq!(session.phase(), Phase::Failed);
     }
+    struct BoundAdiProvider {
+        expected_identifier: &'static str,
+        expected_spim: &'static str,
+        expected_ptm: &'static str,
+        expected_tk: &'static str,
+        started: bool,
+    }
+    impl AdiProvider for BoundAdiProvider {
+        fn start_provisioning(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError> {
+            if self.started || identifier != self.expected_identifier || spim != self.expected_spim {
+                return Err(ProtocolError::InvalidField);
+            }
+            self.started = true;
+            Ok(format!("cpim-{}", self.expected_identifier))
+        }
+        fn finish_provisioning(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError> {
+            if !self.started || ptm != self.expected_ptm || tk != self.expected_tk {
+                return Err(ProtocolError::InvalidField);
+            }
+            Ok(format!("adi-{}", self.expected_identifier))
+        }
+    }
+    fn bound_provider(id: &'static str, spim: &'static str, ptm: &'static str, tk: &'static str) -> BoundAdiProvider {
+        BoundAdiProvider { expected_identifier: id, expected_spim: spim, expected_ptm: ptm, expected_tk: tk, started: false }
+    }
+    #[test] fn concurrent_adi_sessions_do_not_share_provider_state() {
+        use std::thread;
+        let a = thread::spawn(|| {
+            let mut session = Session::new(AdiBackend::new(bound_provider("device-a", "spim-a", "ptm-a", "tk-a")));
+            assert!(session.receive(ClientMessage::Identifier("device-a".into())).is_ok());
+            assert_eq!(session.receive(ClientMessage::Spim("spim-a".into())), Ok(ServerMessage::GiveEndProvisioningData { cpim: "cpim-device-a".into() }));
+            assert_eq!(session.receive(ClientMessage::Finish { ptm: "ptm-a".into(), tk: "tk-a".into() }), Ok(ServerMessage::ProvisioningSuccess { adi_pb: "adi-device-a".into() }));
+        });
+        let b = thread::spawn(|| {
+            let mut session = Session::new(AdiBackend::new(bound_provider("device-b", "spim-b", "ptm-b", "tk-b")));
+            assert!(session.receive(ClientMessage::Identifier("device-b".into())).is_ok());
+            assert_eq!(session.receive(ClientMessage::Spim("spim-a".into())), Err(ProtocolError::InvalidField));
+            assert_eq!(session.phase(), Phase::Failed);
+            assert_eq!(session.receive(ClientMessage::Spim("spim-b".into())), Err(ProtocolError::InvalidTransition));
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+    }
+    #[test] fn provisioning_output_cannot_be_reused_across_sessions() {
+        let mut a = Session::new(AdiBackend::new(bound_provider("a", "sa", "pa", "ta")));
+        let mut b = Session::new(AdiBackend::new(bound_provider("b", "sb", "pb", "tb")));
+        assert!(a.receive(ClientMessage::Identifier("a".into())).is_ok());
+        assert!(b.receive(ClientMessage::Identifier("b".into())).is_ok());
+        assert!(a.receive(ClientMessage::Spim("sa".into())).is_ok());
+        assert!(b.receive(ClientMessage::Spim("sb".into())).is_ok());
+        assert_eq!(b.receive(ClientMessage::Finish { ptm: "pa".into(), tk: "ta".into() }), Err(ProtocolError::InvalidField));
+        assert_eq!(b.phase(), Phase::Failed);
+        assert_eq!(a.receive(ClientMessage::Finish { ptm: "pa".into(), tk: "ta".into() }), Ok(ServerMessage::ProvisioningSuccess { adi_pb: "adi-a".into() }));
+    }
     #[test] fn offline_never_advances() {
         let mut session = Session::new(OfflineBackend);
         assert_eq!(session.initial(), ServerMessage::GiveIdentifier);
