@@ -73,6 +73,23 @@ mod tests {
         }
     }
     #[test]
+    fn worker_binary_process_roundtrip_is_fail_closed() {
+        use std::process::{Command, Stdio};
+        use std::io::Write as _;
+        let executable = std::env::var_os("CARGO_BIN_EXE_zag-adi-worker");
+        // Cargo's unit-test runner does not guarantee this variable. The
+        // workflow's explicit binary smoke step covers subprocess execution.
+        let Some(executable) = executable else { return; };
+        let mut child = Command::new(executable)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&frame(
+            br#"{"version":1,"type":"start","identifier":"id","spim":"spim"}"#
+        )).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, frame(ERROR_RESPONSE));
+    }
+    #[test]
     fn malformed_trailing_and_oversized_input_fail_without_output() {
         for request in [
             frame(br#"{"version":1,"type":"start","identifier":"id"}"#),
