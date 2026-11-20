@@ -35,11 +35,19 @@ pub enum Phase { AwaitStart, AwaitFinish, Completed, Cancelled }
 pub struct Session<B: SessionBackend> {
     backend: B,
     phase: Phase,
+    deadline: Instant,
 }
 impl<B: SessionBackend> Session<B> {
-    pub fn new(backend: B) -> Self { Self { backend, phase: Phase::AwaitStart } }
+    pub fn new(backend: B) -> Self { Self::with_timeout(backend, Duration::from_secs(10)) }
+    pub fn with_timeout(backend: B, timeout: Duration) -> Self {
+        Self { backend, phase: Phase::AwaitStart, deadline: Instant::now() + timeout }
+    }
+    fn ensure_live(&mut self) -> Result<(), &'static str> {
+        if Instant::now() >= self.deadline { self.cancel(); Err("expired") } else { Ok(()) }
+    }
     pub fn phase(&self) -> &Phase { &self.phase }
     pub fn start(&mut self, identifier: &str, spim: &str) -> Result<String, &'static str> {
+        self.ensure_live()?;
         if self.phase != Phase::AwaitStart { return Err("invalid_state"); }
         match self.backend.start(identifier, spim) {
             Ok(cpim) => { self.phase = Phase::AwaitFinish; Ok(cpim) }
@@ -47,6 +55,7 @@ impl<B: SessionBackend> Session<B> {
         }
     }
     pub fn finish(&mut self, ptm: &str, tk: &str) -> Result<String, &'static str> {
+        self.ensure_live()?;
         if self.phase != Phase::AwaitFinish { return Err("invalid_state"); }
         match self.backend.finish(ptm, tk) {
             Ok(adi_pb) => { self.phase = Phase::Completed; Ok(adi_pb) }
@@ -144,6 +153,13 @@ mod tests {
         serve_mock(&input[..], &mut output).unwrap();
         let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(response["type"], "error");
+    }
+    #[test]
+    fn expired_session_cancels_before_native_finish() {
+        let mut s = Session::with_timeout(MockBackend::default(), Duration::ZERO);
+        assert_eq!(s.start("id", "spim"), Err("expired"));
+        assert_eq!(s.phase(), &Phase::Cancelled);
+        assert_eq!(s.finish("ptm", "tk"), Err("expired"));
     }
     #[test]
     fn framed_mock_roundtrip() {
