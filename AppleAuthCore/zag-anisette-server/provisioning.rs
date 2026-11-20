@@ -61,6 +61,51 @@ impl<P: AdiProvider> ProvisioningBackend for AdiBackend<P> {
     }
 }
 
+/// Explicit, offline-only bridge from the provisioning contract to the
+/// reviewed worker IPC. Constructing this adapter does not launch anything;
+/// it is intentionally not registered with the HTTP/WebSocket listener.
+pub struct OfflineWorkerAdiProvider {
+    executable: std::path::PathBuf,
+    timeout: std::time::Duration,
+}
+
+impl OfflineWorkerAdiProvider {
+    pub fn new(executable: std::path::PathBuf, timeout: std::time::Duration) -> Self {
+        Self { executable, timeout }
+    }
+
+    fn exchange(
+        &self,
+        request: crate::adi_worker_protocol::WorkerRequest,
+    ) -> Result<crate::adi_worker_protocol::WorkerResponse, ProtocolError> {
+        crate::adi_worker_lifecycle::execute_offline_worker(
+            &self.executable, &self.executable, &request, self.timeout,
+        ).map_err(|_| ProtocolError::BackendUnavailable)
+    }
+}
+
+impl AdiProvider for OfflineWorkerAdiProvider {
+    fn start_provisioning(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError> {
+        use crate::adi_worker_protocol::{WorkerRequest, WorkerResponse};
+        match self.exchange(WorkerRequest::Start {
+            identifier: identifier.into(), spim: spim.into(),
+        })? {
+            WorkerResponse::Started { cpim } => Ok(cpim),
+            _ => Err(ProtocolError::BackendUnavailable),
+        }
+    }
+
+    fn finish_provisioning(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError> {
+        use crate::adi_worker_protocol::{WorkerRequest, WorkerResponse};
+        match self.exchange(WorkerRequest::Finish {
+            ptm: ptm.into(), tk: tk.into(),
+        })? {
+            WorkerResponse::Finished { adi_pb } => Ok(adi_pb),
+            _ => Err(ProtocolError::BackendUnavailable),
+        }
+    }
+}
+
 /// Safe default: provider never produces Apple provisioning material.
 pub struct DisabledAdiProvider;
 impl AdiProvider for DisabledAdiProvider {
