@@ -85,9 +85,17 @@ pub fn serve_mock<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Resu
             session.cancel();
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid frame"));
         }
-        let value: serde_json::Value = serde_json::from_slice(&line)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid json"))?;
-        let obj = value.as_object().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid object"))?;
+        let value: serde_json::Value = match serde_json::from_slice(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                session.cancel();
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid json"));
+            }
+        };
+        let Some(obj) = value.as_object() else {
+            session.cancel();
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid object"));
+        };
         let kind = obj.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
         let field = |key: &str| obj.get(key).and_then(serde_json::Value::as_str).unwrap_or("");
         let result = match kind {
@@ -160,6 +168,21 @@ mod tests {
         assert_eq!(s.start("id", "spim"), Err("expired"));
         assert_eq!(s.phase(), &Phase::Cancelled);
         assert_eq!(s.finish("ptm", "tk"), Err("expired"));
+    }
+    #[test]
+    fn malformed_json_after_start_cancels_session() {
+        let input = b"{\"type\":\"start\",\"identifier\":\"id\",\"spim\":\"spim\"}\nnot-json\n";
+        let mut output = Vec::new();
+        assert!(serve_mock(&input[..], &mut output).is_err());
+        let first: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+        assert_eq!(first["type"], "started");
+    }
+    #[test]
+    fn cancellation_command_closes_without_finish() {
+        let input = b"{\"type\":\"start\",\"identifier\":\"id\",\"spim\":\"spim\"}\n{\"type\":\"cancel\"}\n";
+        let mut output = Vec::new();
+        serve_mock(&input[..], &mut output).unwrap();
+        assert_eq!(output.iter().filter(|&&c| c == b'\n').count(), 1);
     }
     #[test]
     fn framed_mock_roundtrip() {
