@@ -12,6 +12,20 @@ Prior source review identified SideStore/omnisette-server's `ProviderInstance` w
 
 Before implementation, pin immutable source revisions for SideStore/omnisette-server, SideStore/apple-private-apis, and the exact omnisette dependency; inspect Cargo.lock, feature flags, build scripts, target OS/architecture, dynamic loading paths, license notices and native ABI. Record verified source URLs and SHA values. Do not guess FFI symbols or create placeholder native calls in release code.
 
+## Verified upstream source checkpoint (20 November 2026)
+
+- `Dadoum/anisette-v3-server` main at **`684895737aaf1a1c4586fcd5b67509ffd500a36c`**; source `source/app.d`, manifest `dub.json`. The manifest pins `Dadoum/Provision` at **`7717ce1f7b3c9779fe9982005d07b6665071a239`**, and uses D dependencies `slf4d` and `vibe-d`. These exact commits are available upstream.
+- This implementation is **D**, not a Rust `NativeAdiBackend` crate. Its `app.d` initializes `Device`, `ADI`, and `ProvisioningSession` from `provision`; it also downloads Android Apple Music libraries when missing. Therefore it cannot simply be linked into our Rust worker without a reviewed FFI or separate process/protocol adapter.
+- The upstream source stores a device record and ADI provisioning data under configuration/runtime directories. Our existing supervisor clears the child environment and sets cwd to `/`; we must explicitly design controlled paths and avoid accidental persistent state sharing.
+- An October–November 2026 upstream issue reports Apple GrandSlam rejecting Android CoreADI/device-identity mismatches; the maintainer discussed alternative Windows/macOS CoreADI implementations and **license work still pending**. This is a functional and legal blocker to assuming that a successfully compiled native backend will complete Apple sign-in.
+- Upstream `anisette-v3-server` is a full network service with HTTP/WebSocket endpoints. We must **not** run it as an unrestricted sidecar or substitute its public listener for our bounded private worker IPC.
+- **Decision:** keep our Rust release worker disabled. Next investigate `Dadoum/Provision` at its pinned revision for a legally usable, explicit native boundary and compare with `SideStore/apple-private-apis` under a pinned commit. No native linking until API and license review.
+
+Sources:
+- https://github.com/Dadoum/anisette-v3-server/tree/684895737aaf1a1c4586fcd5b67509ffd500a36c
+- https://github.com/Dadoum/Provision/tree/7717ce1f7b3c9779fe9982005d07b6665071a239
+- https://github.com/Dadoum/anisette-v3-server/issues/61
+
 ## Implementation milestones
 
 1. Introduce a generic typed two-phase session driver with strict Start/Finish transitions, bounded frames and no mock-success logic in release code. Test with a stateful in-memory backend and failure injection.
