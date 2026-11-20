@@ -41,8 +41,9 @@ path-to-execution races.
   returns `backend_unavailable` and is one-request-only.
 - Implement cancellation/disconnect propagation, worker concurrency caps,
   and a bounded native session storage lifecycle.
-- Extend subprocess regression coverage to hung Finish, extra frames,
-  inherited stdout from descendants, and session cross-talk.
+- Extend subprocess regression coverage to inherited stdout from
+  descendants, explicit cancellation, and session cross-talk. Hung Finish
+  and extra-frame tests are now included.
 - Review descriptor-bound execution or immutable root-controlled deployment;
   process groups alone are not sandboxing.
 - Verify native library availability, redistribution/licensing, cleanup,
