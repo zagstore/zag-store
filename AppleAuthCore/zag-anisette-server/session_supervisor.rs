@@ -76,6 +76,15 @@ pub fn run_mock_session(
     let finish_frame = encode_session_frame(&serde_json::from_str::<serde_json::Value>(finish)
         .map_err(|_| SessionError::InvalidResponse)?)
         .map_err(|_| SessionError::InvalidResponse)?;
+    use crate::adi_worker_protocol::{decode_request, WorkerRequest};
+    let start_request = decode_request(&start_frame[4..])
+        .map_err(|_| SessionError::InvalidResponse)?;
+    let finish_request = decode_request(&finish_frame[4..])
+        .map_err(|_| SessionError::InvalidResponse)?;
+    if !matches!(start_request, WorkerRequest::Start { .. })
+        || !matches!(finish_request, WorkerRequest::Finish { .. }) {
+        return Err(SessionError::InvalidResponse);
+    }
     let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(executable);
     cmd.args(args).env_clear().current_dir("/")
@@ -112,6 +121,11 @@ pub fn run_mock_session(
         command_tx.send(start_frame).map_err(|_| SessionError::Transport)?;
         if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
         let started = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
+        let started_bytes = serde_json::to_vec(&started).map_err(|_| SessionError::InvalidResponse)?;
+        if !matches!(crate::adi_worker_protocol::decode_response(&started_bytes, &start_request),
+            Ok(crate::adi_worker_protocol::WorkerResponse::Started { .. })) {
+            return Err(SessionError::InvalidResponse);
+        }
         if !valid_phase_reply(&started, "started") {
             return Err(SessionError::InvalidResponse);
         }
@@ -119,6 +133,11 @@ pub fn run_mock_session(
         if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
         drop(command_tx);
         let finished = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
+        let finished_bytes = serde_json::to_vec(&finished).map_err(|_| SessionError::InvalidResponse)?;
+        if !matches!(crate::adi_worker_protocol::decode_response(&finished_bytes, &finish_request),
+            Ok(crate::adi_worker_protocol::WorkerResponse::Finished { .. })) {
+            return Err(SessionError::InvalidResponse);
+        }
         if !valid_phase_reply(&finished, "finished") {
             return Err(SessionError::InvalidResponse);
         }
