@@ -121,6 +121,49 @@ mod v2_boundary_tests {
     use super::*;
     use crate::adi_worker_wire_v2::{encode_response, Request, Response};
     #[test]
+    fn v2_child_process_exchanges_binary_frames() {
+        use std::io::{Read, Write};
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args(["--exact", "session_supervisor::v2_boundary_tests::v2_child_entry", "--ignored", "--nocapture"])
+            .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
+        let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut request = Vec::new();
+        crate::adi_worker_framing::write_frame(&mut request, &crate::adi_worker_wire_v2::encode_request(&start).unwrap()).unwrap();
+        stdin.write_all(&request).unwrap();
+        let started = crate::adi_worker_framing::read_frame(&mut stdout).unwrap();
+        request.clear();
+        crate::adi_worker_framing::write_frame(&mut request, &crate::adi_worker_wire_v2::encode_request(&finish).unwrap()).unwrap();
+        stdin.write_all(&request).unwrap();
+        drop(stdin);
+        let finished = crate::adi_worker_framing::read_frame(&mut stdout).unwrap();
+        let mut tail = Vec::new();
+        stdout.read_to_end(&mut tail).unwrap();
+        assert!(tail.is_empty(), "worker must emit exactly two frames");
+        assert!(child.wait().unwrap().success());
+        assert_eq!(validate_v2_exchange(&start, &started, &finish, &finished), Ok(()));
+    }
+
+    #[test]
+    #[ignore = "spawned exclusively by v2_child_process_exchanges_binary_frames"]
+    fn v2_child_entry() {
+        let mut input = std::io::stdin().lock();
+        let mut output = std::io::stdout().lock();
+        let first = crate::adi_worker_framing::read_frame(&mut input).unwrap();
+        assert!(matches!(crate::adi_worker_wire_v2::decode_request(&first), Ok(Request::Start { .. })));
+        crate::adi_worker_framing::write_frame(&mut output, &encode_response(&Response::Started(vec![0, 255])).unwrap()).unwrap();
+        let second = crate::adi_worker_framing::read_frame(&mut input).unwrap();
+        assert!(matches!(crate::adi_worker_wire_v2::decode_request(&second), Ok(Request::Finish { .. })));
+        let mut trailing = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut input, &mut trailing).unwrap(), 0);
+        crate::adi_worker_framing::write_frame(&mut output, &encode_response(&Response::Finished(vec![255, 0])).unwrap()).unwrap();
+    }
+
+    #[test]
     fn v2_binary_exchange_uses_bounded_frames_and_correct_phases() {
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255, 128] };
         let finish = Request::Finish { ptm: vec![0, 1], tk: vec![255, 0] };
