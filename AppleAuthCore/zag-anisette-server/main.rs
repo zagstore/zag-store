@@ -153,11 +153,30 @@ fn body_length(head: &Head) -> Result<usize, Response> {
 }
 
 /// A WebSocket opening handshake as RFC 6455 §4.2.1 requires it.
+// RFC 6455 requires a base64-encoded 16-byte nonce. Reject noncanonical
+// encodings as well as malformed characters, without adding a runtime crate.
+fn valid_websocket_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.len() != 24 || &bytes[22..] != b"==" {
+        return false;
+    }
+    let digit = |b: u8| -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let Some(last) = digit(bytes[21]) else { return false };
+    bytes[..21].iter().all(|&b| digit(b).is_some()) && last & 0x0f == 0
+}
+
 fn is_websocket_upgrade(head: &Head) -> bool {
     let key_ok = head.count("sec-websocket-key") == 1
-        && head
-            .header("sec-websocket-key")
-            .is_some_and(|k| k.len() == 24 && k.ends_with("==") && k[..22].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/'));
+        && head.header("sec-websocket-key").is_some_and(valid_websocket_key);
     head.has_token("upgrade", "websocket")
         && head.has_token("connection", "upgrade")
         && head.header("sec-websocket-version") == Some("13")
@@ -375,6 +394,15 @@ mod tests {
         let (response, _) = respond(upgrade("").trim_end_matches("\r\n").as_bytes());
         assert_eq!(response.status, "503 Service Unavailable");
         assert!(!String::from_utf8(response.bytes()).unwrap().contains("101"));
+    }
+    #[test]
+    fn websocket_key_is_canonical() {
+        assert!(valid_websocket_key(KEY));
+        assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAB=="));
+        assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAA=="));
+        assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAA="));
+        assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAA/=="));
+        assert!(!valid_websocket_key("AAAAAAAAAAAAAAAAAAAAA-=="));
     }
     #[test]
     fn websocket_upgrade_requirements() {
