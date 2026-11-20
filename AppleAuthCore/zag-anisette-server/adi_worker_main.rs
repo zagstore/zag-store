@@ -467,6 +467,34 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn native_engine_adapter_destroys_handle_on_finish_failure() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct FailingEngine(Arc<AtomicUsize>);
+        impl NativeAdiEngine for FailingEngine {
+            fn start_native(&mut self, _: &str, _: &str) -> io::Result<(u32, String)> {
+                Ok((73, "cpim".into()))
+            }
+            fn finish_native(&mut self, handle: u32, _: &str, _: &str) -> io::Result<String> {
+                assert_eq!(handle, 73);
+                Err(io::Error::other("native finish failed"))
+            }
+            fn destroy_native(&mut self, handle: u32) -> io::Result<()> {
+                assert_eq!(handle, 73);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        input.extend(frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#));
+        let mut output = Vec::new();
+        assert!(run_typed_session(&mut input.as_slice(), &mut output,
+            NativeEngineAdapter::new(FailingEngine(count.clone()))).is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(!output.windows(b"\"type\":\"finished\"".len()).any(|w| w == b"\"type\":\"finished\""));
+    }
+
+    #[test]
     fn native_engine_adapter_preserves_handle_and_destroys_it() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         struct Engine(Arc<AtomicUsize>);
