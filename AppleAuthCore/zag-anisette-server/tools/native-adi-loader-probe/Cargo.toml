@@ -8,3 +8,5 @@ publish = false
 android-loader = { git = "https://github.com/Dadoum/android-loader", rev = "dfa86501afca7caa23d5ce15322ac7260d857485" }
 libc = "0.2"
 rand = "0.8"
+serde = "1.0"
+serde_json = "1.0"
