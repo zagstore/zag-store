@@ -254,6 +254,101 @@ mod v2_boundary_tests {
     }
 }
 
+/// Offline test-only v2 supervisor. The executable is caller-selected and therefore
+/// this is NOT an approved production launch path.
+#[cfg(test)]
+fn run_v2_session_cancellable(
+    executable: &Path,
+    args: &[&str],
+    start: &crate::adi_worker_wire_v2::Request,
+    finish: &crate::adi_worker_wire_v2::Request,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<(Vec<u8>, Vec<u8>), SessionError> {
+    use crate::adi_worker_wire_v2::{encode_request, decode_response, Request, Response};
+    if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
+    if timeout.is_zero() || timeout > Duration::from_secs(10) { return Err(SessionError::InvalidTimeout); }
+    if !matches!(start, Request::Start { .. }) || !matches!(finish, Request::Finish { .. }) {
+        return Err(SessionError::InvalidResponse);
+    }
+    let _permit = MOCK_SESSION_LIMITER.acquire()?;
+    let frame = |request: &Request| -> Result<Vec<u8>, SessionError> {
+        let payload = encode_request(request).map_err(|_| SessionError::InvalidResponse)?;
+        let mut frame = Vec::new();
+        crate::adi_worker_framing::write_frame(&mut frame, &payload)
+            .map_err(|_| SessionError::InvalidResponse)?;
+        Ok(frame)
+    };
+    let start_frame = frame(start)?;
+    let finish_frame = frame(finish)?;
+    crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
+        .map_err(|_| SessionError::Spawn)?;
+    #[cfg(unix)]
+    let identity = crate::adi_worker_lifecycle::worker_file_identity(executable)
+        .map_err(|_| SessionError::Spawn)?;
+    let mut command = Command::new(executable);
+    command.args(args).env_clear().current_dir("/")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
+        .map_err(|_| SessionError::Spawn)?;
+    #[cfg(unix)]
+    if crate::adi_worker_lifecycle::worker_file_identity(executable)
+        .map_err(|_| SessionError::Spawn)? != identity { return Err(SessionError::Spawn); }
+    if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
+    let mut child = command.spawn().map_err(|_| SessionError::Spawn)?;
+    let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        terminate_and_reap(&mut child);
+        return Err(SessionError::Transport);
+    };
+    let (write_tx, write_rx) = mpsc::channel();
+    let (read_tx, read_rx) = mpsc::channel();
+    let (command_tx, command_rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        for payload in command_rx {
+            let ok = stdin.write_all(&payload).and_then(|_| stdin.flush()).is_ok();
+            if write_tx.send(ok).is_err() || !ok { break; }
+        }
+    });
+    thread::spawn(move || {
+        loop {
+            let reply = crate::adi_worker_framing::read_frame(&mut stdout).ok();
+            let terminal = reply.is_none();
+            if read_tx.send(reply).is_err() || terminal { break; }
+        }
+    });
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        command_tx.send(start_frame).map_err(|_| SessionError::Transport)?;
+        if !receive(&write_rx, deadline, cancel)? { return Err(SessionError::Transport); }
+        let started = receive(&read_rx, deadline, cancel)?.ok_or(SessionError::InvalidResponse)?;
+        if !matches!(decode_response(&started, start), Ok(Response::Started(_))) {
+            return Err(SessionError::InvalidResponse);
+        }
+        command_tx.send(finish_frame).map_err(|_| SessionError::Transport)?;
+        if !receive(&write_rx, deadline, cancel)? { return Err(SessionError::Transport); }
+        drop(command_tx);
+        let finished = receive(&read_rx, deadline, cancel)?.ok_or(SessionError::InvalidResponse)?;
+        if !matches!(decode_response(&finished, finish), Ok(Response::Finished(_))) {
+            return Err(SessionError::InvalidResponse);
+        }
+        if receive(&read_rx, deadline, cancel)?.is_some() { return Err(SessionError::InvalidResponse); }
+        loop {
+            if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
+            remaining(deadline)?;
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok((started, finished)),
+                Ok(Some(_)) => return Err(SessionError::NonZeroExit),
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => return Err(SessionError::Transport),
+            }
+        }
+    })();
+    terminate_and_reap(&mut child);
+    result
+}
+
 /// Runs exactly one mock Start and Finish in the SAME child process.
 /// This function is a test harness, not a safe executable-launch API.
 /// Each reply must be one bounded length-prefixed JSON frame.
