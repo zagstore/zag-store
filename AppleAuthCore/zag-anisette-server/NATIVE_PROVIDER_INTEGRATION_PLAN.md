@@ -113,6 +113,31 @@ claims of measured superiority.
 5. Successful real-provider integration tests **only** in a separately
    approved isolated environment; production remains disabled until reviewed.
 
+## Cancellation and native-handle lifetime contract
+
+The supervisor may cancel or time out a session by terminating the isolated
+worker process. A process kill is **not** a guarantee that a native library's
+`destroy_provisioning_session` callback ran; RAII cleanup runs only during
+ordinary Rust stack unwinding / returns, not SIGKILL or process abort.
+
+The worker must own each native session handle exclusively, call the matching
+native destroy operation on normal completion and recoverable errors, and
+never transmit the handle over IPC. Explicit destruction must be idempotent,
+and a failed destroy must not be retried blindly against an invalid handle.
+The supervisor must retain a hard deadline and kill/reap fallback for blocked
+or unresponsive native calls. Do not run the native operation on an unbounded
+background thread that could outlive the worker's request.
+
+Acceptance tests must cover ordinary success, Start failure, Finish failure,
+protocol rejection, disconnect, deadline expiry, and forced worker death.
+For forced death, assert that the child is reaped and no session remains
+available through the IPC boundary; **do not** assert that native cleanup
+executed. Native library resources must be OS-process-scoped, or provider
+documentation must explicitly establish safe recovery after forced death.
+
+The current `NativeSessionHandle` guard is test-only until a real provider
+uses it. The release worker still fails closed with its disabled backend.
+
 ## SideStore Rust source audit: transport-security blocker
 
 At pinned `SideStore/apple-private-apis` revision
