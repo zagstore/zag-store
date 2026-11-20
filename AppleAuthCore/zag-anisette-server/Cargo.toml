@@ -13,3 +13,8 @@ path = "main.rs"
 panic = "abort"
 lto = true
 codegen-units = 1
+
+# Test-only: the WebSocket client library (and version) the fork's v3 client
+# uses, to check the upgrade is refused as that client sees it.
+[dev-dependencies]
+tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
