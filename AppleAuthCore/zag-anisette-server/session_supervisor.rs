@@ -205,7 +205,7 @@ mod tests {
     }
     #[test]
     fn two_phase_child_roundtrip() {
-        let script = "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\${Math.floor(n/256).toString(8).padStart(3,\"0\")}\\${(n%256).toString(8).padStart(3,\"0\")}{\"version\":1,\"type\":\"started\",\"cpim\":\"mock\"}'; dd bs=1 count=58 2>/dev/null >/dev/null; printf '\\000\\000\\${Math.floor(n/256).toString(8).padStart(3,\"0\")}\\${(n%256).toString(8).padStart(3,\"0\")}{\"version\":1,\"type\":\"finished\",\"adi_pb\":\"mock\"}'";
+        let script = "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\000\\052{\"version\":1,\"type\":\"started\",\"cpim\":\"mock\"}'; dd bs=1 count=58 2>/dev/null >/dev/null; printf '\\000\\000\\000\\054{\"version\":1,\"type\":\"finished\",\"adi_pb\":\"mock\"}'";
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", script],
             "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_secs(2)).unwrap();
         assert_eq!(result.0["type"], "started");
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn unexpected_response_fails_closed() {
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
-            &["-c", "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\${Math.floor(n/256).toString(8).padStart(3,\"0\")}\\${(n%256).toString(8).padStart(3,\"0\")}{\"version\":1,\"type\":\"finished\",\"adi_pb\":\"mock\"}'"]
+            &["-c", "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\000\\054{\"version\":1,\"type\":\"finished\",\"adi_pb\":\"mock\"}'"],
             "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_secs(1));
         assert_eq!(result, Err(SessionError::InvalidResponse));
     }
