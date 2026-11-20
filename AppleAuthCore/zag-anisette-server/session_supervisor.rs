@@ -7,7 +7,7 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
-    sync::{mpsc, atomic::{AtomicBool, Ordering}},
+    sync::{mpsc, atomic::{AtomicBool, AtomicUsize, Ordering}},
     thread,
     time::{Duration, Instant},
 };
@@ -15,7 +15,7 @@ use std::{
 use std::os::unix::process::CommandExt;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum SessionError { InvalidTimeout, Spawn, Transport, Timeout, Cancelled, InvalidResponse, NonZeroExit }
+pub enum SessionError { InvalidTimeout, Spawn, Busy, Transport, Timeout, Cancelled, InvalidResponse, NonZeroExit }
 
 #[cfg(unix)]
 unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
@@ -23,6 +23,26 @@ unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
 fn kill_group(pid: u32) {
     if let Ok(pid) = i32::try_from(pid) {
         if pid > 0 { unsafe { kill(-pid, 9); } }
+    }
+}
+
+/// Test-only admission control shared by all mock sessions in this process.
+/// The counter is released by RAII on every return path, including failures.
+static ACTIVE_MOCK_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+const MAX_MOCK_SESSIONS: usize = 4;
+
+struct SessionPermit;
+impl SessionPermit {
+    fn acquire() -> Result<Self, SessionError> {
+        ACTIVE_MOCK_SESSIONS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |active| (active < MAX_MOCK_SESSIONS).then_some(active + 1))
+            .map_err(|_| SessionError::Busy)?;
+        Ok(Self)
+    }
+}
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        ACTIVE_MOCK_SESSIONS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -84,6 +104,7 @@ pub fn run_mock_session_cancellable(
     cancel: &AtomicBool,
 ) -> Result<(serde_json::Value, serde_json::Value), SessionError> {
     if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
+    let _permit = SessionPermit::acquire()?;
     if timeout.is_zero() || timeout > Duration::from_secs(10) {
         return Err(SessionError::InvalidTimeout);
     }
@@ -232,6 +253,14 @@ pub fn decode_session_frame<R: std::io::Read>(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn admission_limit_rejects_fifth_session_and_releases_permits() {
+        let permits: Vec<_> = (0..MAX_MOCK_SESSIONS)
+            .map(|_| SessionPermit::acquire().unwrap()).collect();
+        assert!(matches!(SessionPermit::acquire(), Err(SessionError::Busy)));
+        drop(permits);
+        assert!(SessionPermit::acquire().is_ok());
+    }
     #[test]
     fn strict_frames_roundtrip_in_phase_order() {
         let start = serde_json::json!({"type":"started","cpim":"mock"});
