@@ -197,3 +197,38 @@ Sources:
 - Typed session lifecycle tested without native libraries, with release mode fail-closed.
 - Remaining OS-specific security and integration blockers explicitly enumerated.
 - CI green on Ubuntu and macOS; separate reviewed PR required before enabling native code.
+
+## Concrete native integration decision (20 November 2026)
+
+The release-compiled worker now has `--offline-v2-session`, a typed
+`V2NativeBackend` with `start(identifier, spim)`, `finish(ptm, tk)`, and
+`abort()`, and a strict binary v2 codec. Its configured backend is still
+`DisabledV2Backend`. The supervised v2 IPC tests have passed on Ubuntu
+and macOS; this does **not** prove native provisioning works.
+
+The pinned SideStore source at
+`SideStore/apple-private-apis@03beb1aa42991ccdad6214dee77e72282bef461f`,
+`omnisette/src/store_services_core.rs`, confirms these native boundaries:
+
+- `ADIProvisioningStart(ds_id, spim, ..., out_cpim, ..., out_session)` yields
+  CPIM and a process-local session handle.
+- `ADIProvisioningEnd(session, ptm, tk)` reports status, not ADI state bytes.
+- `ADIProvisioningDestroy(session)` releases the native handle.
+- `ADISetProvisioningPath(path)` selects a directory used for native state;
+  this is a possible state-export source, **not** proof of an `adi.pb` format
+  or reliable filename on every platform.
+- `StoreServicesCoreADIProxy::with_custom_provisioning_path` loads Android
+  `libstoreservicescore.so` through `android_loader`. A macOS or Ubuntu
+  runner cannot assume this runtime is installed or legally redistributable.
+
+**Next integrated milestone (not a mock):** obtain an authorized, compatible
+native runtime and an isolated operator-controlled provisioning directory;
+implement a single `V2NativeBackend` that owns its native provider and
+session handle, calls the verified native Start/End/Destroy APIs, then exports
+and validates the actual native-written state from that directory after End.
+Do not manufacture an `adi.pb` file, infer its contents, or return success
+without a real state export. Keep the worker disabled if runtime or export
+is unavailable. Verify the target OS and CPU architecture before choosing
+which native loader to implement.
+
+Source: https://github.com/SideStore/apple-private-apis/blob/03beb1aa42991ccdad6214dee77e72282bef461f/omnisette/src/store_services_core.rs
