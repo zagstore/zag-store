@@ -34,6 +34,43 @@ pub trait ProvisioningBackend {
     fn start(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError>;
     fn finish(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError>;
 }
+/// Offline-only adapter boundary for a future ADI provider.
+///
+/// This interface deliberately exposes no Apple transport, credential storage,
+/// or dynamic library loading. Provider errors are mapped to terminal session
+/// errors by Session; provider implementations must not log payloads.
+pub trait AdiProvider {
+    fn start_provisioning(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError>;
+    fn finish_provisioning(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError>;
+}
+
+pub struct AdiBackend<P> {
+    provider: P,
+}
+
+impl<P: AdiProvider> AdiBackend<P> {
+    pub fn new(provider: P) -> Self { Self { provider } }
+}
+
+impl<P: AdiProvider> ProvisioningBackend for AdiBackend<P> {
+    fn start(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError> {
+        self.provider.start_provisioning(identifier, spim)
+    }
+    fn finish(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError> {
+        self.provider.finish_provisioning(ptm, tk)
+    }
+}
+
+/// Safe default: provider never produces Apple provisioning material.
+pub struct DisabledAdiProvider;
+impl AdiProvider for DisabledAdiProvider {
+    fn start_provisioning(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+        Err(ProtocolError::BackendUnavailable)
+    }
+    fn finish_provisioning(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+        Err(ProtocolError::BackendUnavailable)
+    }
+}
 pub struct OfflineBackend;
 impl ProvisioningBackend for OfflineBackend {
     fn start(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> { Err(ProtocolError::BackendUnavailable) }
@@ -129,6 +166,28 @@ pub fn process_text_frame<B: ProvisioningBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn disabled_adi_adapter_fails_closed() {
+        let mut session = Session::new(AdiBackend::new(DisabledAdiProvider));
+        assert_eq!(session.receive(ClientMessage::Identifier("id".into())), Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("spim".into())), Err(ProtocolError::BackendUnavailable));
+        assert_eq!(session.phase(), Phase::Failed);
+    }
+    struct TestAdiProvider;
+    impl AdiProvider for TestAdiProvider {
+        fn start_provisioning(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError> {
+            if identifier == "id" && spim == "spim" { Ok("cpim".into()) } else { Err(ProtocolError::InvalidField) }
+        }
+        fn finish_provisioning(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError> {
+            if ptm == "ptm" && tk == "tk" { Ok("adi_pb".into()) } else { Err(ProtocolError::InvalidField) }
+        }
+    }
+    #[test] fn adi_adapter_matches_provisioning_contract() {
+        let mut session = Session::new(AdiBackend::new(TestAdiProvider));
+        assert_eq!(session.receive(ClientMessage::Identifier("id".into())), Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("spim".into())), Ok(ServerMessage::GiveEndProvisioningData { cpim: "cpim".into() }));
+        assert_eq!(session.receive(ClientMessage::Finish { ptm: "ptm".into(), tk: "tk".into() }), Ok(ServerMessage::ProvisioningSuccess { adi_pb: "adi_pb".into() }));
+        assert_eq!(session.phase(), Phase::Complete);
+    }
     #[test] fn offline_never_advances() {
         let mut session = Session::new(OfflineBackend);
         assert_eq!(session.initial(), ServerMessage::GiveIdentifier);
