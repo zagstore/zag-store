@@ -34,22 +34,22 @@ fn receive<T>(rx: &mpsc::Receiver<T>, deadline: Instant) -> Result<T, SessionErr
     rx.recv_timeout(remaining(deadline)?).map_err(|_| SessionError::Timeout)
 }
 
-/// Fail closed on unexpected JSON fields and incompatible protocol versions.
-/// Mock fixtures may omit version, but versioned replies must declare v1.
+/// Reuse the canonical worker protocol rather than a second permissive schema.
 fn valid_phase_reply(value: &serde_json::Value, phase: &str) -> bool {
-    let Some(obj) = value.as_object() else { return false };
-    let allowed = match phase {
-        "started" => ["type", "version", "cpim"],
-        "finished" => ["type", "version", "adi_pb"],
+    use crate::adi_worker_protocol::{decode_response, WorkerRequest, WorkerResponse};
+    let request = match phase {
+        "started" => WorkerRequest::Start { identifier: "mock".into(), spim: "mock".into() },
+        "finished" => WorkerRequest::Finish { ptm: "mock".into(), tk: "mock".into() },
         _ => return false,
     };
-    if obj.keys().any(|key| !allowed.contains(&key.as_str())) { return false; }
-    if obj.get("type").and_then(serde_json::Value::as_str) != Some(phase) { return false; }
-    if let Some(version) = obj.get("version") {
-        if version.as_u64() != Some(1) { return false; }
-    }
-    let field = if phase == "started" { "cpim" } else { "adi_pb" };
-    obj.get(field).is_none_or(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+    let Ok(bytes) = serde_json::to_vec(value) else { return false };
+    matches!(
+        decode_response(&bytes, &request),
+        Ok(WorkerResponse::Started { .. }) if phase == "started"
+    ) || matches!(
+        decode_response(&bytes, &request),
+        Ok(WorkerResponse::Finished { .. }) if phase == "finished"
+    )
 }
 
 /// Runs exactly one mock Start and Finish in the SAME child process.
