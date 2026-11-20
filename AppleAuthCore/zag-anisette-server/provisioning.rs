@@ -209,7 +209,7 @@ mod tests {
             process_text_frame(&mut session, r#"{"spim":"spim"}"#),
             Err(ProtocolError::BackendUnavailable)
         );
-        assert_eq!(session.phase(), Phase::AwaitStart);
+        assert_eq!(session.phase(), Phase::Failed);
     }
     #[test] fn rejected_frame_does_not_advance_session() {
         let mut session = Session::new(FakeBackend);
