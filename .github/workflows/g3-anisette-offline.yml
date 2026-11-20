@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - review/zag-anisette-server
+      - feature/native-adi-provider-review
     paths:
       - 'AppleAuthCore/zag-anisette-server/**'
       - '.github/workflows/g3-anisette-offline.yml'
