@@ -94,9 +94,15 @@ pub fn run_mock_session(
     crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
         .map_err(|_| SessionError::Spawn)?;
     let mut child = cmd.spawn().map_err(|_| SessionError::Spawn)?;
+    // Any early error after spawn must still terminate and reap the child.
     let pid = child.id();
-    let mut stdin = child.stdin.take().ok_or(SessionError::Transport)?;
-    let stdout = child.stdout.take().ok_or(SessionError::Transport)?;
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        #[cfg(unix)]
+        kill_group(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(SessionError::Transport);
+    };
     let (write_tx, write_rx) = mpsc::channel();
     let (read_tx, read_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel::<Vec<u8>>();
