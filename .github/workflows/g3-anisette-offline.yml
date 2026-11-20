@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   offline-rust:
@@ -29,42 +29,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Resolve dependency lockfile for validation
-        run: |
-          if [ -f Cargo.lock ] && grep -q '^name = "serde_json"
-      - name: Verify validated dependency resolution
+      - name: Resolve dependencies
+        run: cargo generate-lockfile
+      - name: Verify approved lockfile digest
         run: echo "7700574b51984624d6e2b8ad5585231ad08aabe2cf36f5d6792984a4e41b5c00  Cargo.lock" | sha256sum --check
-      - name: Commit verified lockfile to isolated review branch
-        if: github.event_name == 'push' && github.ref == 'refs/heads/review/zag-anisette-server'
-        run: |
-          if ! git diff --quiet -- Cargo.lock; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.lock
-            git commit -m "build(g3): pin validated Cargo dependency lockfile"
-            git push origin HEAD:review/zag-anisette-server
-          fi
-      - name: Upload resolved Cargo lockfile
-        uses: actions/upload-artifact@v4
-        with:
-          name: zag-anisette-cargo-lock
-          path: AppleAuthCore/zag-anisette-server/Cargo.lock
-          if-no-files-found: error
-          retention-days: 7
-      - name: Compile
-        run: cargo build --release --locked
-      - name: Test
-        run: cargo test --locked
-      - name: Lint
-        run: cargo clippy --all-targets --locked -- -D warnings
- Cargo.lock; then
-            cargo metadata --locked --format-version 1 --no-deps > /dev/null
-          else
-            cargo generate-lockfile
-          fi
-      - name: Verify validated dependency resolution
-        run: echo "7700574b51984624d6e2b8ad5585231ad08aabe2cf36f5d6792984a4e41b5c00  Cargo.lock" | sha256sum --check
-      - name: Upload resolved Cargo lockfile
+      - name: Upload approved lockfile
         uses: actions/upload-artifact@v4
         with:
           name: zag-anisette-cargo-lock
