@@ -123,10 +123,14 @@ mod v2_boundary_tests {
     #[test]
     fn v2_child_process_exchanges_binary_frames() {
         use std::io::{Read, Write};
-        let executable = std::env::current_exe().unwrap();
-        let mut child = Command::new(executable)
-            .args(["--exact", "session_supervisor::v2_boundary_tests::v2_child_entry", "--ignored", "--nocapture"])
-            .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!("zag-v2-fixture-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("v2-worker-fixture");
+        assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        let mut child = Command::new(std::fs::canonicalize(&executable).unwrap())
+            .arg("--v2").env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
             .spawn().unwrap();
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
         let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
@@ -145,22 +149,9 @@ mod v2_boundary_tests {
         stdout.read_to_end(&mut tail).unwrap();
         assert!(tail.is_empty(), "worker must emit exactly two frames");
         assert!(child.wait().unwrap().success());
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
         assert_eq!(validate_v2_exchange(&start, &started, &finish, &finished), Ok(()));
-    }
-
-    #[test]
-    #[ignore = "spawned exclusively by v2_child_process_exchanges_binary_frames"]
-    fn v2_child_entry() {
-        let mut input = std::io::stdin().lock();
-        let mut output = std::io::stdout().lock();
-        let first = crate::adi_worker_framing::read_frame(&mut input).unwrap();
-        assert!(matches!(crate::adi_worker_wire_v2::decode_request(&first), Ok(Request::Start { .. })));
-        crate::adi_worker_framing::write_frame(&mut output, &encode_response(&Response::Started(vec![0, 255])).unwrap()).unwrap();
-        let second = crate::adi_worker_framing::read_frame(&mut input).unwrap();
-        assert!(matches!(crate::adi_worker_wire_v2::decode_request(&second), Ok(Request::Finish { .. })));
-        let mut trailing = [0u8; 1];
-        assert_eq!(std::io::Read::read(&mut input, &mut trailing).unwrap(), 0);
-        crate::adi_worker_framing::write_frame(&mut output, &encode_response(&Response::Finished(vec![255, 0])).unwrap()).unwrap();
     }
 
     #[test]
