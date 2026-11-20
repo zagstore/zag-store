@@ -404,8 +404,7 @@ mod tests {
             );
             assert_eq!(result.is_err(), fail_finish);
             assert_eq!(cleaned.load(Ordering::SeqCst), 1);
-            let frames = output.windows(10).filter(|w| *w == b"\"type\":\"").count();
-            assert!(frames >= 1);
+            assert!(output.windows(b"\"type\":\"started\"".len()).any(|w| w == b"\"type\":\"started\""));
         }
     }
 
