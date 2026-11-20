@@ -2,7 +2,6 @@
 //! the entire Apple exchange; the internal mode is never a production service.
 //! Identity JSON is read only from stdin, never from arguments or environment.
 use crate::{process_watchdog, provisioning_client};
-use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
@@ -12,8 +11,6 @@ use std::process::{Command, Stdio};
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const CHILD_MARKER: &str = "ZAG_ADI_WATCHDOG_CHILD";
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TestIdentity {
     device_id: String,
     client_info: String,
@@ -31,7 +28,24 @@ fn read_identity<R: Read>(input: R) -> io::Result<TestIdentity> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_IDENTITY_BYTES {
         return Err(invalid("invalid identity input size"));
     }
-    serde_json::from_slice(&bytes).map_err(|_| invalid("invalid identity JSON"))
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("invalid identity JSON"))?;
+    let object = value.as_object().ok_or_else(|| invalid("identity object required"))?;
+    if object.len() != 4 || !object.keys().all(|key|
+        matches!(key.as_str(), "device_id" | "client_info" | "local_user" | "serial"))
+    {
+        return Err(invalid("identity fields missing or unexpected"));
+    }
+    let field = |name: &str| -> io::Result<String> {
+        object.get(name).and_then(serde_json::Value::as_str)
+            .map(str::to_owned).ok_or_else(|| invalid("missing identity string"))
+    };
+    Ok(TestIdentity {
+        device_id: field("device_id")?,
+        client_info: field("client_info")?,
+        local_user: field("local_user")?,
+        serial: field("serial")?,
+    })
 }
 
 fn validate_paths(runtime: &Path, state: &Path) -> io::Result<()> {
