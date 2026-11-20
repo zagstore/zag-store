@@ -218,12 +218,17 @@ trait NativeAdiEngine {
     fn destroy_native(&mut self, handle: u32) -> io::Result<()>;
 }
 
+#[cfg(test)]
+type NativeDestroy = Box<dyn FnMut(u32) -> io::Result<()>>;
+#[cfg(test)]
+type OwnedNativeHandle = NativeSessionHandle<NativeDestroy>;
+
 /// Adapter ties the typed IPC contract to a single native handle. An Rc cell
 /// lets the handle guard invoke Destroy using the same engine instance.
 #[cfg(test)]
 struct NativeEngineAdapter<E: NativeAdiEngine + 'static> {
     engine: std::rc::Rc<std::cell::RefCell<E>>,
-    session: Option<NativeSessionHandle<Box<dyn FnMut(u32) -> io::Result<()>>>>,
+    session: Option<OwnedNativeHandle>,
 }
 
 #[cfg(test)]
