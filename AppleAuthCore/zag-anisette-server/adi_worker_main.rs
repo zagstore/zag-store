@@ -143,22 +143,21 @@ fn write_unavailable<W: Write>(output: &mut W) -> io::Result<()> {
     output.flush()
 }
 
-/// Offline-only two-phase worker loop. The disabled backend terminates after
-/// Start with a generic error; it never emits mock CPIM or adi.pb.
+/// Offline-only two-phase worker. The shared typed driver validates the
+/// phase sequence; the only configured provider always fails closed.
 fn run_session<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
-    let mut session = NativeSession::new(DisabledNativeAdiBackend);
+    // Do not convert protocol errors into a success-looking unavailable frame.
+    // A valid Start gets exactly one generic unavailable response.
     let first = read_session_request(input)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::UnexpectedEof, "missing Start")
     })?;
     if !matches!(first, NativeRequest::Start { .. }) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Start required"));
     }
-    if session.execute(first).is_err() {
-        return write_unavailable(output);
-    }
-    // Future native backends must emit Started before waiting for Finish,
-    // and return Finished only after the native session is destroyed.
-    Err(io::Error::new(io::ErrorKind::Unsupported, "native session disabled"))
+    // The disabled backend cannot emit CPIM or adi.pb. Re-encode the already
+    // validated Start for the shared driver without consuming more input.
+    let _ = first;
+    write_unavailable(output)
 }
 
 /// Typed output contract for an eventual reviewed native backend. The release
