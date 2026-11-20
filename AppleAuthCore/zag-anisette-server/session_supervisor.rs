@@ -34,6 +34,24 @@ fn receive<T>(rx: &mpsc::Receiver<T>, deadline: Instant) -> Result<T, SessionErr
     rx.recv_timeout(remaining(deadline)?).map_err(|_| SessionError::Timeout)
 }
 
+/// Fail closed on unexpected JSON fields and incompatible protocol versions.
+/// Mock fixtures may omit version, but versioned replies must declare v1.
+fn valid_phase_reply(value: &serde_json::Value, phase: &str) -> bool {
+    let Some(obj) = value.as_object() else { return false };
+    let allowed = match phase {
+        "started" => ["type", "version", "cpim"],
+        "finished" => ["type", "version", "adi_pb"],
+        _ => return false,
+    };
+    if obj.keys().any(|key| !allowed.contains(&key.as_str())) { return false; }
+    if obj.get("type").and_then(serde_json::Value::as_str) != Some(phase) { return false; }
+    if let Some(version) = obj.get("version") {
+        if version.as_u64() != Some(1) { return false; }
+    }
+    let field = if phase == "started" { "cpim" } else { "adi_pb" };
+    obj.get(field).is_none_or(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+}
+
 /// Runs exactly one mock Start and Finish in the SAME child process.
 /// This function is a test harness, not a safe executable-launch API.
 /// Each reply must be one bounded length-prefixed JSON frame.
@@ -94,14 +112,14 @@ pub fn run_mock_session(
         command_tx.send(start_frame).map_err(|_| SessionError::Transport)?;
         if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
         let started = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
-        if started.get("type").and_then(serde_json::Value::as_str) != Some("started") {
+        if !valid_phase_reply(&started, "started") {
             return Err(SessionError::InvalidResponse);
         }
         command_tx.send(finish_frame).map_err(|_| SessionError::Transport)?;
         if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
         drop(command_tx);
         let finished = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
-        if finished.get("type").and_then(serde_json::Value::as_str) != Some("finished") {
+        if !valid_phase_reply(&finished, "finished") {
             return Err(SessionError::InvalidResponse);
         }
         // EOF is required after the terminal response; reject extra output.
@@ -177,6 +195,13 @@ mod tests {
         let oversized = ((crate::adi_worker_protocol::MAX_MESSAGE_BYTES + 1) as u32).to_be_bytes();
         assert_eq!(decode_session_frame(&mut oversized.as_slice(), "started"), Err(SessionFrameError::Framing));
         assert_eq!(decode_session_frame(&mut 0u32.to_be_bytes().as_slice(), "started"), Err(SessionFrameError::Framing));
+    }
+    #[test]
+    fn rejects_unknown_fields_and_wrong_versions() {
+        assert!(!valid_phase_reply(&serde_json::json!({"type":"started","unexpected":true}), "started"));
+        assert!(!valid_phase_reply(&serde_json::json!({"type":"finished","version":2}), "finished"));
+        assert!(!valid_phase_reply(&serde_json::json!({"type":"started","cpim":""}), "started"));
+        assert!(valid_phase_reply(&serde_json::json!({"type":"started","version":1,"cpim":"mock"}), "started"));
     }
     #[test]
     fn two_phase_child_roundtrip() {
