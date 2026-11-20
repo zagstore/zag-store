@@ -223,6 +223,44 @@ type NativeDestroy = Box<dyn FnMut(u32) -> io::Result<()>>;
 #[cfg(test)]
 type OwnedNativeHandle = NativeSessionHandle<NativeDestroy>;
 
+/// The subset of SideStore ADIProxy's native interface needed for a session.
+/// Network lookup, TLS, and Apple HTTP requests are intentionally excluded.
+#[cfg(test)]
+trait AdiProxyNativeCalls {
+    fn start_provisioning(&mut self, ds_id: i64, spim: &[u8]) -> io::Result<(u32, Vec<u8>)>;
+    fn end_provisioning(&mut self, handle: u32, ptm: &[u8], tk: &[u8]) -> io::Result<()>;
+    fn destroy_provisioning_session(&mut self, handle: u32) -> io::Result<()>;
+}
+
+/// Wire conversion boundary for the reviewed SideStore-shaped native API.
+/// This is not an ADI implementation: the platform proxy must be supplied
+/// separately and the actual provisioning material is not fabricated.
+#[cfg(test)]
+struct SideStoreNativeBridge<P: AdiProxyNativeCalls> {
+    proxy: P,
+}
+
+#[cfg(test)]
+impl<P: AdiProxyNativeCalls> NativeAdiEngine for SideStoreNativeBridge<P> {
+    fn start_native(&mut self, identifier: &str, spim: &str) -> io::Result<(u32, String)> {
+        let ds_id = identifier.parse::<i64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid ds_id"))?;
+        let (handle, cpim) = self.proxy.start_provisioning(ds_id, spim.as_bytes())?;
+        let cpim = String::from_utf8(cpim)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid native CPIM encoding"))?;
+        Ok((handle, cpim))
+    }
+    fn finish_native(&mut self, handle: u32, ptm: &str, tk: &str) -> io::Result<String> {
+        self.proxy.end_provisioning(handle, ptm.as_bytes(), tk.as_bytes())?;
+        // The native end_provisioning API returns (), not adi.pb.
+        // Persistence/export requires a separately reviewed provider API.
+        Err(io::Error::new(io::ErrorKind::Unsupported, "native material export unavailable"))
+    }
+    fn destroy_native(&mut self, handle: u32) -> io::Result<()> {
+        self.proxy.destroy_provisioning_session(handle)
+    }
+}
+
 /// Adapter ties the typed IPC contract to a single native handle. An Rc cell
 /// lets the handle guard invoke Destroy using the same engine instance.
 #[cfg(test)]
