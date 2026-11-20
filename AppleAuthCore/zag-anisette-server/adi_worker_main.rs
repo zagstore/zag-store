@@ -77,12 +77,48 @@ impl NativeAdiBackend for DisabledNativeAdiBackend {
     }
 }
 
+/// Session-owned native handle boundary. No native library is linked:
+/// the disabled implementation cannot create a session or emit ADI material.
+#[derive(Debug, PartialEq, Eq)]
+enum NativeSessionState { Ready, Started, Closed }
+
+struct NativeSession<B: NativeAdiBackend> {
+    backend: B,
+    state: NativeSessionState,
+}
+impl<B: NativeAdiBackend> NativeSession<B> {
+    fn new(backend: B) -> Self {
+        Self { backend, state: NativeSessionState::Ready }
+    }
+    fn execute(&mut self, request: NativeRequest) -> io::Result<()> {
+        let permitted = matches!(
+            (&self.state, &request),
+            (NativeSessionState::Ready, NativeRequest::Start { .. })
+                | (NativeSessionState::Started, NativeRequest::Finish { .. })
+        );
+        if !permitted {
+            self.state = NativeSessionState::Closed;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid native phase"));
+        }
+        let next = match request {
+            NativeRequest::Start { .. } => NativeSessionState::Started,
+            NativeRequest::Finish { .. } => NativeSessionState::Closed,
+        };
+        // Any native failure closes the session permanently; never retry
+        // against a potentially half-initialized native provider.
+        match self.backend.execute(request) {
+            Ok(()) => { self.state = next; Ok(()) }
+            Err(error) => { self.state = NativeSessionState::Closed; Err(error) }
+        }
+    }
+}
+
 fn run<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
     let request = read_request(input)?;
     // Parse into a typed request before invoking a future native backend.
     // The disabled backend must never synthesize provisioning material.
     let request = parse_request(&request)?;
-    let _ = DisabledNativeAdiBackend.execute(request);
+    let _ = NativeSession::new(DisabledNativeAdiBackend).execute(request);
     output.write_all(&(ERROR_RESPONSE.len() as u32).to_be_bytes())?;
     output.write_all(ERROR_RESPONSE)?;
     output.flush()
@@ -130,6 +166,40 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, frame(ERROR_RESPONSE));
+    }
+    #[test]
+    fn native_session_enforces_phase_order_and_terminal_failure() {
+        struct MockBackend;
+        impl NativeAdiBackend for MockBackend {
+            fn execute(&mut self, _: NativeRequest) -> io::Result<()> { Ok(()) }
+        }
+        let mut session = NativeSession::new(MockBackend);
+        assert!(session.execute(NativeRequest::Finish {
+            ptm: "p".into(), tk: "t".into(),
+        }).is_err());
+        assert_eq!(session.state, NativeSessionState::Closed);
+        assert!(session.execute(NativeRequest::Start {
+            identifier: "id".into(), spim: "s".into(),
+        }).is_err());
+
+        let mut valid = NativeSession::new(MockBackend);
+        assert!(valid.execute(NativeRequest::Start {
+            identifier: "id".into(), spim: "s".into(),
+        }).is_ok());
+        assert_eq!(valid.state, NativeSessionState::Started);
+        assert!(valid.execute(NativeRequest::Finish {
+            ptm: "p".into(), tk: "t".into(),
+        }).is_ok());
+        assert_eq!(valid.state, NativeSessionState::Closed);
+        assert!(valid.execute(NativeRequest::Finish {
+            ptm: "p".into(), tk: "t".into(),
+        }).is_err());
+
+        let mut disabled = NativeSession::new(DisabledNativeAdiBackend);
+        assert!(disabled.execute(NativeRequest::Start {
+            identifier: "id".into(), spim: "s".into(),
+        }).is_err());
+        assert_eq!(disabled.state, NativeSessionState::Closed);
     }
     #[test]
     fn native_backend_is_explicitly_disabled_for_both_phases() {
