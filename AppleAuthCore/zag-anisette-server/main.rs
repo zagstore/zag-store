@@ -11,6 +11,7 @@
 mod adi_process;
 mod adi_worker_protocol;
 mod adi_worker_framing;
+mod adi_worker_lifecycle;
 mod provisioning;
 mod websocket_transport;
 
