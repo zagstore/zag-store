@@ -35,7 +35,7 @@ fn field(value: &Value, key: &str) -> Result<String, WireError> {
     Ok(text.to_owned())
 }
 
-fn object<'a>(bytes: &'a [u8]) -> Result<Value, WireError> {
+fn object(bytes: &[u8]) -> Result<Value, WireError> {
     if bytes.len() > MAX_MESSAGE_BYTES { return Err(WireError::Oversized); }
     let value: Value = serde_json::from_slice(bytes).map_err(|_| WireError::Malformed)?;
     let map = value.as_object().ok_or(WireError::Malformed)?;
