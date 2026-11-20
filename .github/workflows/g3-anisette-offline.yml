@@ -31,6 +31,8 @@ jobs:
           components: clippy
       - name: Resolve dependency lockfile for validation
         run: cargo generate-lockfile
+      - name: Verify validated dependency resolution
+        run: echo "7700574b51984624d6e2b8ad5585231ad08aabe2cf36f5d6792984a4e41b5c00  Cargo.lock" | sha256sum --check
       - name: Upload resolved Cargo lockfile
         uses: actions/upload-artifact@v4
         with:
