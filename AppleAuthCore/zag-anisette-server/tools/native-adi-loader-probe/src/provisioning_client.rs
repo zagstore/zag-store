@@ -209,14 +209,14 @@ pub fn provision_with_worker(
         .spawn().map_err(|_| transport())?;
     // Extract pipes before transferring exclusive Child ownership to the
     // supervisor. All process termination/reaping occurs in that thread.
-    let mut stdin = child.stdin.take().ok_or_else(transport)?;
+    let mut stdin = Some(child.stdin.take().ok_or_else(transport)?);
     let mut stdout = child.stdout.take().ok_or_else(transport)?;
     let abort = Arc::new(AtomicBool::new(false));
     let supervisor = supervise_child(child, WORKER_DEADLINE, Arc::clone(&abort));
     let result = (|| {
         let start = Request::Start { identifier: "-2".into(), spim };
-        stdin.write_all(&framed_request(&start)?)?;
-        stdin.flush()?;
+        stdin.as_mut().ok_or_else(transport)?.write_all(&framed_request(&start)?)?;
+        stdin.as_mut().ok_or_else(transport)?.flush()?;
         let cpim = match framed_response(&mut stdout, &start)? {
             Response::Started(data) => data,
             _ => return Err(invalid("worker rejected Start")),
@@ -227,9 +227,9 @@ pub fn provision_with_worker(
         let ptm = decoded_field(reply, "ptm")?;
         let tk = decoded_field(reply, "tk")?;
         let finish = Request::Finish { ptm, tk };
-        stdin.write_all(&framed_request(&finish)?)?;
-        stdin.flush()?;
-        drop(stdin);
+        stdin.as_mut().ok_or_else(transport)?.write_all(&framed_request(&finish)?)?;
+        stdin.as_mut().ok_or_else(transport)?.flush()?;
+        drop(stdin.take());
         let adi_pb = match framed_response(&mut stdout, &finish)? {
             Response::Finished(data) => data,
             _ => return Err(invalid("worker rejected Finish")),
@@ -239,7 +239,7 @@ pub fn provision_with_worker(
         Ok(adi_pb)
     })();
     if result.is_err() { abort.store(true, Ordering::Release); }
-    drop(stdin);
+    drop(stdin.take());
     drop(stdout);
     let (status, timed_out) = supervisor.join().map_err(|_| transport())??;
     if timed_out { return Err(io::Error::new(io::ErrorKind::TimedOut, "native worker deadline exceeded")); }
