@@ -228,6 +228,35 @@ mod tests {
         assert_eq!(output.stdout, frame(ERROR_RESPONSE));
     }
     #[test]
+    fn mock_backend_retains_one_session_across_both_phases() {
+        struct StatefulMock { starts: usize, finishes: usize }
+        impl NativeAdiBackend for StatefulMock {
+            fn execute(&mut self, request: NativeRequest) -> io::Result<()> {
+                match request {
+                    NativeRequest::Start { .. } => {
+                        assert_eq!((self.starts, self.finishes), (0, 0));
+                        self.starts += 1;
+                    }
+                    NativeRequest::Finish { .. } => {
+                        assert_eq!((self.starts, self.finishes), (1, 0));
+                        self.finishes += 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut session = NativeSession::new(StatefulMock { starts: 0, finishes: 0 });
+        let start = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        let finish = frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#);
+        let first = read_session_request(&mut start.as_slice()).unwrap().unwrap();
+        let second = read_session_request(&mut finish.as_slice()).unwrap().unwrap();
+        assert!(session.execute(first).is_ok());
+        assert_eq!(session.state, NativeSessionState::Started);
+        assert!(session.execute(second).is_ok());
+        assert_eq!(session.state, NativeSessionState::Closed);
+        assert_eq!((session.backend.starts, session.backend.finishes), (1, 1));
+    }
+    #[test]
     fn session_mode_is_fail_closed_without_native_provider() {
         let start = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"spim"}"#);
         let mut output = Vec::new();
