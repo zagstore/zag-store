@@ -194,6 +194,39 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn timed_out_worker_descendant_cannot_write_after_return() {
+        use std::os::unix::fs::PermissionsExt;
+        // A background helper inherits the worker's process group. If only
+        // the direct child is killed, the helper creates the marker later.
+        let dir = std::env::temp_dir().join(format!(
+            "zag-adi-descendants-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        let marker = dir.join("escaped");
+        let body = format!(
+            "#!/bin/sh\\n(sleep 0.3; echo escaped > '{}') &\\nsleep 5\\n",
+            marker.display()
+        ).replace("\\\\n", "\\n");
+        std::fs::write(&script, body).unwrap();
+        let mut mode = std::fs::metadata(&script).unwrap().permissions();
+        mode.set_mode(0o700);
+        std::fs::set_permissions(&script, mode).unwrap();
+        let started = Instant::now();
+        let result = execute_offline_worker(
+            &script, &script, &request(), Duration::from_millis(100)
+        );
+        assert_eq!(result, Err(WorkerError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(450));
+        assert!(!marker.exists(), "descendant survived worker timeout");
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
     fn nonzero_worker_cannot_produce_success() {
         let path = Path::new("/usr/bin/false").canonicalize().unwrap();
         let result = execute_offline_worker(&path, &path, &request(), Duration::from_secs(1));
