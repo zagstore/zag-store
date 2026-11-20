@@ -462,6 +462,34 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn native_engine_adapter_preserves_handle_and_destroys_it() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct Engine(Arc<AtomicUsize>);
+        impl NativeAdiEngine for Engine {
+            fn start_native(&mut self, _: &str, _: &str) -> io::Result<(u32, String)> {
+                Ok((99, "cpim".into()))
+            }
+            fn finish_native(&mut self, handle: u32, _: &str, _: &str) -> io::Result<String> {
+                assert_eq!(handle, 99);
+                Ok("adi".into())
+            }
+            fn destroy_native(&mut self, handle: u32) -> io::Result<()> {
+                assert_eq!(handle, 99);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        input.extend(frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#));
+        let mut output = Vec::new();
+        run_typed_session(&mut input.as_slice(), &mut output,
+            NativeEngineAdapter::new(Engine(count.clone()))).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(output.windows(b"\"type\":\"finished\"".len()).any(|w| w == b"\"type\":\"finished\""));
+    }
+
+    #[test]
     fn native_handle_destroyed_once_on_drop_and_explicit_close() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         let count = Arc::new(AtomicUsize::new(0));
