@@ -4,7 +4,7 @@
 //! Unit tests exercise real RFC 6455 framing over loopback.
 #![allow(dead_code)]
 use std::{io::{Read, Write}, net::TcpStream, time::Duration};
-use tungstenite::{accept, Message};
+use tungstenite::{accept_with_config, protocol::WebSocketConfig, Message};
 
 use crate::provisioning::{encode_server_message, process_text_frame, OfflineBackend, ProtocolError, Session};
 
@@ -37,7 +37,13 @@ impl Write for PrefixedStream {
 pub fn serve_offline_socket(stream: TcpStream, request_prefix: Vec<u8>) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    let mut socket = accept(PrefixedStream::new(stream, request_prefix)).map_err(|e| e.to_string())?;
+    let config = WebSocketConfig {
+        max_message_size: Some(MAX_FRAME),
+        max_frame_size: Some(MAX_FRAME),
+        ..WebSocketConfig::default()
+    };
+    let mut socket = accept_with_config(PrefixedStream::new(stream, request_prefix), Some(config))
+        .map_err(|e| e.to_string())?;
     let mut session = Session::new(OfflineBackend);
     socket.send(Message::Text(encode_server_message(&session.initial()).into())).map_err(|e| e.to_string())?;
     loop {
