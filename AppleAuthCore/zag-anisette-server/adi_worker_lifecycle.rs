@@ -30,7 +30,7 @@ fn terminate_group(pid: u32) {
 }
 
 use crate::{
-    adi_worker_framing::{read_frame, write_frame},
+    adi_worker_framing::{read_single_frame_to_eof, write_frame},
     adi_worker_protocol::{decode_response, encode_request, WorkerRequest, WorkerResponse},
 };
 
@@ -88,8 +88,8 @@ pub fn execute_offline_worker(
     let (sender, receiver) = mpsc::channel();
     let writer = thread::spawn(move || write_frame(&mut stdin, &payload));
     let reader = thread::spawn(move || {
-        let result = read_frame(&mut stdout);
-        // Do not wait for EOF: the protocol is exactly one response frame.
+        let result = read_single_frame_to_eof(&mut stdout);
+        // Require EOF after the single frame; the parent deadline bounds this read.
         let _ = sender.send(result);
     });
     let deadline = Instant::now() + timeout;
