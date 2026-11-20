@@ -46,5 +46,29 @@ jobs:
         run: cargo build --release --locked
       - name: Test
         run: cargo test --locked
+      - name: Offline worker subprocess smoke
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import struct
+          import subprocess
+          worker = pathlib.Path("target/release/zag-adi-worker")
+          assert worker.is_file(), "worker executable missing"
+          for kind, fields in (
+              ("start", {"identifier": "device", "spim": "spim"}),
+              ("finish", {"ptm": "ptm", "tk": "tk"}),
+          ):
+              request = json.dumps({"version": 1, "type": kind, **fields}, separators=(",", ":")).encode()
+              frame = struct.pack(">I", len(request)) + request
+              proc = subprocess.run([str(worker.resolve())], input=frame, capture_output=True, timeout=5)
+              assert proc.returncode == 0, (kind, proc.returncode)
+              expected = b'{"version":1,"type":"error","code":"backend_unavailable"}'
+              assert proc.stdout == struct.pack(">I", len(expected)) + expected, kind
+              assert proc.stderr == b"", kind
+          invalid = struct.pack(">I", 2) + b"{}"
+          proc = subprocess.run([str(worker.resolve())], input=invalid, capture_output=True, timeout=5)
+          assert proc.returncode != 0 and proc.stdout == b"" and proc.stderr == b""
+          PY
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
