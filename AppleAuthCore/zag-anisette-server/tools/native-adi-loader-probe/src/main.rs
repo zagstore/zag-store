@@ -1,5 +1,6 @@
 //! Offline, operator-run native loader smoke probe. Does not call ADI provisioning.
 mod native_session;
+mod offline_v2_bridge;
 use android_loader::android_library::AndroidLibrary;
 use android_loader::{hook_manager, sysv64};
 use std::collections::HashMap;
