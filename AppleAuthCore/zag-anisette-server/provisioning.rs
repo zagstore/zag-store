@@ -249,6 +249,21 @@ esac
         std::fs::remove_file(script).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
+    #[cfg(unix)]
+    #[test]
+    fn release_worker_adapter_rejects_provisioning_without_native_backend() {
+        // Set only by the cross-platform CI job. Never enables a listener.
+        let Ok(path) = std::env::var("ZAG_OFFLINE_WORKER_TEST_EXECUTABLE") else { return; };
+        let path = std::path::PathBuf::from(path).canonicalize().unwrap();
+        let mut session = Session::new(AdiBackend::new(OfflineWorkerAdiProvider::new(
+            path, std::time::Duration::from_secs(3),
+        )));
+        assert_eq!(session.receive(ClientMessage::Identifier("device".into())),
+            Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("spim".into())),
+            Err(ProtocolError::BackendUnavailable));
+        assert_eq!(session.phase(), Phase::Failed);
+    }
     #[test] fn offline_worker_adapter_fails_closed_without_approved_executable() {
         let provider = OfflineWorkerAdiProvider::new(
             std::path::PathBuf::from("/nonexistent/zag-adi-worker"),
