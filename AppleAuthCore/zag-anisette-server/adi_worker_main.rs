@@ -505,6 +505,38 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn sidestore_bridge_does_not_invent_native_adi_pb() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct Proxy(Arc<AtomicUsize>);
+        impl AdiProxyNativeCalls for Proxy {
+            fn start_provisioning(&mut self, ds_id: i64, spim: &[u8]) -> io::Result<(u32, Vec<u8>)> {
+                assert_eq!(ds_id, -2);
+                assert_eq!(spim, b"spim");
+                Ok((17, b"cpim".to_vec()))
+            }
+            fn end_provisioning(&mut self, handle: u32, ptm: &[u8], tk: &[u8]) -> io::Result<()> {
+                assert_eq!(handle, 17);
+                assert_eq!(ptm, b"ptm");
+                assert_eq!(tk, b"tk");
+                Ok(())
+            }
+            fn destroy_provisioning_session(&mut self, handle: u32) -> io::Result<()> {
+                assert_eq!(handle, 17);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut engine = SideStoreNativeBridge { proxy: Proxy(count.clone()) };
+        let (handle, cpim) = engine.start_native("-2", "spim").unwrap();
+        assert_eq!(cpim, "cpim");
+        assert_eq!(handle, 17);
+        assert_eq!(engine.finish_native(handle, "ptm", "tk").unwrap_err().kind(), io::ErrorKind::Unsupported);
+        engine.destroy_native(handle).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn native_engine_adapter_destroys_handle_on_finish_failure() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         struct FailingEngine(Arc<AtomicUsize>);
