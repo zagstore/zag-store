@@ -99,7 +99,9 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let status = process_watchdog::run_bounded(&mut cmd, process_watchdog::HARD_DEADLINE)?;
-        if !status.success() { return Err(invalid("isolated coordinator failed").into()); }
+        if !status.success() {
+            return Err(invalid("isolated coordinator failed (check that complete identity JSON was supplied on stdin)").into());
+        }
         println!("PASS: supervised isolated ADI state generated");
     } else {
         if std::env::var(CHILD_MARKER).ok().as_deref() != Some("1") {
