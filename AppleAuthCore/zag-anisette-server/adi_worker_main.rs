@@ -377,6 +377,27 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn typed_session_cleans_up_provider_after_start_failure() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct Fail(Arc<AtomicUsize>);
+        impl StatefulMaterialBackend for Fail {
+            fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
+                Err(io::Error::other("failure"))
+            }
+            fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
+                panic!("finish after failure")
+            }
+            fn abort(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        let mut output = Vec::new();
+        assert!(run_typed_session(&mut input.as_slice(), &mut output, Fail(cleaned.clone())).is_err());
+        assert!(output.is_empty());
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn typed_session_rejects_invalid_native_material_without_output() {
         struct Bad;
         impl StatefulMaterialBackend for Bad {
