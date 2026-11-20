@@ -3,7 +3,7 @@
 //! credentials are loaded. The boundary is exercised exclusively in tests.
 #![allow(dead_code)]
 
-use std::{io, process::{Command, Stdio}, time::{Duration, Instant}};
+use std::{process::{Command, Stdio}, time::{Duration, Instant}};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessError {
@@ -70,11 +70,20 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn slow_local_process_is_terminated() {
-        assert_eq!(probe_local_executable("/usr/bin/sleep", Duration::from_millis(100)), Err(ProcessError::NonZeroExit));
-    }
-    #[test]
-    fn unused_io_error_does_not_escape_boundary() {
-        let _: Option<io::Error> = None;
+    fn timeout_kills_slow_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zag-adi-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("slow.sh");
+        std::fs::write(&script, "#!/bin/sh\\nsleep 3\\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let started = Instant::now();
+        let result = probe_local_executable(script.to_str().unwrap(), Duration::from_millis(100));
+        assert_eq!(result, Err(ProcessError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::fs::remove_file(&script).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }
