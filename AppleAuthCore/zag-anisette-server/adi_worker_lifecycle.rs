@@ -55,8 +55,9 @@ pub fn execute_offline_worker(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| WorkerError::Spawn)?;
-    let mut stdin = child.stdin.take().ok_or(WorkerError::Transport)?;
-    let mut stdout = child.stdout.take().ok_or(WorkerError::Transport)?;
+    // Both pipes are present because they were requested when spawning.
+    let mut stdin = child.stdin.take().expect("piped worker stdin");
+    let mut stdout = child.stdout.take().expect("piped worker stdout");
     let (sender, receiver) = mpsc::channel();
     let writer = thread::spawn(move || write_frame(&mut stdin, &payload));
     let reader = thread::spawn(move || {
@@ -66,6 +67,8 @@ pub fn execute_offline_worker(
     });
     let deadline = Instant::now() + timeout;
     let mut result = None;
+    let mut child_exited = false;
+    let mut wait_failed = false;
     while Instant::now() < deadline {
         match receiver.try_recv() {
             Ok(frame) => { result = Some(frame); break; }
@@ -74,12 +77,13 @@ pub fn execute_offline_worker(
         }
         match child.try_wait() {
             Ok(Some(_)) => {
-                // The reader may still be draining bytes from a just-exited
-                // process. Wait for the channel, but never past the deadline.
+                child_exited = true;
+                // A just-exited child may have written a complete reply.
+                // Any inherited stdout held open elsewhere must not extend the deadline.
                 result = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok();
                 break;
             }
-            Err(_) => break,
+            Err(_) => { wait_failed = true; break; },
             Ok(None) => {}
         }
         thread::sleep(Duration::from_millis(5));
@@ -92,15 +96,33 @@ pub fn execute_offline_worker(
         exited = child.try_wait().map_err(|_| WorkerError::Transport)?;
     }
     let timed_out = exited.is_none();
-    if timed_out { let _ = child.kill(); }
+    if timed_out || wait_failed { let _ = child.kill(); }
     let status = child.wait().map_err(|_| WorkerError::Transport)?;
-    let write_result = writer.join().map_err(|_| WorkerError::Transport)?;
-    reader.join().map_err(|_| WorkerError::Transport)?;
-    if timed_out || result.is_none() { return Err(WorkerError::Timeout); }
-    if write_result.is_err() { return Err(WorkerError::Transport); }
-    let frame = result.unwrap().map_err(|_| WorkerError::Transport)?;
+    // Never join the reader/writer on a failure path. A descendant can retain
+    // a pipe indefinitely after its parent exits; joining here could defeat
+    // the worker deadline. Detached threads own their handles and eventually
+    // exit on EOF / broken pipe, but cannot hold this request open.
+    // A future production worker must use a supervised process group.
+    if timed_out || (result.is_none() && !child_exited && Instant::now() >= deadline) {
+        return Err(WorkerError::Timeout);
+    }
+    if wait_failed { return Err(WorkerError::Transport); }
     if !status.success() { return Err(WorkerError::NonZeroExit); }
-    decode_response(&frame, request).map_err(|_| WorkerError::InvalidResponse)
+    let frame = result.ok_or(WorkerError::Transport)?.map_err(|_| WorkerError::Transport)?;
+    let response = decode_response(&frame, request).map_err(|_| WorkerError::InvalidResponse)?;
+    // A positive reply must also have been written successfully, but a worker
+    // may close its stdin early after seeing enough data. Treat that as an
+    // invalid exchange, never as successful provisioning.
+    match writer.is_finished() {
+        true => match writer.join() {
+            Ok(Ok(())) => {}
+            _ => return Err(WorkerError::Transport),
+        },
+        false => return Err(WorkerError::Transport),
+    }
+    // The reader has already sent its result; this join cannot block.
+    let _ = reader.join();
+    Ok(response)
 }
 
 #[cfg(test)]
