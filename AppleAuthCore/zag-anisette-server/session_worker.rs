@@ -124,6 +124,28 @@ mod tests {
         assert_eq!(s.phase(), &Phase::Cancelled);
     }
     #[test]
+    fn oversized_line_is_rejected_without_response() {
+        let mut input = vec![b'x'; MAX_FRAME + 1];
+        input.push(b'\n');
+        let mut output = Vec::new();
+        assert!(serve_mock(&input[..], &mut output).is_err());
+        assert!(output.is_empty());
+    }
+    #[test]
+    fn incomplete_line_is_rejected_without_response() {
+        let mut output = Vec::new();
+        assert!(serve_mock(&b"{\"type\":\"start\"}"[..], &mut output).is_err());
+        assert!(output.is_empty());
+    }
+    #[test]
+    fn finish_before_start_fails_closed() {
+        let input = b"{\"type\":\"finish\",\"ptm\":\"ptm\",\"tk\":\"tk\"}\n";
+        let mut output = Vec::new();
+        serve_mock(&input[..], &mut output).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["type"], "error");
+    }
+    #[test]
     fn framed_mock_roundtrip() {
         let input = b"{\"type\":\"start\",\"identifier\":\"id\",\"spim\":\"spim\"}\n{\"type\":\"finish\",\"ptm\":\"ptm\",\"tk\":\"tk\"}\n";
         let mut output = Vec::new();
