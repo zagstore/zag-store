@@ -231,6 +231,22 @@ mod tests {
         assert_eq!(result.1["type"], "finished");
     }
     #[test]
+    fn rejects_invalid_request_shapes_before_launch() {
+        let executable = std::fs::canonicalize("/bin/sh").unwrap();
+        let valid_start = r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#;
+        let valid_finish = r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#;
+        for (start, finish) in [
+            (r#"{"version":2,"type":"start","identifier":"mock","spim":"mock"}"#, valid_finish),
+            (valid_finish, valid_finish),
+            (valid_start, valid_start),
+            (r#"{"version":1,"type":"start","identifier":"mock","spim":"mock","extra":true}"#, valid_finish),
+        ] {
+            let result = run_mock_session(&executable, &["-c", "exit 99"],
+                start, finish, Duration::from_secs(1));
+            assert_eq!(result, Err(SessionError::InvalidResponse));
+        }
+    }
+    #[test]
     fn stalled_child_is_killed_at_deadline() {
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", "read a; sleep 5"],
             "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_millis(100));
