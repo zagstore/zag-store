@@ -49,6 +49,15 @@ fn run_v2() -> io::Result<()> {
     send(&mut output, r#"{"version":2,"type":"finished","adi_pb_hex":"ff00"}"#)
 }
 fn main() {
-    let result = if std::env::args().nth(1).as_deref() == Some("--v2") { run_v2() } else { run() };
+    let result = match std::env::args().nth(1).as_deref() {
+        Some("--v2") => run_v2(),
+        Some("--v2-stall") => {
+            let mut input = io::stdin().lock();
+            let _ = read_frame(&mut input);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(())
+        }
+        _ => run(),
+    };
     if result.is_err() { std::process::exit(1); }
 }
