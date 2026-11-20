@@ -3,19 +3,41 @@
 //! The existing HTTP route continues to refuse upgrades with 503.
 //! Unit tests exercise real RFC 6455 framing over loopback.
 #![allow(dead_code)]
-use std::{net::TcpStream, time::Duration};
+use std::{io::{Read, Write}, net::TcpStream, time::Duration};
 use tungstenite::{accept, Message};
 
 use crate::provisioning::{encode_server_message, process_text_frame, OfflineBackend, ProtocolError, Session};
 
 const MAX_FRAME: usize = 64 * 1024;
 
+/// Replay HTTP handshake bytes already read by the outer parser.
+pub struct PrefixedStream {
+    prefix: std::io::Cursor<Vec<u8>>,
+    stream: TcpStream,
+}
+impl PrefixedStream {
+    pub fn new(stream: TcpStream, prefix: Vec<u8>) -> Self {
+        Self { prefix: std::io::Cursor::new(prefix), stream }
+    }
+}
+impl Read for PrefixedStream {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.prefix.read(out)?;
+        if n != 0 { Ok(n) } else { self.stream.read(out) }
+    }
+}
+impl Write for PrefixedStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.stream.write(buf) }
+    fn flush(&mut self) -> std::io::Result<()> { self.stream.flush() }
+}
+
+
 /// Serve a single local test connection using the real WebSocket protocol.
 /// The backend remains unavailable; no successful provisioning is possible.
-pub fn serve_offline_socket(stream: TcpStream) -> Result<(), String> {
+pub fn serve_offline_socket(stream: TcpStream, request_prefix: Vec<u8>) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    let mut socket = accept(stream).map_err(|e| e.to_string())?;
+    let mut socket = accept(PrefixedStream::new(stream, request_prefix)).map_err(|e| e.to_string())?;
     let mut session = Session::new(OfflineBackend);
     socket.send(Message::Text(encode_server_message(&session.initial()).into())).map_err(|e| e.to_string())?;
     loop {
@@ -58,7 +80,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_offline_socket(stream)
+            serve_offline_socket(stream, Vec::new())
         });
         let stream = TcpStream::connect(address).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
