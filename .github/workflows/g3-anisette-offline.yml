@@ -29,8 +29,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Check dependency lockfile
-        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
+      - name: Resolve dependency lockfile for validation
+        run: cargo generate-lockfile
       - name: Compile
         run: cargo build --release --locked
       - name: Test
