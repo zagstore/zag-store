@@ -9,6 +9,10 @@ license = "GPL-3.0-only"
 name = "zag-anisette-server"
 path = "main.rs"
 
+[[bin]]
+name = "zag-adi-worker"
+path = "adi_worker_main.rs"
+
 [profile.release]
 panic = "abort"
 lto = true
