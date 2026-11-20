@@ -361,6 +361,59 @@ mod tests {
         ).unwrap();
     }
     #[test]
+    fn typed_session_rejects_finish_first_without_invoking_backend() {
+        struct Never;
+        impl StatefulMaterialBackend for Never {
+            fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
+                panic!("unexpected start")
+            }
+            fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
+                panic!("unexpected finish")
+            }
+        }
+        let input = frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#);
+        let mut output = Vec::new();
+        assert!(run_typed_session(&mut input.as_slice(), &mut output, Never).is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn typed_session_never_emits_finished_when_extra_input_follows_finish() {
+        struct Mock;
+        impl StatefulMaterialBackend for Mock {
+            fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
+                Ok("cpim-test".into())
+            }
+            fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
+                Ok("adi-test".into())
+            }
+        }
+        let mut input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        input.extend(frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#));
+        input.push(0);
+        let mut output = Vec::new();
+        assert!(run_typed_session(&mut input.as_slice(), &mut output, Mock).is_err());
+        assert_eq!(output, frame(br#"{"cpim":"cpim-test","type":"started","version":1}"#));
+    }
+
+    #[test]
+    fn typed_session_start_error_never_emits_material() {
+        struct Fail;
+        impl StatefulMaterialBackend for Fail {
+            fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
+                Err(io::Error::other("native failure"))
+            }
+            fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
+                panic!("finish after failed start")
+            }
+        }
+        let input = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"s"}"#);
+        let mut output = Vec::new();
+        assert!(run_typed_session(&mut input.as_slice(), &mut output, Fail).is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn typed_session_backend_produces_strict_phase_responses() {
         struct Mock { started: bool }
         impl StatefulMaterialBackend for Mock {
