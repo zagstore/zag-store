@@ -230,6 +230,9 @@ trait AdiProxyNativeCalls {
     fn start_provisioning(&mut self, ds_id: i64, spim: &[u8]) -> io::Result<(u32, Vec<u8>)>;
     fn end_provisioning(&mut self, handle: u32, ptm: &[u8], tk: &[u8]) -> io::Result<()>;
     fn destroy_provisioning_session(&mut self, handle: u32) -> io::Result<()>;
+    /// Platform-specific export, not part of SideStore's ADIProxy trait.
+    /// Must read the provisioned state from a reviewed native storage API.
+    fn export_adi_pb(&mut self) -> io::Result<Vec<u8>>;
 }
 
 /// Wire conversion boundary for the reviewed SideStore-shaped native API.
@@ -252,9 +255,14 @@ impl<P: AdiProxyNativeCalls> NativeAdiEngine for SideStoreNativeBridge<P> {
     }
     fn finish_native(&mut self, handle: u32, ptm: &str, tk: &str) -> io::Result<String> {
         self.proxy.end_provisioning(handle, ptm.as_bytes(), tk.as_bytes())?;
-        // The native end_provisioning API returns (), not adi.pb.
-        // Persistence/export requires a separately reviewed provider API.
-        Err(io::Error::new(io::ErrorKind::Unsupported, "native material export unavailable"))
+        // Export is a distinct platform operation: end_provisioning returns ().
+        // The IPC currently carries a String, so reject non-text state rather
+        // than silently corrupt or fabricate binary ADI data.
+        let bytes = self.proxy.export_adi_pb()?;
+        let material = String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "binary ADI material requires encoding"))?;
+        validate_material(&material)?;
+        Ok(material)
     }
     fn destroy_native(&mut self, handle: u32) -> io::Result<()> {
         self.proxy.destroy_provisioning_session(handle)
@@ -524,6 +532,9 @@ mod tests {
                 assert_eq!(handle, 17);
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
+            }
+            fn export_adi_pb(&mut self) -> io::Result<Vec<u8>> {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "no platform export"))
             }
         }
         let count = Arc::new(AtomicUsize::new(0));
