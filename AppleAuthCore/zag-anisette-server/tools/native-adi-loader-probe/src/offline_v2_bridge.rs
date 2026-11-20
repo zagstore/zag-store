@@ -4,7 +4,7 @@
 //! The caller must provide an isolated, trusted state file location and
 //! an already initialized/configured native provider. No network requests.
 #[path = "../../../adi_worker_wire_v2.rs"]
-mod wire;
+pub(crate) mod wire;
 
 use crate::native_session::NativeFunctions;
 use std::fs::{self, File, OpenOptions};
