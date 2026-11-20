@@ -30,3 +30,22 @@ This is research and a review plan, **not** authorization to download Apple's pr
 ## Decision
 
 **No native provider selected yet.** The first implementation candidate to audit is SideStore's Rust `omnisette` stack, with Dadoum/Provision as a cross-check for state handling. Selection requires actual source and license review, not README-level claims.
+
+## Source-level findings: SideStore/omnisette-server (20 November 2026)
+
+Inspected upstream `Cargo.toml`, `src/provider_instance.rs`, and `src/provisioning_session.rs` directly. These observations are source-level, not a successful native build.
+
+- `Cargo.toml` pulls `omnisette` from `https://github.com/SideStore/apple-private-apis.git` with `async` feature. It does not pin the dependency to a Git revision in the manifest; any adoption must pin a reviewed commit and lockfile.
+- `ProviderInstance` owns `ADIProxyAnisetteProvider<StoreServicesCoreADIProxy<'static>>` and a provisioning directory. Its constructor sets the device identifier from a 16-byte identifier formatted as UUID, and derives a SHA-256 local-user UUID.
+- Start calls `adi_proxy().start_provisioning(DS_ID, spim)` and returns a native `StartProvisioningData` containing `session: u32` and `cpim`.
+- Finish calls `adi_proxy().end_provisioning(session, ptm, tk)` **on the existing provider instance**, then reads `adi.pb` from its provisioning directory. The WebSocket actor holds both the provider instance and native session handle until completion.
+- On disconnect the actor attempts `destroy_provisioning_session(session)`. `ProviderInstance::drop` attempts to remove its per-identifier provisioning directory.
+- This establishes a **blocking architectural mismatch** with Zag's separate process per Start/Finish request. Zag's current IPC has no native session handle, no durable per-session state, and no worker ownership mechanism. Do not pretend that simply forwarding `ptm`/`tk` to a new worker reproduces upstream behavior.
+- Upstream creates per-identifier directories and reads/writes `adi.pb` on disk. Before using a similar design, require non-shared per-session paths, restrictive permissions, no symlink traversal, atomic lifecycle and deletion, and a clear threat model for sensitive material.
+- The upstream server repository has an open issue about a missing license file (issue #16). Its `omnisette` dependency repository reports MPL-2.0, but that does **not** by itself license the wrapper's code or Apple's proprietary shared libraries.
+
+### Architecture decision gate
+
+**Preferred for investigation:** a single long-lived, per-session isolated worker process that owns the native provider instance from Start through Finish, with a bounded authenticated local transport and forced cleanup on timeout/disconnect. This is a design direction, **not** an approved implementation. Before implementing it, explicitly resolve its conflict with the existing one-request-one-process, framed-to-EOF worker security contract and review resource limits, process ownership, and session cancellation. A persistent service or encrypted state reconstruction are alternatives, but neither is currently verified against the native library's lifecycle.
+
+Do not wire any native library into the existing `DisabledNativeAdiBackend` until this state-lifetime issue and license review are resolved.
