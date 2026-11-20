@@ -27,7 +27,7 @@ macro_rules! report {
         if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--native-v2-session")) {
             eprintln!($($args)*);
         } else {
-            report!($($args)*);
+            println!($($args)*);
         }
     };
 }
