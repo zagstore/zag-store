@@ -75,11 +75,11 @@ pub fn execute_offline_worker(
         .stderr(Stdio::null());
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = command.spawn().map_err(|_error| {
         // Error kind and OS code only; never print executable arguments,
         // provisioning payloads, paths, or environment values.
         #[cfg(test)]
-        eprintln!("offline worker spawn: kind={:?} os={:?}", error.kind(), error.raw_os_error());
+        eprintln!("offline worker spawn: kind={:?} os={:?}", _error.kind(), _error.raw_os_error());
         WorkerError::Spawn
     })?;
     // Both pipes are present because they were requested when spawning.
