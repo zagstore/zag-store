@@ -205,37 +205,37 @@ mod tests {
     }
     #[test]
     fn two_phase_child_roundtrip() {
-        let script = "dd bs=1 count=20 2>/dev/null >/dev/null; printf '\\000\\000\\000\\022{\"type\":\"started\"}'; dd bs=1 count=21 2>/dev/null >/dev/null; printf '\\000\\000\\000\\023{\"type\":\"finished\"}'";
+        let script = "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\${Math.floor(n/256).toString(8).padStart(3,\"0\")}\\${(n%256).toString(8).padStart(3,\"0\")}{\"version\":1,\"type\":\"started\",\"cpim\":\"mock\"}'; dd bs=1 count=58 2>/dev/null >/dev/null; printf '\\000\\000\\${Math.floor(n/256).toString(8).padStart(3,\"0\")}\\${(n%256).toString(8).padStart(3,\"0\")}{\"version\":1,\"type\":\"finished\",\"adi_pb\":\"mock\"}'";
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", script],
-            "{\"type\":\"start\"}", "{\"type\":\"finish\"}", Duration::from_secs(2)).unwrap();
+            "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_secs(2)).unwrap();
         assert_eq!(result.0["type"], "started");
         assert_eq!(result.1["type"], "finished");
     }
     #[test]
     fn stalled_child_is_killed_at_deadline() {
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", "read a; sleep 5"],
-            "{\"type\":\"start\"}", "{\"type\":\"finish\"}", Duration::from_millis(100));
+            "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_millis(100));
         assert_eq!(result, Err(SessionError::Timeout));
     }
     #[test]
     fn rejects_noncanonical_worker_path() {
         let result = run_mock_session(Path::new("/definitely/not/a/worker"), &[],
-            "{\"type\":\"start\"}", "{\"type\":\"finish\"}", Duration::from_secs(1));
+            "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_secs(1));
         assert_eq!(result, Err(SessionError::Spawn));
     }
     #[test]
     fn rejects_zero_or_excessive_deadlines_before_spawn() {
         for timeout in [Duration::ZERO, Duration::from_secs(11)] {
             let result = run_mock_session(Path::new("/definitely/not/a/worker"), &[],
-                "{\"type\":\"start\"}", "{\"type\":\"finish\"}", timeout);
+                "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", timeout);
             assert_eq!(result, Err(SessionError::InvalidTimeout));
         }
     }
     #[test]
     fn unexpected_response_fails_closed() {
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
-            &["-c", "dd bs=1 count=20 2>/dev/null >/dev/null; printf '\\000\\000\\000\\023{\"type\":\"finished\"}'"],
-            "{\"type\":\"start\"}", "{\"type\":\"finish\"}", Duration::from_secs(1));
+            &["-c", "dd bs=1 count=66 2>/dev/null >/dev/null; printf '\\000\\000\\${Math.floor(n/256).toString(8).padStart(3,\"0\")}\\${(n%256).toString(8).padStart(3,\"0\")}{\"version\":1,\"type\":\"finished\",\"adi_pb\":\"mock\"}'"]
+            "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_secs(1));
         assert_eq!(result, Err(SessionError::InvalidResponse));
     }
 }
