@@ -79,6 +79,19 @@ pub fn execute_offline_worker(
     {
         return Err(WorkerError::UnapprovedExecutable);
     }
+    // The executable's containing directory must not permit another
+    // group member or user to replace its directory entry. A complete
+    // deployment audit must also validate ancestor directories.
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(
+        approved.parent().ok_or(WorkerError::UnapprovedExecutable)?
+    )
+        .map_err(|_| WorkerError::UnapprovedExecutable)?
+        .permissions()
+        .mode() & 0o022 != 0
+    {
+        return Err(WorkerError::UnapprovedExecutable);
+    }
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
     let mut command = Command::new(approved);
     // Do not leak the HTTP process's credentials, proxy settings, dynamic
@@ -186,6 +199,33 @@ mod tests {
         assert_eq!(execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/false"), &request(), Duration::from_secs(1)), Err(WorkerError::UnapprovedExecutable));
         assert_eq!(execute_offline_worker(Path::new("/usr/bin/true"), Path::new("/usr/bin/true"), &request(), Duration::ZERO), Err(WorkerError::InvalidTimeout));
         assert_eq!(execute_offline_worker(Path::new("relative"), Path::new("relative"), &request(), Duration::from_secs(1)), Err(WorkerError::UnapprovedExecutable));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn writable_worker_directory_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "zag-adi-dir-perms-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\\nexit 0\\n").unwrap();
+        let mut executable = std::fs::metadata(&script).unwrap().permissions();
+        executable.set_mode(0o700);
+        std::fs::set_permissions(&script, executable).unwrap();
+        for mode in [0o770, 0o707] {
+            let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+            permissions.set_mode(mode);
+            std::fs::set_permissions(&dir, permissions).unwrap();
+            assert_eq!(
+                execute_offline_worker(&script, &script, &request(), Duration::from_secs(1)),
+                Err(WorkerError::UnapprovedExecutable)
+            );
+        }
+        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&dir, permissions).unwrap();
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
     #[cfg(unix)]
     #[test]
