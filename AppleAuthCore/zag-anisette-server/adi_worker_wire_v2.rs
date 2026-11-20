@@ -62,9 +62,9 @@ fn encode_hex(bytes: &[u8]) -> Result<String, WireError> {
     Ok(result)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request { Start { identifier: String, spim: Vec<u8> }, Finish { ptm: Vec<u8>, tk: Vec<u8> } }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response { Started(Vec<u8>), Finished(Vec<u8>) }
 
 fn exact(obj: &BTreeMap<String, Value>, names: &[&str]) -> Result<(), WireError> {
@@ -125,15 +125,15 @@ mod tests {
     #[test]
     fn binary_round_trip_and_phase() {
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255, 128] };
-        assert_eq!(decode_request(&encode_request(&start).unwrap()), Ok(start));
+        assert_eq!(decode_request(&encode_request(&start).unwrap()), Ok(start.clone()));
         let finish = Request::Finish { ptm: vec![0, 10], tk: vec![255] };
-        assert_eq!(decode_request(&encode_request(&finish).unwrap()), Ok(finish));
+        assert_eq!(decode_request(&encode_request(&finish).unwrap()), Ok(finish.clone()));
         let started = Response::Started(vec![0, 255]);
         let start = Request::Start { identifier: "-2".into(), spim: vec![1] };
-        assert_eq!(decode_response(&encode_response(&started).unwrap(), &start), Ok(started));
+        assert_eq!(decode_response(&encode_response(&started).unwrap(), &start), Ok(started.clone()));
         assert_eq!(decode_response(&encode_response(&started).unwrap(), &finish), Err(WireError::Invalid));
         let finished = Response::Finished(vec![255, 0]);
-        assert_eq!(decode_response(&encode_response(&finished).unwrap(), &finish), Ok(finished));
+        assert_eq!(decode_response(&encode_response(&finished).unwrap(), &finish), Ok(finished.clone()));
     }
     #[test]
     fn rejects_wrong_phase_and_oversized_binary_material() {
