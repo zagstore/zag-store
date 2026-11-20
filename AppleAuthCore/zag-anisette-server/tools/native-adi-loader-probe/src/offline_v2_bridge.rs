@@ -55,7 +55,7 @@ fn read_new_state(state_file: &Path) -> io::Result<Vec<u8>> {
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
-    let mut file: File = options.open(state_file)?;
+    let file: File = options.open(state_file)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.len() == 0 || meta.len() > wire::MAX_FRAME as u64 / 4 {
         return Err(invalid("invalid native state file"));
