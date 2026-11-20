@@ -9,6 +9,26 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// The worker is launched as its own process group on Unix.
+/// Send SIGKILL to the whole group, not just the direct child.
+#[cfg(unix)]
+fn terminate_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        if pid > 0 {
+            // SAFETY: negative PID targets the isolated group created below.
+            unsafe { kill(-pid, 9); }
+        }
+    }
+}
+
 use crate::{
     adi_worker_framing::{read_frame, write_frame},
     adi_worker_protocol::{decode_response, encode_request, WorkerRequest, WorkerResponse},
@@ -49,12 +69,13 @@ pub fn execute_offline_worker(
         return Err(WorkerError::UnapprovedExecutable);
     }
     let payload = encode_request(request).map_err(|_| WorkerError::InvalidRequest)?;
-    let mut child = Command::new(approved)
-        .stdin(Stdio::piped())
+    let mut command = Command::new(approved);
+    command.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| WorkerError::Spawn)?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|_| WorkerError::Spawn)?;
     // Both pipes are present because they were requested when spawning.
     let mut stdin = child.stdin.take().expect("piped worker stdin");
     let mut stdout = child.stdout.take().expect("piped worker stdout");
@@ -94,13 +115,22 @@ pub fn execute_offline_worker(
         exited = child.try_wait().map_err(|_| WorkerError::Transport)?;
     }
     let timed_out = exited.is_none();
+    // Terminate the isolated group before reaping the leader. This also
+    // closes inherited pipes held by descendants of a worker that exited.
+    // Group cleanup is unconditional: a successful direct child is not
+    // allowed to leave helpers running.
+    #[cfg(unix)]
+    terminate_group(child.id());
+    #[cfg(not(unix))]
     if timed_out || wait_failed { let _ = child.kill(); }
     let status = child.wait().map_err(|_| WorkerError::Transport)?;
     // Never join the reader/writer on a failure path. A descendant can retain
     // a pipe indefinitely after its parent exits; joining here could defeat
     // the worker deadline. Detached threads own their handles and eventually
     // exit on EOF / broken pipe, but cannot hold this request open.
-    // A future production worker must use a supervised process group.
+    // On Unix the process group is killed above; uninterruptible I/O or
+    // descendants that deliberately create a new session still require
+    // stronger sandbox/process-tree supervision before production use.
     if timed_out || (result.is_none() && Instant::now() >= deadline) {
         return Err(WorkerError::Timeout);
     }
