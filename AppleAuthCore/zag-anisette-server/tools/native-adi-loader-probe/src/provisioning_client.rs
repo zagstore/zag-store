@@ -299,8 +299,8 @@ mod tests {
         assert!(AppleHttp::new("device", "client", &user, "TEST-123").is_ok());
         assert!(AppleHttp::new("device", "client", "", "TEST-123").is_err());
         assert!(AppleHttp::new("device", "client", &user, "").is_err());
-        assert!(AppleHttp::new("device", "client", &user, "TEST\\r\\nInjected").is_err());
-        assert!(AppleHttp::new("device", "client\\nInjected", &user, "TEST").is_err());
+        assert!(AppleHttp::new("device", "client", &user, "TEST\r\nInjected").is_err());
+        assert!(AppleHttp::new("device", "client\nInjected", &user, "TEST").is_err());
         assert!(AppleHttp::new("device", "client", &("A".repeat(63) + "Z"), "TEST").is_err());
     }
 
