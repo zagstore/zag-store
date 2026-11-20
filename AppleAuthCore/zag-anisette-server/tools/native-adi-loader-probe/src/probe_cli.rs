@@ -3,6 +3,7 @@
 //! Identity JSON is read only from stdin, never from arguments or environment.
 use crate::{process_watchdog, provisioning_client};
 use std::ffi::OsStr;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,41 @@ fn read_identity<R: Read>(input: R) -> io::Result<TestIdentity> {
     })
 }
 
+// Client-generated identity: UUID is the exact 16-byte keychain identifier;
+// MD-LU is the SHA-256 digest of those bytes (not of the UUID text).
+// This check is opt-in: other legitimate identity providers may differ.
+fn validate_client_derived_identity(identity: &TestIdentity) -> io::Result<()> {
+    provisioning_client::validate_identity(
+        &identity.device_id, &identity.client_info,
+        &identity.local_user, &identity.serial,
+    )?;
+    let id = identity.device_id.as_bytes();
+    if id.len() != 36 || ![8, 13, 18, 23].iter().all(|&i| id[i] == b'-') {
+        return Err(invalid("client identity requires canonical UUID"));
+    }
+    let mut raw = [0u8; 16];
+    let mut nibbles = [0u8; 32];
+    let mut count = 0;
+    for &c in id {
+        if c == b'-' { continue; }
+        let digit = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return Err(invalid("client identity requires lowercase UUID hex")),
+        };
+        nibbles[count] = digit;
+        count += 1;
+    }
+    if count != 32 { return Err(invalid("invalid client UUID length")); }
+    for i in 0..16 { raw[i] = (nibbles[2*i] << 4) | nibbles[2*i+1]; }
+    let digest = Sha256::digest(raw);
+    let expected: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    if !identity.local_user.eq_ignore_ascii_case(&expected) {
+        return Err(invalid("client identity UUID and MD-LU mismatch"));
+    }
+    Ok(())
+}
+
 fn validate_paths(runtime: &Path, state: &Path) -> io::Result<()> {
     if !runtime.is_absolute() || !runtime.is_dir() || !state.is_absolute() {
         return Err(invalid("absolute runtime and fresh state paths required"));
@@ -86,15 +122,21 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     let Some(mode) = args.next() else { return Ok(false); };
     if mode != OsStr::new("--provision-supervised")
         && mode != OsStr::new("--coordinator-process")
-        && mode != OsStr::new("--validate-identity") { return Ok(false); }
-    if mode == OsStr::new("--validate-identity") {
+        && mode != OsStr::new("--validate-identity")
+        && mode != OsStr::new("--validate-client-identity") { return Ok(false); }
+    if mode == OsStr::new("--validate-identity") || mode == OsStr::new("--validate-client-identity") {
         if args.next().is_some() { return Err(invalid("unexpected identity validation arguments").into()); }
         let identity = read_identity(io::stdin().lock())?;
-        provisioning_client::validate_identity(
-            &identity.device_id, &identity.client_info,
-            &identity.local_user, &identity.serial,
-        )?;
-        println!("PASS: identity input validated offline");
+        if mode == OsStr::new("--validate-client-identity") {
+            validate_client_derived_identity(&identity)?;
+            println!("PASS: client-derived identity validated offline");
+        } else {
+            provisioning_client::validate_identity(
+                &identity.device_id, &identity.client_info,
+                &identity.local_user, &identity.serial,
+            )?;
+            println!("PASS: identity input validated offline");
+        }
         return Ok(true);
     }
 
@@ -152,4 +194,19 @@ mod tests {
         let p = vec!["/".into(), "/tmp/state".into(), "extra".into()].into_iter();
         assert!(paths(p).is_err());
     }
+    #[test]
+    fn client_identity_matches_known_vector_and_rejects_mismatch() {
+        let mut identity = TestIdentity {
+            device_id: "00010203-0405-0607-0809-0a0b0c0d0e0f".into(),
+            local_user: "be45cb2605bf36bebde684841a28f0fd43c69850a3dce5fedba69928ee3a8991".into(),
+            client_info: "offline-test".into(),
+            serial: "TEST-123".into(),
+        };
+        assert!(validate_client_derived_identity(&identity).is_ok());
+        identity.local_user.replace_range(0..1, "a");
+        assert!(validate_client_derived_identity(&identity).is_err());
+        identity.device_id = "00010203-0405-0607-0809-0a0b0c0d0e0g".into();
+        assert!(validate_client_derived_identity(&identity).is_err());
+    }
+
 }
