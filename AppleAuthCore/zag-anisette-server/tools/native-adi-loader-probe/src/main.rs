@@ -1,4 +1,5 @@
 //! Offline, operator-run native loader smoke probe. Does not call ADI provisioning.
+mod native_session;
 use android_loader::android_library::AndroidLibrary;
 use android_loader::{hook_manager, sysv64};
 use std::collections::HashMap;
@@ -66,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if missing { return Err("required native symbols missing".into()); }
     let mode = std::env::args_os().nth(2);
     let mode = mode.as_deref().and_then(std::ffi::OsStr::to_str);
-    if mode == Some("--initialize-core") || mode == Some("--configure-state") {
+    if mode == Some("--initialize-core") || mode == Some("--configure-state") || mode == Some("--native-abi-preflight") {
         // All calls are explicitly opt-in. Never initiate provisioning in this probe.
         let init: sysv64_type!(fn(*const u8) -> i32) = unsafe {
             std::mem::transmute(lib.get_symbol("kq56gsgHG6").ok_or("missing CoreADI initializer")?)
@@ -78,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if status != 0 { return Err(format!("CoreADI initialization failed: {status}").into()); }
         println!("PASS: CoreADI initialized; no provisioning executed");
 
-        if mode == Some("--configure-state") {
+        if mode == Some("--configure-state") || mode == Some("--native-abi-preflight") {
             // Use an absolute, private test directory. Never reuse production ADI state.
             let state = root.join("probe-state");
             std::fs::create_dir_all(&state)?;
@@ -106,6 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("ADI Android identifier status: {id_status}");
             if id_status != 0 { return Err(format!("native Android identifier rejected: {id_status}").into()); }
             println!("PASS: isolated provisioning path and probe-only identifier configured; no provisioning executed");
+            if mode == Some("--native-abi-preflight") {
+                let _native = native_session::NativeFunctions::resolve(&lib)?;
+                println!("PASS: typed native Start/End/Destroy/Dispose functions bound; no provisioning executed");
+            }
         }
     }
     println!("PASS: native StoreServicesCore loaded and required symbols resolved; no provisioning executed");
