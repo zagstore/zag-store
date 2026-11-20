@@ -313,8 +313,11 @@ mod tests {
             .args(["--edition=2021", "-o"])
             .arg(&executable).arg(&source).status().unwrap();
         assert!(compile.success(), "standalone fixture must compile");
+        // macOS /var is a symlink to /private/var; executable validation
+        // deliberately rejects noncanonical paths.
+        let canonical_executable = std::fs::canonicalize(&executable).unwrap();
         let result = run_mock_session(
-            &executable, &[],
+            &canonical_executable, &[],
             r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
             r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
             Duration::from_secs(5),
