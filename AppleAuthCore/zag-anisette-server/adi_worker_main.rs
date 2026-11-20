@@ -162,6 +162,15 @@ enum SessionMaterial {
 trait StatefulMaterialBackend {
     fn start(&mut self, identifier: &str, spim: &str) -> io::Result<String>;
     fn finish(&mut self, ptm: &str, tk: &str) -> io::Result<String>;
+    /// Called on every terminal path, including failure or dropped sessions.
+    /// Implementations must make cleanup idempotent.
+    fn abort(&mut self) {}
+}
+
+/// Owns one native provider instance and requests cleanup on all exit paths.
+struct MaterialSession<B: StatefulMaterialBackend>(B);
+impl<B: StatefulMaterialBackend> Drop for MaterialSession<B> {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 fn write_material<W: Write>(output: &mut W, material: SessionMaterial) -> io::Result<()> {
@@ -191,14 +200,15 @@ fn validate_material(value: &str) -> io::Result<()> {
 }
 
 fn run_typed_session<R: Read, W: Write, B: StatefulMaterialBackend>(
-    input: &mut R, output: &mut W, mut backend: B,
+    input: &mut R, output: &mut W, backend: B,
 ) -> io::Result<()> {
+    let mut backend = MaterialSession(backend);
     let first = read_session_request(input)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing Start"))?;
     let NativeRequest::Start { identifier, spim } = first else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Start required"));
     };
-    let cpim = backend.start(&identifier, &spim)?;
+    let cpim = backend.0.start(&identifier, &spim)?;
     validate_material(&cpim)?;
     write_material(output, SessionMaterial::Started { cpim })?;
     let second = read_session_request(input)?
@@ -206,7 +216,7 @@ fn run_typed_session<R: Read, W: Write, B: StatefulMaterialBackend>(
     let NativeRequest::Finish { ptm, tk } = second else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Finish required"));
     };
-    let adi_pb = backend.finish(&ptm, &tk)?;
+    let adi_pb = backend.0.finish(&ptm, &tk)?;
     validate_material(&adi_pb)?;
     let mut extra = [0u8; 1];
     if input.read(&mut extra)? != 0 {
