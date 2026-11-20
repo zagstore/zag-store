@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   offline-rust:
@@ -33,6 +33,16 @@ jobs:
         run: cargo generate-lockfile
       - name: Verify approved lockfile digest
         run: echo "7700574b51984624d6e2b8ad5585231ad08aabe2cf36f5d6792984a4e41b5c00  Cargo.lock" | sha256sum --check
+      - name: Commit validated lockfile on isolated branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/review/zag-anisette-server'
+        run: |
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "build(g3): pin approved Cargo.lock"
+            git push origin HEAD:review/zag-anisette-server
+          fi
       - name: Upload approved lockfile
         uses: actions/upload-artifact@v4
         with:
