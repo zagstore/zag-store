@@ -535,6 +535,9 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 	#if ZAG_LIVE_EXPERIMENT
 	let campaign: ZagLiveExperimentCampaign
 	#endif
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	let approvals: ZagExistingAccountApprovals
+	#endif
 
 	init(account: UUID, secrets: ZagFreeAccountSecretStore) {
 		self.account = account
@@ -542,6 +545,9 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		transport = nil
 		#if ZAG_LIVE_EXPERIMENT
 		campaign = ZagLiveExperiment.campaign
+		#endif
+		#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+		approvals = ZagLiveExperiment.approvals
 		#endif
 	}
 
@@ -553,7 +559,20 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		self.secrets = secrets
 		self.transport = transport
 		self.campaign = campaign
+		#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+		approvals = ZagLiveExperiment.approvals
+		#endif
 	}
+
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	init(account: UUID, secrets: ZagFreeAccountSecretStore, campaign: ZagLiveExperimentCampaign, approvals: ZagExistingAccountApprovals, transport: @escaping Transport) {
+		self.account = account
+		self.secrets = secrets
+		self.transport = transport
+		self.campaign = campaign
+		self.approvals = approvals
+	}
+	#endif
 	#endif
 
 	private func call<T: Decodable>(_ request: [String: Any], as type: T.Type) async throws -> T {
@@ -644,6 +663,12 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 	/// or device.
 	private func checkAccountStateIfNeeded(accountKey: String, team: String) async throws {
 		guard campaign.needsAccountStateCheck(accountKey: accountKey, team: team) else { return }
+		#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+		// Existing-account path: E4 is an accepted read-only preflight
+		// (`ZagExistingAccountPreflight.run`), made before any change; there is
+		// no empty-account check to fall back to.
+		throw ZagLiveExperimentRefusal.check("C8")
+		#else
 		// C6 before reading anything: another account stops here.
 		try campaign.checkAccount(accountKey)
 		try campaign.authorize(.portalRead)
@@ -651,11 +676,47 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		let appIDs = try await call(["op": "appIds", "team": team], as: [AppID].self)
 		let devices = try await call(["op": "devices", "team": team], as: [Device].self)
 		try campaign.verifyAccountState(accountKey: accountKey, team: team, certificates: certificates.count, appIDs: appIDs.count, devices: devices.count)
+		#endif
 	}
 	#else
 	private enum Operation { case portalRead, portalMutate, certificateList }
 	private func gate(_ operation: Operation, team: String) async throws {}
 	#endif
+
+	/// An Apple-side change. In the existing-account path each one needs the
+	/// owner's approval of its kind and is sent at most once
+	/// (`ZagExistingAccountApprovals`); app groups are never approved. In
+	/// every other build this only runs `send`.
+	private enum Change { case device, appID, appGroup, profile }
+
+	private func change<T>(_ kind: Change, team: String, _ send: () async throws -> T) async throws -> T {
+		#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+		let mutation: ZagExistingAccountMutation
+		switch kind {
+		case .device: mutation = .device
+		case .appID: mutation = .appID
+		case .profile: mutation = .profile
+		case .appGroup: throw ZagExistingAccountApprovals.Refusal.notRequired
+		}
+		do {
+			try approvals.consume(mutation, accountKey: try accountKey(), team: team)
+		} catch {
+			// Not approved (or already sent): refused before sending, and not a
+			// stop; the provisioner reports it as unavailable.
+			throw ZagPortalError.livePortalDisabled
+		}
+		do {
+			let value = try await send()
+			approvals.settle(mutation, succeeded: true)
+			return value
+		} catch {
+			approvals.settle(mutation, succeeded: false)
+			throw error
+		}
+		#else
+		return try await send()
+		#endif
+	}
 
 	func devices(team: String) async throws -> [ZagRegisteredDevice] {
 		try await gate(.portalRead, team: team)
@@ -664,7 +725,7 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 
 	func registerDevice(udid: String, name: String, team: String) async throws -> ZagRegisteredDevice {
 		try await gate(.portalMutate, team: team)
-		let device = try await call(["op": "registerDevice", "team": team, "udid": udid, "name": name], as: Device.self)
+		let device = try await change(.device, team: team) { try await call(["op": "registerDevice", "team": team, "udid": udid, "name": name], as: Device.self) }
 		return ZagRegisteredDevice(udid: device.udid, name: device.name)
 	}
 
@@ -675,7 +736,9 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 
 	func registerAppID(bundleIdentifier: String, name: String, team: String) async throws -> ZagRegisteredAppID {
 		try await gate(.portalMutate, team: team)
-		return Self.appID(try await call(["op": "registerAppId", "team": team, "bundleIdentifier": bundleIdentifier, "name": name], as: AppID.self))
+		return Self.appID(try await change(.appID, team: team) {
+			try await call(["op": "registerAppId", "team": team, "bundleIdentifier": bundleIdentifier, "name": name], as: AppID.self)
+		})
 	}
 
 	func appGroups(team: String) async throws -> [ZagRegisteredAppGroup] {
@@ -685,12 +748,14 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 
 	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup {
 		try await gate(.portalMutate, team: team)
-		return ZagRegisteredAppGroup(identifier: try await call(["op": "registerAppGroup", "team": team, "identifier": identifier], as: Group.self).identifier)
+		return ZagRegisteredAppGroup(identifier: try await change(.appGroup, team: team) {
+			try await call(["op": "registerAppGroup", "team": team, "identifier": identifier], as: Group.self)
+		}.identifier)
 	}
 
 	func assignAppGroups(_ groups: [String], to appID: ZagRegisteredAppID, team: String) async throws {
 		try await gate(.portalMutate, team: team)
-		_ = try await raw(["op": "assignAppGroups", "team": team, "groups": groups, "appId": appID.identifier])
+		_ = try await change(.appGroup, team: team) { try await raw(["op": "assignAppGroups", "team": team, "groups": groups, "appId": appID.identifier]) }
 	}
 
 	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] {
@@ -703,6 +768,16 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 		// E1 (G5 plan §5.2): the one choke point. Nothing below runs unless the
 		// campaign's single submission is recorded first.
 		let accountKey = try self.accountKey()
+		#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+		// The owner's approval first, so a refusal leaves the budget unspent. A
+		// campaign refusal makes the provisioner settle its pending key as not
+		// issued (nothing was sent).
+		do {
+			try approvals.check(.certificate, accountKey: accountKey, team: team)
+		} catch {
+			throw ZagLiveExperimentRefusal.notArmed
+		}
+		#endif
 		try await ZagCertificateBudget.consume(
 			campaign: campaign,
 			accountKey: accountKey,
@@ -712,11 +787,26 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 				return try await call(["op": "certificates", "team": team], as: [Certificate].self).count
 			}
 		)
+		#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+		do {
+			try approvals.consume(.certificate, accountKey: accountKey, team: team)
+		} catch {
+			// The budget is spent and nothing was sent: a stop, not a retry.
+			campaign.halt(.interruptedAfterConsume)
+			throw ZagLiveExperimentRefusal.halted
+		}
+		#endif
 		do {
 			let issued = try await sendCertificateRequest(request, team: team)
 			ZagLiveExperimentHooks.certificateSubmitted(issued: true)
+			#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+			approvals.settle(.certificate, succeeded: true)
+			#endif
 			return issued
 		} catch {
+			#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+			approvals.settle(.certificate, succeeded: false)
+			#endif
 			// Any outcome other than an issued certificate after consuming is a
 			// stop (plan §7.3): the campaign halts; nothing is sent again.
 			ZagLiveExperimentHooks.certificateSubmitted(issued: false)
@@ -739,7 +829,7 @@ struct ZagIsideloadDeveloperPortal: ZagDeveloperPortalService {
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
 		try await gate(.portalMutate, team: team)
-		let profile = try await call(["op": "profile", "team": team, "appId": appID.identifier], as: Profile.self)
+		let profile = try await change(.profile, team: team) { try await call(["op": "profile", "team": team, "appId": appID.identifier], as: Profile.self) }
 		guard let data = Data(base64Encoded: profile.data) else { throw ZagPortalError.malformedResponse }
 		return try ZagIssuedProfile(profileData: data)
 	}

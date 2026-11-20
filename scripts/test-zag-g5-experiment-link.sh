@@ -8,7 +8,12 @@
 #  3. the same without the library: must FAIL to link on zag_bridge_*
 #     (no stub hides a missing bridge).
 # Builds go to a temporary folder, deleted afterwards. No IPA is made.
+#
+#   test-zag-g5-experiment-link.sh [existing-account]
+# With existing-account, the same for that mode (issue #37).
 set -euo pipefail
+MODE="${1:-}"
+case "$MODE" in "" | existing-account) ;; *) echo "unknown mode $MODE" >&2; exit 2 ;; esac
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRIDGE="$ROOT/AppleAuthCore/zag-apple-bridge"
 WORK=$(mktemp -d "${TMPDIR:-/tmp/}zag-g5-link.XXXXXX")
@@ -19,7 +24,7 @@ grep -q 'static let campaignID = "G5-C0"' "$ROOT/Feather/Utilities/FreeAccount/Z
 (cd "$BRIDGE" && cargo build --quiet --release --target aarch64-apple-ios 2>/dev/null)
 LIB="$BRIDGE/target/aarch64-apple-ios/release/libzag_apple_bridge.a"
 SETTINGS=()
-while IFS= read -r line; do SETTINGS+=("$line"); done < <(bash "$ROOT/scripts/zag-g5-build-check.sh" link-settings "$LIB")
+while IFS= read -r line; do SETTINGS+=("$line"); done < <(bash "$ROOT/scripts/zag-g5-build-check.sh" link-settings "$LIB" $MODE)
 CONDITIONS="${SETTINGS[0]}"
 
 build() { # log [settings...]
@@ -32,7 +37,7 @@ build() { # log [settings...]
 build "$WORK/linked.log" "${SETTINGS[@]}" || { grep -E 'error:|Undefined' "$WORK/linked.log" | sort -u | head -20; echo "FAIL: the experiment configuration does not link" >&2; exit 1; }
 APP="$WORK/root/Applications/Feather.app"
 echo "PASS: the experiment configuration (Release, $CONDITIONS) builds and links with the iOS bridge library"
-bash "$ROOT/scripts/test-zag-g5-experiment-binary.sh" "$APP" G5-C0 -
+bash "$ROOT/scripts/test-zag-g5-experiment-binary.sh" "$APP" G5-C0 - "${MODE:-empty-account}"
 rm -rf "$WORK/root"
 
 if build "$WORK/unlinked.log" "$CONDITIONS" "INFOPLIST_KEY_CFBundleDisplayName=Zag LIVE TEST"; then

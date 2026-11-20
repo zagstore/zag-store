@@ -47,7 +47,8 @@ done
 for marker in ZagLiveExperimentCampaign ZagExperimentLogger ZagExperimentReport ZagExperimentReadback ZagExperimentInstaller \
 	ZagLiveExperimentView ZagCampaignRegistry ZagStore.live-test.registry ZagStore.accounts.live-test campaign-marker.json \
 	zag_bridge_take_policy_decisions zag_bridge_configure_time_window zag_bridge_time_gate_status "Stop the Campaign" \
-	"Provision, Sign and Install" submissionUnconfirmedSet submissionUnconfirmedCleared portal.certificateLimit cert.possessionMismatch; do
+	"Provision, Sign and Install" submissionUnconfirmedSet submissionUnconfirmedCleared portal.certificateLimit cert.possessionMismatch \
+	ZagExistingAccountApprovals ZagExistingAccountPreflight ZagStore.live-test.existing-approvals "Read Account Inventory (read-only)"; do
 	if [ "$MODE" = release ] && grep -qF -- "$marker" "$WORK/symbols.txt"; then found=$((found + 1)); echo "FOUND: $marker"; fi
 done
 if [ "$MODE" = release ]; then

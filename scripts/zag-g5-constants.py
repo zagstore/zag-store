@@ -8,6 +8,8 @@ import datetime, os, re, sys
 LEDGER = os.environ.get("ZAG_G5_LEDGER", "")
 CONDITIONS = os.environ.get("ZAG_G5_CONDITIONS", "").split()
 EXPECTED_CONDITIONS = {"ZAG_APPLE_BRIDGE", "ZAG_ZSIGN_STRICT", "ZAG_LIVE_EXPERIMENT"}
+# The existing-account path (issue #37): the same three plus its own.
+EXISTING_ACCOUNT = "ZAG_EXISTING_ACCOUNT_EXPERIMENT"
 COLUMNS = ["ID", "Number", "Authorisation (quoted)", "notBefore (UTC)", "notAfter (UTC)", "Account label", "Provider",
            "Serial policy", "Branch SHA", "Build nonce", "IPA SHA-256", "State"]
 PLACEHOLDER_ID = 'static let campaignID = "G5-C0"'
@@ -41,8 +43,10 @@ def when(text):
 
 
 def authorised():
-    if set(CONDITIONS) != EXPECTED_CONDITIONS or len(CONDITIONS) != 3:
-        refuse(f"the conditions must be exactly {sorted(EXPECTED_CONDITIONS)}; never DEBUG or ZAG_G5_TESTS (got {CONDITIONS})")
+    existing = EXISTING_ACCOUNT in CONDITIONS
+    expected = EXPECTED_CONDITIONS | ({EXISTING_ACCOUNT} if existing else set())
+    if set(CONDITIONS) != expected or len(CONDITIONS) != len(expected):
+        refuse(f"the conditions must be exactly {sorted(EXPECTED_CONDITIONS)}, optionally with {EXISTING_ACCOUNT}; never DEBUG or ZAG_G5_TESTS (got {CONDITIONS})")
     all_rows = rows()
     candidates = [r for r in all_rows if r["State"] == "authorised"]
     if not candidates:
@@ -75,6 +79,10 @@ def authorised():
         refuse("g3Fixed needs ZAG_G5_DEVICE_SERIAL (never stored in the ledger)")
     if not re.fullmatch(r"[A-Z]", row["Account label"]):
         refuse("the account label must be a single letter, never an address")
+    # An existing-account build only for a campaign authorised as one, and
+    # the empty-account build never for such a campaign.
+    if existing != ("existing account" in row["Authorisation (quoted)"].lower()):
+        refuse("the build's mode (existing account or empty account) does not match the authorisation")
     return row, start, end
 
 

@@ -35,7 +35,7 @@ enum ZagLiveExperimentLaunch {
 			"bridgeLibSHA8": .string(String(ZagLiveExperimentCampaignConstants.bridgeLibSHA.prefix(8))),
 			"zsignSHA8": .string(String(ZagLiveExperimentCampaignConstants.zsignSHA.prefix(8))),
 			"installID8": .string(ZagLiveExperiment.logger?.installID8 ?? "00000000"),
-			"conditions": .list(["ZAG_APPLE_BRIDGE", "ZAG_LIVE_EXPERIMENT", "ZAG_ZSIGN_STRICT"]),
+			"conditions": .list(ZagLogSchema.conditions.sorted()),
 			"debugCompiled": .string("false"),
 		])
 	}
@@ -59,6 +59,22 @@ final class ZagLiveExperimentModel: ObservableObject {
 	private let secrets = ZagKeychainFreeAccountSecretStore(service: ZagLiveExperiment.accountNamespace)
 	private var configuration: ZagAccountDirectory.Configuration
 
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	/// The existing-account path (issue #37): an account that has signed apps
+	/// before; its assets are inventoried, never revoked or deleted.
+	static let confirmationsRequired: [(String, String)] = [
+		("A1", "The Apple Account the owner chose for this campaign (it has signed apps before); never the personal account"),
+		("A2", "Not in the Apple Developer Program (a free Personal Team)"),
+		("A3", "2FA on; codes reach a device or number the owner controls"),
+		("A4", "Account details kept on paper only"),
+		("A5", "Existing certificates, devices and App IDs stay; Zag Store changes only what is approved below"),
+		("A6", "This iPhone only, this campaign only"),
+	]
+
+	@Published private(set) var assessment: ZagExistingAccountPreflight.Assessment?
+	@Published private(set) var approved = Set<ZagExistingAccountMutation>()
+	private var inventoried: (accountKey: String, team: String)?
+	#else
 	static let confirmationsRequired: [(String, String)] = [
 		("A1", "Created for this experiment; never the personal account; never used to sign apps"),
 		("A2", "No payment method; not in the Apple Developer Program"),
@@ -67,6 +83,7 @@ final class ZagLiveExperimentModel: ObservableObject {
 		("A5", "Expected: no certificates, App IDs or registered devices"),
 		("A6", "This iPhone only, this campaign only"),
 	]
+	#endif
 
 	init() {
 		var configuration = ZagAccountDirectory.Configuration()
@@ -86,6 +103,56 @@ final class ZagLiveExperimentModel: ObservableObject {
 	var constants: ZagCampaignConstants { .compiled }
 	var allConfirmed: Bool { Set(Self.confirmationsRequired.map(\.0)).isSubset(of: confirmations) }
 	var canRun: Bool { durability == .armed && state == .armed && allConfirmed && !isBusy }
+
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	/// Provisioning needs an accepted inventory and every change it needs approved.
+	var changesApproved: Bool {
+		guard let assessment, assessment.decision.allowsProvisioning else { return false }
+		return assessment.required.isSubset(of: approved)
+	}
+
+	/// The read-only inventory: the three listings, then the decision. Nothing
+	/// is created, registered, revoked or deleted.
+	func readInventory() async {
+		isBusy = true
+		defer {
+			isBusy = false
+			state = campaign.state
+		}
+		guard case .paired(_, _, let udid) = ZagRPPairingCore.shared.state, !udid.isEmpty else {
+			outcome = "Pair this iPhone first (Settings › Pairing)."
+			return
+		}
+		guard let record = await directory.registry.accounts.first, let team = record.teams.first else {
+			outcome = "Sign in first."
+			return
+		}
+		guard let bundle = ZagBundleIdentifierMapping.mapped(ZagLiveExperiment.testBundleIdentifier, team: team.identifier) else { return }
+		do {
+			let result = try await ZagExistingAccountPreflight.run(
+				reader: ZagReadOnlyPortal(ZagIsideloadDeveloperPortal(account: record.id, secrets: secrets)),
+				team: team, teamCount: record.teams.count, accountKey: record.accountKey, account: record.id,
+				secrets: secrets, keys: ZagKeychainSigningKeyFactory(keys: configuration.signingKeys),
+				bundleIdentifier: bundle, deviceUDID: udid, campaign: campaign, approvals: ZagLiveExperiment.approvals
+			)
+			assessment = result
+			inventoried = (record.accountKey, team.identifier)
+			approved = Set(ZagLiveExperiment.approvals.journal?.approved ?? [])
+			outcome = nil
+		} catch {
+			assessment = nil
+			outcome = "The inventory was not accepted: nothing can be changed. Read it again, or stop the campaign."
+		}
+	}
+
+	/// The owner's approval of one change the inventory requires.
+	func approve(_ mutation: ZagExistingAccountMutation) {
+		guard let inventoried else { return }
+		if (try? ZagLiveExperiment.approvals.approve(mutation, accountKey: inventoried.accountKey, team: inventoried.team)) != nil {
+			approved.insert(mutation)
+		}
+	}
+	#endif
 
 	func appear() async {
 		durability = ZagLiveExperimentLaunch.run()
@@ -187,7 +254,7 @@ final class ZagLiveExperimentModel: ObservableObject {
 			startedAtUTC: Date(), iOS: Self.iOSVersion, device: "iPhone",
 			gates: ZagLiveExperimentCampaignConstants.gates,
 			providerHost: constants.providerHost ?? "", serialPolicy: constants.deviceSerialPolicy,
-			conditions: ["ZAG_APPLE_BRIDGE", "ZAG_LIVE_EXPERIMENT", "ZAG_ZSIGN_STRICT"]
+			conditions: ZagLogSchema.conditions.sorted()
 		)
 		let report = ZagExperimentReport(header: header, events: logger.events, privateKeyExportCalls: logger.privateKeyExportCalls)
 		switch report.export(provider: constants.providerHost) {
@@ -267,13 +334,17 @@ struct ZagLiveExperimentView: View {
 				ZagLiveExperimentSignInSection(signIn: signIn, enabled: model.canRun)
 			}
 
+			#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+			ZagExistingAccountSection(model: model)
+			#endif
+
 			Section {
 				Button("Read Installed Profiles (P3)") { Task { await model.readPreflight() } }
 					.disabled(model.isBusy)
 				if let preflight = model.preflight { Text("Read-back: \(preflight.rawValue)").font(.footnote) }
 				Button(model.testApp == nil ? "Choose Test App…" : "Test App: \(model.testApp!.lastPathComponent)") { choosingApp = true }
 				Button("Provision, Sign and Install") { Task { await model.run() } }
-					.disabled(!model.canRun || model.preflight != .verified || model.testApp == nil || model.signIn?.phase != .signedIn)
+					.disabled(!model.canRun || model.preflight != .verified || model.testApp == nil || model.signIn?.phase != .signedIn || !model.existingAccountReady)
 				if let outcome = model.outcome { Text(outcome).font(.footnote) }
 				Button("The test app opened") { model.confirmLaunch(true) }
 				Button("The test app did not open") { model.confirmLaunch(false) }
@@ -300,6 +371,17 @@ struct ZagLiveExperimentView: View {
 		.sheet(isPresented: $sharing) {
 			ZagLiveExperimentShareSheet(items: model.exported)
 		}
+	}
+}
+
+extension ZagLiveExperimentModel {
+	/// The existing-account path's approvals (always true for the empty-account campaign).
+	var existingAccountReady: Bool {
+		#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+		changesApproved
+		#else
+		true
+		#endif
 	}
 }
 

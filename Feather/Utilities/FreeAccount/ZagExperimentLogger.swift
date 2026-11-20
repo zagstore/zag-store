@@ -85,7 +85,11 @@ enum ZagLogSchema {
 	static let states: Set<String> = Set(ZagCampaignState.allCases.map(\.rawValue))
 	static let readback: Set<String> = ["verified", "mismatch", "notVerified", "unavailable"]
 	static let unavailableReasons: Set<String> = ["pairing", "tunnel", "misagent", "timeout", "other"]
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	static let conditions: Set<String> = ["ZAG_APPLE_BRIDGE", "ZAG_ZSIGN_STRICT", "ZAG_LIVE_EXPERIMENT", "ZAG_EXISTING_ACCOUNT_EXPERIMENT"]
+	#else
 	static let conditions: Set<String> = ["ZAG_APPLE_BRIDGE", "ZAG_ZSIGN_STRICT", "ZAG_LIVE_EXPERIMENT"]
+	#endif
 	static let checks: Set<String> = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"]
 	static let windows: Set<String> = ["inside", "before", "after"]
 	static let pins: Set<String> = ["pinnedNow", "matches", "mismatch"]

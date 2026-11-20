@@ -212,7 +212,7 @@ build() { # sources-dir output
 		-I "$WORK/branchlib/include" -import-objc-header "$BRIDGE/include/zag_apple_bridge.h" \
 		"$1"/*.swift \
 		"$ROOT/Feather/Utilities/ZagEntitlementCompatibility.swift" "$ROOT/Feather/Utilities/CertificateReader/Models/CertificateModel.swift" "$ROOT/Feather/Utilities/AnyCodable.swift" \
-		"$WORK/zsign/Sources/zsign.swift" "$ROOT/scripts/ZagFreeAccountTestSupport.swift" "$ROOT/scripts/ZagG5ExperimentTests.swift" \
+		"$WORK/zsign/Sources/zsign.swift" "$ROOT/scripts/ZagFreeAccountTestSupport.swift" "$ROOT/scripts/ZagG5TestHarness.swift" "$ROOT/scripts/ZagG5ExperimentTests.swift" \
 		"$BRIDGE/target/release/libzag_apple_bridge.a" -Xlinker "$WORK/branchlib/libzsign.a" -lc++ \
 		-framework Security -framework CoreFoundation -framework SystemConfiguration -o "$2" 2>&1 | grep -E 'error|warning' || true
 	[ -x "$2" ] || { echo "FAIL: $(basename "$2") did not build" >&2; exit 1; }

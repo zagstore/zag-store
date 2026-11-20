@@ -259,6 +259,12 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 	/// C8 / E4: the accounts and teams found empty in this process, each
 	/// `accountKey + "\n" + team`. Only the pinned account can be in it.
 	private var verifiedAccounts = Set<String>()
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	/// Existing-account path: the certificate count each accepted preflight
+	/// saw, per `accountKey + "\n" + team`; the budget's recheck must find it
+	/// unchanged (instead of zero).
+	private var existingAccountBaselines: [String: Int] = [:]
+	#endif
 	/// A halt was attempted in this process: even if it could not be
 	/// stored, nothing more runs here.
 	private var haltedInProcess = false
@@ -702,6 +708,43 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 
 	private static func verificationKey(_ accountKey: String, _ team: String) -> String { accountKey + "\n" + team }
 
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	/// The existing-account path's E4: instead of an empty account, an
+	/// accepted read-only preflight (`ZagExistingAccountPreflight`). Pins the
+	/// account like `verifyAccountState`. A blocked or unknown inventory is
+	/// refused (nothing was sent, so the campaign is not halted).
+	func acceptExistingAccountPreflight(accountKey: String, team: String, assessment: ZagExistingAccountPreflight.Assessment) throws {
+		try lock.withLock {
+			try checkPinLocked(accountKey)
+			let report = assessment.report
+			logger?.certPreflight(certificates: report.certificates ?? 0, appIDs: report.appIDs ?? 0, devices: report.devices ?? 0,
+								  ok: assessment.decision.allowsProvisioning)
+			guard assessment.decision.allowsProvisioning, assessment.certificateCount >= 0 else {
+				logger?.campaignCheck("C8", pass: false)
+				throw ZagLiveExperimentRefusal.check("C8")
+			}
+			let id = constants.campaignID
+			guard case .some(let stored) = load(), let record = stored?.campaigns[id], record.state == .armed || record.accountKey == accountKey else {
+				logger?.campaignCheck("C8", pass: false)
+				throw ZagLiveExperimentRefusal.check("C8")
+			}
+			if record.accountKey == nil {
+				do {
+					try commit { registry in registry.campaigns[id]?.accountKey = accountKey }
+				} catch {
+					_ = haltLocked(.ledgerWriteFailed)
+					throw ZagLiveExperimentRefusal.ledgerWriteFailed
+				}
+				logger?.campaignAccountPin("pinnedNow")
+			}
+			logger?.campaignCheck("C8", pass: true)
+			let key = Self.verificationKey(accountKey, team)
+			existingAccountBaselines[key] = assessment.certificateCount
+			verifiedAccounts.insert(key)
+		}
+	}
+	#endif
+
 	// MARK: The budget (E1), through ZagCertificateBudget only
 
 	/// Lets exactly one certificate request through for this campaign, and
@@ -730,7 +773,13 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 				_ = haltLocked(.accountMismatch)
 				throw ZagLiveExperimentRefusal.accountMismatch
 			}
-			guard verifiedAccounts.contains(Self.verificationKey(accountKey, team)), certificatesNow == 0 else {
+			#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+			// Unchanged since the accepted preflight (no baseline: refused).
+			let expectedCertificates = existingAccountBaselines[Self.verificationKey(accountKey, team)] ?? -1
+			#else
+			let expectedCertificates = 0
+			#endif
+			guard verifiedAccounts.contains(Self.verificationKey(accountKey, team)), certificatesNow == expectedCertificates else {
 				logger?.campaignCheck("C8", pass: false)
 				logger?.certBudget(before: record.submissions, state: record.state, pin: pin, decision: "halted")
 				_ = haltLocked(.accountNotEmpty)
@@ -789,12 +838,18 @@ enum ZagLiveExperiment {
 	nonisolated(unsafe) static var logger: ZagExperimentLogger? = nil
 	nonisolated(unsafe) static var campaign = ZagLiveExperimentCampaign(registry: MemoryCampaignRegistry(), marker: MemoryCampaignMarker())
 	nonisolated(unsafe) static var testAllowsAbandon = false
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	nonisolated(unsafe) static var approvals = ZagExistingAccountApprovals(campaignID: "G5-C0", store: MemoryCampaignRegistry())
+	#endif
 	#else
 	static let logger: ZagExperimentLogger? = ZagExperimentLogger.live()
 	static let campaign = ZagLiveExperimentCampaign(logger: logger, authenticatedTime: {
 		let seconds = zag_bridge_last_apple_date()
 		return seconds > 0 ? Date(timeIntervalSince1970: TimeInterval(seconds)) : nil
 	})
+	#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+	static let approvals = ZagExistingAccountApprovals(campaignID: campaign.constants.campaignID)
+	#endif
 	#endif
 }
 

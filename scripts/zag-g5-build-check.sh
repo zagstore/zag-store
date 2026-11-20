@@ -13,9 +13,10 @@
 #       (only that file). `--out` writes elsewhere and commits nothing (tests).
 #   zag-g5-build-check.sh verify-constants-commit
 #       The HEAD commit changes only the constants file, in the expected form.
-#   zag-g5-build-check.sh link-settings LIB
+#   zag-g5-build-check.sh link-settings LIB [existing-account]
 #       The xcodebuild settings for an experiment build linked with LIB (the
 #       iOS bridge library); the app's bridging header declares the bridge.
+#       existing-account adds ZAG_EXISTING_ACCOUNT_EXPERIMENT (issue #37).
 #
 # Inputs (environment): ZAG_G5_CONDITIONS (default: the three experiment
 # conditions), ZAG_G5_LEDGER, ZAG_G5_BRIDGE_LIB and ZAG_G5_ZSIGN_LIB (for the
@@ -35,7 +36,9 @@ link-settings)
 	# is no stub.
 	LIB="${2:?link-settings needs the iOS bridge library path}"
 	[ -f "$LIB" ] || { echo "REFUSED: no bridge library at $LIB" >&2; exit 1; }
-	printf '%s\n' "SWIFT_ACTIVE_COMPILATION_CONDITIONS=\$(inherited) ZAG_APPLE_BRIDGE ZAG_ZSIGN_STRICT ZAG_LIVE_EXPERIMENT" \
+	EXTRA=""
+	case "${3:-}" in "") ;; existing-account) EXTRA=" ZAG_EXISTING_ACCOUNT_EXPERIMENT" ;; *) echo "REFUSED: unknown mode ${3}" >&2; exit 2 ;; esac
+	printf '%s\n' "SWIFT_ACTIVE_COMPILATION_CONDITIONS=\$(inherited) ZAG_APPLE_BRIDGE ZAG_ZSIGN_STRICT ZAG_LIVE_EXPERIMENT$EXTRA" \
 		"OTHER_LDFLAGS=\$(inherited) $LIB" "INFOPLIST_KEY_CFBundleDisplayName=Zag LIVE TEST"
 	exit 0
 	;;
@@ -47,7 +50,7 @@ verify-constants-commit)
 	exit 0
 	;;
 check | constants) ;;
-*) echo "usage: $0 check | constants [--out FILE] | verify-constants-commit | link-settings LIB" >&2; exit 2 ;;
+*) echo "usage: $0 check | constants [--out FILE] | verify-constants-commit | link-settings LIB [existing-account]" >&2; exit 2 ;;
 esac
 
 python3 -I "$ROOT/scripts/zag-g5-constants.py" check < "$ROOT/$CONSTANTS"
