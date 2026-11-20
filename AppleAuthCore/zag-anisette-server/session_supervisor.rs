@@ -130,20 +130,20 @@ mod tests {
     #[test]
     fn two_phase_child_roundtrip() {
         let script = "read a; echo '{\"type\":\"started\"}'; read b; echo '{\"type\":\"finished\"}'";
-        let result = run_mock_session(Path::new("/bin/sh"), &["-c", script],
+        let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", script],
             "{\"type\":\"start\"}\n", "{\"type\":\"finish\"}\n", Duration::from_secs(2)).unwrap();
         assert_eq!(result.0["type"], "started");
         assert_eq!(result.1["type"], "finished");
     }
     #[test]
     fn stalled_child_is_killed_at_deadline() {
-        let result = run_mock_session(Path::new("/bin/sh"), &["-c", "read a; sleep 5"],
+        let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", "read a; sleep 5"],
             "{\"type\":\"start\"}\n", "{\"type\":\"finish\"}\n", Duration::from_millis(100));
         assert_eq!(result, Err(SessionError::Timeout));
     }
     #[test]
     fn unexpected_response_fails_closed() {
-        let result = run_mock_session(Path::new("/bin/sh"),
+        let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(),
             &["-c", "read a; echo '{\"type\":\"finished\"}'"],
             "{\"type\":\"start\"}\n", "{\"type\":\"finish\"}\n", Duration::from_secs(1));
         assert_eq!(result, Err(SessionError::InvalidResponse));
