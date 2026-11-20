@@ -1,0 +1,68 @@
+//! Offline, operator-run native loader smoke probe. Does not call ADI provisioning.
+use android_loader::android_library::AndroidLibrary;
+use android_loader::{hook_manager, sysv64};
+use std::collections::HashMap;
+use std::ffi::c_char;
+use std::path::PathBuf;
+
+#[sysv64]
+fn arc4random() -> u32 { rand::random() }
+
+static mut ERRNO: i32 = 0;
+#[sysv64]
+unsafe fn __errno_location() -> *mut i32 {
+    ERRNO = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    &raw mut ERRNO
+}
+#[sysv64]
+unsafe fn __system_property_get(_name: *const c_char, value: *mut c_char) -> i32 {
+    if !value.is_null() { *value = b'0' as c_char; }
+    1
+}
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = PathBuf::from(std::env::args_os().nth(1).ok_or("usage: zag-native-adi-loader-probe <runtime-root>")?);
+    let arch = if cfg!(target_arch = "x86_64") { "x86_64" } else if cfg!(target_arch = "aarch64") { "arm64-v8a" } else { return Err("unsupported host architecture".into()); };
+    let dir = root.join("lib").join(arch);
+    for name in ["libstoreservicescore.so", "libCoreADI.so"] {
+        if !dir.join(name).is_file() { return Err(format!("missing {}", dir.join(name).display()).into()); }
+    }
+    let mut hooks = HashMap::new();
+    hooks.insert("arc4random".to_string(), arc4random as usize);
+    hooks.insert("__system_property_get".to_string(), __system_property_get as usize);
+    hooks.insert("__errno".to_string(), __errno_location as usize);
+    hooks.insert("chmod".to_string(), libc::chmod as usize);
+    hooks.insert("close".to_string(), libc::close as usize);
+    hooks.insert("free".to_string(), libc::free as usize);
+    hooks.insert("fstat".to_string(), libc::fstat as usize);
+    hooks.insert("ftruncate".to_string(), libc::ftruncate as usize);
+    hooks.insert("gettimeofday".to_string(), libc::gettimeofday as usize);
+    hooks.insert("lstat".to_string(), libc::lstat as usize);
+    hooks.insert("malloc".to_string(), libc::malloc as usize);
+    hooks.insert("mkdir".to_string(), libc::mkdir as usize);
+    hooks.insert("open".to_string(), libc::open as usize);
+    hooks.insert("read".to_string(), libc::read as usize);
+    hooks.insert("strncpy".to_string(), libc::strncpy as usize);
+    hooks.insert("umask".to_string(), libc::umask as usize);
+    hooks.insert("write".to_string(), libc::write as usize);
+    hook_manager::add_hooks(hooks);
+    eprintln!("Loading {} (no provisioning calls)", dir.join("libstoreservicescore.so").display());
+    let lib = AndroidLibrary::load(dir.join("libstoreservicescore.so").to_str().ok_or("non-UTF8 runtime path")?)?;
+    let symbols = [
+        ("load_core_adi", "kq56gsgHG6"),
+        ("set_android_id", "Sph98paBcz"),
+        ("set_provisioning_path", "nf92ngaK92"),
+        ("start_provisioning", "rsegvyrt87"),
+        ("end_provisioning", "uv5t6nhkui"),
+        ("destroy_session", "fy34trz2st"),
+        ("dispose_buffer", "jk24uiwqrg"),
+    ];
+    let mut missing = false;
+    for (label, symbol) in symbols {
+        let found = lib.get_symbol(symbol).is_some();
+        println!("{label}: {}", if found { "resolved" } else { "MISSING" });
+        missing |= !found;
+    }
+    if missing { return Err("required native symbols missing".into()); }
+    println!("PASS: native StoreServicesCore loaded and required symbols resolved; no provisioning executed");
+    Ok(())
+}
