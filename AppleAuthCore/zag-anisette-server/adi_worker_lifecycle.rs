@@ -121,7 +121,12 @@ pub fn execute_offline_worker(
     let mut stdin = child.stdin.take().expect("piped worker stdin");
     let mut stdout = child.stdout.take().expect("piped worker stdout");
     let (sender, receiver) = mpsc::channel();
-    let writer = thread::spawn(move || write_frame(&mut stdin, &payload));
+    let (write_sender, write_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let outcome = write_frame(&mut stdin, &payload);
+        drop(stdin);
+        let _ = write_sender.send(outcome);
+    });
     let reader = thread::spawn(move || {
         let result = read_single_frame_to_eof(&mut stdout);
         // Require EOF after the single frame; the parent deadline bounds this read.
@@ -182,13 +187,14 @@ pub fn execute_offline_worker(
     // A positive reply must also have been written successfully, but a worker
     // may close its stdin early after seeing enough data. Treat that as an
     // invalid exchange, never as successful provisioning.
-    match writer.is_finished() {
-        true => match writer.join() {
-            Ok(Ok(())) => {}
-            _ => return Err(WorkerError::Transport),
-        },
-        false => return Err(WorkerError::Transport),
+    // Wait only within the original deadline for the writer to finish.
+    // is_finished() was a scheduling race: the worker could reply and exit
+    // before Rust marked an already-successful writer thread finished.
+    match write_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(())) => {}
+        _ => return Err(WorkerError::Transport),
     }
+    writer.join().map_err(|_| WorkerError::Transport)?;
     // The reader has already sent its result; this join cannot block.
     let _ = reader.join();
     Ok(response)
