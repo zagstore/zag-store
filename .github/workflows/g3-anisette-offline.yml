@@ -16,6 +16,11 @@ on:
 permissions:
   contents: read
 
+# Only the newest push needs a full matrix; superseded commits remain in history.
+concurrency:
+  group: anisette-offline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   offline-rust:
     strategy:
