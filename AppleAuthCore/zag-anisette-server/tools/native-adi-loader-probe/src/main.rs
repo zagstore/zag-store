@@ -3,6 +3,7 @@ mod native_session;
 mod offline_v2_bridge;
 mod provisioning_client;
 mod process_watchdog;
+mod probe_cli;
 use android_loader::android_library::AndroidLibrary;
 use android_loader::{hook_manager, sysv64};
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ macro_rules! report {
     };
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if probe_cli::dispatch()? { return Ok(()); }
     let root = PathBuf::from(std::env::args_os().nth(1).ok_or("usage: zag-native-adi-loader-probe <runtime-root>")?);
     let arch = if cfg!(target_arch = "x86_64") { "x86_64" } else if cfg!(target_arch = "aarch64") { "arm64-v8a" } else { return Err("unsupported host architecture".into()); };
     let dir = root.join("lib").join(arch);
