@@ -4,7 +4,7 @@
 //! No network integration, native libraries, or Apple provisioning.
 #![allow(dead_code)]
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Command, Stdio},
     sync::mpsc,
@@ -81,7 +81,8 @@ pub fn run_mock_session(
                     serde_json::from_slice::<serde_json::Value>(&line).ok(),
                 _ => None,
             };
-            if read_tx.send(outcome).is_err() { break; }
+            let terminal = outcome.is_none();
+            if read_tx.send(outcome).is_err() || terminal { break; }
         }
     });
     let result = (|| {
