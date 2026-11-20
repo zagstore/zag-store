@@ -155,6 +155,42 @@ mod v2_boundary_tests {
     }
 
     #[test]
+    fn stalled_v2_child_is_killed_and_reaped_at_deadline() {
+        use std::io::Write;
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!("zag-v2-stall-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("v2-stall-fixture");
+        assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        let mut command = Command::new(std::fs::canonicalize(&executable).unwrap());
+        command.arg("--v2-stall").env_clear().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let mut frame = Vec::new();
+        let request = crate::adi_worker_wire_v2::Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
+        crate::adi_worker_framing::write_frame(&mut frame, &crate::adi_worker_wire_v2::encode_request(&request).unwrap()).unwrap();
+        child.stdin.take().unwrap().write_all(&frame).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let timed_out = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(!status.success(), "stalled worker must not report success");
+                break false;
+            }
+            if Instant::now() >= deadline { break true; }
+            thread::sleep(Duration::from_millis(5));
+        };
+        #[cfg(unix)]
+        kill_group(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+        assert!(timed_out, "stalled child must reach the deadline before cleanup");
+    }
+
+    #[test]
     fn v2_binary_exchange_uses_bounded_frames_and_correct_phases() {
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255, 128] };
         let finish = Request::Finish { ptm: vec![0, 1], tk: vec![255, 0] };
