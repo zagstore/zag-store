@@ -242,6 +242,10 @@ fn read_before(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> std
     stream.read(buf)
 }
 
+fn offline_socket_enabled() -> bool {
+    std::env::var("ZAG_ANISETTE_OFFLINE_WS_TEST").ok().as_deref() == Some("1")
+}
+
 fn handle(mut stream: TcpStream) -> std::io::Result<()> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -268,6 +272,26 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
         None => (reply("431 Request Header Fields Too Large", r#"{"error":"header_limit"}"#), 0),
         Some(i) => respond(&buf[..i]),
     };
+    // Explicit loopback-only test mode. The request bytes consumed by the
+    // HTTP parser are replayed to Tungstenite, including any coalesced data.
+    // The only backend available here is OfflineBackend, which cannot
+    // generate provisioning credentials.
+    if offline_socket_enabled() && response.status == "503 Service Unavailable" {
+        if let Some(i) = end {
+            if let Ok(head) = parse(&buf[..i]) {
+                if head.path == "/v3/provisioning_session"
+                    && head.method == "GET"
+                    && is_websocket_upgrade(&head)
+                    && body == 0
+                {
+                    let prefix = buf[..count].to_vec();
+                    buf.fill(0);
+                    return websocket_transport::serve_offline_socket(stream, prefix)
+                        .map_err(std::io::Error::other);
+                }
+            }
+        }
+    }
     // Drain (and discard) the declared body so the client reads the response
     // rather than a reset. Nothing of it is kept.
     let mut left = body.saturating_sub(count - end.map_or(count, |i| i + 4));
