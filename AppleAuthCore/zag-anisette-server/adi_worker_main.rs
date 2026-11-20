@@ -371,7 +371,7 @@ mod tests {
         struct Bad;
         impl StatefulMaterialBackend for Bad {
             fn start(&mut self, _: &str, _: &str) -> io::Result<String> {
-                Ok("bad\\nmaterial".into())
+                Ok("bad\nmaterial".into())
             }
             fn finish(&mut self, _: &str, _: &str) -> io::Result<String> {
                 panic!("finish must not run")
