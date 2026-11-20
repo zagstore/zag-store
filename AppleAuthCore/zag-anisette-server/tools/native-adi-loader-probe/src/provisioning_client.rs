@@ -14,6 +14,15 @@ use url::Url;
 const LOOKUP: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 const MAX_HTTP_BYTES: usize = 128 * 1024;
 const WORKER_DEADLINE: Duration = Duration::from_secs(45);
+const EXCHANGE_DEADLINE: Duration = Duration::from_secs(90);
+
+fn remaining(end: Instant) -> io::Result<Duration> {
+    let left = end.checked_duration_since(Instant::now())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Apple provisioning deadline exceeded"))?;
+    if left.is_zero() { return Err(io::Error::new(io::ErrorKind::TimedOut, "Apple provisioning deadline exceeded")); }
+    Ok(left)
+}
+
 const MAX_BINARY_BYTES: usize = 12 * 1024;
 const MAX_FRAME: usize = wire::MAX_FRAME;
 
@@ -131,14 +140,16 @@ impl AppleHttp {
         Ok(Self { agent, device_id: device_id.to_owned(), client_info: client_info.to_owned(),
             local_user: local_user.to_owned(), serial: serial.to_owned() })
     }
-    fn get(&self, url: &str) -> io::Result<Dictionary> { self.send(url, None) }
-    fn post(&self, url: &str, body: &[u8]) -> io::Result<Dictionary> { self.send(url, Some(body)) }
-    fn send(&self, target: &str, body: Option<&[u8]>) -> io::Result<Dictionary> {
+    fn get(&self, url: &str, end: Instant) -> io::Result<Dictionary> { self.send(url, None, end) }
+    fn post(&self, url: &str, body: &[u8], end: Instant) -> io::Result<Dictionary> { self.send(url, Some(body), end) }
+    fn send(&self, target: &str, body: Option<&[u8]>, end: Instant) -> io::Result<Dictionary> {
         let url = validated_endpoint(target)?;
+        let budget = remaining(end)?;
         let req = match body {
             Some(_) => self.agent.post(url.as_str()),
             None => self.agent.get(url.as_str()),
         }
+            .timeout(budget)
             .set("User-Agent", "akd/1.0 CFNetwork/808.1.4")
             .set("X-Mme-Device-Id", &self.device_id)
             .set("X-Mme-Client-Info", &self.client_info)
@@ -156,6 +167,7 @@ impl AppleHttp {
         let mut bytes = Vec::new();
         bounded.read_to_end(&mut bytes).map_err(|_| transport())?;
         if bytes.is_empty() || bytes.len() > MAX_HTTP_BYTES { return Err(invalid("invalid HTTP body size")); }
+        remaining(end)?;
         plist_response(&bytes)
     }
 }
@@ -202,13 +214,14 @@ pub fn provision_with_worker(
         return Err(invalid("invalid isolated worker configuration"));
     }
     if fresh_state_dir.exists() { return Err(invalid("state directory already exists")); }
+    let end = Instant::now() + EXCHANGE_DEADLINE;
     let http = AppleHttp::new(device_id, client_info, local_user, serial)?;
-    let lookup = http.get(LOOKUP)?;
+    let lookup = http.get(LOOKUP, end)?;
     let bag = dictionary_field(&lookup, "urls")?;
     let start_url = validated_endpoint(string_field(bag, "midStartProvisioning")?)?;
     let finish_url = validated_endpoint(string_field(bag, "midFinishProvisioning")?)?;
     let start_body = empty_request()?;
-    let start_reply = http.post(start_url.as_str(), &start_body)?;
+    let start_reply = http.post(start_url.as_str(), &start_body, end)?;
     let spim = decoded_field(dictionary_field(&start_reply, "Response")?, "spim")?;
 
     let mut child = Command::new(worker_binary)
@@ -229,6 +242,7 @@ pub fn provision_with_worker(
     let supervisor = supervise_child(child, WORKER_DEADLINE, Arc::clone(&abort));
     let result = (|| {
         let start = Request::Start { identifier: "-2".into(), spim };
+        remaining(end)?;
         stdin.as_mut().ok_or_else(transport)?.write_all(&framed_request(&start)?)?;
         stdin.as_mut().ok_or_else(transport)?.flush()?;
         let cpim = match framed_response(&mut stdout, &start)? {
@@ -236,11 +250,12 @@ pub fn provision_with_worker(
             _ => return Err(invalid("worker rejected Start")),
         };
         let body = finish_request(&cpim)?;
-        let finish_reply = http.post(finish_url.as_str(), &body)?;
+        let finish_reply = http.post(finish_url.as_str(), &body, end)?;
         let reply = dictionary_field(&finish_reply, "Response")?;
         let ptm = decoded_field(reply, "ptm")?;
         let tk = decoded_field(reply, "tk")?;
         let finish = Request::Finish { ptm, tk };
+        remaining(end)?;
         stdin.as_mut().ok_or_else(transport)?.write_all(&framed_request(&finish)?)?;
         stdin.as_mut().ok_or_else(transport)?.flush()?;
         drop(stdin.take());
@@ -291,6 +306,15 @@ mod tests {
         let (status, timed_out) = worker.join().unwrap().unwrap();
         assert!(status.success());
         assert!(!timed_out);
+    }
+
+    #[test]
+    fn expired_exchange_budget_fails_closed() {
+        let end = Instant::now() - Duration::from_millis(1);
+        assert_eq!(remaining(end).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let user = "A".repeat(64);
+        let http = AppleHttp::new("device", "client", &user, "TEST").unwrap();
+        assert_eq!(http.get(LOOKUP, end).unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
