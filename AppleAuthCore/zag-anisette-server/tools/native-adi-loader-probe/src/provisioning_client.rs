@@ -105,13 +105,22 @@ struct AppleHttp {
     agent: ureq::Agent,
     device_id: String,
     client_info: String,
+    local_user: String,
+    serial: String,
 }
 impl AppleHttp {
-    fn new(device_id: &str, client_info: &str) -> io::Result<Self> {
+    fn new(device_id: &str, client_info: &str, local_user: &str, serial: &str) -> io::Result<Self> {
         if device_id.is_empty() || client_info.is_empty() || device_id.len() > 256
             || client_info.len() > 512 || device_id.chars().any(char::is_control)
             || client_info.chars().any(char::is_control) {
             return Err(invalid("invalid device headers"));
+        }
+        // Never synthesize identity headers or accept control characters.
+        // Values must be stable operator-provided test identities.
+        if local_user.len() != 64 || !local_user.bytes().all(|b| b.is_ascii_hexdigit())
+            || serial.is_empty() || serial.len() > 64
+            || !serial.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(invalid("invalid Apple identity headers"));
         }
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(8))
@@ -119,7 +128,8 @@ impl AppleHttp {
             .timeout_write(Duration::from_secs(12))
             .redirects(0)
             .build();
-        Ok(Self { agent, device_id: device_id.to_owned(), client_info: client_info.to_owned() })
+        Ok(Self { agent, device_id: device_id.to_owned(), client_info: client_info.to_owned(),
+            local_user: local_user.to_owned(), serial: serial.to_owned() })
     }
     fn get(&self, url: &str) -> io::Result<Dictionary> { self.send(url, None) }
     fn post(&self, url: &str, body: &[u8]) -> io::Result<Dictionary> { self.send(url, Some(body)) }
@@ -132,6 +142,8 @@ impl AppleHttp {
             .set("User-Agent", "akd/1.0 CFNetwork/808.1.4")
             .set("X-Mme-Device-Id", &self.device_id)
             .set("X-Mme-Client-Info", &self.client_info)
+            .set("X-Apple-I-MD-LU", &self.local_user)
+            .set("X-Apple-I-SRL-NO", &self.serial)
             .set("Content-Type", "text/x-xml-plist");
         // ureq's default TLS verification is retained; no insecure opt-out.
         // Any redirect is rejected by redirects(0) and status validation.
@@ -183,12 +195,14 @@ pub fn provision_with_worker(
     fresh_state_dir: &std::path::Path,
     device_id: &str,
     client_info: &str,
+    local_user: &str,
+    serial: &str,
 ) -> io::Result<Vec<u8>> {
     if !worker_binary.is_file() || !runtime_root.is_dir() || !fresh_state_dir.is_absolute() {
         return Err(invalid("invalid isolated worker configuration"));
     }
     if fresh_state_dir.exists() { return Err(invalid("state directory already exists")); }
-    let http = AppleHttp::new(device_id, client_info)?;
+    let http = AppleHttp::new(device_id, client_info, local_user, serial)?;
     let lookup = http.get(LOOKUP)?;
     let bag = dictionary_field(&lookup, "urls")?;
     let start_url = validated_endpoint(string_field(bag, "midStartProvisioning")?)?;
@@ -277,6 +291,17 @@ mod tests {
         let (status, timed_out) = worker.join().unwrap().unwrap();
         assert!(status.success());
         assert!(!timed_out);
+    }
+
+    #[test]
+    fn identity_headers_reject_missing_or_injected_values() {
+        let user = "A".repeat(64);
+        assert!(AppleHttp::new("device", "client", &user, "TEST-123").is_ok());
+        assert!(AppleHttp::new("device", "client", "", "TEST-123").is_err());
+        assert!(AppleHttp::new("device", "client", &user, "").is_err());
+        assert!(AppleHttp::new("device", "client", &user, "TEST\\r\\nInjected").is_err());
+        assert!(AppleHttp::new("device", "client\\nInjected", &user, "TEST").is_err());
+        assert!(AppleHttp::new("device", "client", &("A".repeat(63) + "Z"), "TEST").is_err());
     }
 
     #[test]
