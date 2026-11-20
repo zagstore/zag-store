@@ -113,6 +113,42 @@ claims of measured superiority.
 5. Successful real-provider integration tests **only** in a separately
    approved isolated environment; production remains disabled until reviewed.
 
+## SideStore Rust source audit: transport-security blocker
+
+At pinned `SideStore/apple-private-apis` revision
+`03beb1aa42991ccdad6214dee77e72282bef461f`,
+`omnisette/src/adi_proxy.rs` defines the `ADIProxy` trait with native
+`start_provisioning`, `end_provisioning`, and
+`destroy_provisioning_session` methods, including a `u32` native session
+handle. This confirms that its provider-facing interface can inform our
+worker's typed two-phase design.
+
+**Do not import its HTTP provisioning client unchanged.** The same file's
+`make_http_client` calls
+`ClientBuilder::danger_accept_invalid_certs(true)` and even carries a
+TODO to pin Apple's certificate. That disables TLS certificate validation.
+It also takes start/finish provisioning URLs from a remote response without
+an evident local origin allowlist in the inspected function. Its plist
+response parsing includes several `unwrap()` calls on network-derived
+values, risking panics on malformed responses.
+
+**Zag Store acceptance gates:** default TLS verification must stay enabled;
+validate any discovered endpoint's scheme and approved host before requests;
+parse untrusted plist data without panic; limit response body size and
+request duration; prohibit sensitive header logging; and keep the network
+client outside the native worker unless explicitly justified by the threat
+model. Validate these controls with negative tests before enabling live
+provisioning. This is a source-level finding, not a claim that an upstream
+deployment has been exploited.
+
+The `omnisette/Cargo.toml` also depends on Dadoum's `android-loader`
+from the floating `bigger_pages` branch; any reused code requires
+immutable dependency pinning and platform-specific loader review.
+
+Sources:
+- https://github.com/SideStore/apple-private-apis/blob/03beb1aa42991ccdad6214dee77e72282bef461f/omnisette/src/adi_proxy.rs
+- https://github.com/SideStore/apple-private-apis/blob/03beb1aa42991ccdad6214dee77e72282bef461f/omnisette/Cargo.toml
+
 ## Implementation milestones
 
 1. Introduce a generic typed two-phase session driver with strict Start/Finish transitions, bounded frames and no mock-success logic in release code. Test with a stateful in-memory backend and failure injection.
