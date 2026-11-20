@@ -65,7 +65,7 @@ fn encode_hex(bytes: &[u8]) -> Result<String, WireError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request { Start { identifier: String, spim: Vec<u8> }, Finish { ptm: Vec<u8>, tk: Vec<u8> } }
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Response { Started(Vec<u8>), Finished(Vec<u8>) }
+pub enum Response { Started(Vec<u8>), Finished(Vec<u8>), Failed }
 
 fn exact(obj: &BTreeMap<String, Value>, names: &[&str]) -> Result<(), WireError> {
     if obj.len() != names.len() || obj.keys().any(|key| !names.contains(&key.as_str())) { return Err(WireError::Invalid); }
@@ -101,6 +101,13 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>, WireError> {
 
 pub fn decode_response(bytes: &[u8], expected: &Request) -> Result<Response, WireError> {
     let obj = parse(bytes)?;
+    if obj.get("type").and_then(Value::as_str) == Some("error") {
+        exact(&obj, &["version", "type", "code"])?;
+        return match obj.get("code").and_then(Value::as_str) {
+            Some("backend_unavailable") => Ok(Response::Failed),
+            _ => Err(WireError::Invalid),
+        };
+    }
     exact(&obj, &["version", "type", match expected { Request::Start { .. } => "cpim_hex", Request::Finish { .. } => "adi_pb_hex" }])?;
     match (expected, obj.get("type").and_then(Value::as_str)) {
         (Request::Start { .. }, Some("started")) => Ok(Response::Started(material(&obj, "cpim_hex")?)),
@@ -113,6 +120,7 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>, WireError> {
     let value = match response {
         Response::Started(bytes) => json!({"version":VERSION,"type":"started","cpim_hex":encode_hex(bytes)?}),
         Response::Finished(bytes) => json!({"version":VERSION,"type":"finished","adi_pb_hex":encode_hex(bytes)?}),
+        Response::Failed => json!({"version":VERSION,"type":"error","code":"backend_unavailable"}),
     };
     let encoded = serde_json::to_vec(&value).map_err(|_| WireError::Invalid)?;
     if encoded.len() > MAX_FRAME { return Err(WireError::Oversized); }
