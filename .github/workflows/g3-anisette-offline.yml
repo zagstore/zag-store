@@ -46,6 +46,10 @@ jobs:
         run: cargo build --release --locked
       - name: Test
         run: cargo test --locked
+      - name: Rust adapter integration with release worker
+        run: |
+          ZAG_OFFLINE_WORKER_TEST_EXECUTABLE="$(pwd)/target/release/zag-adi-worker" \
+            cargo test --locked release_worker_adapter_rejects_provisioning_without_native_backend -- --nocapture
       - name: Offline worker subprocess smoke
         run: |
           python3 - <<'PY'
