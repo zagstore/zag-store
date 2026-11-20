@@ -10,6 +10,7 @@
 //! client stop: `error_for_status` fails, and a non-101 upgrade fails.
 mod adi_process;
 mod adi_worker_protocol;
+mod adi_worker_framing;
 mod provisioning;
 mod websocket_transport;
 
