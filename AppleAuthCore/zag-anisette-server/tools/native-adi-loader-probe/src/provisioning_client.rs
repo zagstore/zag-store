@@ -224,14 +224,18 @@ pub fn provision_with_worker(
         };
         let mut extra = [0u8; 1];
         if stdout.read(&mut extra)? != 0 { return Err(invalid("worker trailing output")); }
-        if !child.wait()?.success() { return Err(transport()); }
+        let status = child.wait()?;
+        // Stop the watchdog as soon as the child is reaped to minimize any
+        // chance of a signal reaching a subsequently recycled PID.
+        finished.store(true, Ordering::Release);
+        if !status.success() { return Err(transport()); }
         Ok(adi_pb)
     })();
     if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
+        finished.store(true, Ordering::Release);
     }
-    finished.store(true, Ordering::Release);
     let _ = watchdog.join();
     result
 }
