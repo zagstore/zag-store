@@ -2,7 +2,8 @@
 use android_loader::android_library::AndroidLibrary;
 use android_loader::{hook_manager, sysv64};
 use std::collections::HashMap;
-use std::ffi::c_char;
+use std::ffi::{c_char, CString};
+use android_loader::sysv64_type;
 use std::path::PathBuf;
 
 #[sysv64]
@@ -63,6 +64,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         missing |= !found;
     }
     if missing { return Err("required native symbols missing".into()); }
+    if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--initialize-core")) {
+        // Explicit opt-in native initialization; never invoke provisioning in this probe.
+        let init: sysv64_type!(fn(*const u8) -> i32) = unsafe {
+            std::mem::transmute(lib.get_symbol("kq56gsgHG6").ok_or("missing CoreADI initializer")?)
+        };
+        let native_dir = CString::new(dir.to_str().ok_or("non-UTF8 native directory")?)?;
+        eprintln!("Initializing CoreADI from {} (no provisioning)", dir.display());
+        let status = init(native_dir.as_ptr().cast());
+        println!("CoreADI initialization status: {status}");
+        if status != 0 { return Err(format!("CoreADI initialization failed: {status}").into()); }
+        println!("PASS: CoreADI initialized; no provisioning executed");
+    }
     println!("PASS: native StoreServicesCore loaded and required symbols resolved; no provisioning executed");
     Ok(())
 }
