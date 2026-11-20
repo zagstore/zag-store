@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if missing { return Err("required native symbols missing".into()); }
     let mode = std::env::args_os().nth(2);
     let mode = mode.as_deref().and_then(std::ffi::OsStr::to_str);
-    if mode == Some("--initialize-core") || mode == Some("--configure-state") || mode == Some("--native-abi-preflight") {
+    if mode == Some("--initialize-core") || mode == Some("--configure-state") || mode == Some("--native-abi-preflight") || mode == Some("--native-v2-session") {
         // All calls are explicitly opt-in. Never initiate provisioning in this probe.
         let init: sysv64_type!(fn(*const u8) -> i32) = unsafe {
             std::mem::transmute(lib.get_symbol("kq56gsgHG6").ok_or("missing CoreADI initializer")?)
@@ -80,9 +80,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if status != 0 { return Err(format!("CoreADI initialization failed: {status}").into()); }
         println!("PASS: CoreADI initialized; no provisioning executed");
 
-        if mode == Some("--configure-state") || mode == Some("--native-abi-preflight") {
+        if mode == Some("--configure-state") || mode == Some("--native-abi-preflight") || mode == Some("--native-v2-session") {
             // Use an absolute, private test directory. Never reuse production ADI state.
-            let state = root.join("probe-state");
+            let state = if mode == Some("--native-v2-session") {
+                let candidate = PathBuf::from(std::env::args_os().nth(3).ok_or("missing fresh state directory")?);
+                if !candidate.is_absolute() { return Err("state directory must be absolute".into()); }
+                if candidate.exists() { return Err("state directory already exists".into()); }
+                std::fs::create_dir(&candidate)?;
+                candidate
+            } else { root.join("probe-state") };
             std::fs::create_dir_all(&state)?;
             #[cfg(unix)]
             {
@@ -100,7 +106,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if path_status != 0 { return Err(format!("native state path rejected: {path_status}").into()); }
 
             // Fixed probe-only identifier: not an Apple ID, device serial, or user credential.
-            let identifier = b"zagadi-probe0001";
+            let operator_identifier = if mode == Some("--native-v2-session") {
+                let value = std::env::args().nth(4).ok_or("missing Android identifier")?;
+                if value.is_empty() || value.len() > 256 || value.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+                    return Err("invalid Android identifier".into());
+                }
+                value
+            } else { "zagadi-probe0001".to_owned() };
+            let identifier = operator_identifier.as_bytes();
             let set_id: sysv64_type!(fn(*const u8, u32) -> i32) = unsafe {
                 std::mem::transmute(lib.get_symbol("Sph98paBcz").ok_or("missing set_android_id")?)
             };
@@ -108,8 +121,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("ADI Android identifier status: {id_status}");
             if id_status != 0 { return Err(format!("native Android identifier rejected: {id_status}").into()); }
             println!("PASS: isolated provisioning path and probe-only identifier configured; no provisioning executed");
-            if mode == Some("--native-abi-preflight") {
+            if mode == Some("--native-abi-preflight") || mode == Some("--native-v2-session") {
                 let _native = native_session::NativeFunctions::resolve(&lib)?;
+                if mode == Some("--native-v2-session") {
+                    offline_v2_bridge::run_native_v2(
+                        &_native, &state.join("adi.pb"),
+                        &mut std::io::stdin().lock(), &mut std::io::stdout().lock(),
+                    )?;
+                    return Ok(());
+                }
                 println!("PASS: typed native Start/End/Destroy/Dispose functions bound; no provisioning executed");
             }
         }
