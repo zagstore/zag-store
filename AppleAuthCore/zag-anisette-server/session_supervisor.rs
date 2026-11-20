@@ -1,10 +1,10 @@
 //! Offline-only two-phase child supervisor prototype.
-//! NOT approved for production: test-only caller-selected executable and newline framing
+//! NOT approved for production: test-only caller-selected executable and mock framing
 //! deliberately differ from the reviewed one-shot worker security contract.
 //! No network integration, native libraries, or Apple provisioning.
 #![allow(dead_code)]
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     path::Path,
     process::{Command, Stdio},
     sync::mpsc,
@@ -36,7 +36,7 @@ fn receive<T>(rx: &mpsc::Receiver<T>, deadline: Instant) -> Result<T, SessionErr
 
 /// Runs exactly one mock Start and Finish in the SAME child process.
 /// This function is a test harness, not a safe executable-launch API.
-/// Each reply must be a single newline-terminated JSON object of at most 64KiB.
+/// Each reply must be one bounded length-prefixed JSON frame.
 pub fn run_mock_session(
     executable: &Path,
     args: &[&str],
@@ -47,12 +47,17 @@ pub fn run_mock_session(
     if timeout.is_zero() || timeout > Duration::from_secs(10) {
         return Err(SessionError::InvalidTimeout);
     }
-    if start.len() > 64 * 1024 || finish.len() > 64 * 1024
-        || !start.ends_with('\n') || !finish.ends_with('\n') {
+    if start.len() > 64 * 1024 || finish.len() > 64 * 1024 {
         return Err(SessionError::InvalidResponse);
     }
     crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
         .map_err(|_| SessionError::Spawn)?;
+    let start_frame = encode_session_frame(&serde_json::from_str::<serde_json::Value>(start)
+        .map_err(|_| SessionError::InvalidResponse)?)
+        .map_err(|_| SessionError::InvalidResponse)?;
+    let finish_frame = encode_session_frame(&serde_json::from_str::<serde_json::Value>(finish)
+        .map_err(|_| SessionError::InvalidResponse)?)
+        .map_err(|_| SessionError::InvalidResponse)?;
     let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(executable);
     cmd.args(args).env_clear().current_dir("/")
@@ -67,36 +72,32 @@ pub fn run_mock_session(
     let stdout = child.stdout.take().ok_or(SessionError::Transport)?;
     let (write_tx, write_rx) = mpsc::channel();
     let (read_tx, read_rx) = mpsc::channel();
-    let (command_tx, command_rx) = mpsc::channel::<String>();
+    let (command_tx, command_rx) = mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
         for payload in command_rx {
-            let result = stdin.write_all(payload.as_bytes()).and_then(|_| stdin.flush());
+            let result = stdin.write_all(&payload).and_then(|_| stdin.flush());
             if write_tx.send(result.is_ok()).is_err() { break; }
             if result.is_err() { break; }
         }
     });
     thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
+        let mut reader = stdout;
         loop {
-            let mut line = Vec::new();
-            let result = reader.by_ref().take(65_537).read_until(b'\n', &mut line);
-            let outcome = match result {
-                Ok(n) if n > 0 && n <= 65_536 && line.ends_with(b"\n") =>
-                    serde_json::from_slice::<serde_json::Value>(&line).ok(),
-                _ => None,
-            };
+            let outcome = crate::adi_worker_framing::read_frame(&mut reader)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
             let terminal = outcome.is_none();
             if read_tx.send(outcome).is_err() || terminal { break; }
         }
     });
     let result = (|| {
-        command_tx.send(start.to_string()).map_err(|_| SessionError::Transport)?;
+        command_tx.send(start_frame).map_err(|_| SessionError::Transport)?;
         if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
         let started = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
         if started.get("type").and_then(serde_json::Value::as_str) != Some("started") {
             return Err(SessionError::InvalidResponse);
         }
-        command_tx.send(finish.to_string()).map_err(|_| SessionError::Transport)?;
+        command_tx.send(finish_frame).map_err(|_| SessionError::Transport)?;
         if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
         drop(command_tx);
         let finished = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
