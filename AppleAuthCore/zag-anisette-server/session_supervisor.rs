@@ -1,5 +1,5 @@
 //! Offline-only two-phase child supervisor prototype.
-//! NOT approved for production: caller-selected executable and newline framing
+//! NOT approved for production: test-only caller-selected executable and newline framing
 //! deliberately differ from the reviewed one-shot worker security contract.
 //! No network integration, native libraries, or Apple provisioning.
 #![allow(dead_code)]
@@ -51,12 +51,16 @@ pub fn run_mock_session(
         || !start.ends_with('\n') || !finish.ends_with('\n') {
         return Err(SessionError::InvalidResponse);
     }
+    crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
+        .map_err(|_| SessionError::Spawn)?;
     let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(executable);
     cmd.args(args).env_clear().current_dir("/")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(unix)]
     cmd.process_group(0);
+    crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
+        .map_err(|_| SessionError::Spawn)?;
     let mut child = cmd.spawn().map_err(|_| SessionError::Spawn)?;
     let pid = child.id();
     let mut stdin = child.stdin.take().ok_or(SessionError::Transport)?;
