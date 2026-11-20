@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn writes_no_request_data() {
         let source = include_str!("main.rs");
-        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let production = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
         assert_eq!(production.matches("eprintln!").count(), 3, "only the startup and bind-failure messages");
         assert!(!production.replace("eprintln!(", "").contains("println!("));
         for forbidden in ["dbg!(", "log::", "tracing::", "std::fs", "File::", "TcpStream::connect", "UdpSocket"] {
