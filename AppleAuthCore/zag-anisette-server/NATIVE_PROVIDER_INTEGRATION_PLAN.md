@@ -232,3 +232,18 @@ is unavailable. Verify the target OS and CPU architecture before choosing
 which native loader to implement.
 
 Source: https://github.com/SideStore/apple-private-apis/blob/03beb1aa42991ccdad6214dee77e72282bef461f/omnisette/src/store_services_core.rs
+
+## Verified operator runtime inventory (20 November 2026)
+
+Operator confirmed on `zagstore-prod-01` (Ubuntu, `x86_64`):
+
+| Local file (under `~/zag-adi-setup/runtime/lib/x86_64/`) | Size | SHA-256 |
+|---|---:|---|
+| `libCoreADI.so` | 1.6 MB | `ece4ffa6bbe4239e8f0d4714da57e62ce5e3c581d19553a83d78ac897783b905` |
+| `libstoreservicescore.so` | 2.3 MB | `d8be230df34c0044758d43e33a8dabd3236b9a4258c4d48cb366911224d52f68` |
+
+Both have ELF magic and machine code 62 (x86-64). Total local runtime size 3.9 MB. This proves **file presence and architecture only**; no dynamic loading or ADI calls have been verified. The files remain outside the repository and should not be committed.
+
+The pinned SideStore `omnisette/Cargo.toml` specifies `android-loader` from `https://github.com/Dadoum/android-loader` branch `bigger_pages`. The pinned `omnisette/src/store_services_core.rs` uses that loader's `AndroidLibrary`, `hook_manager`, and `sysv64` APIs to load Android ELF objects and resolve native symbols. **Plain `dlopen` is not a drop-in replacement.**
+
+Next: isolate an offline loader probe using a pinned revision of `Dadoum/android-loader`, inspect its native dependencies and hooks, and demonstrate actual symbol resolution on Ubuntu before enabling a real provider. After Start/End, confirm the native state storage format rather than assuming `adi.pb` is returned. Do not run provisioning on the public listener until verified.
