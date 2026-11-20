@@ -96,3 +96,16 @@ Interim only: the period ends 25 November and no verdict is given before then.
   - the provider never receives credentials;
   - a provider failure is a stop.
 - Recommended: decide after the period ends on 25 November, choosing "approve with notice" or self-hosting.
+
+## Owner direction — 20 November 2026: self-host Zag Anisette
+
+The owner has chosen a **self-hosted v3-compatible anisette service** for G5-C1 rather than using `ani.sidestore.io` as the experiment provider. The previous public-provider study remains evidence only; its completion is no longer a prerequisite to selecting a self-hosted candidate. This is **direction to implement and evaluate**, not G3 approval or permission for live Apple requests.
+
+Deployment constraints:
+- Use the existing Zag Store server, isolated from production WordPress, the signing engine and production credentials. Do not create a new project directory without checking the owner's standing directory rule.
+- `anisette.zagstore.app` is the proposed DNS name, not an asserted working endpoint. Verify DNS ownership, TLS, firewall and routing before claiming deployment.
+- Identify a v3-compatible server implementation and its licence, upstream maintenance and dependencies; do not assume the current client bridge works with an arbitrary anisette server.
+- Do not log or persist Apple credentials, 2FA codes, tokens, provisioning blobs, client identifiers or device serials. Determine what transient provisioning state the protocol actually requires, and document any unavoidable retention before enabling it.
+- Run offline/static tests, HTTPS and transport checks first. Any v3 provisioning compatibility test that contacts Apple is separately gated; no live test or campaign authorisation is implied.
+- Pin the approved host in the experiment allowlist, without changing production defaults. Record deployment configuration, rollback and health checks without secrets.
+- G3 remains **open** until compatibility, privacy and operational review are documented and the owner approves the exact HTTPS endpoint. G2 and G4 remain separate gates.
