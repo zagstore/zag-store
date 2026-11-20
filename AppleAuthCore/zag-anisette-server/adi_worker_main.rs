@@ -550,6 +550,11 @@ mod tests {
     fn native_binary_encoding_is_lossless_and_bounded() {
         let bytes = [0x00, 0xff, 0x0a, 0x80, 0x41];
         assert_eq!(encode_native_bytes(&bytes).unwrap(), "00ff0a8041");
+        assert_eq!(decode_native_bytes("00ff0a8041").unwrap(), bytes);
+        for invalid in ["", "0", "AA", "gg", "00ffz0", "00 0", "é"] {
+            assert!(decode_native_bytes(invalid).is_err());
+        }
+        assert!(decode_native_bytes(&"aa".repeat(MAX_MESSAGE_BYTES)).is_err());
         assert!(encode_native_bytes(&[]).is_err());
         assert!(encode_native_bytes(&vec![0u8; MAX_MESSAGE_BYTES]).is_err());
     }
@@ -575,7 +580,7 @@ mod tests {
             (Vec::new(), Some(io::ErrorKind::InvalidData)),
         ] {
             let mut bridge = SideStoreNativeBridge { proxy: Proxy { material: bytes } };
-            let result = bridge.finish_native(8, "ptm", "tk");
+            let result = bridge.finish_native(8, "70746d", "746b");
             match expected {
                 None => assert!(!result.unwrap().is_empty()),
                 Some(kind) => assert_eq!(result.unwrap_err().kind(), kind),
@@ -610,10 +615,10 @@ mod tests {
         }
         let count = Arc::new(AtomicUsize::new(0));
         let mut engine = SideStoreNativeBridge { proxy: Proxy(count.clone()) };
-        let (handle, cpim) = engine.start_native("-2", "spim").unwrap();
+        let (handle, cpim) = engine.start_native("-2", "7370696d").unwrap();
         assert_eq!(cpim, "6370696d");
         assert_eq!(handle, 17);
-        assert_eq!(engine.finish_native(handle, "ptm", "tk").unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(engine.finish_native(handle, "70746d", "746b").unwrap_err().kind(), io::ErrorKind::Unsupported);
         engine.destroy_native(handle).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
