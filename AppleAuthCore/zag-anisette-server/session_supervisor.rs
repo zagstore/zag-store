@@ -85,6 +85,53 @@ fn valid_phase_reply(value: &serde_json::Value, phase: &str) -> bool {
     )
 }
 
+/// Offline-only v2 framing validation at the supervisor boundary.
+/// Deliberately does not spawn a worker or activate native provisioning.
+#[cfg(test)]
+fn validate_v2_exchange(
+    start: &crate::adi_worker_wire_v2::Request,
+    started: &[u8],
+    finish: &crate::adi_worker_wire_v2::Request,
+    finished: &[u8],
+) -> Result<(), SessionError> {
+    use crate::adi_worker_wire_v2::{decode_request, decode_response, encode_request, Response, Request};
+    if !matches!(start, Request::Start { .. }) || !matches!(finish, Request::Finish { .. }) {
+        return Err(SessionError::InvalidResponse);
+    }
+    for request in [start, finish] {
+        let payload = encode_request(request).map_err(|_| SessionError::InvalidResponse)?;
+        let mut frame = Vec::new();
+        crate::adi_worker_framing::write_frame(&mut frame, &payload)
+            .map_err(|_| SessionError::InvalidResponse)?;
+        let roundtrip = crate::adi_worker_framing::read_frame(&mut frame.as_slice())
+            .map_err(|_| SessionError::InvalidResponse)?;
+        if decode_request(&roundtrip).map_err(|_| SessionError::InvalidResponse)? != *request {
+            return Err(SessionError::InvalidResponse);
+        }
+    }
+    if !matches!(decode_response(started, start), Ok(Response::Started(_)))
+        || !matches!(decode_response(finished, finish), Ok(Response::Finished(_))) {
+        return Err(SessionError::InvalidResponse);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod v2_boundary_tests {
+    use super::*;
+    use crate::adi_worker_wire_v2::{encode_response, Request, Response};
+    #[test]
+    fn v2_binary_exchange_uses_bounded_frames_and_correct_phases() {
+        let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255, 128] };
+        let finish = Request::Finish { ptm: vec![0, 1], tk: vec![255, 0] };
+        let started = encode_response(&Response::Started(vec![0, 255])).unwrap();
+        let finished = encode_response(&Response::Finished(vec![255, 0])).unwrap();
+        assert_eq!(validate_v2_exchange(&start, &started, &finish, &finished), Ok(()));
+        assert_eq!(validate_v2_exchange(&start, &finished, &finish, &started), Err(SessionError::InvalidResponse));
+        assert_eq!(validate_v2_exchange(&finish, &started, &start, &finished), Err(SessionError::InvalidResponse));
+    }
+}
+
 /// Runs exactly one mock Start and Finish in the SAME child process.
 /// This function is a test harness, not a safe executable-launch API.
 /// Each reply must be one bounded length-prefixed JSON frame.
