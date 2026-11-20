@@ -13,7 +13,6 @@ mod adi_worker_protocol;
 mod adi_worker_framing;
 mod adi_worker_lifecycle;
 mod provisioning;
-mod session_worker;
 mod websocket_transport;
 
 use std::{
@@ -382,6 +381,9 @@ fn main() {
     eprintln!("zag-anisette-server: offline-only, listening on {address}");
     serve(listener);
 }
+
+#[cfg(test)]
+mod session_worker;
 
 #[cfg(test)]
 mod tests {
