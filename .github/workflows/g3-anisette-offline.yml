@@ -72,3 +72,27 @@ jobs:
           PY
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Offline provisioning adapter against compiled worker
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import struct
+          import subprocess
+          worker = pathlib.Path("target/release/zag-adi-worker").resolve()
+          def exchange(message):
+              data = json.dumps(message, separators=(",", ":")).encode()
+              proc = subprocess.run([str(worker)], input=struct.pack(">I", len(data)) + data,
+                                    capture_output=True, timeout=5)
+              assert proc.returncode == 0 and proc.stderr == b""
+              assert len(proc.stdout) >= 4
+              size = struct.unpack(">I", proc.stdout[:4])[0]
+              assert size == len(proc.stdout) - 4
+              return json.loads(proc.stdout[4:])
+          for message in (
+              {"version": 1, "type": "start", "identifier": "device", "spim": "spim"},
+              {"version": 1, "type": "finish", "ptm": "ptm", "tk": "tk"},
+          ):
+              response = exchange(message)
+              assert response == {"version": 1, "type": "error", "code": "backend_unavailable"}
+          PY
