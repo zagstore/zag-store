@@ -22,6 +22,7 @@ pub enum Phase {
     AwaitStart,
     AwaitFinish,
     Complete,
+    Failed,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -59,14 +60,20 @@ impl<B: ProvisioningBackend> Session<B> {
             }
             (Phase::AwaitStart, ClientMessage::Spim(spim)) if field_ok(&spim) => {
                 let identifier = self.identifier.as_deref().ok_or(ProtocolError::InvalidTransition)?;
-                let cpim = self.backend.start(identifier, &spim)?;
-                if !field_ok(&cpim) { return Err(ProtocolError::InvalidField); }
+                let cpim = match self.backend.start(identifier, &spim) {
+                    Ok(value) => value,
+                    Err(error) => { self.phase = Phase::Failed; return Err(error); }
+                };
+                if !field_ok(&cpim) { self.phase = Phase::Failed; return Err(ProtocolError::InvalidField); }
                 self.phase = Phase::AwaitFinish;
                 Ok(ServerMessage::GiveEndProvisioningData { cpim })
             }
             (Phase::AwaitFinish, ClientMessage::Finish { ptm, tk }) if field_ok(&ptm) && field_ok(&tk) => {
-                let adi_pb = self.backend.finish(&ptm, &tk)?;
-                if !field_ok(&adi_pb) { return Err(ProtocolError::InvalidField); }
+                let adi_pb = match self.backend.finish(&ptm, &tk) {
+                    Ok(value) => value,
+                    Err(error) => { self.phase = Phase::Failed; return Err(error); }
+                };
+                if !field_ok(&adi_pb) { self.phase = Phase::Failed; return Err(ProtocolError::InvalidField); }
                 self.phase = Phase::Complete;
                 Ok(ServerMessage::ProvisioningSuccess { adi_pb })
             }
@@ -127,7 +134,14 @@ mod tests {
         assert_eq!(session.initial(), ServerMessage::GiveIdentifier);
         assert_eq!(session.receive(ClientMessage::Identifier("id".into())), Ok(ServerMessage::GiveStartProvisioningData));
         assert_eq!(session.receive(ClientMessage::Spim("spim".into())), Err(ProtocolError::BackendUnavailable));
-        assert_eq!(session.phase(), Phase::AwaitStart);
+        assert_eq!(session.phase(), Phase::Failed);
+    }
+    #[test] fn backend_failure_is_terminal() {
+        let mut session = Session::new(OfflineBackend);
+        assert!(session.receive(ClientMessage::Identifier("id".into())).is_ok());
+        assert_eq!(session.receive(ClientMessage::Spim("spim".into())), Err(ProtocolError::BackendUnavailable));
+        assert_eq!(session.phase(), Phase::Failed);
+        assert_eq!(session.receive(ClientMessage::Spim("spim".into())), Err(ProtocolError::InvalidTransition));
     }
     #[test] fn malformed_identifier_rejected() {
         let mut session = Session::new(OfflineBackend);
