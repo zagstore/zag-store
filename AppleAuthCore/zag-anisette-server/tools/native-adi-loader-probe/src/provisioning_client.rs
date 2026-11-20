@@ -5,7 +5,7 @@ use crate::offline_v2_bridge::wire::{self, Request, Response};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use plist::{Dictionary, Value};
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
@@ -148,6 +148,31 @@ impl AppleHttp {
     }
 }
 
+/// Owns the Child handle until it is reaped. Never signals a bare PID:
+/// kill() operates on the still-owned Child, preventing PID-reuse races.
+/// Abort requests and the hard deadline are both handled by this thread.
+fn supervise_child(
+    mut child: Child,
+    deadline: Duration,
+    abort: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<(ExitStatus, bool)>> {
+    thread::spawn(move || {
+        let end = Instant::now() + deadline;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok((status, false));
+            }
+            if abort.load(Ordering::Acquire) || Instant::now() >= end {
+                let timed_out = Instant::now() >= end;
+                child.kill()?;
+                let status = child.wait()?;
+                return Ok((status, timed_out));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    })
+}
+
 /// Native child remains in its own process. Only a single local worker
 /// executable and operator-supplied empty private directory are allowed.
 /// The child is not registered as a production service.
@@ -182,26 +207,13 @@ pub fn provision_with_worker(
         .stdin(Stdio::piped()).stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn().map_err(|_| transport())?;
-    // A native library or pipe read can block indefinitely. Keep the child
-    // in a separate process group, and terminate it on a hard deadline.
-    // The watchdog is joined before the process handle is released.
-    let finished = Arc::new(AtomicBool::new(false));
-    let watchdog_finished = Arc::clone(&finished);
-    let child_pid = child.id();
-    let watchdog = thread::spawn(move || {
-        let deadline = Instant::now() + WORKER_DEADLINE;
-        while !watchdog_finished.load(Ordering::Acquire) {
-            if Instant::now() >= deadline {
-                // Child remains owned by the caller until watchdog joins.
-                unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-    });
+    // Extract pipes before transferring exclusive Child ownership to the
+    // supervisor. All process termination/reaping occurs in that thread.
+    let mut stdin = child.stdin.take().ok_or_else(transport)?;
+    let mut stdout = child.stdout.take().ok_or_else(transport)?;
+    let abort = Arc::new(AtomicBool::new(false));
+    let supervisor = supervise_child(child, WORKER_DEADLINE, Arc::clone(&abort));
     let result = (|| {
-        let mut stdin = child.stdin.take().ok_or_else(transport)?;
-        let mut stdout = child.stdout.take().ok_or_else(transport)?;
         let start = Request::Start { identifier: "-2".into(), spim };
         stdin.write_all(&framed_request(&start)?)?;
         stdin.flush()?;
@@ -224,25 +236,49 @@ pub fn provision_with_worker(
         };
         let mut extra = [0u8; 1];
         if stdout.read(&mut extra)? != 0 { return Err(invalid("worker trailing output")); }
-        let status = child.wait()?;
-        // Stop the watchdog as soon as the child is reaped to minimize any
-        // chance of a signal reaching a subsequently recycled PID.
-        finished.store(true, Ordering::Release);
-        if !status.success() { return Err(transport()); }
         Ok(adi_pb)
     })();
-    if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        finished.store(true, Ordering::Release);
-    }
-    let _ = watchdog.join();
+    if result.is_err() { abort.store(true, Ordering::Release); }
+    drop(stdin);
+    drop(stdout);
+    let (status, timed_out) = supervisor.join().map_err(|_| transport())??;
+    if timed_out { return Err(io::Error::new(io::ErrorKind::TimedOut, "native worker deadline exceeded")); }
+    if !status.success() { return Err(transport()); }
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_reaps_hung_child_without_raw_pid_signals() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 10"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let started = Instant::now();
+        let abort = Arc::new(AtomicBool::new(false));
+        let worker = supervise_child(child, Duration::from_millis(120), abort);
+        let (status, timed_out) = worker.join().unwrap().unwrap();
+        assert!(timed_out);
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_preserves_successful_exit() {
+        let child = Command::new("/bin/sh").args(["-c", "exit 0"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let worker = supervise_child(child, Duration::from_secs(2),
+            Arc::new(AtomicBool::new(false)));
+        let (status, timed_out) = worker.join().unwrap().unwrap();
+        assert!(status.success());
+        assert!(!timed_out);
+    }
+
     #[test]
     fn endpoint_allowlist_is_strict() {
         for good in [
