@@ -67,7 +67,6 @@ pub fn execute_offline_worker(
     });
     let deadline = Instant::now() + timeout;
     let mut result = None;
-    let mut child_exited = false;
     let mut wait_failed = false;
     while Instant::now() < deadline {
         match receiver.try_recv() {
@@ -77,7 +76,6 @@ pub fn execute_offline_worker(
         }
         match child.try_wait() {
             Ok(Some(_)) => {
-                child_exited = true;
                 // A just-exited child may have written a complete reply.
                 // Any inherited stdout held open elsewhere must not extend the deadline.
                 result = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok();
@@ -103,7 +101,7 @@ pub fn execute_offline_worker(
     // the worker deadline. Detached threads own their handles and eventually
     // exit on EOF / broken pipe, but cannot hold this request open.
     // A future production worker must use a supervised process group.
-    if timed_out || (result.is_none() && !child_exited && Instant::now() >= deadline) {
+    if timed_out || (result.is_none() && Instant::now() >= deadline) {
         return Err(WorkerError::Timeout);
     }
     if wait_failed { return Err(WorkerError::Transport); }
