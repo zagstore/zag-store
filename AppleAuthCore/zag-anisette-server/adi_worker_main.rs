@@ -223,6 +223,22 @@ type NativeDestroy = Box<dyn FnMut(u32) -> io::Result<()>>;
 #[cfg(test)]
 type OwnedNativeHandle = NativeSessionHandle<NativeDestroy>;
 
+/// Lossless lowercase hex wire representation for opaque native bytes.
+/// Maximum size is bounded before encoding to stay within the 64KiB frame.
+#[cfg(test)]
+fn encode_native_bytes(bytes: &[u8]) -> io::Result<String> {
+    if bytes.is_empty() || bytes.len() > (MAX_MESSAGE_BYTES - 128) / 2 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid native material size"));
+    }
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}")
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encoding failed"))?;
+    }
+    Ok(encoded)
+}
+
 /// The subset of SideStore ADIProxy's native interface needed for a session.
 /// Network lookup, TLS, and Apple HTTP requests are intentionally excluded.
 #[cfg(test)]
@@ -249,20 +265,15 @@ impl<P: AdiProxyNativeCalls> NativeAdiEngine for SideStoreNativeBridge<P> {
         let ds_id = identifier.parse::<i64>()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid ds_id"))?;
         let (handle, cpim) = self.proxy.start_provisioning(ds_id, spim.as_bytes())?;
-        let cpim = String::from_utf8(cpim)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid native CPIM encoding"))?;
+        let cpim = encode_native_bytes(&cpim)?;
         Ok((handle, cpim))
     }
     fn finish_native(&mut self, handle: u32, ptm: &str, tk: &str) -> io::Result<String> {
         self.proxy.end_provisioning(handle, ptm.as_bytes(), tk.as_bytes())?;
-        // Export is a distinct platform operation: end_provisioning returns ().
-        // The IPC currently carries a String, so reject non-text state rather
-        // than silently corrupt or fabricate binary ADI data.
-        let bytes = self.proxy.export_adi_pb()?;
-        let material = String::from_utf8(bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "binary ADI material requires encoding"))?;
-        validate_material(&material)?;
-        Ok(material)
+        // Export is distinct from native Finish and must preserve arbitrary bytes.
+        // This bridge's hex representation is test-only; production must agree
+        // on a versioned encoding with the supervisor before activation.
+        encode_native_bytes(&self.proxy.export_adi_pb()?)
     }
     fn destroy_native(&mut self, handle: u32) -> io::Result<()> {
         self.proxy.destroy_provisioning_session(handle)
