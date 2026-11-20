@@ -110,6 +110,10 @@ fn framed_response<R: Read>(reader: &mut R, request: &Request) -> io::Result<Res
     wire::decode_response(&bytes, request).map_err(|_| invalid("invalid worker response"))
 }
 
+pub(crate) fn validate_identity(device_id: &str, client_info: &str, local_user: &str, serial: &str) -> io::Result<()> {
+    AppleHttp::new(device_id, client_info, local_user, serial).map(|_| ())
+}
+
 struct AppleHttp {
     agent: ureq::Agent,
     device_id: String,
