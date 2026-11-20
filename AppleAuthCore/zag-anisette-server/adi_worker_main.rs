@@ -1,5 +1,9 @@
 //! Standalone offline ADI worker skeleton. No native ADI library is loaded.
+#[cfg(test)]
+mod adi_worker_wire_v2;
 //! One bounded framed request in, one generic unavailable response out.
+#[cfg(test)]
+mod adi_worker_wire_v2;
 use std::io::{self, Read, Write};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
