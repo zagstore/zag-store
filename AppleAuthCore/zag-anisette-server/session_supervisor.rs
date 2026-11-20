@@ -7,7 +7,7 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{mpsc, atomic::{AtomicBool, Ordering}},
     thread,
     time::{Duration, Instant},
 };
@@ -15,7 +15,7 @@ use std::{
 use std::os::unix::process::CommandExt;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum SessionError { InvalidTimeout, Spawn, Transport, Timeout, InvalidResponse, NonZeroExit }
+pub enum SessionError { InvalidTimeout, Spawn, Transport, Timeout, Cancelled, InvalidResponse, NonZeroExit }
 
 #[cfg(unix)]
 unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
@@ -30,8 +30,16 @@ fn remaining(deadline: Instant) -> Result<Duration, SessionError> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() { Err(SessionError::Timeout) } else { Ok(left) }
 }
-fn receive<T>(rx: &mpsc::Receiver<T>, deadline: Instant) -> Result<T, SessionError> {
-    rx.recv_timeout(remaining(deadline)?).map_err(|_| SessionError::Timeout)
+fn receive<T>(rx: &mpsc::Receiver<T>, deadline: Instant, cancel: &AtomicBool) -> Result<T, SessionError> {
+    loop {
+        if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
+        let wait = remaining(deadline)?.min(Duration::from_millis(20));
+        match rx.recv_timeout(wait) {
+            Ok(value) => return Ok(value),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(SessionError::Transport),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 /// Reuse the canonical worker protocol rather than a second permissive schema.
@@ -62,6 +70,20 @@ pub fn run_mock_session(
     finish: &str,
     timeout: Duration,
 ) -> Result<(serde_json::Value, serde_json::Value), SessionError> {
+    let cancel = AtomicBool::new(false);
+    run_mock_session_cancellable(executable, args, start, finish, timeout, &cancel)
+}
+
+/// Test-only cancellation signal, checked during every IPC wait and child exit.
+pub fn run_mock_session_cancellable(
+    executable: &Path,
+    args: &[&str],
+    start: &str,
+    finish: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<(serde_json::Value, serde_json::Value), SessionError> {
+    if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
     if timeout.is_zero() || timeout > Duration::from_secs(10) {
         return Err(SessionError::InvalidTimeout);
     }
@@ -133,8 +155,8 @@ pub fn run_mock_session(
     });
     let result = (|| {
         command_tx.send(start_frame).map_err(|_| SessionError::Transport)?;
-        if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
-        let started = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
+        if !receive(&write_rx, deadline, cancel)? { return Err(SessionError::Transport); }
+        let started = receive(&read_rx, deadline, cancel)?.ok_or(SessionError::InvalidResponse)?;
         let started_bytes = serde_json::to_vec(&started).map_err(|_| SessionError::InvalidResponse)?;
         if !matches!(crate::adi_worker_protocol::decode_response(&started_bytes, &start_request),
             Ok(crate::adi_worker_protocol::WorkerResponse::Started { .. })) {
@@ -144,9 +166,9 @@ pub fn run_mock_session(
             return Err(SessionError::InvalidResponse);
         }
         command_tx.send(finish_frame).map_err(|_| SessionError::Transport)?;
-        if !receive(&write_rx, deadline)? { return Err(SessionError::Transport); }
+        if !receive(&write_rx, deadline, cancel)? { return Err(SessionError::Transport); }
         drop(command_tx);
-        let finished = receive(&read_rx, deadline)?.ok_or(SessionError::InvalidResponse)?;
+        let finished = receive(&read_rx, deadline, cancel)?.ok_or(SessionError::InvalidResponse)?;
         let finished_bytes = serde_json::to_vec(&finished).map_err(|_| SessionError::InvalidResponse)?;
         if !matches!(crate::adi_worker_protocol::decode_response(&finished_bytes, &finish_request),
             Ok(crate::adi_worker_protocol::WorkerResponse::Finished { .. })) {
@@ -156,8 +178,9 @@ pub fn run_mock_session(
             return Err(SessionError::InvalidResponse);
         }
         // EOF is required after the terminal response; reject extra output.
-        if receive(&read_rx, deadline)?.is_some() { return Err(SessionError::InvalidResponse); }
+        if receive(&read_rx, deadline, cancel)?.is_some() { return Err(SessionError::InvalidResponse); }
         while Instant::now() < deadline {
+            if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok((started, finished)),
                 Ok(Some(_)) => return Err(SessionError::NonZeroExit),
@@ -265,6 +288,23 @@ mod tests {
         let result = run_mock_session(std::fs::canonicalize("/bin/sh").unwrap().as_path(), &["-c", "read a; sleep 5"],
             "{\"version\":1,\"type\":\"start\",\"identifier\":\"mock\",\"spim\":\"mock\"}", "{\"version\":1,\"type\":\"finish\",\"ptm\":\"mock\",\"tk\":\"mock\"}", Duration::from_millis(100));
         assert_eq!(result, Err(SessionError::Timeout));
+    }
+    #[test]
+    fn cancellation_during_blocked_start_terminates_session() {
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let signal = std::sync::Arc::clone(&cancel);
+        let notifier = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            signal.store(true, Ordering::Release);
+        });
+        let result = run_mock_session_cancellable(
+            std::fs::canonicalize("/bin/sh").unwrap().as_path(),
+            &["-c", "sleep 5"],
+            r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+            r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+            Duration::from_secs(2), &cancel);
+        notifier.join().unwrap();
+        assert_eq!(result, Err(SessionError::Cancelled));
     }
     #[test]
     fn stalled_finish_phase_times_out() {
