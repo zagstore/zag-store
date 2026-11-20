@@ -155,6 +155,29 @@ mod v2_boundary_tests {
     }
 
     #[test]
+    fn v2_wrong_phase_reply_from_child_is_rejected() {
+        use std::io::Write;
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!("zag-v2-phase-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("v2-phase-fixture");
+        assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        let mut child = Command::new(std::fs::canonicalize(&executable).unwrap())
+            .arg("--v2-wrong-phase").env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
+        let mut frame = Vec::new();
+        crate::adi_worker_framing::write_frame(&mut frame, &crate::adi_worker_wire_v2::encode_request(&start).unwrap()).unwrap();
+        child.stdin.take().unwrap().write_all(&frame).unwrap();
+        let reply = crate::adi_worker_framing::read_frame(&mut child.stdout.take().unwrap()).unwrap();
+        assert!(crate::adi_worker_wire_v2::decode_response(&reply, &start).is_err());
+        assert!(child.wait().unwrap().success());
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+    }
+
+    #[test]
     fn stalled_v2_child_is_killed_and_reaped_at_deadline() {
         use std::io::Write;
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
