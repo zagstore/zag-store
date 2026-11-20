@@ -246,7 +246,11 @@ fn offline_socket_enabled() -> bool {
     std::env::var("ZAG_ANISETTE_OFFLINE_WS_TEST").ok().as_deref() == Some("1")
 }
 
-fn handle(mut stream: TcpStream) -> std::io::Result<()> {
+fn handle(stream: TcpStream) -> std::io::Result<()> {
+    handle_with_offline_mode(stream, offline_socket_enabled())
+}
+
+fn handle_with_offline_mode(mut stream: TcpStream, offline_mode: bool) -> std::io::Result<()> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let mut buf = vec![0u8; MAX_HEADER];
@@ -276,7 +280,7 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
     // HTTP parser are replayed to Tungstenite, including any coalesced data.
     // The only backend available here is OfflineBackend, which cannot
     // generate provisioning credentials.
-    if offline_socket_enabled() && response.status == "503 Service Unavailable" {
+    if offline_mode && response.status == "503 Service Unavailable" {
         if let Some(i) = end {
             if let Ok(head) = parse(&buf[..i]) {
                 if head.path == "/v3/provisioning_session"
@@ -574,5 +578,56 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         panic!("capacity was not released");
+    }
+}
+
+#[cfg(test)]
+mod offline_http_websocket_integration {
+    use super::*;
+    use tungstenite::Message;
+
+    #[test]
+    fn http_listener_hands_off_websocket_with_buffered_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_with_offline_mode(stream, true)
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (mut ws, response) = tungstenite::client(
+            format!("ws://{address}/v3/provisioning_session"), stream
+        ).unwrap();
+        assert_eq!(response.status().as_u16(), 101);
+        let first: serde_json::Value =
+            serde_json::from_str(&ws.read().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(first["result"], "GiveIdentifier");
+        ws.send(Message::Text(r#"{"identifier":"offline-test"}"#.into())).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&ws.read().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(second["result"], "GiveStartProvisioningData");
+        ws.send(Message::Text(r#"{"spim":"offline-test"}"#.into())).unwrap();
+        let third: serde_json::Value =
+            serde_json::from_str(&ws.read().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(third["result"], "StartProvisioningError");
+        assert_eq!(third["message"], "backend_not_enabled");
+        assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn disabled_mode_refuses_upgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_with_offline_mode(stream, false)
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        let result = tungstenite::client(
+            format!("ws://{address}/v3/provisioning_session"), stream
+        );
+        assert!(result.is_err());
+        assert!(worker.join().unwrap().is_ok());
     }
 }
