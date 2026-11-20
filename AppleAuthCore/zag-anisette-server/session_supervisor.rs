@@ -300,6 +300,34 @@ mod tests {
         assert!(valid_phase_reply(&serde_json::json!({"type":"started","version":1,"cpim":"mock"}), "started"));
     }
     #[test]
+    fn standalone_rust_fixture_rejects_incorrect_phase_before_launch() {
+        let executable = std::fs::canonicalize("/bin/sh").unwrap();
+        let start = r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#;
+        let finish = r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#;
+        for (first, second) in [(finish, start), (start, start), (finish, finish)] {
+            assert_eq!(
+                run_mock_session(&executable, &["-c", "exit 99"], first, second,
+                    Duration::from_secs(1)),
+                Err(SessionError::InvalidResponse),
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_cancellation_before_spawn_never_runs_fixture() {
+        let executable = std::fs::canonicalize("/bin/sh").unwrap();
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            run_mock_session_cancellable(
+                &executable, &["-c", "exit 99"],
+                r#"{"version":1,"type":"start","identifier":"mock","spim":"mock"}"#,
+                r#"{"version":1,"type":"finish","ptm":"mock","tk":"mock"}"#,
+                Duration::from_secs(1), &cancelled,
+            ),
+            Err(SessionError::Cancelled),
+        );
+    }
+    #[test]
     fn standalone_rust_fixture_completes_supervised_two_phase_session() {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/session_worker_fixture.rs");
