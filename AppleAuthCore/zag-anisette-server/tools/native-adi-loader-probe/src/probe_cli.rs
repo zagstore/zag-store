@@ -85,7 +85,18 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     let _binary = args.next();
     let Some(mode) = args.next() else { return Ok(false); };
     if mode != OsStr::new("--provision-supervised")
-        && mode != OsStr::new("--coordinator-process") { return Ok(false); }
+        && mode != OsStr::new("--coordinator-process")
+        && mode != OsStr::new("--validate-identity") { return Ok(false); }
+    if mode == OsStr::new("--validate-identity") {
+        if args.next().is_some() { return Err(invalid("unexpected identity validation arguments").into()); }
+        let identity = read_identity(io::stdin().lock())?;
+        provisioning_client::validate_identity(
+            &identity.device_id, &identity.client_info,
+            &identity.local_user, &identity.serial,
+        )?;
+        println!("PASS: identity input validated offline");
+        return Ok(true);
+    }
 
     let (runtime, state) = paths(args)?;
     if mode == OsStr::new("--provision-supervised") {
