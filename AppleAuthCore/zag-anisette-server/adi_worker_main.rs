@@ -113,6 +113,52 @@ impl<B: NativeAdiBackend> NativeSession<B> {
     }
 }
 
+/// Read one bounded frame without requiring EOF, for a future long-lived
+/// session worker. This is deliberately separate from the one-shot parser.
+fn read_session_request<R: Read>(reader: &mut R) -> io::Result<Option<NativeRequest>> {
+    let mut header = [0u8; 4];
+    let first = reader.read(&mut header[..1])?;
+    if first == 0 { return Ok(None); }
+    reader.read_exact(&mut header[1..])?;
+    let len = u32::from_be_bytes(header) as usize;
+    if len == 0 || len > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid frame length"));
+    }
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    // Reuse the strict v1 field allowlist from the one-shot parser without
+    // exposing any provisioning data in errors.
+    let mut framed = Vec::with_capacity(4 + len);
+    framed.extend_from_slice(&header);
+    framed.extend_from_slice(&payload);
+    let validated = read_request(&mut framed.as_slice())?;
+    parse_request(&validated).map(Some)
+}
+
+fn write_unavailable<W: Write>(output: &mut W) -> io::Result<()> {
+    output.write_all(&(ERROR_RESPONSE.len() as u32).to_be_bytes())?;
+    output.write_all(ERROR_RESPONSE)?;
+    output.flush()
+}
+
+/// Offline-only two-phase worker loop. The disabled backend terminates after
+/// Start with a generic error; it never emits mock CPIM or adi.pb.
+fn run_session<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
+    let mut session = NativeSession::new(DisabledNativeAdiBackend);
+    let first = read_session_request(input)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "missing Start")
+    })?;
+    if !matches!(first, NativeRequest::Start { .. }) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Start required"));
+    }
+    if session.execute(first).is_err() {
+        return write_unavailable(output);
+    }
+    // Future native backends must emit Started before waiting for Finish,
+    // and return Finished only after the native session is destroyed.
+    Err(io::Error::new(io::ErrorKind::Unsupported, "native session disabled"))
+}
+
 fn run<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
     let request = read_request(input)?;
     // Parse into a typed request before invoking a future native backend.
@@ -166,6 +212,22 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, frame(ERROR_RESPONSE));
+    }
+    #[test]
+    fn session_mode_is_fail_closed_without_native_provider() {
+        let start = frame(br#"{"version":1,"type":"start","identifier":"id","spim":"spim"}"#);
+        let mut output = Vec::new();
+        assert!(run_session(&mut start.as_slice(), &mut output).is_ok());
+        assert_eq!(output, frame(ERROR_RESPONSE));
+        for invalid in [
+            frame(br#"{"version":1,"type":"finish","ptm":"p","tk":"t"}"#),
+            frame(br#"{"version":2,"type":"start","identifier":"id","spim":"s"}"#),
+            (65537u32).to_be_bytes().to_vec(),
+        ] {
+            let mut output = Vec::new();
+            assert!(run_session(&mut invalid.as_slice(), &mut output).is_err());
+            assert!(output.is_empty());
+        }
     }
     #[test]
     fn native_session_enforces_phase_order_and_terminal_failure() {
