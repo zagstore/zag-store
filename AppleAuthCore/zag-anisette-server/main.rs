@@ -9,6 +9,7 @@
 //! `/v3/provisioning_session` (reached as `wss://`). Every 503 makes that
 //! client stop: `error_for_status` fails, and a non-101 upgrade fails.
 mod provisioning;
+mod websocket_transport;
 
 use std::{
     io::{Read, Write},
