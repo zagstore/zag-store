@@ -340,6 +340,39 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn framed_worker_roundtrip_and_trailing_output_rejection() {
+        let dir = std::env::temp_dir().join(format!(
+            "zag-adi-roundtrip-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        let reply = r#"{"version":1,"type":"started","cpim":"ok"}"#;
+        assert_eq!(reply.len(), 42);
+        for trailing in [false, true] {
+            let body = format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf '\\000\\000\\000\\052%s' '{}'\n{}\n",
+                reply,
+                if trailing { "printf x" } else { ":" }
+            );
+            std::fs::write(&script, body).unwrap();
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&script, permissions).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            let result = execute_offline_worker(
+                &script, &script, &request(), Duration::from_secs(2)
+            );
+            if trailing {
+                assert_eq!(result, Err(WorkerError::Transport));
+            } else {
+                assert!(matches!(result, Ok(WorkerResponse::Started { .. })), "{result:?}");
+            }
+        }
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
     fn nonzero_worker_cannot_produce_success() {
         let path = Path::new("/usr/bin/false").canonicalize().unwrap();
         let result = execute_offline_worker(&path, &path, &request(), Duration::from_secs(1));
