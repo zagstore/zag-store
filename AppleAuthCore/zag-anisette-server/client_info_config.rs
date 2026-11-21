@@ -4,7 +4,7 @@ use std::{fs, io::{self, Read}, path::Path};
 
 pub(crate) fn read_config(path: &Path) -> io::Result<String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, OpenOptionsExt};
-    let mut file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0 || metadata.len() > 2048 {
