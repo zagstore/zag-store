@@ -2,16 +2,19 @@
 //! the entire Apple exchange; the internal mode is never a production service.
 //! Identity JSON is read only from stdin, never from arguments or environment.
 use crate::{process_watchdog, provisioning_client};
+#[path = "../../../client_info_config.rs"]
+mod client_info_config;
 use std::ffi::OsStr;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const CHILD_MARKER: &str = "ZAG_ADI_WATCHDOG_CHILD";
 
+#[derive(serde::Serialize)]
 struct TestIdentity {
     device_id: String,
     client_info: String,
@@ -52,6 +55,22 @@ fn read_identity<R: Read>(input: R) -> io::Result<TestIdentity> {
 // Client-generated identity: UUID is the exact 16-byte keychain identifier;
 // MD-LU is the SHA-256 digest of those bytes (not of the UUID text).
 // This check is opt-in: other legitimate identity providers may differ.
+// The HTTP service and supervised launcher use exactly the same private
+// configuration parser. Never synthesize or silently override an identity.
+fn apply_configured_metadata(identity: &mut TestIdentity) -> io::Result<()> {
+    let Some(path) = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE") else {
+        return Ok(());
+    };
+    let metadata = client_info_config::read_config(Path::new(&path))?;
+    let value: serde_json::Value = serde_json::from_str(&metadata)?;
+    let configured = value["client_info"].as_str().ok_or_else(|| invalid("invalid configured client info"))?;
+    if !identity.client_info.is_empty() && identity.client_info != configured {
+        return Err(invalid("identity and configured client info disagree"));
+    }
+    identity.client_info = configured.to_owned();
+    Ok(())
+}
+
 fn validate_client_derived_identity(identity: &TestIdentity) -> io::Result<()> {
     provisioning_client::validate_identity(
         &identity.device_id, &identity.client_info,
@@ -128,7 +147,8 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         && mode != OsStr::new("--client-coordinator-process") { return Ok(false); }
     if mode == OsStr::new("--validate-identity") || mode == OsStr::new("--validate-client-identity") {
         if args.next().is_some() { return Err(invalid("unexpected identity validation arguments").into()); }
-        let identity = read_identity(io::stdin().lock())?;
+        let mut identity = read_identity(io::stdin().lock())?;
+        apply_configured_metadata(&mut identity)?;
         if mode == OsStr::new("--validate-client-identity") {
             validate_client_derived_identity(&identity)?;
             println!("PASS: client-derived identity validated offline");
@@ -145,6 +165,14 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     let (runtime, state) = paths(args)?;
     if mode == OsStr::new("--provision-supervised") || mode == OsStr::new("--provision-client-supervised") {
         let binary = std::env::current_exe()?.canonicalize()?;
+        let mut identity = read_identity(io::stdin().lock())?;
+        apply_configured_metadata(&mut identity)?;
+        if mode == OsStr::new("--provision-client-supervised") {
+            validate_client_derived_identity(&identity)?;
+        } else {
+            provisioning_client::validate_identity(&identity.device_id, &identity.client_info, &identity.local_user, &identity.serial)?;
+        }
+        let identity_bytes = serde_json::to_vec(&identity).map_err(|_| invalid("invalid identity encoding"))?;
         let mut cmd = Command::new(binary);
         cmd.arg(if mode == OsStr::new("--provision-client-supervised") {
                 "--client-coordinator-process"
@@ -154,10 +182,21 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
             .arg(&runtime).arg(&state)
             .env_clear().env(CHILD_MARKER, "1")
             .current_dir("/")
-            .stdin(Stdio::inherit())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let status = process_watchdog::run_bounded(&mut cmd, process_watchdog::HARD_DEADLINE)?;
+        // The coordinator receives validated identity only through a private pipe.
+        // Its environment remains cleared and no metadata enters argv.
+        let mut child = cmd.spawn()?;
+        let mut pipe = child.stdin.take().ok_or_else(|| invalid("missing coordinator stdin"))?;
+        let write_result = pipe.write_all(&identity_bytes);
+        drop(pipe);
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+        let status = process_watchdog::wait_bounded(child, process_watchdog::HARD_DEADLINE)?;
         if !status.success() {
             return Err(invalid("isolated coordinator failed (check that complete identity JSON was supplied on stdin)").into());
         }
