@@ -1,16 +1,17 @@
 //! Operator-configured client metadata; never inferred or fabricated.
 //! Only a private, regular JSON file owned by the current process may enable it.
-use std::{fs, io, path::Path};
+use std::{fs, io::{self, Read}, path::Path};
 
 pub(crate) fn read_config(path: &Path) -> io::Result<String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, OpenOptionsExt};
-    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let mut file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0 || metadata.len() > 2048 {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe client-info file"));
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::new();
+    file.take(2049).read_to_end(&mut bytes)?;
     if bytes.len() > 2048 { return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized metadata")); }
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     let object = value.as_object().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object required"))?;
