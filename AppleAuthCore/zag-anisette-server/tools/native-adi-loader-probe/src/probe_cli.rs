@@ -123,7 +123,9 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     if mode != OsStr::new("--provision-supervised")
         && mode != OsStr::new("--coordinator-process")
         && mode != OsStr::new("--validate-identity")
-        && mode != OsStr::new("--validate-client-identity") { return Ok(false); }
+        && mode != OsStr::new("--validate-client-identity")
+        && mode != OsStr::new("--provision-client-supervised")
+        && mode != OsStr::new("--client-coordinator-process") { return Ok(false); }
     if mode == OsStr::new("--validate-identity") || mode == OsStr::new("--validate-client-identity") {
         if args.next().is_some() { return Err(invalid("unexpected identity validation arguments").into()); }
         let identity = read_identity(io::stdin().lock())?;
@@ -141,10 +143,14 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     }
 
     let (runtime, state) = paths(args)?;
-    if mode == OsStr::new("--provision-supervised") {
+    if mode == OsStr::new("--provision-supervised") || mode == OsStr::new("--provision-client-supervised") {
         let binary = std::env::current_exe()?.canonicalize()?;
         let mut cmd = Command::new(binary);
-        cmd.arg("--coordinator-process")
+        cmd.arg(if mode == OsStr::new("--provision-client-supervised") {
+                "--client-coordinator-process"
+            } else {
+                "--coordinator-process"
+            })
             .arg(runtime).arg(state)
             .env_clear().env(CHILD_MARKER, "1")
             .current_dir("/")
@@ -163,6 +169,9 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         // No Apple request is made until a complete, valid operator-supplied
         // identity has been parsed. Never echo the identity or ADI material.
         let identity = read_identity(io::stdin().lock())?;
+        if mode == OsStr::new("--client-coordinator-process") {
+            validate_client_derived_identity(&identity)?;
+        }
         let worker = std::env::current_exe()?.canonicalize()?;
         let _adi = provisioning_client::provision_with_worker(
             &worker, &runtime, &state,
