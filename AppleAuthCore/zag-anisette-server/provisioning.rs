@@ -283,6 +283,50 @@ pub fn process_text_frame<B: ProvisioningBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Default)]
+    struct MockNativeTransport {
+        counts: std::sync::Arc<std::sync::Mutex<(usize, usize, usize)>>,
+        fail_start: bool,
+    }
+    impl NativeSessionTransport for MockNativeTransport {
+        fn start(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+            self.counts.lock().unwrap().0 += 1;
+            if self.fail_start { Err(ProtocolError::BackendUnavailable) }
+            else { Ok("offline-cpim".into()) }
+        }
+        fn finish(&mut self, _: &str, _: &str) -> Result<String, ProtocolError> {
+            self.counts.lock().unwrap().1 += 1;
+            Ok("offline-adi".into())
+        }
+        fn abort(&mut self) { self.counts.lock().unwrap().2 += 1; }
+    }
+    #[test]
+    fn session_owned_provider_preserves_transport_and_rejects_replay() {
+        let counts = std::sync::Arc::new(std::sync::Mutex::new((0, 0, 0)));
+        let transport = MockNativeTransport { counts: counts.clone(), fail_start: false };
+        let mut provider = SessionOwnedAdiProvider::new(transport);
+        assert_eq!(provider.finish_provisioning("ptm", "tk"), Err(ProtocolError::InvalidTransition));
+        assert_eq!(provider.start_provisioning("id", "spim"), Ok("offline-cpim".into()));
+        assert_eq!(provider.start_provisioning("id", "spim"), Err(ProtocolError::InvalidTransition));
+        assert_eq!(provider.finish_provisioning("ptm", "tk"), Ok("offline-adi".into()));
+        assert_eq!(provider.finish_provisioning("ptm", "tk"), Err(ProtocolError::InvalidTransition));
+        drop(provider);
+        assert_eq!(*counts.lock().unwrap(), (1, 1, 1));
+    }
+    #[test]
+    fn session_owned_provider_start_failure_is_terminal_and_aborted() {
+        let counts = std::sync::Arc::new(std::sync::Mutex::new((0, 0, 0)));
+        let transport = MockNativeTransport { counts: counts.clone(), fail_start: true };
+        let mut provider = SessionOwnedAdiProvider::new(transport);
+        assert_eq!(provider.start_provisioning("id", "spim"), Err(ProtocolError::BackendUnavailable));
+        assert_eq!(provider.start_provisioning("id", "spim"), Err(ProtocolError::InvalidTransition));
+        assert_eq!(provider.finish_provisioning("ptm", "tk"), Err(ProtocolError::InvalidTransition));
+        drop(provider);
+        let result = *counts.lock().unwrap();
+        assert_eq!((result.0, result.1), (1, 0));
+        assert!(result.2 >= 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn offline_worker_adapter_completes_both_provisioning_phases() {
