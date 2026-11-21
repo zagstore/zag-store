@@ -334,7 +334,7 @@ mod v2_boundary_tests {
 /// between Start and Finish. This is deliberately test-gated: caller-selected
 /// executables and Apple native libraries are not enabled in release builds.
 #[cfg(test)]
-struct SplitV2Session {
+pub(crate) struct SplitV2Session {
     child: std::process::Child,
     commands: Option<mpsc::Sender<Vec<u8>>>,
     writes: mpsc::Receiver<bool>,
@@ -344,7 +344,7 @@ struct SplitV2Session {
 }
 #[cfg(test)]
 impl SplitV2Session {
-    fn spawn(executable: &Path, args: &[&str], timeout: Duration) -> Result<Self, SessionError> {
+    pub(crate) fn spawn(executable: &Path, args: &[&str], timeout: Duration) -> Result<Self, SessionError> {
         if timeout.is_zero() || timeout > Duration::from_secs(10) { return Err(SessionError::InvalidTimeout); }
         crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
             .map_err(|_| SessionError::Spawn)?;
@@ -383,7 +383,7 @@ impl SplitV2Session {
         Ok(Self { child, commands: Some(command_tx), writes: write_rx,
             replies: read_rx, deadline: Instant::now() + timeout, phase: 0 })
     }
-    fn exchange(&mut self, request: &crate::adi_worker_wire_v2::Request,
+    pub(crate) fn exchange(&mut self, request: &crate::adi_worker_wire_v2::Request,
         cancel: &AtomicBool) -> Result<crate::adi_worker_wire_v2::Response, SessionError> {
         use crate::adi_worker_wire_v2::{decode_response, encode_request, Request, Response};
         if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
