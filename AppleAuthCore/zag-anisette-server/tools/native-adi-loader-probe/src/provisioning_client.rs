@@ -227,13 +227,36 @@ fn client_headers(client_info: &str, user_agent: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+/// Apple Root CA (SHA-256 B0B1730E…F024): the file the Zag Store client
+/// pins in GrandSlam::build_reqwest_client. gsa.apple.com and gsas.apple.com
+/// chain to it, and it is not in the Mozilla roots ureq bundles, which is
+/// why lookups failed with UnknownIssuer.
+const APPLE_ROOT: &[u8] = include_bytes!("../../../../zag-isideload/src/assets/apple_root.cer");
+
+/// The only trust anchor for Apple requests. The endpoint allow-list
+/// admits only these two Apple hosts, so no other root is needed; neither
+/// the host's certificate store nor bundled roots are consulted. Hostname
+/// and chain verification are rustls's defaults.
+fn apple_roots() -> io::Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(APPLE_ROOT))
+        .map_err(|_| invalid("embedded Apple Root CA is invalid"))?;
+    Ok(roots)
+}
+
+fn agent() -> io::Result<ureq::Agent> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions().map_err(|_| invalid("TLS configuration failed"))?
+        .with_root_certificates(apple_roots()?)
+        .with_no_client_auth();
+    Ok(ureq::AgentBuilder::new()
+        .tls_config(std::sync::Arc::new(tls))
         .timeout_connect(Duration::from_secs(8))
         .timeout_read(Duration::from_secs(12))
         .timeout_write(Duration::from_secs(12))
         .redirects(0)
-        .build()
+        .build())
 }
 
 /// Names a transport failure without its message text: DNS, TLS (with
@@ -277,7 +300,7 @@ impl AppleHttp {
     /// device identity, so it cannot send one.
     pub(crate) fn lookup_only(client_info: &str, user_agent: &str) -> io::Result<Self> {
         client_headers(client_info, user_agent)?;
-        Ok(Self { agent: agent(), client_info: client_info.to_owned(), user_agent: user_agent.to_owned(), device: None })
+        Ok(Self { agent: agent()?, client_info: client_info.to_owned(), user_agent: user_agent.to_owned(), device: None })
     }
 
     pub(crate) fn new(identity: &ClientIdentity<'_>) -> io::Result<Self> {
@@ -298,7 +321,7 @@ impl AppleHttp {
             }
         }
         Ok(Self {
-            agent: agent(), client_info: client_info.to_owned(), user_agent: user_agent.to_owned(),
+            agent: agent()?, client_info: client_info.to_owned(), user_agent: user_agent.to_owned(),
             device: Some(DeviceHeaders {
                 device_id: device_id.to_owned(), local_user: local_user.to_owned(), serial: serial.map(str::to_owned),
             }),
@@ -597,6 +620,18 @@ mod tests {
         for agent in ["", "bad\r\nInjected", "bad\0agent", &"x".repeat(513)] {
             assert!(!ok(identity("device", "client", &user, None, agent)));
         }
+    }
+
+    #[test]
+    fn apple_requests_trust_exactly_the_pinned_apple_root() {
+        // The same certificate as the client's asset, Apple's published root.
+        assert_eq!(sha256_hex(APPLE_ROOT), "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024");
+        assert_eq!(apple_roots().unwrap().len(), 1);
+        assert!(agent().is_ok());
+        // A lookup-only client cannot be made to send device headers.
+        let apple = AppleHttp::lookup_only("<a> <b;c;d> <e/1 (f/1)>", "f/1").unwrap();
+        let error = apple.send(&validated_endpoint(LOOKUP).unwrap(), None, true, Instant::now() + Duration::from_secs(5));
+        assert_eq!(error.unwrap_err().to_string(), "lookup-only client has no device headers");
     }
 
     #[test]
