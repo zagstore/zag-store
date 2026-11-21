@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(session.receive(ClientMessage::Identifier("offline-id".into())),
             Ok(ServerMessage::GiveStartProvisioningData));
         assert_eq!(session.receive(ClientMessage::Spim("".into())),
-            Err(ProtocolError::InvalidField));
+            Err(ProtocolError::InvalidTransition));
         // Invalid input cannot advance to native Finish.
         assert_eq!(session.receive(ClientMessage::Finish {
             ptm: "ptm".into(), tk: "tk".into(),
