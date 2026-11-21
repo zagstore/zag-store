@@ -1,39 +1,31 @@
 use plist::Dictionary;
-use plist_macro::pretty_print_dictionary;
 use rootcause::prelude::*;
 use serde::de::DeserializeOwned;
 
+/// What an error report may say about a plist: its top-level key names.
+/// Zag Store fork: values (tokens, session data, provisioning material) are
+/// never kept, so no report can show them; upstream's `DEBUG_SENSITIVE`
+/// switch, which printed the whole plist, is removed.
 pub struct SensitivePlistAttachment {
-    pub plist: Dictionary,
+    keys: Vec<String>,
 }
 
 impl SensitivePlistAttachment {
     pub fn new(plist: Dictionary) -> Self {
-        SensitivePlistAttachment { plist }
+        let mut keys: Vec<String> = plist.keys().take(64).cloned().collect();
+        keys.sort();
+        SensitivePlistAttachment { keys }
     }
 
     pub fn from_text(text: &str) -> Self {
-        let dict: Result<Dictionary, _> = plist::from_bytes(text.as_bytes());
-        match dict {
-            Err(e) => {
-                error!(
-                    "Failed to parse plist text for sensitive attachment, returning empty plist: {:?}",
-                    e
-                );
-                return SensitivePlistAttachment::new(Dictionary::new());
-            }
+        match plist::from_bytes::<Dictionary>(text.as_bytes()) {
             Ok(d) => SensitivePlistAttachment::new(d),
+            Err(_) => SensitivePlistAttachment::new(Dictionary::new()),
         }
     }
 
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if std::env::var("DEBUG_SENSITIVE").is_ok() {
-            return writeln!(f, "{}", pretty_print_dictionary(&self.plist));
-        }
-        writeln!(
-            f,
-            "<Potentially sensitive data - set DEBUG_SENSITIVE env variable to see contents>"
-        )
+        writeln!(f, "<plist values withheld; keys: {}>", self.keys.join(", "))
     }
 }
 
@@ -47,6 +39,21 @@ impl std::fmt::Debug for SensitivePlistAttachment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.fmt(f)
     }
+}
+
+/// Decodes a JSON response body. Zag Store fork: a decoding error can quote
+/// the value it rejected (serde's "invalid type: string …"), so on failure
+/// the report says only what failed and how long the body was.
+pub fn decode_json<T: DeserializeOwned>(body: &str, what: &'static str) -> Result<T, Report> {
+    serde_json::from_str(body)
+        .map_err(|_| report!("Failed to decode {} ({} bytes withheld)", what, body.len()))
+}
+
+/// Parses a response body as a plist. Zag Store fork: on failure the report
+/// says how long the body was, never what it held.
+pub fn parse_response_plist(body: &str, what: &'static str) -> Result<Dictionary, Report> {
+    plist::from_bytes(body.as_bytes())
+        .map_err(|_| report!("Failed to parse {} plist ({} bytes withheld)", what, body.len()))
 }
 
 pub trait PlistDataExtract {
@@ -108,12 +115,10 @@ impl PlistDataExtract for Dictionary {
             report!("Plist missing dictionary for key '{}'", key)
                 .attach(SensitivePlistAttachment::new(self.clone()))
         })?;
-        let struct_data: T = plist::from_value(dict).map_err(|e| {
-            report!(
-                "Failed to deserialize plist struct for key '{}': {:?}",
-                key,
-                e
-            )
+        // Zag Store fork: the deserializer's error can quote the rejected
+        // value, so it is not reported.
+        let struct_data: T = plist::from_value(dict).map_err(|_| {
+            report!("Failed to deserialize plist struct for key '{}'", key)
             .attach(SensitivePlistAttachment::new(
                 dict.as_dictionary().cloned().unwrap_or_default(),
             ))
@@ -126,5 +131,60 @@ impl PlistDataExtract for Dictionary {
             report!("Plist missing boolean for key '{}'", key)
                 .attach(SensitivePlistAttachment::new(self.clone()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "SECRET-TOKEN-VALUE";
+
+    fn sensitive() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("GsIdmsToken".into(), plist::Value::String(SECRET.into()));
+        dict.insert("adsid".into(), plist::Value::String(SECRET.into()));
+        dict
+    }
+
+    #[test]
+    fn reports_name_keys_but_never_show_values() {
+        let report = sensitive().get_str("missing").unwrap_err();
+        for rendered in [format!("{report}"), format!("{report:?}")] {
+            assert!(!rendered.contains(SECRET), "{rendered}");
+            assert!(rendered.contains("GsIdmsToken"), "key names stay, for protocol changes");
+        }
+        let attachment = format!("{}", SensitivePlistAttachment::new(sensitive()));
+        assert!(!attachment.contains(SECRET));
+    }
+
+    #[test]
+    fn decoding_errors_do_not_quote_values() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Numbered {
+            id: u32,
+        }
+        // serde's own message would be: invalid type: string "SECRET…", expected u32
+        let body = format!(r#"{{"id":"{SECRET}"}}"#);
+        let report = decode_json::<Numbered>(&body, "test").unwrap_err();
+        assert!(!format!("{report:?}").contains(SECRET));
+        let mut dict = Dictionary::new();
+        let mut inner = Dictionary::new();
+        inner.insert("id".into(), plist::Value::String(SECRET.into()));
+        dict.insert("item".into(), plist::Value::Dictionary(inner));
+        let report = dict.get_struct::<Numbered>("item").unwrap_err();
+        let rendered = format!("{report:?}");
+        assert!(!rendered.contains(SECRET) && rendered.contains("id"), "{rendered}");
+    }
+
+    #[test]
+    fn unparseable_bodies_are_not_reported() {
+        let body = format!("<html>{SECRET}</html>");
+        let report = parse_response_plist(&body, "test").unwrap_err();
+        for rendered in [format!("{report}"), format!("{report:?}")] {
+            assert!(!rendered.contains(SECRET), "{rendered}");
+        }
+        assert!(parse_response_plist("<plist><dict/></plist>", "test").is_ok());
     }
 }

@@ -61,4 +61,10 @@ void zag_bridge_take_policy_decisions(void *context, zag_bridge_event_callback c
 int32_t zag_bridge_configure_time_window(int64_t not_before, int64_t not_after, int64_t max_skew);
 int32_t zag_bridge_time_gate_status(void);
 
+// Diagnostics (data-free): how many times, in this process, the anisette
+// device state was 0 loaded, 1 adopted from another session, 2 created (none
+// stored), 3 replaced because it was corrupted, 4 reset (-45061). Any other
+// kind returns 0. No identifier or provisioning material is involved.
+uint64_t zag_bridge_anisette_state_count(int32_t kind);
+
 #endif

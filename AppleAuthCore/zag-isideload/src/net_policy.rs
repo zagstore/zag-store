@@ -74,10 +74,21 @@ pub fn host_of(url: &str) -> Result<String, Report> {
     }
 }
 
-/// Adds the policy to an HTTP client: https only, no redirects, and the
-/// allowlist checked on every request.
+/// Longest wait to connect (TCP and TLS) to Apple or the anisette server.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Longest time for one whole request, response body included. Without it a
+/// stalled connection holds a sign-in (and its slot) forever.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The time limits every client gets.
+fn with_timeouts(builder: ClientBuilder, connect: std::time::Duration, request: std::time::Duration) -> ClientBuilder {
+    builder.connect_timeout(connect).timeout(request)
+}
+
+/// Adds the policy to an HTTP client: https only, no redirects, time limits,
+/// and the allowlist checked on every request.
 pub fn guarded_client(builder: ClientBuilder, allowed: Vec<String>) -> Result<ClientWithMiddleware, Report> {
-    let client = builder
+    let client = with_timeouts(builder, CONNECT_TIMEOUT, REQUEST_TIMEOUT)
         .https_only(true)
         .redirect(redirect::Policy::none())
         .build()?;
@@ -401,6 +412,36 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stalled_server_times_out() {
+        // Accepts and never answers (as a stalled Apple or anisette server):
+        // the request must end with a timeout, not wait forever.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let hold = std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            drop(held);
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = with_timeouts(reqwest::Client::builder(), std::time::Duration::from_millis(500), std::time::Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let error = client.get(format!("http://{address}/")).send().await.unwrap_err();
+        assert!(error.is_timeout(), "{error:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        hold.join().unwrap();
+    }
+
+    #[test]
+    fn every_client_has_time_limits() {
+        let source = include_str!("net_policy.rs");
+        let builder = &source[source.find("pub fn guarded_client").unwrap()..];
+        assert!(builder[..builder.find("\n}").unwrap()].contains("with_timeouts(builder, CONNECT_TIMEOUT, REQUEST_TIMEOUT)"));
+        assert!(CONNECT_TIMEOUT <= REQUEST_TIMEOUT && REQUEST_TIMEOUT.as_secs() <= 120);
     }
 
     #[test]

@@ -288,3 +288,20 @@ pub unsafe extern "C" fn zag_bridge_take_policy_decisions(context: *mut c_void, 
     let bytes = Zeroizing::new(serde_json::to_vec(&decisions).unwrap_or_else(|_| b"[]".to_vec()));
     callback(context, bytes.as_ptr(), bytes.len());
 }
+
+/// Diagnostics (data-free): how many times, in this process, the anisette
+/// device state was 0 loaded, 1 adopted from another session, 2 created,
+/// 3 replaced because it was corrupted, 4 reset (-45061). Other kinds: 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn zag_bridge_anisette_state_count(kind: i32) -> u64 {
+    use isideload::anisette::remote_v3::{StateChange, diagnostics};
+    let change = match kind {
+        0 => StateChange::Loaded,
+        1 => StateChange::Adopted,
+        2 => StateChange::Created,
+        3 => StateChange::ReplacedCorrupt,
+        4 => StateChange::Reset,
+        _ => return 0,
+    };
+    diagnostics::count(change)
+}

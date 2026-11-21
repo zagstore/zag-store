@@ -19,7 +19,6 @@ use reqwest::{
     ClientBuilder,
     header::{CONTENT_TYPE, HeaderMap, HeaderValue},
 };
-use rootcause::option_ext::OptionExt;
 use rootcause::prelude::*;
 use serde::Deserialize;
 
@@ -30,10 +29,87 @@ use crate::anisette::{
     remote_v3::{state::AnisetteState, websocket::WsMessage},
 };
 use crate::auth::grandslam::GrandSlam;
-use crate::util::plist::PlistDataExtract;
+use crate::util::plist::{PlistDataExtract, decode_json};
 use crate::util::storage::SideloadingStorage;
 
 pub const ANISETTE_STATE_KEY: &str = "anisette_state";
+
+#[cfg(test)]
+pub(crate) fn state_for_tests(keychain_identifier: [u8; 16], adi_pb: Option<Vec<u8>>) -> AnisetteState {
+    AnisetteState { keychain_identifier, adi_pb }
+}
+
+/// What happened to the stored device state. Data-free: no identifier or
+/// provisioning material is ever part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateChange {
+    /// The stored, provisioned state was used.
+    Loaded,
+    /// Another provider for the same scope had provisioned (or reset) it
+    /// meanwhile: its device was adopted instead of making another.
+    Adopted,
+    /// There was no stored state: a new device was made.
+    Created,
+    /// The stored state could not be parsed: it was replaced by a new device.
+    ReplacedCorrupt,
+    /// The anisette server reported the device as not provisioned (-45061):
+    /// a new device was made.
+    Reset,
+}
+
+/// Process-wide counts of `StateChange`s, for diagnostics.
+pub mod diagnostics {
+    use super::StateChange;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+    fn index(change: StateChange) -> usize {
+        match change {
+            StateChange::Loaded => 0,
+            StateChange::Adopted => 1,
+            StateChange::Created => 2,
+            StateChange::ReplacedCorrupt => 3,
+            StateChange::Reset => 4,
+        }
+    }
+
+    pub(super) fn record(change: StateChange) {
+        COUNTS[index(change)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many times `change` has happened in this process.
+    pub fn count(change: StateChange) -> u64 {
+        COUNTS[index(change)].load(Ordering::Relaxed)
+    }
+}
+
+/// One lock per state scope, shared by every provider in the process.
+mod coordination {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    type Lock = Arc<tokio::sync::Mutex<()>>;
+
+    fn locks() -> &'static Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>> {
+        static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+        LOCKS.get_or_init(Default::default)
+    }
+
+    /// The scope's lock; without a scope, a lock of its own. Entries no
+    /// provider holds any more are dropped, so the map stays small.
+    pub(super) fn lock(scope: Option<&str>) -> Lock {
+        let Some(scope) = scope else { return Lock::default() };
+        let mut locks = locks().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lock) = locks.get(scope).and_then(Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Lock::default();
+        locks.insert(scope.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+}
 
 pub struct RemoteV3AnisetteProvider {
     pub state: Option<AnisetteState>,
@@ -42,6 +118,13 @@ pub struct RemoteV3AnisetteProvider {
     serial_number: String,
     client: reqwest_middleware::ClientWithMiddleware,
     client_info_override: Option<AnisetteClientInfo>,
+    /// The account whose stored state this provider uses: providers with the
+    /// same scope provision one at a time (`coordination`). `None`: only this
+    /// provider's own calls are serialised.
+    state_scope: Option<String>,
+    /// Tests: replaces the exchange with the anisette server and Apple.
+    #[cfg(test)]
+    test_exchange: Option<fn(&mut AnisetteState) -> Result<(), Report>>,
 }
 
 impl RemoteV3AnisetteProvider {
@@ -63,6 +146,9 @@ impl RemoteV3AnisetteProvider {
             serial_number,
             client: Self::build_reqwest_client(url)?,
             client_info_override: None,
+            state_scope: None,
+            #[cfg(test)]
+            test_exchange: None,
         })
     }
 
@@ -80,6 +166,13 @@ impl RemoteV3AnisetteProvider {
 
     pub fn set_serial_number(mut self, serial_number: String) -> RemoteV3AnisetteProvider {
         self.serial_number = serial_number;
+        self
+    }
+
+    /// Names the stored state's scope (Zag Store: the account's anisette
+    /// scope). Every provider over the same stored state must use the same.
+    pub fn set_state_scope(mut self, scope: &str) -> RemoteV3AnisetteProvider {
+        self.state_scope = Some(scope.to_string());
         self
     }
 
@@ -114,10 +207,10 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
             .context("Failed to request /v3/client_info from anisette server")?
             .error_for_status()
             .context("anisette server returned an error for /v3/client_info")?
-            .json::<AnisetteClientInfo>()
+            .text()
             .await
-            .context("Failed to parse /v3/client_info response")?;
-        Ok(info)
+            .context("Failed to read /v3/client_info response")?;
+        decode_json::<AnisetteClientInfo>(&info, "/v3/client_info response")
     }
 
     async fn provision(&mut self, gs: &Arc<GrandSlam>, force_reset: bool) -> Result<(), Report> {
@@ -157,8 +250,9 @@ impl RemoteV3AnisetteProvider {
             .send()
             .await?
             .error_for_status()?
-            .json::<AnisetteHeaders>()
+            .text()
             .await?;
+        let headers = decode_json::<AnisetteHeaders>(&headers, "/v3/get_headers response")?;
 
         match headers {
             AnisetteHeaders::Headers {
@@ -179,48 +273,87 @@ impl RemoteV3AnisetteProvider {
                     warn!("Server says anisette not provisioned");
                     return Ok(AnisetteDataResponse::IncorrectlyProvisioned);
                 }
-                Err(report!("Failed to get anisette headers").attach(message))
+                Err(report!("Failed to get anisette headers ({} bytes withheld)", message.len()))
             }
         }
     }
 
+    /// The device state to use, provisioned. Zag Store fork: the whole
+    /// decision runs under the lock of this provider's state scope, and the
+    /// stored state is read again under it. Another provider for the same
+    /// account (another bridge session) may have provisioned or reset while
+    /// this one waited, and its device is then adopted, never replaced.
     async fn get_state(
         &mut self,
         gs: &Arc<GrandSlam>,
         force_reset: bool,
     ) -> Result<&mut AnisetteState, Report> {
-        if force_reset {
-            warn!("Resetting anisette state");
-            self.state = Some(AnisetteState::new());
-        } else if self.state.is_none() {
-            if let Ok(Some(state)) = &self.storage.retrieve_data(ANISETTE_STATE_KEY) {
-                if let Ok(state) = plist::from_bytes(state) {
-                    info!("Loaded existing anisette state");
-                    self.state = Some(state);
-                } else {
-                    warn!("Failed to parse existing anisette state, starting fresh");
-                    self.state = Some(AnisetteState::new());
-                }
-            } else {
-                info!("No existing anisette state found");
-                self.state = Some(AnisetteState::new());
-            }
+        let lock = coordination::lock(self.state_scope.as_deref());
+        let _guard = lock.lock().await;
+
+        // A storage that cannot be read is not an absent state. Starting
+        // fresh there would provision a new device with Apple and then
+        // overwrite the stored identity, so it stops instead.
+        let stored = self
+            .storage
+            .retrieve_data(ANISETTE_STATE_KEY)
+            .context("Failed to read stored anisette state")?;
+        let (stored, corrupt) = match stored {
+            Some(bytes) => match plist::from_bytes::<AnisetteState>(&bytes) {
+                Ok(state) => (Some(state), false),
+                Err(_) => (None, true),
+            },
+            None => (None, false),
+        };
+        // On a reset, the device being rejected is this provider's own.
+        let rejected = force_reset.then(|| self.state.as_ref().map(|s| s.keychain_identifier)).flatten();
+
+        if let Some(state) = stored.filter(|s| s.is_provisioned() && Some(s.keychain_identifier) != rejected) {
+            let adopted = self.state.as_ref().is_some_and(|own| own.keychain_identifier != state.keychain_identifier);
+            diagnostics::record(if adopted { StateChange::Adopted } else { StateChange::Loaded });
+            info!("Using stored anisette state");
+            return Ok(self.state.insert(state));
         }
 
-        let state = self.state.as_mut().ok_or_report()?;
+        let mut state = if force_reset {
+            warn!("Resetting anisette state");
+            diagnostics::record(StateChange::Reset);
+            AnisetteState::new()
+        } else {
+            // Cloned, not taken: if this call is cancelled during the exchange,
+            // the provider keeps its identity rather than losing it.
+            match self.state.clone() {
+                // An earlier attempt of this provider: keep its identity.
+                Some(own) => own,
+                None => {
+                    diagnostics::record(if corrupt { StateChange::ReplacedCorrupt } else { StateChange::Created });
+                    AnisetteState::new()
+                }
+            }
+        };
+
         if !state.is_provisioned() {
             info!("Provisioning required...");
-            Self::provision(state, gs, &self.url)
-                .await
-                .context("Failed to provision")?;
+            let result = self.exchange(&mut state, gs).await;
+            if let Err(error) = result {
+                self.state = Some(state);
+                return Err(error.context("Failed to provision").into());
+            }
         }
-        let buf = Vec::new();
-        let mut writer = std::io::BufWriter::new(buf);
-        plist::to_writer_xml(&mut writer, &state)?;
-        self.storage
-            .store_data(ANISETTE_STATE_KEY, &writer.into_inner()?)?;
-
+        let mut bytes = Vec::new();
+        plist::to_writer_xml(&mut bytes, &state)?;
+        let state = self.state.insert(state);
+        self.storage.store_data(ANISETTE_STATE_KEY, &bytes)?;
         Ok(state)
+    }
+
+    async fn exchange(&self, state: &mut AnisetteState, gs: &Arc<GrandSlam>) -> Result<(), Report> {
+        #[cfg(test)]
+        if let Some(exchange) = self.test_exchange {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            return exchange(state);
+        }
+        Self::provision(state, gs, &self.url).await
     }
 
     async fn provisioning_headers(state: &AnisetteState) -> Result<HeaderMap, Report> {
@@ -290,7 +423,7 @@ impl RemoteV3AnisetteProvider {
 
             // Provisioning messages may carry CPIM, PTM, TK, or ADI state.
             // Never log raw payloads, even at debug level.
-            let provision_msg: ProvisioningMessage = serde_json::from_str(&text)?;
+            let provision_msg: ProvisioningMessage = decode_json(&text, "provisioning message")?;
 
             match provision_msg {
                 ProvisioningMessage::GiveIdentifier => {
@@ -368,8 +501,14 @@ impl RemoteV3AnisetteProvider {
                     .context("Failed to send start provisioning data")?;
                 }
                 ProvisioningMessage::ProvisioningSuccess { adi_pb } => {
-                    state.adi_pb = Some(BASE64_STANDARD.decode(adi_pb)?);
-                    ws.close().await?;
+                    state.adi_pb = Some(
+                        BASE64_STANDARD
+                            .decode(adi_pb)
+                            .map_err(|_| report!("Provisioning result is not valid base64"))?,
+                    );
+                    // Zag Store fork: provisioning is complete; a failed close
+                    // must not discard it before it is stored.
+                    let _ = ws.close().await;
                     info!("Provisioning successful");
                     break;
                 }
@@ -377,17 +516,13 @@ impl RemoteV3AnisetteProvider {
                 ProvisioningMessage::InvalidIdentifier => {
                     bail!("Anisette provisioning failed: invalid identifier")
                 }
+                // Zag Store fork: the server's message may echo Apple's
+                // response; only its length is reported.
                 ProvisioningMessage::StartProvisioningError { message } => {
-                    return Err(
-                        report!("Anisette provisioning failed: start provisioning error")
-                            .attach(message),
-                    );
+                    bail!("Anisette provisioning failed: start provisioning error ({} bytes withheld)", message.len());
                 }
                 ProvisioningMessage::EndProvisioningError { message } => {
-                    return Err(
-                        report!("Anisette provisioning failed: end provisioning error")
-                            .attach(message),
-                    );
+                    bail!("Anisette provisioning failed: end provisioning error ({} bytes withheld)", message.len());
                 }
             }
         }
@@ -423,4 +558,246 @@ enum AnisetteHeaders {
         #[serde(rename = "X-Apple-I-MD-RINFO")]
         routing_info: String,
     },
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records writes; reads return `read` (an error when `None`).
+    struct Recording {
+        read: Option<Option<Vec<u8>>>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl SideloadingStorage for Recording {
+        fn store(&self, _: &str, _: &str) -> Result<(), Report> {
+            unreachable!("state is stored as data")
+        }
+        fn retrieve(&self, _: &str) -> Result<Option<String>, Report> {
+            unreachable!("state is read as data")
+        }
+        fn store_data(&self, _: &str, value: &[u8]) -> Result<(), Report> {
+            self.writes.lock().unwrap().push(value.to_vec());
+            Ok(())
+        }
+        fn retrieve_data(&self, _: &str) -> Result<Option<Vec<u8>>, Report> {
+            self.read.clone().ok_or_else(|| report!("Keychain unavailable"))
+        }
+    }
+
+    fn provider(read: Option<Option<Vec<u8>>>) -> (RemoteV3AnisetteProvider, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let storage = Recording { read, writes: writes.clone() };
+        let provider = RemoteV3AnisetteProvider::new("https://anisette.example", Box::new(storage), "S".into()).unwrap();
+        (provider, writes)
+    }
+
+    fn stored(state: &AnisetteState) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        plist::to_writer_xml(&mut bytes, state).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn unreadable_storage_never_replaces_the_identity() {
+        // A Keychain read that fails (not "not found") must stop: starting
+        // fresh would register a new device with Apple and overwrite the
+        // stored one.
+        let (mut provider, writes) = provider(None);
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        assert!(provider.get_state(&gs, false).await.is_err());
+        assert!(provider.state.is_none());
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stored_identity_is_reused_without_provisioning() {
+        let state = AnisetteState { keychain_identifier: [7; 16], adi_pb: Some(vec![1, 2, 3]) };
+        let (mut provider, writes) = provider(Some(Some(stored(&state))));
+        // The URL bag is empty: any attempt to provision would fail.
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let loaded = provider.get_state(&gs, false).await.unwrap();
+        assert_eq!(loaded.keychain_identifier, [7; 16]);
+        assert_eq!(loaded.adi_pb.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert!(writes.lock().unwrap().is_empty(), "an unchanged state is not written again");
+    }
+
+    /// One Keychain, as two bridge sessions for the same account see it.
+    struct Shared(Arc<crate::util::storage::InMemoryStorage>);
+
+    impl SideloadingStorage for Shared {
+        fn store(&self, key: &str, value: &str) -> Result<(), Report> {
+            self.0.store(key, value)
+        }
+        fn retrieve(&self, key: &str) -> Result<Option<String>, Report> {
+            self.0.retrieve(key)
+        }
+    }
+
+    fn sharing(storage: &Arc<crate::util::storage::InMemoryStorage>, scope: &str, exchange: fn(&mut AnisetteState) -> Result<(), Report>) -> RemoteV3AnisetteProvider {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut provider = RemoteV3AnisetteProvider::new("https://anisette.example", Box::new(Shared(storage.clone())), "S".into())
+            .unwrap()
+            .set_state_scope(scope);
+        provider.test_exchange = Some(exchange);
+        provider
+    }
+
+    fn stored_identity(storage: &crate::util::storage::InMemoryStorage) -> [u8; 16] {
+        let bytes = storage.retrieve_data(ANISETTE_STATE_KEY).unwrap().unwrap();
+        plist::from_bytes::<AnisetteState>(&bytes).unwrap().keychain_identifier
+    }
+
+    static FIRST_EXCHANGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn first_exchange(state: &mut AnisetteState) -> Result<(), Report> {
+        FIRST_EXCHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.adi_pb = Some(vec![9]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_sessions_for_one_account_provision_one_device() {
+        // Two independent providers (two bridge sessions) over one stored
+        // state, both finding none: one provisions, the other adopts it.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let (mut a, mut b) = (sharing(&storage, "test-first", first_exchange), sharing(&storage, "test-first", first_exchange));
+        let (ra, rb) = tokio::join!(a.get_state(&gs, false), b.get_state(&gs, false));
+        let (ia, ib) = (ra.unwrap().keychain_identifier, rb.unwrap().keychain_identifier);
+        assert_eq!(FIRST_EXCHANGES.load(std::sync::atomic::Ordering::SeqCst), 1, "one device registered, not two");
+        assert_eq!(ia, ib);
+        assert_eq!(stored_identity(&storage), ia, "the stored identity is the one both use");
+    }
+
+    static RESET_EXCHANGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn reset_exchange(state: &mut AnisetteState) -> Result<(), Report> {
+        RESET_EXCHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.adi_pb = Some(vec![8]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_sessions_resetting_one_device_reset_it_once() {
+        // Both sessions use device X; the server rejects it (-45061) for both.
+        // The second must adopt the first's replacement, not reset it again.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let old = AnisetteState { keychain_identifier: [3; 16], adi_pb: Some(vec![1]) };
+        storage.store_data(ANISETTE_STATE_KEY, &stored(&old)).unwrap();
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let (mut a, mut b) = (sharing(&storage, "test-reset", reset_exchange), sharing(&storage, "test-reset", reset_exchange));
+        assert_eq!(a.get_state(&gs, false).await.unwrap().keychain_identifier, [3; 16]);
+        assert_eq!(b.get_state(&gs, false).await.unwrap().keychain_identifier, [3; 16]);
+        let (ra, rb) = tokio::join!(a.get_state(&gs, true), b.get_state(&gs, true));
+        let (ia, ib) = (ra.unwrap().keychain_identifier, rb.unwrap().keychain_identifier);
+        assert_eq!(RESET_EXCHANGES.load(std::sync::atomic::Ordering::SeqCst), 1, "reset once");
+        assert_eq!(ia, ib);
+        assert_ne!(ia, [3; 16], "the rejected device is not kept");
+        assert_eq!(stored_identity(&storage), ia);
+    }
+
+    fn never_exchange(_: &mut AnisetteState) -> Result<(), Report> {
+        panic!("must not provision")
+    }
+
+    #[tokio::test]
+    async fn reset_adopts_a_replacement_another_session_made() {
+        // This provider's device X was rejected (-45061), but storage already
+        // holds Y, made by another session: Y is adopted, nothing provisioned.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let y = AnisetteState { keychain_identifier: [5; 16], adi_pb: Some(vec![5]) };
+        storage.store_data(ANISETTE_STATE_KEY, &stored(&y)).unwrap();
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut provider = sharing(&storage, "test-adopt-reset", never_exchange);
+        provider.state = Some(AnisetteState { keychain_identifier: [4; 16], adi_pb: Some(vec![4]) });
+        let before = diagnostics::count(StateChange::Adopted);
+        assert_eq!(provider.get_state(&gs, true).await.unwrap().keychain_identifier, [5; 16]);
+        assert!(diagnostics::count(StateChange::Adopted) > before);
+    }
+
+    #[tokio::test]
+    async fn reset_of_the_stored_device_replaces_it() {
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let x = AnisetteState { keychain_identifier: [6; 16], adi_pb: Some(vec![6]) };
+        storage.store_data(ANISETTE_STATE_KEY, &stored(&x)).unwrap();
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut provider = sharing(&storage, "test-reset-own", corrupt_exchange);
+        provider.state = Some(x);
+        let identity = provider.get_state(&gs, true).await.unwrap().keychain_identifier;
+        assert_ne!(identity, [6; 16], "the rejected device is not adopted back");
+        assert_eq!(stored_identity(&storage), identity);
+    }
+
+    fn slow_exchange(state: &mut AnisetteState) -> Result<(), Report> {
+        state.adi_pb = Some(vec![1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_provisioning_releases_the_lock_and_stores_nothing() {
+        // The sign-in is cancelled mid-exchange (the future is dropped): the
+        // scope's lock is released, nothing is stored, and the provider keeps
+        // its in-memory identity.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut a = sharing(&storage, "test-cancel", slow_exchange);
+        a.state = Some(AnisetteState { keychain_identifier: [2; 16], adi_pb: None });
+        // The test exchange waits 30 ms first; 5 ms cancels it inside.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(5), a.get_state(&gs, false)).await.is_err());
+        assert!(storage.retrieve_data(ANISETTE_STATE_KEY).unwrap().is_none());
+        assert_eq!(a.state.as_ref().map(|s| s.keychain_identifier), Some([2; 16]));
+        let mut b = sharing(&storage, "test-cancel", slow_exchange);
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), b.get_state(&gs, false)).await;
+        assert!(done.expect("the lock was released").is_ok());
+    }
+
+    #[tokio::test]
+    async fn accounts_do_not_wait_for_each_other() {
+        // Holding one account's lock blocks only that account.
+        let held = coordination::lock(Some("test-account-a"));
+        let _guard = held.lock().await;
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let other = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let mut b = sharing(&other, "test-account-b", slow_exchange);
+        let quick = std::time::Duration::from_millis(500);
+        assert!(tokio::time::timeout(quick, b.get_state(&gs, false)).await.expect("another account is not blocked").is_ok());
+        let same = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let mut a = sharing(&same, "test-account-a", slow_exchange);
+        assert!(tokio::time::timeout(quick, a.get_state(&gs, false)).await.is_err(), "the same account waits");
+        // A provider without a scope has a lock of its own.
+        assert!(!Arc::ptr_eq(&coordination::lock(None), &coordination::lock(None)));
+        assert!(Arc::ptr_eq(&held, &coordination::lock(Some("test-account-a"))));
+    }
+
+    fn corrupt_exchange(state: &mut AnisetteState) -> Result<(), Report> {
+        state.adi_pb = Some(vec![7]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupted_state_is_replaced_and_counted_without_data() {
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        storage.store_data(ANISETTE_STATE_KEY, b"not a plist").unwrap();
+        let before = diagnostics::count(StateChange::ReplacedCorrupt);
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut provider = sharing(&storage, "test-corrupt", corrupt_exchange);
+        let identity = provider.get_state(&gs, false).await.unwrap().keychain_identifier;
+        assert_eq!(stored_identity(&storage), identity, "recovered: a new, provisioned device is stored");
+        assert!(diagnostics::count(StateChange::ReplacedCorrupt) > before, "the replacement is recorded");
+        // The diagnostic is a variant and a number: nothing else exists to leak.
+        assert_eq!(format!("{:?}", StateChange::ReplacedCorrupt), "ReplacedCorrupt");
+    }
+
+    #[tokio::test]
+    async fn failed_provisioning_stores_nothing() {
+        // Absent state: a fresh identity is provisioned. When that fails, the
+        // half-made identity is never stored.
+        let (mut provider, writes) = provider(Some(None));
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        assert!(provider.get_state(&gs, false).await.is_err());
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(!provider.state.as_ref().unwrap().is_provisioned());
+    }
 }

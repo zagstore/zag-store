@@ -46,7 +46,7 @@ where
     s.try_into().map_err(|_| serde::de::Error::custom("anisette identifier must be exactly 16 bytes"))
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AnisetteState {
     #[serde(
         serialize_with = "bin_serialize",
@@ -58,6 +58,16 @@ pub struct AnisetteState {
         deserialize_with = "bin_deserialize_opt"
     )]
     pub adi_pb: Option<Vec<u8>>,
+}
+
+/// Zag Store fork: the identifier and provisioning material are never shown.
+impl std::fmt::Debug for AnisetteState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnisetteState")
+            .field("keychain_identifier", &"<withheld>")
+            .field("provisioned", &self.is_provisioned())
+            .finish()
+    }
 }
 
 impl Default for AnisetteState {

@@ -79,13 +79,26 @@ pub struct TwoFactorCallbackParams {
     pub selected_number_id: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum TwoFactorCallbackResponse {
     SubmitCode(String),
     SendSms(u32),
     SendToDevices,
     ResendCode,
     Abort,
+}
+
+/// Zag Store fork: the code is never shown.
+impl std::fmt::Debug for TwoFactorCallbackResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SubmitCode(_) => write!(f, "SubmitCode(<withheld>)"),
+            Self::SendSms(id) => write!(f, "SendSms({id})"),
+            Self::SendToDevices => write!(f, "SendToDevices"),
+            Self::ResendCode => write!(f, "ResendCode"),
+            Self::Abort => write!(f, "Abort"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +150,66 @@ fn resync_sim(resp: &plist::Dictionary) -> Option<String> {
         plist::Value::String(s) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// The trusted number to send an SMS code to. Zag Store fork: the sign-in
+/// response does not say which number, so upstream guesses id 1; an account
+/// whose numbers are numbered otherwise then fails 2FA. When the account's
+/// numbers are known and the guess is not one of them, the first is used.
+fn sms_number_id(requested: u32, numbers: Option<&[TrustedNumber]>) -> u32 {
+    match numbers {
+        Some(numbers) if !numbers.iter().any(|n| n.id == requested) => numbers.first().map_or(requested, |n| n.id),
+        _ => requested,
+    }
+}
+
+/// The login state a completed proof response's `Status` asks for.
+///
+/// Zag Store fork: upstream treated any `hsc` other than 409 as signed in,
+/// so an unexpected status surfaced later as a confusing app-token failure.
+/// Now: `au` is handled as upstream does; no `hsc`, or a 2xx `hsc`, is signed
+/// in; 409 means a 2FA code was already sent; any other `hsc` is an error
+/// (only its number is reported).
+fn login_state_for(status: &Dictionary) -> Result<LoginState, Report> {
+    if let Some(plist::Value::String(s)) = status.get("au") {
+        return Ok(match s.as_str() {
+            "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
+            "secondaryAuth" => LoginState::NeedsSMS2FA(
+                1, /* Just start by trying 1, user can correct after */
+            ),
+            "repair" => LoginState::LoggedIn, // Just means that you don't have 2FA set up
+            unknown => LoginState::NeedsExtraStep(unknown.to_string()),
+        });
+    }
+    match status.get("hsc") {
+        Some(plist::Value::Integer(hsc)) => match hsc.as_signed() {
+            Some(200..=299) => Ok(LoginState::LoggedIn),
+            Some(409) => Ok(LoginState::NeedsDevice2FAVerification),
+            Some(code) => bail!("Unexpected authentication status {}", code),
+            None => bail!("Unexpected authentication status (not a valid integer)"),
+        },
+        _ => Ok(LoginState::LoggedIn),
+    }
+}
+
+/// An app token from its dictionary. Zag Store fork: a negative duration or
+/// expiry is refused; upstream's `as u64` turned it into a time centuries
+/// away.
+fn app_token_from(token: &Dictionary) -> Result<AppToken, Report> {
+    let unsigned = |key: &str| -> Result<u64, Report> {
+        let value = token
+            .get_signed_integer(key)
+            .context("Failed to get app token time")?;
+        u64::try_from(value).map_err(|_| report!("App token {} is negative", key))
+    };
+    Ok(AppToken {
+        token: token
+            .get_str("token")
+            .context("Failed to get app token string")?
+            .to_string(),
+        duration: unsigned("duration")?,
+        expiry: unsigned("expiry")?,
+    })
 }
 
 impl AppleAccount {
@@ -257,6 +330,7 @@ impl AppleAccount {
                 }
                 LoginState::NeedsSMS2FA(id) => {
                     self.update_trusted_numbers().await;
+                    let id = sms_number_id(id, self.trusted_phone_numbers.as_deref());
                     info!("SMS 2FA required");
                     self.login_state = self
                         .send_sms_2fa(id)
@@ -417,9 +491,7 @@ impl AppleAccount {
             .await
             .context("Failed to read trusted device 2FA response text")?;
 
-        let plist: Dictionary = plist::from_bytes(res.as_bytes())
-            .context("Failed to parse trusted device response plist")
-            .attach_with(|| res.clone())?;
+        let plist = crate::util::plist::parse_response_plist(&res, "trusted device response")?;
         let res = plist
             .check_grandslam_error()
             .context("Trusted device 2FA rejected");
@@ -614,9 +686,9 @@ impl AppleAccount {
         }
 
         bail!(
-            "SMS 2FA request failed with http status {}: {}",
+            "SMS 2FA request failed with http status {} ({} bytes withheld)",
             status,
-            text
+            text.len()
         );
     }
 
@@ -646,9 +718,9 @@ impl AppleAccount {
     fn parse_sms_error(text: String, status: u16) -> Result<SMSTwoFactorError, Report> {
         Self::parse_sms_service_error(&text).ok_or_else(|| {
             report!(
-                "SMS 2FA code submission failed with http status {}: {}",
+                "SMS 2FA code submission failed with http status {} ({} bytes withheld)",
                 status,
-                text
+                text.len()
             )
         })
     }
@@ -690,8 +762,9 @@ impl AppleAccount {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
             && let Some(numbers) = json.get("trustedPhoneNumbers")
         {
+            // Zag Store fork: serde's error could quote a number; it is dropped.
             let numbers: Vec<TrustedNumber> = serde_json::from_value(numbers.clone())
-                .context("Failed to parse trusted phone numbers")?;
+                .map_err(|_| report!("Failed to parse trusted phone numbers"))?;
             debug!(
                 "Retrieved {} trusted phone numbers (status {}): {:?}",
                 numbers.len(),
@@ -702,9 +775,9 @@ impl AppleAccount {
         }
 
         bail!(
-            "Failed to retrieve trusted phone numbers (status {}): {}",
+            "Failed to retrieve trusted phone numbers (status {}, {} bytes withheld)",
             status,
-            text
+            text.len()
         );
     }
 
@@ -886,35 +959,12 @@ impl AppleAccount {
 
         debug!("Login step 2 completed");
 
-        if let Some(plist::Value::String(s)) = status.get("au") {
-            return Ok(match s.as_str() {
-                "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
-                "secondaryAuth" => LoginState::NeedsSMS2FA(
-                    1, /* Just start by trying 1, user can correct after */
-                ),
-                "repair" => LoginState::LoggedIn, // Just means that you don't have 2FA set up
-                unknown => LoginState::NeedsExtraStep(unknown.to_string()),
-            });
+        let state = login_state_for(status)?;
+        if matches!(state, LoginState::NeedsDevice2FAVerification) {
+            info!("2FA code already sent");
+            self.update_trusted_numbers().await;
         }
-
-        if let Some(plist::Value::Integer(hsc)) = status.get("hsc") {
-            match hsc.as_signed() {
-                Some(200) => {}
-                Some(409) => {
-                    info!("2FA code already sent");
-                    self.update_trusted_numbers().await;
-                    return Ok(LoginState::NeedsDevice2FAVerification);
-                }
-                Some(code) => {
-                    warn!("Unknown status code {}: {:?}", code, status);
-                }
-                None => {
-                    warn!("Unknown status code (invalid integer): {:?}", status);
-                }
-            }
-        }
-
-        Ok(LoginState::LoggedIn)
+        Ok(state)
     }
 
     pub async fn get_app_token(&mut self, app: &str) -> Result<AppToken, Report> {
@@ -1003,18 +1053,7 @@ impl AppleAccount {
             .get_dict(&app)
             .context("Failed to get app token string")?;
 
-        let app_token = AppToken {
-            token: app_token
-                .get_str("token")
-                .context("Failed to get app token string")?
-                .to_string(),
-            duration: app_token
-                .get_signed_integer("duration")
-                .context("Failed to get app token duration")? as u64,
-            expiry: app_token
-                .get_signed_integer("expiry")
-                .context("Failed to get app token expiry")? as u64,
-        };
+        let app_token = app_token_from(app_token)?;
 
         info!("Successfully retrieved app token for {}", app);
 
@@ -1128,11 +1167,22 @@ impl std::fmt::Display for AppleAccount {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppToken {
     pub token: String,
     pub duration: u64,
     pub expiry: u64,
+}
+
+/// Zag Store fork: the token is never shown.
+impl std::fmt::Debug for AppToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppToken")
+            .field("token", &"<withheld>")
+            .field("duration", &self.duration)
+            .field("expiry", &self.expiry)
+            .finish()
+    }
 }
 
 fn censor_email(email: &str) -> String {
@@ -1153,5 +1203,86 @@ fn censor_email(email: &str) -> String {
         }
     } else {
         "***".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn number(id: u32) -> TrustedNumber {
+        TrustedNumber { number_with_dial_code: "+• (•••) •••-••00".into(), last_two_digits: "00".into(), push_mode: "sms".into(), id }
+    }
+
+    fn status(entries: &[(&str, plist::Value)]) -> Dictionary {
+        entries.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn valid_statuses_keep_their_meaning() {
+        let int = |n: i64| plist::Value::Integer(n.into());
+        let text = |s: &str| plist::Value::String(s.into());
+        assert!(matches!(login_state_for(&status(&[("hsc", int(200))])).unwrap(), LoginState::LoggedIn));
+        assert!(matches!(login_state_for(&status(&[])).unwrap(), LoginState::LoggedIn), "no hsc, as upstream");
+        assert!(matches!(login_state_for(&status(&[("hsc", int(409))])).unwrap(), LoginState::NeedsDevice2FAVerification));
+        assert!(matches!(login_state_for(&status(&[("au", text("trustedDeviceSecondaryAuth")), ("hsc", int(409))])).unwrap(), LoginState::NeedsDevice2FA), "au wins");
+        assert!(matches!(login_state_for(&status(&[("au", text("secondaryAuth"))])).unwrap(), LoginState::NeedsSMS2FA(1)));
+        assert!(matches!(login_state_for(&status(&[("au", text("repair"))])).unwrap(), LoginState::LoggedIn));
+        assert!(matches!(login_state_for(&status(&[("au", text("other"))])).unwrap(), LoginState::NeedsExtraStep(s) if s == "other"));
+    }
+
+    #[test]
+    fn unexpected_statuses_are_errors_not_sign_ins() {
+        let int = |n: i64| plist::Value::Integer(n.into());
+        for code in [401, 403, 434, 500, 503, -1] {
+            let error = login_state_for(&status(&[("hsc", int(code)), ("em", plist::Value::String("SECRET".into()))])).unwrap_err();
+            let rendered = format!("{error:?}");
+            assert!(rendered.contains(&code.to_string()) && !rendered.contains("SECRET"), "{rendered}");
+        }
+        let huge = plist::Value::Integer(u64::MAX.into());
+        assert!(login_state_for(&status(&[("hsc", huge)])).is_err());
+    }
+
+    fn token(duration: i64, expiry: i64) -> Dictionary {
+        status(&[
+            ("token", plist::Value::String("T".into())),
+            ("duration", plist::Value::Integer(duration.into())),
+            ("expiry", plist::Value::Integer(expiry.into())),
+        ])
+    }
+
+    #[test]
+    fn app_token_times_must_not_be_negative() {
+        let valid = app_token_from(&token(31_536_000, 1_795_000_000_000)).unwrap();
+        assert_eq!((valid.duration, valid.expiry), (31_536_000, 1_795_000_000_000), "valid values unchanged");
+        assert!(app_token_from(&token(-1, 1_795_000_000)).is_err());
+        assert!(app_token_from(&token(3_600, -5)).is_err(), "previously 18446744073709551611");
+        assert!(app_token_from(&token(0, 0)).is_ok(), "zero is the bridge's to judge");
+    }
+
+    #[test]
+    fn debug_output_withholds_codes_and_tokens() {
+        let code = format!("{:?}", TwoFactorCallbackResponse::SubmitCode("123456".into()));
+        assert!(!code.contains("123456"), "{code}");
+        let token = format!("{:?}", AppToken { token: "TOKEN-VALUE".into(), duration: 1, expiry: 2 });
+        assert!(!token.contains("TOKEN-VALUE") && token.contains("expiry: 2"), "{token}");
+    }
+
+    #[test]
+    fn sms_failures_do_not_report_the_body() {
+        let body = r#"{"trustedPhoneNumbers":[{"numberWithDialCode":"+44 SECRET"}]}"#;
+        let report = AppleAccount::classify_sms_send_response(500, body, 1).unwrap_err();
+        assert!(!format!("{report:?}").contains("SECRET"));
+        let report = AppleAccount::parse_sms_error(body.to_string(), 500).unwrap_err();
+        assert!(!format!("{report:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn sms_goes_to_a_number_the_account_has() {
+        assert_eq!(sms_number_id(1, Some(&[number(1), number(2)])), 1, "a valid choice is kept");
+        assert_eq!(sms_number_id(2, Some(&[number(1), number(2)])), 2, "the user's choice is kept");
+        assert_eq!(sms_number_id(1, Some(&[number(3), number(4)])), 3, "the guess 1 is not a number: the first is used");
+        assert_eq!(sms_number_id(1, None), 1, "numbers unknown: unchanged");
+        assert_eq!(sms_number_id(1, Some(&[])), 1, "no numbers: unchanged");
     }
 }

@@ -9,7 +9,6 @@
 
 use plist::Dictionary;
 use plist_macro::plist_to_xml_string;
-use plist_macro::pretty_print_dictionary;
 use reqwest::{
     ClientBuilder,
     header::{HeaderMap, HeaderValue},
@@ -71,6 +70,17 @@ impl GrandSlam {
             .ok_or_else(|| report!("URL Bag plist missing 'urls' dictionary"))?;
 
         Ok(urls)
+    }
+
+    /// A client with an empty URL bag, for tests that must not fetch one.
+    #[cfg(test)]
+    pub(crate) fn offline_for_tests() -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Self {
+            client: Self::build_reqwest_client().expect("client"),
+            client_info: AnisetteClientInfo { client_info: String::new(), user_agent: String::new() },
+            url_bag: Dictionary::new(),
+        }
     }
 
     pub fn get_url(&self, key: &str) -> Result<String, Report> {
@@ -142,37 +152,39 @@ impl GrandSlam {
         additional_headers: Option<HeaderMap>,
         retry_limit: Option<u32>,
     ) -> Result<Dictionary, Report> {
-        let result = self
-            .post(url)?
-            .headers(
-                additional_headers
-                    .clone()
-                    .unwrap_or_else(reqwest::header::HeaderMap::new),
-            )
-            .body(plist_to_xml_string(body))
-            .send()
-            .await
-            .context("Failed to send grandslam request")?;
+        // Zag Store fork: retries after 429 (off unless the caller sets a
+        // limit) wait before each attempt, as `retry_delay` says, rather than
+        // resending at once into the limit.
+        let mut retries_left = retry_limit;
+        let mut attempt = 0u32;
+        let result = loop {
+            let result = self
+                .post(url)?
+                .headers(
+                    additional_headers
+                        .clone()
+                        .unwrap_or_else(reqwest::header::HeaderMap::new),
+                )
+                .body(plist_to_xml_string(body))
+                .send()
+                .await
+                .context("Failed to send grandslam request")?;
 
-        if let Some(retries) = retry_limit
-            && result.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
-            if retries > 0 {
-                warn!(
-                    "Received 429 Too Many Requests, retrying request ({} retries left)",
-                    retries
-                );
-                return Box::pin(self.plist_request(
-                    url,
-                    body,
-                    additional_headers,
-                    Some(retries - 1),
-                ))
-                .await;
-            } else {
-                bail!("Received 429 Too Many Requests, no retries left");
+            if let Some(retries) = retries_left
+                && result.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                if retries == 0 {
+                    bail!("Received 429 Too Many Requests, no retries left");
+                }
+                let delay = retry_delay(attempt, result.headers().get(reqwest::header::RETRY_AFTER));
+                warn!("Received 429 Too Many Requests, retrying in {:?} ({} retries left)", delay, retries);
+                tokio::time::sleep(delay).await;
+                retries_left = Some(retries - 1);
+                attempt += 1;
+                continue;
             }
-        }
+            break result;
+        };
 
         let resp = result
             .error_for_status()
@@ -181,9 +193,7 @@ impl GrandSlam {
             .await
             .context("Failed to read grandslam response as text")?;
 
-        let dict: Dictionary = plist::from_bytes(resp.as_bytes())
-            .context("Failed to parse grandslam response plist")
-            .attach_with(|| resp.clone())?;
+        let dict = crate::util::plist::parse_response_plist(&resp, "grandslam response")?;
 
         let response_plist = dict
             .get("Response")
@@ -191,7 +201,7 @@ impl GrandSlam {
             .cloned()
             .ok_or_else(|| {
                 report!("grandslam response missing 'Response'")
-                    .attach(pretty_print_dictionary(&dict))
+                    .attach(crate::util::plist::SensitivePlistAttachment::new(dict.clone()))
             })?;
 
         Ok(response_plist)
@@ -247,6 +257,22 @@ impl GrandSlam {
     }
 }
 
+/// The wait before retry `attempt` (0-based) after a 429: Apple's
+/// `Retry-After` in seconds when given, at most `MAX_RETRY_AFTER`; otherwise
+/// 2, 4, 8 … seconds, at most `MAX_BACKOFF`.
+pub(crate) fn retry_delay(attempt: u32, retry_after: Option<&HeaderValue>) -> std::time::Duration {
+    const MAX_RETRY_AFTER: u64 = 120;
+    const MAX_BACKOFF: u64 = 32;
+    let given = retry_after
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let seconds = match given {
+        Some(seconds) => seconds.clamp(1, MAX_RETRY_AFTER),
+        None => 2u64.saturating_pow(attempt.saturating_add(1)).min(MAX_BACKOFF),
+    };
+    std::time::Duration::from_secs(seconds)
+}
+
 pub trait GrandSlamErrorChecker {
     fn check_grandslam_error(self) -> Result<Dictionary, Report<SideloadError>>;
 }
@@ -266,5 +292,35 @@ impl GrandSlamErrorChecker for Dictionary {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn retries_back_off() {
+        assert_eq!(retry_delay(0, None), Duration::from_secs(2));
+        assert_eq!(retry_delay(1, None), Duration::from_secs(4));
+        assert_eq!(retry_delay(2, None), Duration::from_secs(8));
+        assert_eq!(retry_delay(10, None), Duration::from_secs(32), "capped");
+        assert_eq!(retry_delay(u32::MAX, None), Duration::from_secs(32), "no overflow");
+    }
+
+    #[test]
+    fn retry_after_is_honoured_within_bounds() {
+        let header = |v: &'static str| HeaderValue::from_static(v);
+        assert_eq!(retry_delay(0, Some(&header("30"))), Duration::from_secs(30));
+        assert_eq!(retry_delay(0, Some(&header("0"))), Duration::from_secs(1), "never at once");
+        assert_eq!(retry_delay(0, Some(&header("86400"))), Duration::from_secs(120), "capped");
+        assert_eq!(retry_delay(1, Some(&header("Wed, 21 Oct 2026 07:28:00 GMT"))), Duration::from_secs(4), "dates fall back to backoff");
+    }
+
+    #[test]
+    fn retries_stay_off_by_default() {
+        let source = include_str!("builder.rs");
+        assert!(source.contains("err_429_retries: None,"));
     }
 }

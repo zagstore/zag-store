@@ -16,7 +16,7 @@ pub struct AnisetteClientInfo {
     pub user_agent: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnisetteData {
     machine_id: String,
     one_time_password: String,
@@ -25,6 +25,17 @@ pub struct AnisetteData {
     device_unique_identifier: String,
     _local_user_id: String,
     generated_at: SystemTime,
+}
+
+/// Zag Store fork: the one-time password, machine and device identifiers
+/// and routing info are never shown.
+impl std::fmt::Debug for AnisetteData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnisetteData")
+            .field("values", &"<withheld>")
+            .field("generated_at", &self.generated_at)
+            .finish()
+    }
 }
 
 // Some headers don't seem to be required. I guess not including them is technically more efficient soooo
@@ -163,10 +174,18 @@ impl AnisetteDataGenerator {
         let provider = self.provider.read().await;
         match provider.get_anisette_data().await? {
             AnisetteDataResponse::Data(data) => Ok(data),
-            status @ (AnisetteDataResponse::NeedsProvisioning
-            | AnisetteDataResponse::IncorrectlyProvisioned) => {
+            AnisetteDataResponse::NeedsProvisioning | AnisetteDataResponse::IncorrectlyProvisioned => {
                 drop(provider);
                 let mut provider_write = self.provider.write().await;
+                // Zag Store fork: clones of this generator share the provider.
+                // Another caller may have provisioned while this one waited for
+                // the lock; provisioning again would register a second device
+                // with Apple (or reset the one just made), so check first. The
+                // reset is decided by this answer, not the one before the wait.
+                let status = provider_write.get_anisette_data().await?;
+                if let AnisetteDataResponse::Data(data) = status {
+                    return Ok(data);
+                }
                 provider_write
                     .provision(
                         gs,
@@ -196,5 +215,137 @@ impl AnisetteDataGenerator {
         let arc_data = Arc::new(data);
         self.data = Some(arc_data.clone());
         Ok(arc_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Unprovisioned until `provision` runs, which takes a while (as the real
+    /// exchange with Apple does).
+    struct Counting {
+        provisioned: bool,
+        provisions: Arc<AtomicUsize>,
+        incorrect_first: bool,
+    }
+
+    fn data() -> AnisetteData {
+        AnisetteData {
+            machine_id: "M".into(),
+            one_time_password: "O".into(),
+            routing_info: "0".into(),
+            _device_description: String::new(),
+            device_unique_identifier: "D".into(),
+            _local_user_id: String::new(),
+            generated_at: SystemTime::now(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AnisetteProvider for Counting {
+        async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
+            // The real provider asks the anisette server here: callers overlap.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(match (self.provisioned, self.incorrect_first) {
+                (true, _) => AnisetteDataResponse::Data(data()),
+                (false, true) => AnisetteDataResponse::IncorrectlyProvisioned,
+                (false, false) => AnisetteDataResponse::NeedsProvisioning,
+            })
+        }
+        async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
+            Ok(AnisetteClientInfo { client_info: String::new(), user_agent: String::new() })
+        }
+        async fn provision(&mut self, _: &Arc<GrandSlam>, _: bool) -> Result<(), Report> {
+            self.provisions.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.provisioned = true;
+            Ok(())
+        }
+    }
+
+    async fn concurrent_provisions(incorrect_first: bool) -> usize {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provisions = Arc::new(AtomicUsize::new(0));
+        let provider = Counting { provisioned: false, provisions: provisions.clone(), incorrect_first };
+        let generator = AnisetteDataGenerator::new(Arc::new(RwLock::new(provider)));
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let (mut a, mut b, mut c) = (generator.clone(), generator.clone(), generator);
+        let (ra, rb, rc) = tokio::join!(
+            a.get_anisette_data(gs.clone()),
+            b.get_anisette_data(gs.clone()),
+            c.get_anisette_data(gs.clone())
+        );
+        assert!(ra.is_ok() && rb.is_ok() && rc.is_ok());
+        provisions.load(Ordering::SeqCst)
+    }
+
+    /// Rejected (-45061) before the write lock, then merely unprovisioned
+    /// after it (another caller cleared it): the reset must follow the newer
+    /// answer.
+    struct Changing {
+        reads: std::sync::Mutex<Vec<AnisetteDataResponse>>,
+        forced: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AnisetteProvider for Changing {
+        async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
+            let mut reads = self.reads.lock().unwrap();
+            Ok(if reads.is_empty() { AnisetteDataResponse::Data(data()) } else { reads.remove(0) })
+        }
+        async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
+            Ok(AnisetteClientInfo { client_info: String::new(), user_agent: String::new() })
+        }
+        async fn provision(&mut self, _: &Arc<GrandSlam>, force: bool) -> Result<(), Report> {
+            self.forced.lock().unwrap().push(force);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_follows_the_answer_after_the_wait() {
+        for (after, expected) in [
+            (AnisetteDataResponse::NeedsProvisioning, false),
+            (AnisetteDataResponse::IncorrectlyProvisioned, true),
+        ] {
+            let forced = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Changing {
+                reads: std::sync::Mutex::new(vec![AnisetteDataResponse::IncorrectlyProvisioned, after]),
+                forced: forced.clone(),
+            };
+            let mut generator = AnisetteDataGenerator::new(Arc::new(RwLock::new(provider)));
+            generator.get_anisette_data(Arc::new(GrandSlam::offline_for_tests())).await.unwrap();
+            assert_eq!(*forced.lock().unwrap(), vec![expected]);
+        }
+    }
+
+    #[test]
+    fn debug_output_withholds_anisette_values() {
+        let mut secret = data();
+        secret.one_time_password = "OTP-SECRET".into();
+        secret.machine_id = "MID-SECRET".into();
+        secret.device_unique_identifier = "DEV-SECRET".into();
+        secret.routing_info = "RINFO-SECRET".into();
+        let rendered = format!("{secret:?}");
+        assert!(!rendered.contains("SECRET"), "{rendered}");
+        let state = remote_v3::state_for_tests([0xab; 16], Some(vec![0xcd; 4]));
+        let rendered = format!("{state:?}");
+        assert!(!rendered.to_lowercase().contains("ab") && !rendered.contains("171") && rendered.contains("provisioned: true"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_provision_once() {
+        // Sign-in and the developer session share the provider: three callers
+        // that all find it unprovisioned must register one device, not three.
+        assert_eq!(concurrent_provisions(false).await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_reset_once() {
+        // -45061 (incorrectly provisioned) resets the identity: a second reset
+        // would throw away the device the first one just provisioned.
+        assert_eq!(concurrent_provisions(true).await, 1);
     }
 }
