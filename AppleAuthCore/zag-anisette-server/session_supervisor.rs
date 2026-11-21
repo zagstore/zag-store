@@ -37,7 +37,7 @@ impl SessionLimiter {
         Self { active: AtomicUsize::new(0), maximum }
     }
     fn acquire(&self) -> Result<SessionPermit<'_>, SessionError> {
-        self.active.try_update(Ordering::AcqRel, Ordering::Acquire,
+        self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |active| (active < self.maximum).then_some(active + 1))
             .map_err(|_| SessionError::Busy)?;
         Ok(SessionPermit(self))
