@@ -68,7 +68,11 @@ fn apply_configured_metadata(identity: &mut TestIdentity) -> io::Result<()> {
     let Some(path) = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE") else {
         return Ok(());
     };
-    let metadata = client_info_config::read_config(Path::new(&path))?;
+    apply_metadata_file(identity, Path::new(&path))
+}
+
+fn apply_metadata_file(identity: &mut TestIdentity, path: &Path) -> io::Result<()> {
+    let metadata = client_info_config::read_config(path)?;
     let value: serde_json::Value = serde_json::from_str(&metadata)?;
     let configured = value["client_info"].as_str().ok_or_else(|| invalid("invalid configured client info"))?;
     if !identity.client_info.is_empty() && identity.client_info != configured {
@@ -184,8 +188,8 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         } else {
             provisioning_client::validate_identity(&identity.device_id, &identity.client_info, &identity.local_user, &identity.serial)?;
         }
-        if identity.user_agent.is_none() {
-            return Err(invalid("supervised provisioning requires configured user agent").into());
+        if std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE").is_none() || identity.user_agent.is_none() {
+            return Err(invalid("supervised provisioning requires private client metadata configuration").into());
         }
         let identity_bytes = serde_json::to_vec(&identity).map_err(|_| invalid("invalid identity encoding"))?;
         let mut cmd = Command::new(binary);
@@ -253,6 +257,35 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_file_sets_both_fields_and_rejects_conflicts() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "zag-adi-metadata-contract-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("metadata.json");
+        fs::write(&path, r#"{"client_info":"offline-client","user_agent":"offline-agent/1.0"}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut identity = TestIdentity {
+            device_id: "device".into(), local_user: "a".repeat(64),
+            client_info: String::new(), serial: "TEST-123".into(), user_agent: None,
+        };
+        apply_metadata_file(&mut identity, &path).unwrap();
+        assert_eq!(identity.client_info, "offline-client");
+        assert_eq!(identity.user_agent.as_deref(), Some("offline-agent/1.0"));
+        let bytes = serde_json::to_vec(&identity).unwrap();
+        let parsed = read_identity(bytes.as_slice()).unwrap();
+        assert_eq!(parsed.user_agent.as_deref(), Some("offline-agent/1.0"));
+        identity.user_agent = Some("conflicting-agent".into());
+        assert!(apply_metadata_file(&mut identity, &path).is_err());
+        identity.user_agent = None;
+        identity.client_info = "conflicting-client".into();
+        assert!(apply_metadata_file(&mut identity, &path).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn identity_json_must_be_complete_and_bounded() {
         assert!(read_identity("{}".as_bytes()).is_err());
