@@ -13,9 +13,8 @@
 //!   publish          atomic, no-replace rename to the final name
 //! Any failure or cancellation removes the attempt's directories; the final
 //! name only ever holds a complete, verified state (see `supervise`).
+use crate::metadata::{self, client_info_config, ClientMetadata, Provenance};
 use crate::{process_watchdog, provisioning_client};
-#[path = "../../../client_info_config.rs"]
-mod client_info_config;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
@@ -109,27 +108,54 @@ fn read_identity<R: Read>(input: R) -> io::Result<TestIdentity> {
 // This check is opt-in: other legitimate identity providers may differ.
 // The HTTP service and supervised launcher use exactly the same private
 // configuration parser. Never synthesize or silently override an identity.
-fn apply_configured_metadata(identity: &mut TestIdentity) -> io::Result<()> {
+fn apply_configured_metadata(identity: &mut TestIdentity) -> io::Result<Option<ClientMetadata>> {
     let Some(path) = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE") else {
-        return Ok(());
+        return Ok(None);
     };
-    apply_metadata_file(identity, Path::new(&path))
+    apply_metadata_file(identity, Path::new(&path)).map(Some)
 }
 
-fn apply_metadata_file(identity: &mut TestIdentity, path: &Path) -> io::Result<()> {
-    let metadata = client_info_config::read_config(path)?;
-    let value: serde_json::Value = serde_json::from_str(&metadata)?;
-    let configured = value["client_info"].as_str().ok_or_else(|| invalid("invalid configured client info"))?;
-    if identity.client_info.as_deref().is_some_and(|existing| existing != configured) {
+/// Fills the identity's client fields from the configured file, the same
+/// file `/v3/client_info` serves. Values already in the identity must agree.
+fn apply_metadata_file(identity: &mut TestIdentity, path: &Path) -> io::Result<ClientMetadata> {
+    let metadata = client_info_config::load(path)?;
+    if identity.client_info.as_deref().is_some_and(|existing| existing != metadata.client_info) {
         return Err(invalid("identity and configured client info disagree"));
     }
-    identity.client_info = Some(configured.to_owned());
-    let agent = value["user_agent"].as_str().ok_or_else(|| invalid("invalid configured user agent"))?;
-    if identity.user_agent.as_deref().is_some_and(|existing| existing != agent) {
+    identity.client_info = Some(metadata.client_info.clone());
+    if identity.user_agent.as_deref().is_some_and(|existing| existing != metadata.user_agent) {
         return Err(invalid("identity and configured user agent disagree"));
     }
-    identity.user_agent = Some(agent.to_owned());
-    Ok(())
+    identity.user_agent = Some(metadata.user_agent.clone());
+    Ok(metadata)
+}
+
+/// The record saved beside adi.pb: the identity and android identifier the
+/// state belongs to, and the fingerprint and provenance of the client
+/// metadata it was provisioned with, so a later mismatch is detectable
+/// (metadata::check_state).
+fn state_record(identity: &TestIdentity, android_id: &str, configured: &ClientMetadata) -> io::Result<serde_json::Value> {
+    let mut record = serde_json::to_value(identity).map_err(|_| invalid("invalid identity encoding"))?;
+    let provenance = configured.provenance.as_ref().ok_or_else(|| invalid("provenance required"))?;
+    record["client_info"] = configured.client_info.clone().into();
+    record["user_agent"] = configured.user_agent.clone().into();
+    record["android_identifier"] = android_id.into();
+    record["ds_id"] = (-2).into();
+    record["metadata_sha256"] = metadata::fingerprint(configured).into();
+    record["metadata_source"] = provenance.source.clone().into();
+    record["metadata_apple_verified"] = provenance.apple_verified.into();
+    Ok(record)
+}
+
+/// Provisioning binds a state to one sourced pair. An unverified pair is
+/// allowed only when the operator says so for this attempt.
+fn require_provisioning_metadata(metadata: &ClientMetadata, accept_unverified: bool) -> io::Result<()> {
+    match &metadata.provenance {
+        None => Err(invalid("client metadata has no provenance; prepare it with --metadata-prepare")),
+        Some(p) if !p.apple_verified && !accept_unverified =>
+            Err(invalid("client metadata is not Apple-verified; pass --accept-unverified-metadata for this attempt")),
+        Some(_) => Ok(()),
+    }
 }
 
 fn validate_client_derived_identity(identity: &TestIdentity) -> io::Result<()> {
@@ -199,11 +225,17 @@ fn validate_paths(runtime: &Path, state: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn paths<I: Iterator<Item = std::ffi::OsString>>(mut args: I) -> io::Result<(PathBuf, PathBuf)> {
+/// `<runtime> <state> [--accept-unverified-metadata]`
+fn paths<I: Iterator<Item = std::ffi::OsString>>(mut args: I) -> io::Result<(PathBuf, PathBuf, bool)> {
     let runtime = PathBuf::from(args.next().ok_or_else(|| invalid("missing runtime root"))?);
     let state = PathBuf::from(args.next().ok_or_else(|| invalid("missing private state path"))?);
+    let accept = match args.next() {
+        None => false,
+        Some(flag) if flag == "--accept-unverified-metadata" => true,
+        Some(_) => return Err(invalid("unexpected provision arguments")),
+    };
     if args.next().is_some() { return Err(invalid("unexpected provision arguments")); }
-    Ok((runtime, state))
+    Ok((runtime, state, accept))
 }
 
 /// A failed supervised run: the stage name and a reason free of identity
@@ -422,6 +454,91 @@ fn supervise(state: &Path, identity: Vec<u8>, mut record: serde_json::Value, mut
     Ok(())
 }
 
+/// The metadata workflow modes. Output never contains identity values.
+///   --metadata-report <file>...    classify each possible source
+///   --metadata-candidates          list sourced, unverified reference pairs
+///   --metadata-prepare <out> (--from-candidate <id> | --from-file <file> [--source <text>] [--apple-verified])
+///   --metadata-check-state <state> state recorded with the configured pair?
+fn metadata_mode(mode: &str, mut args: std::env::ArgsOs) -> io::Result<()> {
+    let text = |arg: Option<std::ffi::OsString>, what: &'static str| -> io::Result<String> {
+        arg.and_then(|a| a.into_string().ok()).ok_or_else(|| invalid(what))
+    };
+    match mode {
+        "--metadata-candidates" => {
+            for candidate in metadata::candidates()? {
+                println!("CANDIDATE {}: {}\n  status: {}", candidate.id, metadata::describe(&candidate.metadata), candidate.status);
+            }
+            Ok(())
+        }
+        "--metadata-report" => {
+            let mut usable = 0;
+            for path in args {
+                let path = PathBuf::from(path);
+                let line = match metadata::inspect(&path) {
+                    Ok(metadata::Source::Metadata(m)) => { usable += 1; format!("USABLE metadata file: {}", metadata::describe(&m)) }
+                    Ok(metadata::Source::State(m)) => { usable += 1; format!("USABLE provisioned-state record: {}", metadata::describe(&m)) }
+                    Ok(metadata::Source::Identity(Some(m))) => { usable += 1; format!("USABLE identity client fields: {}", metadata::describe(&m)) }
+                    Ok(metadata::Source::Identity(None)) => "UNUSABLE identity file: holds no client metadata".into(),
+                    Err(error) => format!("UNUSABLE: {}", provisioning_client::safe_reason(&error)),
+                };
+                println!("{line}  [{}]", path.display());
+            }
+            if usable == 0 { return Err(invalid("no usable client metadata source")); }
+            Ok(())
+        }
+        "--metadata-prepare" => {
+            let out = PathBuf::from(args.next().ok_or_else(|| invalid("missing output path"))?);
+            let kind = text(args.next(), "missing --from-candidate or --from-file")?;
+            let origin = text(args.next(), "missing source")?;
+            let mut source_text = None;
+            let mut apple_verified = false;
+            while let Some(flag) = args.next() {
+                match flag.to_str() {
+                    Some("--source") => source_text = Some(text(args.next(), "missing --source text")?),
+                    Some("--apple-verified") => apple_verified = true,
+                    _ => return Err(invalid("unexpected prepare argument")),
+                }
+            }
+            let metadata = match kind.as_str() {
+                "--from-candidate" => {
+                    if source_text.is_some() || apple_verified {
+                        return Err(invalid("a candidate keeps its own source and is never Apple-verified"));
+                    }
+                    metadata::candidates()?.into_iter().find(|c| c.id == origin)
+                        .ok_or_else(|| invalid("unknown candidate"))?.metadata
+                }
+                "--from-file" => {
+                    let mut metadata = match metadata::inspect(Path::new(&origin))? {
+                        metadata::Source::Metadata(m) | metadata::Source::State(m) | metadata::Source::Identity(Some(m)) => m,
+                        metadata::Source::Identity(None) => return Err(invalid("identity file holds no client metadata")),
+                    };
+                    let existing = metadata.provenance.take();
+                    let source = source_text.or_else(|| existing.as_ref().map(|p| p.source.clone()))
+                        .ok_or_else(|| invalid("record where this pair came from with --source"))?;
+                    metadata.provenance = Some(Provenance {
+                        source, apple_verified: apple_verified || existing.is_some_and(|p| p.apple_verified),
+                    });
+                    metadata
+                }
+                _ => return Err(invalid("missing --from-candidate or --from-file")),
+            };
+            metadata::prepare(&out, &metadata)?;
+            println!("PREPARED {} (0600): {}", out.display(), metadata::describe(&metadata));
+            Ok(())
+        }
+        "--metadata-check-state" => {
+            let state = PathBuf::from(args.next().ok_or_else(|| invalid("missing state directory"))?);
+            if args.next().is_some() { return Err(invalid("unexpected arguments")); }
+            let path = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE")
+                .ok_or_else(|| invalid("ZAG_ANISETTE_CLIENT_INFO_FILE not set"))?;
+            metadata::check_state(&state, &client_info_config::load(Path::new(&path))?)?;
+            println!("PASS: state was provisioned with the configured client metadata");
+            Ok(())
+        }
+        _ => Err(invalid("unknown metadata mode")),
+    }
+}
+
 /// Return true for a handled isolated mode; other modes remain in main.rs.
 pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     let mut args = std::env::args_os();
@@ -431,7 +548,8 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         "--provision-supervised" | "--coordinator-process"
         | "--validate-identity" | "--validate-client-identity"
         | "--provision-client-supervised" | "--client-coordinator-process"
-        | "--metadata-readiness")) else { return Ok(false); };
+        | "--metadata-readiness" | "--metadata-report" | "--metadata-candidates"
+        | "--metadata-prepare" | "--metadata-check-state")) else { return Ok(false); };
     let client_derived = mode.contains("client");
     if mode == "--metadata-readiness" {
         if args.next().is_some() {
@@ -440,9 +558,15 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         let Some(path) = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE") else {
             return Err(invalid("BLOCKED: private client metadata not configured; no credentials required").into());
         };
-        client_info_config::read_config(Path::new(&path))
-            .map_err(|_| invalid("BLOCKED: private client metadata is missing or invalid; no credentials required"))?;
-        println!("PASS: private client metadata is readable and structurally valid (Apple compatibility unverified)");
+        let metadata = client_info_config::load(Path::new(&path)).map_err(|error| {
+            eprintln!("BLOCKED: private client metadata is unusable: {}", provisioning_client::safe_reason(&error));
+            invalid("BLOCKED: private client metadata is missing or invalid; no credentials required")
+        })?;
+        println!("PASS: private client metadata is readable and well-formed: {}", metadata::describe(&metadata));
+        return Ok(true);
+    }
+    if mode.starts_with("--metadata-") {
+        metadata_mode(mode, args)?;
         return Ok(true);
     }
     if mode.starts_with("--validate-") {
@@ -457,23 +581,20 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(true);
     }
 
-    let (runtime, state) = paths(args)?;
+    let (runtime, state, accept_unverified) = paths(args)?;
     if mode.starts_with("--provision") {
         let result = (|| {
             validate_paths(&runtime, &state).map_err(fail("configuration"))?;
             let mut identity = read_identity(io::stdin().lock()).map_err(fail("configuration"))?;
-            apply_configured_metadata(&mut identity).map_err(fail("configuration"))?;
-            if std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE").is_none() {
-                return Err(fail("configuration")(invalid("private client metadata configuration required")));
-            }
+            let configured = apply_configured_metadata(&mut identity).map_err(fail("configuration"))?
+                .ok_or_else(|| fail("configuration")(invalid("private client metadata configuration required")))?;
+            require_provisioning_metadata(&configured, accept_unverified).map_err(fail("configuration"))?;
             let android_id = validate(&identity, client_derived, true).map_err(fail("configuration"))?;
             let identity_bytes = serde_json::to_vec(&identity)
                 .map_err(|_| fail("configuration")(invalid("invalid identity encoding")))?;
-            let mut record = serde_json::to_value(&identity)
+            let record = state_record(&identity, &android_id, &configured)
                 .map_err(|_| fail("configuration")(invalid("invalid identity encoding")))?;
-            record["android_identifier"] = android_id.clone().into();
-            record["ds_id"] = (-2).into();
-            println!("PASS configuration: identity and client metadata validated offline");
+            println!("PASS configuration: identity and client metadata validated offline: {}", metadata::describe(&configured));
 
             let (staging, verify) = attempt_paths(&state).map_err(fail("configuration"))?;
             let binary = std::env::current_exe().and_then(|path| path.canonicalize())
@@ -558,27 +679,51 @@ mod tests {
     }
 
     #[test]
-    fn metadata_file_sets_both_fields_and_rejects_conflicts() {
+    fn provisioning_takes_the_served_pair_and_refuses_mismatches_and_unsourced_metadata() {
         let root = private_dir("metadata-contract");
         let path = root.join("metadata.json");
-        fs::write(&path, r#"{"client_info":"offline-client","user_agent":"offline-agent/1.0"}"#).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        // Blank placeholders, as in an identity that lacks client metadata.
+        let candidate = metadata::candidates().unwrap().remove(0).metadata;
+        metadata::prepare(&path, &candidate).unwrap();
+        // An existing identity with blank placeholders is preserved as is.
         let mut identity = read_identity(
             br#"{"device_id":"d","local_user":"l","client_info":"","serial":""}"#.as_slice()).unwrap();
         assert!(identity.client_info.is_none() && identity.serial.is_none());
-        apply_metadata_file(&mut identity, &path).unwrap();
-        assert_eq!(identity.client_info.as_deref(), Some("offline-client"));
-        assert_eq!(identity.user_agent.as_deref(), Some("offline-agent/1.0"));
-        let bytes = serde_json::to_vec(&identity).unwrap();
-        let parsed = read_identity(bytes.as_slice()).unwrap();
-        assert_eq!(parsed.user_agent.as_deref(), Some("offline-agent/1.0"));
+        let configured = apply_metadata_file(&mut identity, &path).unwrap();
+        // What provisioning sends is exactly what /v3/client_info serves.
+        let served: serde_json::Value = serde_json::from_str(&client_info_config::read_config(&path).unwrap()).unwrap();
+        assert_eq!(identity.client_info.as_deref(), served["client_info"].as_str());
+        assert_eq!(identity.user_agent.as_deref(), served["user_agent"].as_str());
+        let parsed = read_identity(serde_json::to_vec(&identity).unwrap().as_slice()).unwrap();
+        assert_eq!(parsed.user_agent, identity.user_agent);
         assert!(parsed.serial.is_none());
-        identity.user_agent = Some("conflicting-agent".into());
+        // Identity values that disagree with the configuration are refused.
+        identity.user_agent = Some("akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0".into());
         assert!(apply_metadata_file(&mut identity, &path).is_err());
         identity.user_agent = None;
-        identity.client_info = Some("conflicting-client".into());
+        identity.client_info = Some("<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.akd/1.0)>".into());
         assert!(apply_metadata_file(&mut identity, &path).is_err());
+        // Unverified needs the explicit flag; unsourced is never enough.
+        assert!(require_provisioning_metadata(&configured, false).is_err());
+        assert!(require_provisioning_metadata(&configured, true).is_ok());
+        let mut unsourced = configured.clone();
+        unsourced.provenance = None;
+        assert!(require_provisioning_metadata(&unsourced, true).is_err());
+        let mut verified = configured;
+        verified.provenance.as_mut().unwrap().apple_verified = true;
+        assert!(require_provisioning_metadata(&verified, false).is_ok());
+        // A provisioned state's record matches only the pair it was made with.
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        let record = state_record(&identity, "00010203-0405-06", &verified).unwrap();
+        fs::write(state.join(metadata::RECORD), serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::set_permissions(state.join(metadata::RECORD), fs::Permissions::from_mode(0o600)).unwrap();
+        metadata::check_state(&state, &verified).unwrap();
+        let mut changed = verified.clone();
+        changed.user_agent = "akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0".into();
+        assert!(metadata::check_state(&state, &changed).is_err());
+        let args = |extra: &str| paths(vec!["/r".into(), "/s".into(), extra.into()].into_iter());
+        assert!(args("--accept-unverified-metadata").unwrap().2);
+        assert!(args("--accept").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -617,6 +762,7 @@ mod tests {
     #[test]
     fn provision_paths_reject_relative_existing_and_public_parents() {
         assert!(paths(vec!["/".into(), "/tmp/state".into(), "extra".into()].into_iter()).is_err());
+        assert!(!paths(vec!["/".into(), "/tmp/state".into()].into_iter()).unwrap().2);
         let root = private_dir("paths");
         assert!(validate_paths(Path::new("relative"), &root.join("state")).is_err());
         assert!(validate_paths(Path::new("/"), &root).is_err());
