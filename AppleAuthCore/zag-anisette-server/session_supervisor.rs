@@ -441,7 +441,7 @@ mod split_v2_tests {
         assert!(Command::new("rustc").args(["--edition=2021", "-o"])
             .arg(&executable).arg(&source).status().unwrap().success());
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut session = SplitV2Session::spawn(&executable, &["--v2"], Duration::from_secs(5)).unwrap();
+        let mut session = SplitV2Session::spawn(&executable, &["--v2-split"], Duration::from_secs(5)).unwrap();
         let pid = session.child.id();
         let cancel = AtomicBool::new(false);
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
@@ -449,13 +449,11 @@ mod split_v2_tests {
         assert_eq!(session.exchange(&start, &cancel), Ok(Response::Started(vec![0, 255])));
         assert_eq!(session.child.id(), pid);
         assert_eq!(session.exchange(&start, &cancel), Err(SessionError::InvalidResponse));
-        // The fixture waits for stdin EOF before responding to Finish. The
-        // split-phase adapter must close its command channel before awaiting
-        // the final reply; this test deliberately exposes that requirement.
+        assert_eq!(session.exchange(&finish, &cancel), Ok(Response::Finished(vec![255, 0])));
+        assert_eq!(session.exchange(&finish, &cancel), Err(SessionError::InvalidResponse));
         drop(session);
         let _ = std::fs::remove_file(&executable);
         let _ = std::fs::remove_dir(&temp);
-        let _ = finish;
     }
 }
 
