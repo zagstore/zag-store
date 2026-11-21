@@ -207,7 +207,7 @@ impl<B: crate::session_worker::SessionBackend> NativeSessionTransport for Offlin
 /// real Apple protocol field encoding requires separate validation.
 #[cfg(test)]
 pub struct OfflineSplitChildTransport {
-    child: crate::session_supervisor::SplitV2Session,
+    child: Option<crate::session_supervisor::SplitV2Session>,
     cancel: std::sync::atomic::AtomicBool,
 }
 #[cfg(test)]
@@ -215,8 +215,8 @@ impl OfflineSplitChildTransport {
     pub fn spawn(path: &std::path::Path, args: &[&str], timeout: std::time::Duration)
         -> Result<Self, ProtocolError> {
         Ok(Self {
-            child: crate::session_supervisor::SplitV2Session::spawn(path, args, timeout)
-                .map_err(|_| ProtocolError::BackendUnavailable)?,
+            child: Some(crate::session_supervisor::SplitV2Session::spawn(path, args, timeout)
+                .map_err(|_| ProtocolError::BackendUnavailable)?),
             cancel: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -242,7 +242,8 @@ impl NativeSessionTransport for OfflineSplitChildTransport {
         let request = Request::Start {
             identifier: identifier.into(), spim: Self::decode_hex(spim)?,
         };
-        match self.child.exchange(&request, &self.cancel)
+        match self.child.as_mut().ok_or(ProtocolError::BackendUnavailable)?
+            .exchange(&request, &self.cancel)
             .map_err(|_| ProtocolError::BackendUnavailable)? {
             Response::Started(bytes) => Ok(Self::encode_hex(&bytes)),
             _ => Err(ProtocolError::BackendUnavailable),
@@ -253,7 +254,8 @@ impl NativeSessionTransport for OfflineSplitChildTransport {
         let request = Request::Finish {
             ptm: Self::decode_hex(ptm)?, tk: Self::decode_hex(tk)?,
         };
-        match self.child.exchange(&request, &self.cancel)
+        match self.child.as_mut().ok_or(ProtocolError::BackendUnavailable)?
+            .exchange(&request, &self.cancel)
             .map_err(|_| ProtocolError::BackendUnavailable)? {
             Response::Finished(bytes) => Ok(Self::encode_hex(&bytes)),
             _ => Err(ProtocolError::BackendUnavailable),
@@ -261,6 +263,8 @@ impl NativeSessionTransport for OfflineSplitChildTransport {
     }
     fn abort(&mut self) {
         self.cancel.store(true, std::sync::atomic::Ordering::Release);
+        // Drop synchronously kills the process group and waits for its leader.
+        self.child.take();
     }
 }
 
@@ -369,6 +373,33 @@ pub fn process_text_frame<B: ProvisioningBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn explicit_abort_immediately_closes_worker_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!(
+            "zag-provider-abort-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temp.join("fixture");
+        assert!(std::process::Command::new("rustc")
+            .args(["--edition=2021", "-o"]).arg(&executable).arg(&source)
+            .status().unwrap().success());
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut transport = OfflineSplitChildTransport::spawn(&executable,
+            &["--v2-split"], std::time::Duration::from_secs(5)).unwrap();
+        assert!(transport.child.is_some());
+        transport.abort();
+        assert!(transport.child.is_none());
+        transport.abort();
+        assert_eq!(transport.start("-2", "00ff"), Err(ProtocolError::BackendUnavailable));
+        assert_eq!(transport.finish("ff00", "80"), Err(ProtocolError::BackendUnavailable));
+        drop(transport);
+        std::fs::remove_file(&executable).unwrap();
+        std::fs::remove_dir(&temp).unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn persistent_subprocess_rejects_bad_reply_and_terminates_provisioning() {
