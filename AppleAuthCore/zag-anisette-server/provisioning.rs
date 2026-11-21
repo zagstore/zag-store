@@ -106,6 +106,78 @@ impl AdiProvider for OfflineWorkerAdiProvider {
     }
 }
 
+/// A session-owned native transport. The same transport instance must survive
+/// Start and Finish; dropping it must cancel and reap its native child.
+/// This boundary is deliberately not connected to the network listener.
+pub trait NativeSessionTransport {
+    fn start(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError>;
+    fn finish(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError>;
+    fn abort(&mut self);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePhase { Fresh, AwaitFinish, Terminal }
+
+/// Owns exactly one native transport for the entire provisioning exchange.
+/// No executable path, native session handle, or Apple material is exposed.
+pub struct SessionOwnedAdiProvider<T: NativeSessionTransport> {
+    transport: T,
+    phase: NativePhase,
+}
+
+impl<T: NativeSessionTransport> SessionOwnedAdiProvider<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport, phase: NativePhase::Fresh }
+    }
+}
+
+impl<T: NativeSessionTransport> AdiProvider for SessionOwnedAdiProvider<T> {
+    fn start_provisioning(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError> {
+        if self.phase != NativePhase::Fresh { return Err(ProtocolError::InvalidTransition); }
+        // Mark terminal before crossing the native boundary: a failed Start
+        // must never be retried against an ambiguous native handle.
+        self.phase = NativePhase::Terminal;
+        match self.transport.start(identifier, spim) {
+            Ok(cpim) if field_ok(&cpim) => {
+                self.phase = NativePhase::AwaitFinish;
+                Ok(cpim)
+            }
+            Ok(_) => {
+                self.transport.abort();
+                Err(ProtocolError::InvalidField)
+            }
+            Err(error) => {
+                self.transport.abort();
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_provisioning(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError> {
+        if self.phase != NativePhase::AwaitFinish { return Err(ProtocolError::InvalidTransition); }
+        self.phase = NativePhase::Terminal;
+        match self.transport.finish(ptm, tk) {
+            Ok(adi_pb) if field_ok(&adi_pb) => Ok(adi_pb),
+            Ok(_) => {
+                self.transport.abort();
+                Err(ProtocolError::InvalidField)
+            }
+            Err(error) => {
+                self.transport.abort();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<T: NativeSessionTransport> Drop for SessionOwnedAdiProvider<T> {
+    fn drop(&mut self) {
+        // Abort even after successful Finish: implementations must make
+        // cleanup idempotent; never retry a native handle destruction.
+        self.transport.abort();
+    }
+}
+
 /// Safe default: provider never produces Apple provisioning material.
 pub struct DisabledAdiProvider;
 impl AdiProvider for DisabledAdiProvider {
