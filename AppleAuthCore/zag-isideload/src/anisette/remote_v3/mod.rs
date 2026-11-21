@@ -29,7 +29,7 @@ use crate::anisette::{
     remote_v3::{state::AnisetteState, websocket::WsMessage},
 };
 use crate::auth::grandslam::GrandSlam;
-use crate::util::plist::PlistDataExtract;
+use crate::util::plist::{PlistDataExtract, decode_json};
 use crate::util::storage::SideloadingStorage;
 
 pub const ANISETTE_STATE_KEY: &str = "anisette_state";
@@ -207,10 +207,10 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
             .context("Failed to request /v3/client_info from anisette server")?
             .error_for_status()
             .context("anisette server returned an error for /v3/client_info")?
-            .json::<AnisetteClientInfo>()
+            .text()
             .await
-            .context("Failed to parse /v3/client_info response")?;
-        Ok(info)
+            .context("Failed to read /v3/client_info response")?;
+        decode_json::<AnisetteClientInfo>(&info, "/v3/client_info response")
     }
 
     async fn provision(&mut self, gs: &Arc<GrandSlam>, force_reset: bool) -> Result<(), Report> {
@@ -250,8 +250,9 @@ impl RemoteV3AnisetteProvider {
             .send()
             .await?
             .error_for_status()?
-            .json::<AnisetteHeaders>()
+            .text()
             .await?;
+        let headers = decode_json::<AnisetteHeaders>(&headers, "/v3/get_headers response")?;
 
         match headers {
             AnisetteHeaders::Headers {
@@ -319,7 +320,9 @@ impl RemoteV3AnisetteProvider {
             diagnostics::record(StateChange::Reset);
             AnisetteState::new()
         } else {
-            match self.state.take() {
+            // Cloned, not taken: if this call is cancelled during the exchange,
+            // the provider keeps its identity rather than losing it.
+            match self.state.clone() {
                 // An earlier attempt of this provider: keep its identity.
                 Some(own) => own,
                 None => {
@@ -420,7 +423,7 @@ impl RemoteV3AnisetteProvider {
 
             // Provisioning messages may carry CPIM, PTM, TK, or ADI state.
             // Never log raw payloads, even at debug level.
-            let provision_msg: ProvisioningMessage = serde_json::from_str(&text)?;
+            let provision_msg: ProvisioningMessage = decode_json(&text, "provisioning message")?;
 
             match provision_msg {
                 ProvisioningMessage::GiveIdentifier => {
@@ -498,7 +501,11 @@ impl RemoteV3AnisetteProvider {
                     .context("Failed to send start provisioning data")?;
                 }
                 ProvisioningMessage::ProvisioningSuccess { adi_pb } => {
-                    state.adi_pb = Some(BASE64_STANDARD.decode(adi_pb)?);
+                    state.adi_pb = Some(
+                        BASE64_STANDARD
+                            .decode(adi_pb)
+                            .map_err(|_| report!("Provisioning result is not valid base64"))?,
+                    );
                     // Zag Store fork: provisioning is complete; a failed close
                     // must not discard it before it is stored.
                     let _ = ws.close().await;
@@ -689,6 +696,79 @@ mod persistence_tests {
         assert_eq!(ia, ib);
         assert_ne!(ia, [3; 16], "the rejected device is not kept");
         assert_eq!(stored_identity(&storage), ia);
+    }
+
+    fn never_exchange(_: &mut AnisetteState) -> Result<(), Report> {
+        panic!("must not provision")
+    }
+
+    #[tokio::test]
+    async fn reset_adopts_a_replacement_another_session_made() {
+        // This provider's device X was rejected (-45061), but storage already
+        // holds Y, made by another session: Y is adopted, nothing provisioned.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let y = AnisetteState { keychain_identifier: [5; 16], adi_pb: Some(vec![5]) };
+        storage.store_data(ANISETTE_STATE_KEY, &stored(&y)).unwrap();
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut provider = sharing(&storage, "test-adopt-reset", never_exchange);
+        provider.state = Some(AnisetteState { keychain_identifier: [4; 16], adi_pb: Some(vec![4]) });
+        let before = diagnostics::count(StateChange::Adopted);
+        assert_eq!(provider.get_state(&gs, true).await.unwrap().keychain_identifier, [5; 16]);
+        assert!(diagnostics::count(StateChange::Adopted) > before);
+    }
+
+    #[tokio::test]
+    async fn reset_of_the_stored_device_replaces_it() {
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let x = AnisetteState { keychain_identifier: [6; 16], adi_pb: Some(vec![6]) };
+        storage.store_data(ANISETTE_STATE_KEY, &stored(&x)).unwrap();
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut provider = sharing(&storage, "test-reset-own", corrupt_exchange);
+        provider.state = Some(x);
+        let identity = provider.get_state(&gs, true).await.unwrap().keychain_identifier;
+        assert_ne!(identity, [6; 16], "the rejected device is not adopted back");
+        assert_eq!(stored_identity(&storage), identity);
+    }
+
+    fn slow_exchange(state: &mut AnisetteState) -> Result<(), Report> {
+        state.adi_pb = Some(vec![1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_provisioning_releases_the_lock_and_stores_nothing() {
+        // The sign-in is cancelled mid-exchange (the future is dropped): the
+        // scope's lock is released, nothing is stored, and the provider keeps
+        // its in-memory identity.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut a = sharing(&storage, "test-cancel", slow_exchange);
+        a.state = Some(AnisetteState { keychain_identifier: [2; 16], adi_pb: None });
+        // The test exchange waits 30 ms first; 5 ms cancels it inside.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(5), a.get_state(&gs, false)).await.is_err());
+        assert!(storage.retrieve_data(ANISETTE_STATE_KEY).unwrap().is_none());
+        assert_eq!(a.state.as_ref().map(|s| s.keychain_identifier), Some([2; 16]));
+        let mut b = sharing(&storage, "test-cancel", slow_exchange);
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), b.get_state(&gs, false)).await;
+        assert!(done.expect("the lock was released").is_ok());
+    }
+
+    #[tokio::test]
+    async fn accounts_do_not_wait_for_each_other() {
+        // Holding one account's lock blocks only that account.
+        let held = coordination::lock(Some("test-account-a"));
+        let _guard = held.lock().await;
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let other = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let mut b = sharing(&other, "test-account-b", slow_exchange);
+        let quick = std::time::Duration::from_millis(500);
+        assert!(tokio::time::timeout(quick, b.get_state(&gs, false)).await.expect("another account is not blocked").is_ok());
+        let same = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let mut a = sharing(&same, "test-account-a", slow_exchange);
+        assert!(tokio::time::timeout(quick, a.get_state(&gs, false)).await.is_err(), "the same account waits");
+        // A provider without a scope has a lock of its own.
+        assert!(!Arc::ptr_eq(&coordination::lock(None), &coordination::lock(None)));
+        assert!(Arc::ptr_eq(&held, &coordination::lock(Some("test-account-a"))));
     }
 
     fn corrupt_exchange(state: &mut AnisetteState) -> Result<(), Report> {

@@ -762,8 +762,9 @@ impl AppleAccount {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
             && let Some(numbers) = json.get("trustedPhoneNumbers")
         {
+            // Zag Store fork: serde's error could quote a number; it is dropped.
             let numbers: Vec<TrustedNumber> = serde_json::from_value(numbers.clone())
-                .context("Failed to parse trusted phone numbers")?;
+                .map_err(|_| report!("Failed to parse trusted phone numbers"))?;
             debug!(
                 "Retrieved {} trusted phone numbers (status {}): {:?}",
                 numbers.len(),

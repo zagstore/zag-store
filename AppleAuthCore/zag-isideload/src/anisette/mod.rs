@@ -174,15 +174,16 @@ impl AnisetteDataGenerator {
         let provider = self.provider.read().await;
         match provider.get_anisette_data().await? {
             AnisetteDataResponse::Data(data) => Ok(data),
-            status @ (AnisetteDataResponse::NeedsProvisioning
-            | AnisetteDataResponse::IncorrectlyProvisioned) => {
+            AnisetteDataResponse::NeedsProvisioning | AnisetteDataResponse::IncorrectlyProvisioned => {
                 drop(provider);
                 let mut provider_write = self.provider.write().await;
                 // Zag Store fork: clones of this generator share the provider.
                 // Another caller may have provisioned while this one waited for
                 // the lock; provisioning again would register a second device
-                // with Apple (or reset the one just made), so check first.
-                if let AnisetteDataResponse::Data(data) = provider_write.get_anisette_data().await? {
+                // with Apple (or reset the one just made), so check first. The
+                // reset is decided by this answer, not the one before the wait.
+                let status = provider_write.get_anisette_data().await?;
+                if let AnisetteDataResponse::Data(data) = status {
                     return Ok(data);
                 }
                 provider_write
@@ -278,6 +279,46 @@ mod tests {
         );
         assert!(ra.is_ok() && rb.is_ok() && rc.is_ok());
         provisions.load(Ordering::SeqCst)
+    }
+
+    /// Rejected (-45061) before the write lock, then merely unprovisioned
+    /// after it (another caller cleared it): the reset must follow the newer
+    /// answer.
+    struct Changing {
+        reads: std::sync::Mutex<Vec<AnisetteDataResponse>>,
+        forced: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AnisetteProvider for Changing {
+        async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
+            let mut reads = self.reads.lock().unwrap();
+            Ok(if reads.is_empty() { AnisetteDataResponse::Data(data()) } else { reads.remove(0) })
+        }
+        async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
+            Ok(AnisetteClientInfo { client_info: String::new(), user_agent: String::new() })
+        }
+        async fn provision(&mut self, _: &Arc<GrandSlam>, force: bool) -> Result<(), Report> {
+            self.forced.lock().unwrap().push(force);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_follows_the_answer_after_the_wait() {
+        for (after, expected) in [
+            (AnisetteDataResponse::NeedsProvisioning, false),
+            (AnisetteDataResponse::IncorrectlyProvisioned, true),
+        ] {
+            let forced = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Changing {
+                reads: std::sync::Mutex::new(vec![AnisetteDataResponse::IncorrectlyProvisioned, after]),
+                forced: forced.clone(),
+            };
+            let mut generator = AnisetteDataGenerator::new(Arc::new(RwLock::new(provider)));
+            generator.get_anisette_data(Arc::new(GrandSlam::offline_for_tests())).await.unwrap();
+            assert_eq!(*forced.lock().unwrap(), vec![expected]);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Apple authentication reliability audit
 
-21 November 2026. Base: `feature/native-adi-provider-review` at `c37b6331`. Branch: `claude/auth-reliability`. The first pass fixed R1–R6 (`93a39d36`); the second fixed D1–D4.
+21 November 2026. Base: `feature/native-adi-provider-review` at `c37b6331`. Branch: `claude/auth-reliability`. The first pass fixed R1–R6 (`93a39d36`), and the second fixed D1–D4 (`f826b912`). The third pass merged `1be6498c` and reviewed the lock and redaction, below.
 
 **Scope:** sign-in, 2FA, the app token, the anisette provider, its device state, and the bridge's storage. The covered code is `zag-isideload` (`auth/`, `anisette/`, `net_policy.rs`), `zag-apple-bridge/src/live.rs` and Swift's anisette Keychain callbacks.
 
@@ -263,24 +263,86 @@ Everything below is counts and buckets. No identifiers, account data or response
 
 **API note.** The bridge's `FailureKind::Network` currently merges timeout, connect failure and 5xx. Splitting it is an API change for Swift, so it is a recommendation only. A server-side synthetic check, for example a URL bag request every few minutes, would contact Apple, and needs its own approval.
 
+## Integration review (third pass)
+
+`feature/native-adi-provider-review` at `1be6498c` (GPT-6's `Cargo.lock` fix) was **merged**, not rebased, because the branch is already pushed and is never force-pushed. There were no conflicts. Nothing in `zag-anisette-server`, the native CoreADI code or the provisioning coordinator was modified.
+
+### The scope lock
+
+**Deadlock and lock ordering: no cycle.**
+- The only order is generator `RwLock` (write), then the scope's `tokio::Mutex`. Nothing takes them the other way round.
+- `get_state` never re-enters itself and never touches a generator.
+- The provisioning exchange uses only GrandSlam and the anisette socket.
+- The registry's `std::sync::Mutex` is held only to look up or insert an entry, never across an `await`, and a poisoned registry is recovered.
+
+**Bounded hold.** The lock is held through the exchange with Apple. Every step of that is now time-limited: 15 s connect and 60 s per request (R2), and 30 s socket connect plus 60 s per message (R3). A waiting session can be cancelled, because waiting for a `tokio::Mutex` is cancel-safe.
+
+**No cross-account interference.**
+- Locks are keyed by the account's validated anisette scope; providers without a scope get a private lock.
+- **Test:** `accounts_do_not_wait_for_each_other`. Holding account A's lock doesn't block account B, while a second A provider waits.
+- Registry entries are weak references, so an entry nobody holds is replaced, never shared with a stale holder.
+
+**Cancellation safety. Defect found and fixed.**
+- **Defect:** `get_state` *took* the provider's own unprovisioned state before the exchange. A cancelled sign-in (the future dropped mid-exchange) left the provider with no identity at all.
+- **Fix:** it is now cloned. Dropping the future releases the lock, stores nothing, and keeps the provider's identity.
+- No `await` lies between a successful exchange and the synchronous store, so a cancel cannot fall between them.
+- **Test:** `cancelled_provisioning_releases_the_lock_and_stores_nothing`. Mutation-checked: `take()` fails it.
+
+**State re-check and the `-45061` reset path. Defect found and fixed.**
+- **Defect:** in `AnisetteDataGenerator`, the reset flag came from the answer *before* waiting for the write lock. If the re-check under the lock said only "needs provisioning" (no state), a reset was still forced.
+- **Fix:** the flag now comes from the re-checked answer.
+- **Test:** `reset_follows_the_answer_after_the_wait`. Mutation-checked.
+
+Under the scope lock, a reset rejects only the provider's own device:
+- a different stored device is adopted with no provisioning (`reset_adopts_a_replacement_another_session_made`, whose exchange panics if called);
+- the provider's own stored device is replaced and the new one stored (`reset_of_the_stored_device_replaces_it`);
+- two sessions resetting together reset once (`two_sessions_resetting_one_device_reset_it_once`).
+
+**Residual.** A reset arriving with no in-memory state cannot name a rejected device, so it would adopt the stored one. This cannot happen in practice, because `-45061` comes only from a request made with in-memory state. If it ever did, it would at worst repeat the request once, within the generator's three attempts.
+
+### Redaction
+
+**Re-checked:**
+- the five redacted `Debug` types (`AnisetteData`, `AnisetteState`, `AppToken`, `TwoFactorCallbackResponse`, `SensitivePlistAttachment`);
+- every remaining `derive(Debug)` in the crate, which carries no OTP, token, identifier, blob or code;
+- every error that could carry a body.
+
+**Gap found and fixed: deserializer errors.** serde's and plist's own messages quote the rejected value (`invalid type: string "…", expected u32`). That covered these places:
+- the anisette `client_info` and `get_headers` responses and each provisioning message (which can carry `adi_pb`, `cpim` and `tk`);
+- `get_struct` (developer-services responses, which carry device identifiers);
+- `listAppIds`;
+- the trusted-number list.
+
+All of them now go through `decode_json`, or drop the error, and report only what failed and how long the body was. A base64 error in `adi_pb` is no longer reported either. **Test:** `decoding_errors_do_not_quote_values`, which covers JSON and plist.
+
+**Unchanged, verified:**
+- The bridge's `classify` reduces every report to a `FailureKind`, so no report text reaches Swift.
+- Logging is compiled out.
+
 ## Test results
 
-These are the results after the second pass, D1–D4. Everything is offline, with no Apple contact and no credentials.
+These were run once after the merge of `1be6498c` and the third-pass fixes. Everything is offline, with no Apple contact and no credentials.
 
 | Suite | Result |
 |---|---|
-| `zag-isideload`: `cargo test` | 32 passed (9 at `c37b6331`, 18 after R1–R6) |
-| `zag-isideload`: `cargo test --features live-network` | 33 passed |
-| Concurrency tests (R5 ×2, D1 ×2, D2) | 20 of 20 repeated runs passed |
-| `zag-apple-bridge`: `cargo test` / `--features live` / `--features mock` | 4 + 4 / 8 + 4 / 3 + 15 passed |
+| `zag-isideload`: `cargo test` | 38 passed (9 at `c37b6331`) |
+| `zag-isideload`: `cargo test --features live-network` | 39 passed |
+| Concurrency, reset and cancellation tests (10) | 20 of 20 repeated runs passed |
+| `zag-apple-bridge`: default / `live` / `mock` | 4 + 4 / 8 + 4 / 3 + 15 passed |
 | `scripts/test-zag-apple-bridge.sh` | 112 checks passed |
 | `scripts/test-zag-existing-account.sh` | 122 checks passed |
 | `scripts/test-zag-g5-experiment.sh` | 419 checks passed |
 | `scripts/test-zag-free-account-*.sh` | authentication 90, portal 43, signing 94, Keychain, foundation 96: passed |
 
-**Mutation checks.** Each of these fails when its fix is removed:
+**Mutation-checked.** Each of these fails when its fix is removed:
 - R1: the storage-read stop;
 - R5: the re-check under the write lock;
-- D1: the scope lock, and the re-read after taking it.
+- D1: the scope lock, and the re-read under it;
+- third pass: clone instead of take, and the reset flag taken from the re-checked answer.
 
-**Not run.** `zag-anisette-server` (GPT-6's) was not run on this pass, and nothing in it was touched.
+**Not affected by this branch:** `zag-anisette-server` (GPT-6's crate). Nothing in it is changed, and it doesn't depend on `zag-isideload`. With `--locked` it now builds. On this Mac 116 tests passed and 8 failed (9 on another run). The failures are all subprocess and worker tests:
+- `provisioning::tests` ×3;
+- `session_supervisor::split_v2_tests` ×4;
+- `adi_worker_lifecycle::tests::worker_does_not_inherit_environment_or_working_directory`.
+
+These are the macOS failures reported earlier. GPT-6 reports all 124 pass on Ubuntu.

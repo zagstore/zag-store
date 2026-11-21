@@ -94,8 +94,10 @@ pub trait AppIdsApi {
             .context("Failed to list developer app IDs")?
             .into();
 
-        let app_ids: ListAppIdsResponse = plist::from_value(&response).map_err(|e| {
-            report!("Failed to deserialize app id response: {:?}", e).attach(
+        let app_ids: ListAppIdsResponse = plist::from_value(&response).map_err(|_| {
+            // Zag Store fork: the deserializer's error is not reported (it can
+            // quote values); the attachment names keys only.
+            report!("Failed to deserialize app id response").attach(
                 SensitivePlistAttachment::new(
                     response
                         .as_dictionary()
