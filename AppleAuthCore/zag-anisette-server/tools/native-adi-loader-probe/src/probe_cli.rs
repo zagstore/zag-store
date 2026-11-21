@@ -160,7 +160,22 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         && mode != OsStr::new("--validate-identity")
         && mode != OsStr::new("--validate-client-identity")
         && mode != OsStr::new("--provision-client-supervised")
-        && mode != OsStr::new("--client-coordinator-process") { return Ok(false); }
+        && mode != OsStr::new("--client-coordinator-process")
+        && mode != OsStr::new("--metadata-readiness") { return Ok(false); }
+    if mode == OsStr::new("--metadata-readiness") {
+        if args.next().is_some() {
+            return Err(invalid("unexpected metadata readiness arguments").into());
+        }
+        let Some(path) = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE") else {
+            println!("BLOCKED: private client metadata not configured; no credentials required");
+            return Ok(true);
+        };
+        match client_info_config::read_config(Path::new(&path)) {
+            Ok(_) => println!("PASS: private client metadata is readable and structurally valid (Apple compatibility unverified)"),
+            Err(_) => println!("BLOCKED: private client metadata is missing or invalid; no credentials required"),
+        }
+        return Ok(true);
+    }
     if mode == OsStr::new("--validate-identity") || mode == OsStr::new("--validate-client-identity") {
         if args.next().is_some() { return Err(invalid("unexpected identity validation arguments").into()); }
         let mut identity = read_identity(io::stdin().lock())?;
