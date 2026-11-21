@@ -261,6 +261,10 @@ mod tests {
         ));
         let nested = root.join("protected");
         std::fs::create_dir_all(&nested).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let script = nested.join("worker.sh");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
         let mut executable = std::fs::metadata(&script).unwrap().permissions();
@@ -290,6 +294,10 @@ mod tests {
             "zag-adi-dir-perms-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let script = dir.join("worker.sh");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
         let mut executable = std::fs::metadata(&script).unwrap().permissions();
@@ -317,6 +325,10 @@ mod tests {
             "zag-adi-permissions-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let script = dir.join("worker.sh");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
         for mode in [0o722, 0o702, 0o777] {
@@ -346,6 +358,10 @@ mod tests {
         // stdout descriptor. No IPC frame is produced.
         let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("zag-adi-lifecycle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let script = dir.join("worker.sh");
         std::fs::write(&script, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
         let mut mode = std::fs::metadata(&script).unwrap().permissions();
@@ -370,6 +386,10 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let script = dir.join("worker.sh");
         let marker = dir.join("escaped");
         let body = format!(
@@ -399,6 +419,10 @@ mod tests {
             "zag-adi-env-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let script = dir.join("worker.sh");
         let marker = dir.join("isolated");
         // HOME is set in GitHub runners and most shells. The worker should
@@ -428,6 +452,10 @@ mod tests {
             "zag-adi-roundtrip-{}-{:?}", std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let script = dir.join("worker.sh");
         let reply = r#"{"version":1,"type":"started","cpim":"ok"}"#;
         assert_eq!(reply.len(), 42);
