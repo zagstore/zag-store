@@ -161,7 +161,20 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         if !status.success() {
             return Err(invalid("isolated coordinator failed (check that complete identity JSON was supplied on stdin)").into());
         }
-        println!("PASS: supervised isolated ADI state generated");
+        // The native bridge writes adi.pb itself. Confirm that this invocation
+        // produced a regular, non-symlink file before reporting success.
+        let artifact = state.join("adi.pb");
+        let metadata = fs::symlink_metadata(&artifact)
+            .map_err(|_| invalid("coordinator succeeded without ADI state file"))?;
+        if !metadata.file_type().is_file() || metadata.len() == 0 {
+            return Err(invalid("coordinator produced invalid ADI state file").into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&artifact, fs::Permissions::from_mode(0o600))?;
+        }
+        println!("PASS: supervised isolated ADI state generated and secured");
     } else {
         if std::env::var(CHILD_MARKER).ok().as_deref() != Some("1") {
             return Err(invalid("internal coordinator requires watchdog marker").into());
