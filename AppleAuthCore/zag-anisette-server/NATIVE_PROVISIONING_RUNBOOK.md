@@ -33,6 +33,22 @@ operator ─▶ supervisor (probe --provision-client-supervised)
   it identically, or the state does not match the device.
 * ds_id is AuthKit's fixed `-2`.
 
+## TLS trust
+
+GrandSlam (`gsa.apple.com`, `gsas.apple.com`) chains to Apple Root CA
+(SHA-256 `B0B1730E…F024`). That root is not among the Mozilla roots that
+ureq bundles. The coordinator therefore trusts exactly that root, embedded
+from the same file the Zag Store client pins
+(`zag-isideload/src/assets/apple_root.cer`). It does not use the host's
+certificate store, so a `curl` success there proves nothing about the probe.
+
+`ZAG_ANISETTE_CLIENT_INFO_FILE=<file> <probe> --diagnose-lookup` makes one
+read-only GET of the URL bag through the coordinator's own stack. It sends
+the client headers but never device headers. It reports `PASS lookup: HTTP
+200, URL bag parsed …`, or `FAIL lookup: <reason>`, where the reason is one
+of DNS, TLS certificate (with rustls's reason), TLS handshake, timeout,
+connect, HTTP status or response parsing.
+
 ## Stages and failure reporting
 
 | Stage | Meaning |

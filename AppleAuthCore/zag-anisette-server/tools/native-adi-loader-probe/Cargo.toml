@@ -13,5 +13,7 @@ serde_json = "1.0"
 base64 = "0.22"
 plist = "=1.7.0"
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
+# Same rustls build ureq uses (no new crates); needed to name TLS failures.
+rustls = { version = "0.23.19", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 url = "=2.5.4"
 sha2 = "0.10"

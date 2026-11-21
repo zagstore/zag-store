@@ -549,7 +549,7 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         | "--validate-identity" | "--validate-client-identity"
         | "--provision-client-supervised" | "--client-coordinator-process"
         | "--metadata-readiness" | "--metadata-report" | "--metadata-candidates"
-        | "--metadata-prepare" | "--metadata-check-state")) else { return Ok(false); };
+        | "--metadata-prepare" | "--metadata-check-state" | "--diagnose-lookup")) else { return Ok(false); };
     let client_derived = mode.contains("client");
     if mode == "--metadata-readiness" {
         if args.next().is_some() {
@@ -563,6 +563,23 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
             invalid("BLOCKED: private client metadata is missing or invalid; no credentials required")
         })?;
         println!("PASS: private client metadata is readable and well-formed: {}", metadata::describe(&metadata));
+        return Ok(true);
+    }
+    if mode == "--diagnose-lookup" {
+        // One read-only GET of the URL bag through the coordinator's own
+        // HTTP stack, with the configured client headers only.
+        if args.next().is_some() { return Err(invalid("unexpected diagnose arguments").into()); }
+        let path = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE")
+            .ok_or_else(|| invalid("ZAG_ANISETTE_CLIENT_INFO_FILE not set"))?;
+        let metadata = client_info_config::load(Path::new(&path))?;
+        let apple = provisioning_client::AppleHttp::lookup_only(&metadata.client_info, &metadata.user_agent)?;
+        match provisioning_client::diagnose_lookup(&apple, Duration::from_secs(20)) {
+            Ok(summary) => println!("PASS lookup: {summary}"),
+            Err(error) => {
+                println!("FAIL lookup: {}", provisioning_client::safe_reason(&error));
+                std::process::exit(1);
+            }
+        }
         return Ok(true);
     }
     if mode.starts_with("--metadata-") {

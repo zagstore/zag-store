@@ -207,23 +207,106 @@ pub(crate) trait AppleTransport {
     fn send(&self, url: &Url, body: Option<&[u8]>, device: bool, end: Instant) -> io::Result<Dictionary>;
 }
 
+struct DeviceHeaders { device_id: String, local_user: String, serial: Option<String> }
+
 pub(crate) struct AppleHttp {
     agent: ureq::Agent,
-    device_id: String,
     client_info: String,
-    local_user: String,
-    serial: Option<String>,
     user_agent: String,
+    /// None for a lookup-only client, which can never send device headers.
+    device: Option<DeviceHeaders>,
 }
+
+fn client_headers(client_info: &str, user_agent: &str) -> io::Result<()> {
+    if user_agent.is_empty() || user_agent.len() > 512 || user_agent.chars().any(char::is_control) {
+        return Err(invalid("invalid configured user agent"));
+    }
+    if client_info.is_empty() || client_info.len() > 512 || client_info.chars().any(char::is_control) {
+        return Err(invalid("invalid device headers"));
+    }
+    Ok(())
+}
+
+/// Apple Root CA (SHA-256 B0B1730E…F024): the file the Zag Store client
+/// pins in GrandSlam::build_reqwest_client. gsa.apple.com and gsas.apple.com
+/// chain to it, and it is not in the Mozilla roots ureq bundles, which is
+/// why lookups failed with UnknownIssuer.
+const APPLE_ROOT: &[u8] = include_bytes!("../../../../zag-isideload/src/assets/apple_root.cer");
+
+/// The only trust anchor for Apple requests. The endpoint allow-list
+/// admits only these two Apple hosts, so no other root is needed; neither
+/// the host's certificate store nor bundled roots are consulted. Hostname
+/// and chain verification are rustls's defaults.
+fn apple_roots() -> io::Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(APPLE_ROOT))
+        .map_err(|_| invalid("embedded Apple Root CA is invalid"))?;
+    Ok(roots)
+}
+
+fn agent() -> io::Result<ureq::Agent> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions().map_err(|_| invalid("TLS configuration failed"))?
+        .with_root_certificates(apple_roots()?)
+        .with_no_client_auth();
+    Ok(ureq::AgentBuilder::new()
+        .tls_config(std::sync::Arc::new(tls))
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(12))
+        .timeout_write(Duration::from_secs(12))
+        .redirects(0)
+        .build())
+}
+
+/// Names a transport failure without its message text: DNS, TLS (with
+/// rustls's reason, e.g. an untrusted issuer), connect, timeout or a
+/// malformed response. Never includes headers, bodies or identity values.
+fn transport_reason(error: &ureq::Transport) -> String {
+    use std::error::Error as _;
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = error.source();
+    while let Some(current) = cause {
+        let tls = current.downcast_ref::<rustls::Error>().or_else(|| current.downcast_ref::<io::Error>()
+            .and_then(|io| io.get_ref()).and_then(|inner| inner.downcast_ref::<rustls::Error>()));
+        if let Some(tls) = tls {
+            return match tls {
+                rustls::Error::InvalidCertificate(reason) => format!("TLS certificate rejected ({reason:?})"),
+                other => format!("TLS handshake failed ({})", tls_kind(other)),
+            };
+        }
+        if let Some(io) = current.downcast_ref::<io::Error>() {
+            if matches!(io.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+                return "Apple connection timed out".into();
+            }
+        }
+        cause = current.source();
+    }
+    match error.kind() {
+        ureq::ErrorKind::Dns => "DNS resolution failed".into(),
+        ureq::ErrorKind::ConnectionFailed => "connection to Apple failed".into(),
+        ureq::ErrorKind::Io => "I/O error talking to Apple".into(),
+        ureq::ErrorKind::BadStatus | ureq::ErrorKind::BadHeader => "malformed HTTP response from Apple".into(),
+        kind => format!("unexpected transport error ({kind:?})"),
+    }
+}
+
+/// The variant name of a non-certificate rustls error, without payloads.
+fn tls_kind(error: &rustls::Error) -> String {
+    format!("{error:?}").split(['(', ' ', '{']).next().unwrap_or("unknown").to_owned()
+}
+
 impl AppleHttp {
+    /// A client for the credential-free URL bag lookup only: it holds no
+    /// device identity, so it cannot send one.
+    pub(crate) fn lookup_only(client_info: &str, user_agent: &str) -> io::Result<Self> {
+        client_headers(client_info, user_agent)?;
+        Ok(Self { agent: agent()?, client_info: client_info.to_owned(), user_agent: user_agent.to_owned(), device: None })
+    }
+
     pub(crate) fn new(identity: &ClientIdentity<'_>) -> io::Result<Self> {
         let ClientIdentity { device_id, client_info, local_user, serial, user_agent } = *identity;
-        if user_agent.is_empty() || user_agent.len() > 512 || user_agent.chars().any(char::is_control) {
-            return Err(invalid("invalid configured user agent"));
-        }
-        if device_id.is_empty() || client_info.is_empty() || device_id.len() > 256
-            || client_info.len() > 512 || device_id.chars().any(char::is_control)
-            || client_info.chars().any(char::is_control) {
+        client_headers(client_info, user_agent)?;
+        if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
             return Err(invalid("invalid device headers"));
         }
         // Never synthesize identity headers or accept control characters.
@@ -237,14 +320,12 @@ impl AppleHttp {
                 return Err(invalid("invalid Apple identity headers"));
             }
         }
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(8))
-            .timeout_read(Duration::from_secs(12))
-            .timeout_write(Duration::from_secs(12))
-            .redirects(0)
-            .build();
-        Ok(Self { agent, device_id: device_id.to_owned(), client_info: client_info.to_owned(),
-            local_user: local_user.to_owned(), serial: serial.map(str::to_owned), user_agent: user_agent.to_owned() })
+        Ok(Self {
+            agent: agent()?, client_info: client_info.to_owned(), user_agent: user_agent.to_owned(),
+            device: Some(DeviceHeaders {
+                device_id: device_id.to_owned(), local_user: local_user.to_owned(), serial: serial.map(str::to_owned),
+            }),
+        })
     }
 }
 impl AppleTransport for AppleHttp {
@@ -264,9 +345,10 @@ impl AppleTransport for AppleHttp {
             .set("X-Apple-App-Info", APP_INFO)
             .set("Connection", "close");
         if device {
-            req = req.set("X-Apple-I-MD-LU", &self.local_user)
-                .set("X-Mme-Device-Id", &self.device_id);
-            if let Some(serial) = &self.serial { req = req.set("X-Apple-I-SRL-NO", serial); }
+            let headers = self.device.as_ref().ok_or_else(|| invalid("lookup-only client has no device headers"))?;
+            req = req.set("X-Apple-I-MD-LU", &headers.local_user)
+                .set("X-Mme-Device-Id", &headers.device_id);
+            if let Some(serial) = &headers.serial { req = req.set("X-Apple-I-SRL-NO", serial); }
         }
         // ureq's default TLS verification is retained; no insecure opt-out.
         // Any redirect is rejected by redirects(0) and status validation.
@@ -275,7 +357,7 @@ impl AppleTransport for AppleHttp {
             None => req.call(),
         }.map_err(|error| match error {
             ureq::Error::Status(code, _) => io::Error::new(io::ErrorKind::Other, format!("Apple HTTP status {code}")),
-            ureq::Error::Transport(_) => transport(),
+            ureq::Error::Transport(error) => io::Error::new(io::ErrorKind::Other, transport_reason(&error)),
         })?;
         if result.status() != 200 {
             return Err(io::Error::new(io::ErrorKind::Other, format!("Apple HTTP status {}", result.status())));
@@ -470,6 +552,21 @@ pub(crate) fn provision<T: AppleTransport>(
     persist_state(state_dir, &adi_pb).map_err(at(Stage::Persist))
 }
 
+/// Read-only check of the exact lookup the coordinator performs: one GET
+/// of the URL bag with the client headers (never device headers), then the
+/// same parsing and endpoint validation. Returns a redacted summary.
+pub(crate) fn diagnose_lookup(apple: &AppleHttp, deadline: Duration) -> io::Result<String> {
+    let end = Instant::now() + deadline;
+    let bag = apple.send(&validated_endpoint(LOOKUP)?, None, false, end)?;
+    let urls = dictionary_field(&bag, "urls")?;
+    let mut endpoints = Vec::new();
+    for key in ["midStartProvisioning", "midFinishProvisioning"] {
+        let url = validated_endpoint(string_field(urls, key)?)?;
+        endpoints.push(format!("{key}={}{}", url.host_str().unwrap_or(""), url.path()));
+    }
+    Ok(format!("HTTP 200, URL bag parsed ({} entries); {}", urls.len(), endpoints.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +620,18 @@ mod tests {
         for agent in ["", "bad\r\nInjected", "bad\0agent", &"x".repeat(513)] {
             assert!(!ok(identity("device", "client", &user, None, agent)));
         }
+    }
+
+    #[test]
+    fn apple_requests_trust_exactly_the_pinned_apple_root() {
+        // The same certificate as the client's asset, Apple's published root.
+        assert_eq!(sha256_hex(APPLE_ROOT), "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024");
+        assert_eq!(apple_roots().unwrap().len(), 1);
+        assert!(agent().is_ok());
+        // A lookup-only client cannot be made to send device headers.
+        let apple = AppleHttp::lookup_only("<a> <b;c;d> <e/1 (f/1)>", "f/1").unwrap();
+        let error = apple.send(&validated_endpoint(LOOKUP).unwrap(), None, true, Instant::now() + Duration::from_secs(5));
+        assert_eq!(error.unwrap_err().to_string(), "lookup-only client has no device headers");
     }
 
     #[test]
