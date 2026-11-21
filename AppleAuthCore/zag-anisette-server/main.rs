@@ -8,6 +8,7 @@
 //! `POST /v3/get_headers` (JSON) and the `GET` WebSocket upgrade at
 //! `/v3/provisioning_session` (reached as `wss://`). Every 503 makes that
 //! client stop: `error_for_status` fails, and a non-101 upgrade fails.
+mod client_info_config;
 mod adi_process;
 #[cfg(test)]
 mod adi_worker_wire_v2;
@@ -18,6 +19,7 @@ mod provisioning;
 mod websocket_transport;
 
 use std::{
+    borrow::Cow,
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -41,17 +43,17 @@ const DEFAULT_BIND: &str = "127.0.0.1:18760";
 
 struct Response {
     status: &'static str,
-    body: &'static str,
+    body: Cow<'static, str>,
     allow: Option<&'static str>,
     upgrade: bool,
 }
 
-fn reply(status: &'static str, body: &'static str) -> Response {
-    Response { status, body, allow: None, upgrade: false }
+fn reply(status: &'static str, body: impl Into<Cow<'static, str>>) -> Response {
+    Response { status, body: body.into(), allow: None, upgrade: false }
 }
 
 fn not_allowed(allow: &'static str) -> Response {
-    Response { status: "405 Method Not Allowed", body: r#"{"error":"method_not_allowed"}"#, allow: Some(allow), upgrade: false }
+    Response { status: "405 Method Not Allowed", body: r#"{"error":"method_not_allowed"}"#.into(), allow: Some(allow), upgrade: false }
 }
 
 const OFFLINE: &str = r#"{"error":"provisioning_backend_not_enabled"}"#;
@@ -200,7 +202,10 @@ fn route(head: &Head) -> Response {
     match head.path.as_str() {
         "/healthz" if method == "GET" => reply("200 OK", r#"{"status":"offline_only"}"#),
         "/healthz" => not_allowed("GET"),
-        "/v3/client_info" if method == "GET" => reply("503 Service Unavailable", OFFLINE),
+        "/v3/client_info" if method == "GET" => match client_info_config::configured_response() {
+            Some(metadata) => reply("200 OK", metadata),
+            None => reply("503 Service Unavailable", OFFLINE),
+        },
         "/v3/client_info" => not_allowed("GET"),
         "/v3/get_headers" if method == "POST" => {
             if !head.header("content-type").is_some_and(|t| t.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json")) {
@@ -211,7 +216,7 @@ fn route(head: &Head) -> Response {
         "/v3/get_headers" => not_allowed("POST"),
         "/v3/provisioning_session" if method == "GET" => {
             if head.count("upgrade") == 0 {
-                return Response { status: "426 Upgrade Required", body: r#"{"error":"websocket_required"}"#, allow: None, upgrade: true };
+                return Response { status: "426 Upgrade Required", body: r#"{"error":"websocket_required"}"#.into(), allow: None, upgrade: true };
             }
             if !is_websocket_upgrade(head) {
                 return reply("400 Bad Request", r#"{"error":"invalid_websocket_upgrade"}"#);
