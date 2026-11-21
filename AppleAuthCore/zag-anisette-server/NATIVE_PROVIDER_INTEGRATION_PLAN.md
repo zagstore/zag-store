@@ -247,3 +247,57 @@ Both have ELF magic and machine code 62 (x86-64). Total local runtime size 3.9 M
 The pinned SideStore `omnisette/Cargo.toml` specifies `android-loader` from `https://github.com/Dadoum/android-loader` branch `bigger_pages`. The pinned `omnisette/src/store_services_core.rs` uses that loader's `AndroidLibrary`, `hook_manager`, and `sysv64` APIs to load Android ELF objects and resolve native symbols. **Plain `dlopen` is not a drop-in replacement.**
 
 Next: isolate an offline loader probe using a pinned revision of `Dadoum/android-loader`, inspect its native dependencies and hooks, and demonstrate actual symbol resolution on Ubuntu before enabling a real provider. After Start/End, confirm the native state storage format rather than assuming `adi.pb` is returned. Do not run provisioning on the public listener until verified.
+
+
+## Implementation boundary selected (21 November 2026)
+
+The isolated native loader probe now successfully loads the Apple Music Android
+libraries, initializes CoreADI, and resolves its typed Start/Finish/Destroy
+functions. The Rust probe also contains a supervised coordinator that can perform
+Apple's GrandSlam lookup and provisioning requests, but **no successful real
+provisioning exchange has been observed**.
+
+The existing `OfflineWorkerAdiProvider` in `provisioning.rs` is **not** a
+production-native provider: its `exchange` method starts a new executable for
+each Start and Finish call. A native CoreADI session handle cannot survive
+that boundary. Do not switch the network listener to this adapter.
+
+### Two separate protocols: do not conflate them
+
+1. **Remote-v3 protocol:** the iSideload client requests GrandSlam URLs and
+   exchanges `identifier`, `spim`, `cpim`, `ptm`, `tk`, and `adi_pb`
+   with the server over WebSocket. This requires a session-owned provider
+   which preserves one native child between Start and Finish.
+2. **Probe-owned coordinator:** the native probe itself performs GrandSlam
+   lookup, Start/Finish HTTP requests and native Start/Finish in one bounded
+   subprocess. It consumes a complete, privately configured identity on stdin
+   and writes isolated ADI state. This is **not** an implementation of the
+   remote-v3 WebSocket provider and cannot be plugged into the listener as-is.
+
+### Concrete integration sequence
+
+- Define an internal session-owned `AdiProvider` backed by one supervised
+  native worker; use the existing typed v2 frame format and preserve the
+  child from Start through Finish. Do not call `execute_offline_worker`
+  separately for each phase.
+- Keep GrandSlam HTTP ownership singular: for remote-v3 clients the client
+  owns the Apple lookup and HTTP exchange, while the provider handles only
+  native Start/Finish. The standalone probe coordinator remains an
+  operator-only diagnostic path.
+- Bind each WebSocket session to exactly one child and one client identifier;
+  enforce phase order, time limits, bounded frames, cancellation, and
+  cleanup. A disconnected session must never be resumed by a different client.
+- Keep the listener returning 503 until native provider licensing, private
+  identity provenance, and explicit live-test approval are resolved. No
+  feature flag or environment variable should silently enable the provider.
+- Verify success only with a fresh, nonempty, regular, private `adi.pb`
+  produced by an authorized isolated real exchange; never print or commit
+  the state file.
+
+### Provenance checkpoint
+
+The local operator's shell history shows both native libraries were extracted
+from Apple's official Android Apple Music APK at `apps.mzstatic.com`.
+The source is known, but extraction from an official download does **not**
+establish a license to run the proprietary libraries as a separate server.
+No legal authorization or production approval is inferred from this checkpoint.
