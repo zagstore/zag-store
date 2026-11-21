@@ -1,6 +1,7 @@
 //! Operator-run native loader probe. The default and preflight modes do not
 //! provision; --native-v2-session is reached only from the supervised
 //! coordinator in probe_cli, and --native-verify-state only checks its result.
+mod metadata;
 mod native_session;
 mod offline_v2_bridge;
 mod provisioning_client;

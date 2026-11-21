@@ -1,0 +1,9 @@
+[
+  {
+    "id": "anisette-v3-server-default",
+    "client_info": "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+    "user_agent": "akd/1.0 CFNetwork/808.1.4",
+    "source": "Dadoum/anisette-v3-server@684895737aaf1a1c4586fcd5b67509ffd500a36c source/app.d (clientInfo constant; /v3/client_info user_agent)",
+    "status": "upstream convention, served by public v3 servers with Android CoreADI; not verified by Zag Store; upstream issue 61 reports GrandSlam sign-in -80045 for this pair since about October 2026"
+  }
+]
