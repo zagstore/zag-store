@@ -20,6 +20,8 @@ struct TestIdentity {
     client_info: String,
     local_user: String,
     serial: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_agent: Option<String>,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -35,8 +37,8 @@ fn read_identity<R: Read>(input: R) -> io::Result<TestIdentity> {
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|_| invalid("invalid identity JSON"))?;
     let object = value.as_object().ok_or_else(|| invalid("identity object required"))?;
-    if object.len() != 4 || !object.keys().all(|key|
-        matches!(key.as_str(), "device_id" | "client_info" | "local_user" | "serial"))
+    if !(object.len() == 4 || object.len() == 5) || !object.keys().all(|key|
+        matches!(key.as_str(), "device_id" | "client_info" | "local_user" | "serial" | "user_agent"))
     {
         return Err(invalid("identity fields missing or unexpected"));
     }
@@ -49,6 +51,11 @@ fn read_identity<R: Read>(input: R) -> io::Result<TestIdentity> {
         client_info: field("client_info")?,
         local_user: field("local_user")?,
         serial: field("serial")?,
+        user_agent: match object.get("user_agent") {
+            None => None,
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            _ => return Err(invalid("invalid user agent field")),
+        },
     })
 }
 
@@ -68,6 +75,11 @@ fn apply_configured_metadata(identity: &mut TestIdentity) -> io::Result<()> {
         return Err(invalid("identity and configured client info disagree"));
     }
     identity.client_info = configured.to_owned();
+    let agent = value["user_agent"].as_str().ok_or_else(|| invalid("invalid configured user agent"))?;
+    if identity.user_agent.as_deref().is_some_and(|existing| existing != agent) {
+        return Err(invalid("identity and configured user agent disagree"));
+    }
+    identity.user_agent = Some(agent.to_owned());
     Ok(())
 }
 
@@ -172,6 +184,9 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         } else {
             provisioning_client::validate_identity(&identity.device_id, &identity.client_info, &identity.local_user, &identity.serial)?;
         }
+        if identity.user_agent.is_none() {
+            return Err(invalid("supervised provisioning requires configured user agent").into());
+        }
         let identity_bytes = serde_json::to_vec(&identity).map_err(|_| invalid("invalid identity encoding"))?;
         let mut cmd = Command::new(binary);
         cmd.arg(if mode == OsStr::new("--provision-client-supervised") {
@@ -221,6 +236,7 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         // No Apple request is made until a complete, valid operator-supplied
         // identity has been parsed. Never echo the identity or ADI material.
         let identity = read_identity(io::stdin().lock())?;
+        let user_agent = identity.user_agent.as_deref().ok_or_else(|| invalid("coordinator requires configured user agent"))?;
         if mode == OsStr::new("--client-coordinator-process") {
             validate_client_derived_identity(&identity)?;
         }
@@ -228,7 +244,7 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         let _adi = provisioning_client::provision_with_worker(
             &worker, &runtime, &state,
             &identity.device_id, &identity.client_info,
-            &identity.local_user, &identity.serial,
+            &identity.local_user, &identity.serial, user_agent,
         )?;
     }
     Ok(true)
@@ -262,6 +278,7 @@ mod tests {
             local_user: "be45cb2605bf36bebde684841a28f0fd43c69850a3dce5fedba69928ee3a8991".into(),
             client_info: "offline-test".into(),
             serial: "TEST-123".into(),
+            user_agent: None,
         };
         assert!(validate_client_derived_identity(&identity).is_ok());
         identity.local_user.replace_range(0..1, "a");
