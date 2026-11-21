@@ -167,13 +167,11 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
             return Err(invalid("unexpected metadata readiness arguments").into());
         }
         let Some(path) = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE") else {
-            println!("BLOCKED: private client metadata not configured; no credentials required");
-            return Ok(true);
+            return Err(invalid("BLOCKED: private client metadata not configured; no credentials required").into());
         };
-        match client_info_config::read_config(Path::new(&path)) {
-            Ok(_) => println!("PASS: private client metadata is readable and structurally valid (Apple compatibility unverified)"),
-            Err(_) => println!("BLOCKED: private client metadata is missing or invalid; no credentials required"),
-        }
+        client_info_config::read_config(Path::new(&path))
+            .map_err(|_| invalid("BLOCKED: private client metadata is missing or invalid; no credentials required"))?;
+        println!("PASS: private client metadata is readable and structurally valid (Apple compatibility unverified)");
         return Ok(true);
     }
     if mode == OsStr::new("--validate-identity") || mode == OsStr::new("--validate-client-identity") {
