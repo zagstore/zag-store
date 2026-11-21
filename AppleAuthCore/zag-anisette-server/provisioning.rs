@@ -202,6 +202,68 @@ impl<B: crate::session_worker::SessionBackend> NativeSessionTransport for Offlin
     fn abort(&mut self) { self.session.cancel(); }
 }
 
+/// Test-only bridge from the text provisioning protocol to binary v2 IPC.
+/// Text fields here are lowercase hex, solely for the deterministic fixture;
+/// real Apple protocol field encoding requires separate validation.
+#[cfg(test)]
+pub struct OfflineSplitChildTransport {
+    child: crate::session_supervisor::SplitV2Session,
+    cancel: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+impl OfflineSplitChildTransport {
+    pub fn spawn(path: &std::path::Path, args: &[&str], timeout: std::time::Duration)
+        -> Result<Self, ProtocolError> {
+        Ok(Self {
+            child: crate::session_supervisor::SplitV2Session::spawn(path, args, timeout)
+                .map_err(|_| ProtocolError::BackendUnavailable)?,
+            cancel: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    fn decode_hex(text: &str) -> Result<Vec<u8>, ProtocolError> {
+        if text.is_empty() || text.len() % 2 != 0 { return Err(ProtocolError::InvalidField); }
+        text.as_bytes().chunks_exact(2).map(|pair| {
+            let digit = |b: u8| match b {
+                b'0'..=b'9' => Ok(b - b'0'),
+                b'a'..=b'f' => Ok(b - b'a' + 10),
+                _ => Err(ProtocolError::InvalidField),
+            };
+            Ok((digit(pair[0])? << 4) | digit(pair[1])?)
+        }).collect()
+    }
+    fn encode_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+#[cfg(test)]
+impl NativeSessionTransport for OfflineSplitChildTransport {
+    fn start(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError> {
+        use crate::adi_worker_wire_v2::{Request, Response};
+        let request = Request::Start {
+            identifier: identifier.into(), spim: Self::decode_hex(spim)?,
+        };
+        match self.child.exchange(&request, &self.cancel)
+            .map_err(|_| ProtocolError::BackendUnavailable)? {
+            Response::Started(bytes) => Ok(Self::encode_hex(&bytes)),
+            _ => Err(ProtocolError::BackendUnavailable),
+        }
+    }
+    fn finish(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError> {
+        use crate::adi_worker_wire_v2::{Request, Response};
+        let request = Request::Finish {
+            ptm: Self::decode_hex(ptm)?, tk: Self::decode_hex(tk)?,
+        };
+        match self.child.exchange(&request, &self.cancel)
+            .map_err(|_| ProtocolError::BackendUnavailable)? {
+            Response::Finished(bytes) => Ok(Self::encode_hex(&bytes)),
+            _ => Err(ProtocolError::BackendUnavailable),
+        }
+    }
+    fn abort(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Safe default: provider never produces Apple provisioning material.
 pub struct DisabledAdiProvider;
 impl AdiProvider for DisabledAdiProvider {
@@ -307,6 +369,39 @@ pub fn process_text_frame<B: ProvisioningBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn persistent_subprocess_drives_complete_provisioning_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!(
+            "zag-provider-child-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temp.join("fixture");
+        assert!(std::process::Command::new("rustc")
+            .args(["--edition=2021", "-o"]).arg(&executable).arg(&source)
+            .status().unwrap().success());
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let transport = OfflineSplitChildTransport::spawn(&executable,
+            &["--v2-split"], std::time::Duration::from_secs(5)).unwrap();
+        let mut session = Session::new(AdiBackend::new(SessionOwnedAdiProvider::new(transport)));
+        assert_eq!(session.receive(ClientMessage::Identifier("-2".into())),
+            Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("00ff".into())),
+            Ok(ServerMessage::GiveEndProvisioningData { cpim: "00ff".into() }));
+        assert_eq!(session.receive(ClientMessage::Finish {
+            ptm: "ff00".into(), tk: "80".into(),
+        }), Ok(ServerMessage::ProvisioningSuccess { adi_pb: "ff00".into() }));
+        assert_eq!(session.phase(), Phase::Complete);
+        assert_eq!(session.receive(ClientMessage::Finish {
+            ptm: "ff00".into(), tk: "80".into(),
+        }), Err(ProtocolError::InvalidTransition));
+        drop(session);
+        std::fs::remove_file(&executable).unwrap();
+        std::fs::remove_dir(&temp).unwrap();
+    }
     #[test]
     fn session_owned_adapter_drives_existing_worker_state_machine() {
         let transport = OfflineSessionTransport::new(crate::session_worker::MockBackend::default());
