@@ -1,10 +1,11 @@
-//! Standalone whole-process watchdog for a future opt-in provisioning coordinator.
-//! Owns the child handle and reaps it on deadline; never signals a raw PID.
-//! Not wired to the production service or a live provisioning CLI.
+//! Whole-process watchdog for the opt-in provisioning coordinator.
+//! Owns the child handle and reaps it on deadline or cancellation; never
+//! signals a raw PID. Not wired to the production service.
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 #[cfg(test)]
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::thread;
 
@@ -21,7 +22,13 @@ pub(crate) fn run_bounded(command: &mut Command, deadline: Duration) -> io::Resu
     wait_bounded(child, deadline)
 }
 
-pub(crate) fn wait_bounded(mut child: Child, deadline: Duration) -> io::Result<ExitStatus> {
+pub(crate) fn wait_bounded(child: Child, deadline: Duration) -> io::Result<ExitStatus> {
+    wait_cancellable(child, deadline, &AtomicBool::new(false))
+}
+
+/// As wait_bounded, and also kills and reaps the child as soon as `cancel`
+/// is set, returning ErrorKind::Interrupted.
+pub(crate) fn wait_cancellable(mut child: Child, deadline: Duration, cancel: &AtomicBool) -> io::Result<ExitStatus> {
     if deadline.is_zero() {
         let _ = child.kill();
         let _ = child.wait();
@@ -38,10 +45,15 @@ pub(crate) fn wait_bounded(mut child: Child, deadline: Duration) -> io::Result<E
                 return Err(error);
             }
         }
+        if cancel.load(Ordering::Acquire) {
+            let _ = child.kill();
+            child.wait()?;
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by operator"));
+        }
         if Instant::now() >= end {
             let _ = child.kill();
             child.wait()?;
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "coordinator process deadline exceeded"));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "process deadline exceeded"));
         }
         thread::sleep(Duration::from_millis(20));
     }
