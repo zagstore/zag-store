@@ -43,7 +43,7 @@ where
 {
     let s: Data = Deserialize::deserialize(d)?;
     let s: Vec<u8> = s.into();
-    Ok(s.try_into().unwrap())
+    s.try_into().map_err(|_| serde::de::Error::custom("anisette identifier must be exactly 16 bytes"))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -110,6 +110,18 @@ mod identity_contract_tests {
             "be45cb2605bf36bebde684841a28f0fd43c69850a3dce5fedba69928ee3a8991"
         );
         assert!(!state.is_provisioned());
+    }
+
+    #[test]
+    fn malformed_persisted_identifier_is_rejected_without_panic() {
+        // A corrupted Keychain payload must not crash the authentication process.
+        for length in [0usize, 15, 17, 64] {
+            let mut dict = plist::Dictionary::new();
+            dict.insert("keychain_identifier".into(), plist::Value::Data(vec![0u8; length]));
+            let mut bytes = Vec::new();
+            plist::Value::Dictionary(dict).to_writer_xml(&mut bytes).unwrap();
+            assert!(plist::from_bytes::<AnisetteState>(&bytes).is_err());
+        }
     }
 
     #[test]
