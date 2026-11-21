@@ -897,13 +897,19 @@ enum ZagBridgeAnisetteKeychain {
 		return SecItemUpdate(item as CFDictionary, attributes as CFDictionary) == errSecSuccess ? 0 : 1
 	}
 
+	/// 0: found; 1: no item; 2: the Keychain could not be read. The bridge
+	/// must tell 1 from 2: treating an unreadable Keychain as no state would
+	/// register a new anisette device with Apple and overwrite the stored one.
 	static func retrieve(_ key: UnsafePointer<CChar>?, _ value: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ length: UnsafeMutablePointer<Int>?,
 						 service: String = service) -> Int32 {
-		guard var item = query(key, service: service), let value, let length else { return 1 }
+		guard var item = query(key, service: service), let value, let length else { return 2 }
 		item[kSecReturnData as String] = true
 		item[kSecMatchLimit as String] = kSecMatchLimitOne
 		var result: CFTypeRef?
-		guard SecItemCopyMatching(item as CFDictionary, &result) == errSecSuccess, let data = result as? Data, !data.isEmpty else { return 1 }
+		let status = SecItemCopyMatching(item as CFDictionary, &result)
+		if status == errSecItemNotFound { return 1 }
+		guard status == errSecSuccess, let data = result as? Data else { return 2 }
+		if data.isEmpty { return 1 }
 		let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: data.count)
 		data.copyBytes(to: buffer, count: data.count)
 		value.pointee = buffer

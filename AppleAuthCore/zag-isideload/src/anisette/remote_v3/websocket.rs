@@ -4,6 +4,21 @@ use rootcause::prelude::*;
 
 use crate::net_policy;
 
+/// The longest wait for one provisioning message from the anisette server.
+const MESSAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Text and close are messages; ping, pong and raw frames are not (`None`).
+/// Binary is not part of the protocol: it ends the exchange like a close.
+fn classify(message: tokio_tungstenite::tungstenite::Message) -> Option<WsMessage> {
+    use tokio_tungstenite::tungstenite::Message;
+    match message {
+        Message::Text(text) => Some(WsMessage::Text(text.to_string())),
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => None,
+        Message::Close(_) | Message::Binary(_) => Some(WsMessage::Close),
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum WsMessage {
     Text(String),
     Close,
@@ -43,17 +58,41 @@ impl AppWebSocket {
         Ok(())
     }
 
+    /// The next text or close message. Zag Store fork: control frames are
+    /// skipped (tungstenite answers pings itself), so a server keep-alive no
+    /// longer ends provisioning as a close; and a server that goes quiet ends
+    /// it after `MESSAGE_TIMEOUT` rather than never.
     pub async fn next(&mut self) -> Option<Result<WsMessage, Report>> {
-        let msg = self.inner.next().await?;
-        Some(msg.map_err(Into::into).map(|m| match m {
-            tokio_tungstenite::tungstenite::Message::Text(t) => WsMessage::Text(t.to_string()),
-            tokio_tungstenite::tungstenite::Message::Close(_) => WsMessage::Close,
-            _ => WsMessage::Close,
-        }))
+        loop {
+            let msg = match tokio::time::timeout(MESSAGE_TIMEOUT, self.inner.next()).await {
+                Ok(msg) => msg?,
+                Err(_) => return Some(Err(report!("Timed out waiting for the provisioning socket"))),
+            };
+            match msg.map(classify) {
+                Ok(Some(message)) => return Some(Ok(message)),
+                Ok(None) => continue,
+                Err(error) => return Some(Err(error.into())),
+            }
+        }
     }
 
     pub async fn close(&mut self) -> Result<(), Report> {
         self.inner.close(None).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn keep_alive_frames_do_not_end_provisioning() {
+        assert_eq!(classify(Message::Ping(vec![1].into())), None);
+        assert_eq!(classify(Message::Pong(vec![].into())), None);
+        assert_eq!(classify(Message::Text("{}".into())), Some(WsMessage::Text("{}".into())));
+        assert_eq!(classify(Message::Close(None)), Some(WsMessage::Close));
+        assert_eq!(classify(Message::Binary(vec![0].into())), Some(WsMessage::Close));
     }
 }

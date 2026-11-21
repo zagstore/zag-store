@@ -736,6 +736,12 @@ struct ZagAppleBridgeTests {
 			  "anisette storage: writing an item again replaces its value in place, without deleting it first")
 		check(stored.withCString { ZagBridgeAnisetteKeychain.store($0, nil, 0, service: service) } == 1 && get() == "second",
 			  "anisette storage: a refused write leaves the previous value")
+		var unused: UnsafeMutablePointer<UInt8>?
+		var unusedLength = 0
+		check("\(stored)-absent".withCString { ZagBridgeAnisetteKeychain.retrieve($0, &unused, &unusedLength, service: service) } == 1 && unused == nil,
+			  "anisette storage: a missing item reads as 1 (no item)")
+		check("".withCString { ZagBridgeAnisetteKeychain.retrieve($0, &unused, &unusedLength, service: service) } == 2 && unused == nil,
+			  "anisette storage: a read that cannot be made is 2 (unreadable), never 1 (no item)")
 
 		let secrets = MemorySecrets()
 		let directory = makeDirectory(secrets: secrets, diagnostics: ZagFreeAccountDiagnostics(), localState: state)

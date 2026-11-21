@@ -111,8 +111,13 @@ impl SideloadingStorage for KeychainStorage {
         let key = self.scoped(key)?;
         let mut pointer = std::ptr::null_mut();
         let mut length = 0usize;
-        if (self.storage.retrieve)(self.storage.context, key.as_ptr(), &mut pointer, &mut length) != 0 || pointer.is_null() {
-            return Ok(None);
+        // 0: found; 1: no item. Anything else is a Keychain that could not
+        // be read: not an absent state, which would make the provider register
+        // a new anisette device with Apple and overwrite the stored one.
+        match (self.storage.retrieve)(self.storage.context, key.as_ptr(), &mut pointer, &mut length) {
+            0 if !pointer.is_null() => {}
+            0 | 1 => return Ok(None),
+            _ => return Err(rootcause::report!("storage")),
         }
         let data = unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec();
         (self.storage.release)(self.storage.context, pointer, length);
@@ -511,6 +516,10 @@ mod tests {
             }
             0
         }
+        /// As Swift's Keychain answers when it cannot be read.
+        pub extern "C" fn unreadable(_: *mut c_void, _: *const c_char, _: *mut *mut u8, _: *mut usize) -> i32 {
+            2
+        }
         pub extern "C" fn delete_item(_: *mut c_void, k: *const c_char) -> i32 {
             ITEMS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&key(k));
             0
@@ -518,6 +527,22 @@ mod tests {
         pub extern "C" fn release(_: *mut c_void, v: *mut u8, n: usize) {
             drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(v, n)) });
         }
+    }
+
+    #[test]
+    fn unreadable_keychain_is_an_error_not_an_absent_state() {
+        let storage = ZagBridgeStorage {
+            context: std::ptr::null_mut(),
+            store: memory::store,
+            retrieve: memory::unreadable,
+            delete_item: memory::delete_item,
+            release: memory::release,
+        };
+        let keychain = KeychainStorage::new(storage, "c0123456789abcdef").unwrap();
+        assert!(keychain.retrieve_data("anisette_state").is_err());
+        assert!(keychain.retrieve("anisette_state").is_err());
+        let absent = KeychainStorage::new(ZagBridgeStorage { retrieve: memory::retrieve, ..storage }, "d0123456789abcdef").unwrap();
+        assert_eq!(absent.retrieve_data("anisette_state").unwrap(), None, "1 is still \"no item\"");
     }
 
     #[test]

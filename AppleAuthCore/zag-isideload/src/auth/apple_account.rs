@@ -139,6 +139,17 @@ fn resync_sim(resp: &plist::Dictionary) -> Option<String> {
     }
 }
 
+/// The trusted number to send an SMS code to. Zag Store fork: the sign-in
+/// response does not say which number, so upstream guesses id 1; an account
+/// whose numbers are numbered otherwise then fails 2FA. When the account's
+/// numbers are known and the guess is not one of them, the first is used.
+fn sms_number_id(requested: u32, numbers: Option<&[TrustedNumber]>) -> u32 {
+    match numbers {
+        Some(numbers) if !numbers.iter().any(|n| n.id == requested) => numbers.first().map_or(requested, |n| n.id),
+        _ => requested,
+    }
+}
+
 impl AppleAccount {
     /// Create a new AppleAccountBuilder with the given email
     ///
@@ -257,6 +268,7 @@ impl AppleAccount {
                 }
                 LoginState::NeedsSMS2FA(id) => {
                     self.update_trusted_numbers().await;
+                    let id = sms_number_id(id, self.trusted_phone_numbers.as_deref());
                     info!("SMS 2FA required");
                     self.login_state = self
                         .send_sms_2fa(id)
@@ -1153,5 +1165,23 @@ fn censor_email(email: &str) -> String {
         }
     } else {
         "***".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn number(id: u32) -> TrustedNumber {
+        TrustedNumber { number_with_dial_code: "+• (•••) •••-••00".into(), last_two_digits: "00".into(), push_mode: "sms".into(), id }
+    }
+
+    #[test]
+    fn sms_goes_to_a_number_the_account_has() {
+        assert_eq!(sms_number_id(1, Some(&[number(1), number(2)])), 1, "a valid choice is kept");
+        assert_eq!(sms_number_id(2, Some(&[number(1), number(2)])), 2, "the user's choice is kept");
+        assert_eq!(sms_number_id(1, Some(&[number(3), number(4)])), 3, "the guess 1 is not a number: the first is used");
+        assert_eq!(sms_number_id(1, None), 1, "numbers unknown: unchanged");
+        assert_eq!(sms_number_id(1, Some(&[])), 1, "no numbers: unchanged");
     }
 }

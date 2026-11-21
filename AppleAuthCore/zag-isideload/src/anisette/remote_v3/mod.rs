@@ -193,8 +193,15 @@ impl RemoteV3AnisetteProvider {
             warn!("Resetting anisette state");
             self.state = Some(AnisetteState::new());
         } else if self.state.is_none() {
-            if let Ok(Some(state)) = &self.storage.retrieve_data(ANISETTE_STATE_KEY) {
-                if let Ok(state) = plist::from_bytes(state) {
+            // Zag Store fork: a storage that cannot be read is not an absent
+            // state. Starting fresh there would provision a new device with
+            // Apple and then overwrite the stored identity, so it stops instead.
+            let stored = self
+                .storage
+                .retrieve_data(ANISETTE_STATE_KEY)
+                .context("Failed to read stored anisette state")?;
+            if let Some(state) = stored {
+                if let Ok(state) = plist::from_bytes(&state) {
                     info!("Loaded existing anisette state");
                     self.state = Some(state);
                 } else {
@@ -369,7 +376,9 @@ impl RemoteV3AnisetteProvider {
                 }
                 ProvisioningMessage::ProvisioningSuccess { adi_pb } => {
                     state.adi_pb = Some(BASE64_STANDARD.decode(adi_pb)?);
-                    ws.close().await?;
+                    // Zag Store fork: provisioning is complete; a failed close
+                    // must not discard it before it is stored.
+                    let _ = ws.close().await;
                     info!("Provisioning successful");
                     break;
                 }
@@ -423,4 +432,84 @@ enum AnisetteHeaders {
         #[serde(rename = "X-Apple-I-MD-RINFO")]
         routing_info: String,
     },
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records writes; reads return `read` (an error when `None`).
+    struct Recording {
+        read: Option<Option<Vec<u8>>>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl SideloadingStorage for Recording {
+        fn store(&self, _: &str, _: &str) -> Result<(), Report> {
+            unreachable!("state is stored as data")
+        }
+        fn retrieve(&self, _: &str) -> Result<Option<String>, Report> {
+            unreachable!("state is read as data")
+        }
+        fn store_data(&self, _: &str, value: &[u8]) -> Result<(), Report> {
+            self.writes.lock().unwrap().push(value.to_vec());
+            Ok(())
+        }
+        fn retrieve_data(&self, _: &str) -> Result<Option<Vec<u8>>, Report> {
+            self.read.clone().ok_or_else(|| report!("Keychain unavailable"))
+        }
+    }
+
+    fn provider(read: Option<Option<Vec<u8>>>) -> (RemoteV3AnisetteProvider, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let storage = Recording { read, writes: writes.clone() };
+        let provider = RemoteV3AnisetteProvider::new("https://anisette.example", Box::new(storage), "S".into()).unwrap();
+        (provider, writes)
+    }
+
+    fn stored(state: &AnisetteState) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        plist::to_writer_xml(&mut bytes, state).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn unreadable_storage_never_replaces_the_identity() {
+        // A Keychain read that fails (not "not found") must stop: starting
+        // fresh would register a new device with Apple and overwrite the
+        // stored one.
+        let (mut provider, writes) = provider(None);
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        assert!(provider.get_state(&gs, false).await.is_err());
+        assert!(provider.state.is_none());
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stored_identity_is_reused_without_provisioning() {
+        let state = AnisetteState { keychain_identifier: [7; 16], adi_pb: Some(vec![1, 2, 3]) };
+        let (mut provider, writes) = provider(Some(Some(stored(&state))));
+        // The URL bag is empty: any attempt to provision would fail.
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let loaded = provider.get_state(&gs, false).await.unwrap();
+        assert_eq!(loaded.keychain_identifier, [7; 16]);
+        assert_eq!(loaded.adi_pb.as_deref(), Some(&[1u8, 2, 3][..]));
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        let rewritten: AnisetteState = plist::from_bytes(&writes[0]).unwrap();
+        assert_eq!(rewritten.keychain_identifier, [7; 16]);
+    }
+
+    #[tokio::test]
+    async fn failed_provisioning_stores_nothing() {
+        // Absent state: a fresh identity is provisioned. When that fails, the
+        // half-made identity is never stored.
+        let (mut provider, writes) = provider(Some(None));
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        assert!(provider.get_state(&gs, false).await.is_err());
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(!provider.state.as_ref().unwrap().is_provisioned());
+    }
 }

@@ -167,6 +167,13 @@ impl AnisetteDataGenerator {
             | AnisetteDataResponse::IncorrectlyProvisioned) => {
                 drop(provider);
                 let mut provider_write = self.provider.write().await;
+                // Zag Store fork: clones of this generator share the provider.
+                // Another caller may have provisioned while this one waited for
+                // the lock; provisioning again would register a second device
+                // with Apple (or reset the one just made), so check first.
+                if let AnisetteDataResponse::Data(data) = provider_write.get_anisette_data().await? {
+                    return Ok(data);
+                }
                 provider_write
                     .provision(
                         gs,
@@ -196,5 +203,83 @@ impl AnisetteDataGenerator {
         let arc_data = Arc::new(data);
         self.data = Some(arc_data.clone());
         Ok(arc_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Unprovisioned until `provision` runs, which takes a while (as the real
+    /// exchange with Apple does).
+    struct Counting {
+        provisioned: bool,
+        provisions: Arc<AtomicUsize>,
+        incorrect_first: bool,
+    }
+
+    fn data() -> AnisetteData {
+        AnisetteData {
+            machine_id: "M".into(),
+            one_time_password: "O".into(),
+            routing_info: "0".into(),
+            _device_description: String::new(),
+            device_unique_identifier: "D".into(),
+            _local_user_id: String::new(),
+            generated_at: SystemTime::now(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AnisetteProvider for Counting {
+        async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
+            // The real provider asks the anisette server here: callers overlap.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(match (self.provisioned, self.incorrect_first) {
+                (true, _) => AnisetteDataResponse::Data(data()),
+                (false, true) => AnisetteDataResponse::IncorrectlyProvisioned,
+                (false, false) => AnisetteDataResponse::NeedsProvisioning,
+            })
+        }
+        async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
+            Ok(AnisetteClientInfo { client_info: String::new(), user_agent: String::new() })
+        }
+        async fn provision(&mut self, _: &Arc<GrandSlam>, _: bool) -> Result<(), Report> {
+            self.provisions.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.provisioned = true;
+            Ok(())
+        }
+    }
+
+    async fn concurrent_provisions(incorrect_first: bool) -> usize {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provisions = Arc::new(AtomicUsize::new(0));
+        let provider = Counting { provisioned: false, provisions: provisions.clone(), incorrect_first };
+        let generator = AnisetteDataGenerator::new(Arc::new(RwLock::new(provider)));
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let (mut a, mut b, mut c) = (generator.clone(), generator.clone(), generator);
+        let (ra, rb, rc) = tokio::join!(
+            a.get_anisette_data(gs.clone()),
+            b.get_anisette_data(gs.clone()),
+            c.get_anisette_data(gs.clone())
+        );
+        assert!(ra.is_ok() && rb.is_ok() && rc.is_ok());
+        provisions.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_provision_once() {
+        // Sign-in and the developer session share the provider: three callers
+        // that all find it unprovisioned must register one device, not three.
+        assert_eq!(concurrent_provisions(false).await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_reset_once() {
+        // -45061 (incorrectly provisioned) resets the identity: a second reset
+        // would throw away the device the first one just provisioned.
+        assert_eq!(concurrent_provisions(true).await, 1);
     }
 }

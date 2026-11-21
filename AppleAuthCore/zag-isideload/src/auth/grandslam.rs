@@ -73,6 +73,16 @@ impl GrandSlam {
         Ok(urls)
     }
 
+    /// A client with an empty URL bag, for tests that must not fetch one.
+    #[cfg(test)]
+    pub(crate) fn offline_for_tests() -> Self {
+        Self {
+            client: Self::build_reqwest_client().expect("client"),
+            client_info: AnisetteClientInfo { client_info: String::new(), user_agent: String::new() },
+            url_bag: Dictionary::new(),
+        }
+    }
+
     pub fn get_url(&self, key: &str) -> Result<String, Report> {
         let url = self
             .url_bag
