@@ -38,10 +38,16 @@ done
 probe=$(realpath -e -- "$probe") runtime=$(realpath -e -- "$runtime") parent=$(realpath -e -- "$parent")
 [[ -x "$probe" ]] || { echo "Probe binary is not executable" >&2; exit 1; }
 [[ -f "$identity" ]] || { echo "Identity file missing" >&2; exit 1; }
-here=$(dirname -- "$(realpath -e -- "$0")")
+[[ "$(uname -m)" == x86_64 ]] || { echo "x86_64 host required" >&2; exit 1; }
 
 echo "== runtime libraries"
-"$here/prepare-native-adi-runtime.sh" --destination "$runtime" --verify-only
+# Regular ELF files, not links; the native check below proves they load.
+for name in libstoreservicescore.so libCoreADI.so; do
+  lib="$runtime/lib/x86_64/$name"
+  [[ -f "$lib" && ! -L "$lib" && "$(head -c 4 -- "$lib" | od -An -c | tr -d ' ')" == '177ELF' ]] || {
+    echo "Missing or invalid library: $name" >&2; exit 1; }
+  sha256sum -- "$lib"
+done
 echo "== client metadata"
 ZAG_ANISETTE_CLIENT_INFO_FILE=$metadata "$probe" --metadata-readiness
 echo "== identity (offline)"
