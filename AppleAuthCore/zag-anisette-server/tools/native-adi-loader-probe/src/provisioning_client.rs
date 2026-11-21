@@ -382,7 +382,7 @@ mod tests {
             "device", "client", &local_user, "TEST-123", agent
         );
         assert_eq!(make("Zag-Offline-Test/1.0").unwrap().user_agent, "Zag-Offline-Test/1.0");
-        for invalid_agent in ["", "bad\\r\\nInjected", "bad\\nInjected", "bad\\0agent"] {
+        for invalid_agent in ["", "bad\r\nInjected", "bad\nInjected", "bad\0agent"] {
             assert!(make(invalid_agent).is_err());
         }
         assert!(make(&"x".repeat(513)).is_err());
