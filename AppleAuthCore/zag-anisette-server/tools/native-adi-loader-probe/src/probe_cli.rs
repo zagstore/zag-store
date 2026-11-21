@@ -151,7 +151,7 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
             } else {
                 "--coordinator-process"
             })
-            .arg(runtime).arg(state)
+            .arg(&runtime).arg(&state)
             .env_clear().env(CHILD_MARKER, "1")
             .current_dir("/")
             .stdin(Stdio::inherit())
