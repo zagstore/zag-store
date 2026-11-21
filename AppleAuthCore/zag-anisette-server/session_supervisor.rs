@@ -410,8 +410,7 @@ impl SplitV2Session {
         }
         self.phase = expected;
         if expected == 2 {
-            // Fixture requires stdin EOF before it sends the final reply;
-            // a native worker may instead send the reply immediately.
+            // No further writes are permitted after a terminal response.
             self.commands.take();
         }
         Ok(response)
@@ -429,6 +428,60 @@ impl Drop for SplitV2Session {
 mod split_v2_tests {
     use super::*;
     use crate::adi_worker_wire_v2::{Request, Response};
+    fn fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!("zag-split-extra-{}-{:?}",
+            std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temp.join("fixture");
+        assert!(Command::new("rustc").args(["--edition=2021", "-o"])
+            .arg(&executable).arg(&source).status().unwrap().success());
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (temp, executable)
+    }
+    fn start() -> Request { Request::Start { identifier: "-2".into(), spim: vec![0, 255] } }
+    fn finish() -> Request { Request::Finish { ptm: vec![255, 0], tk: vec![128] } }
+    #[test]
+    fn split_phase_timeout_and_replay_fail_closed() {
+        let (temp, executable) = fixture();
+        let cancel = AtomicBool::new(false);
+        let mut session = SplitV2Session::spawn(&executable, &["--v2-stall"],
+            Duration::from_millis(120)).unwrap();
+        assert_eq!(session.exchange(&start(), &cancel), Err(SessionError::Timeout));
+        assert_eq!(session.exchange(&finish(), &cancel), Err(SessionError::InvalidResponse));
+        drop(session);
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+    }
+    #[test]
+    fn split_phase_cancellation_and_wrong_phase_fail_closed() {
+        let (temp, executable) = fixture();
+        let cancel = AtomicBool::new(true);
+        let mut session = SplitV2Session::spawn(&executable, &["--v2-split"],
+            Duration::from_secs(5)).unwrap();
+        assert_eq!(session.exchange(&start(), &cancel), Err(SessionError::Cancelled));
+        cancel.store(false, Ordering::Release);
+        assert_eq!(session.exchange(&finish(), &cancel), Err(SessionError::InvalidResponse));
+        assert_eq!(session.exchange(&start(), &cancel), Ok(Response::Started(vec![0, 255])));
+        drop(session);
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+    }
+    #[test]
+    fn split_phase_wrong_response_and_worker_exit_fail_closed() {
+        let (temp, executable) = fixture();
+        let cancel = AtomicBool::new(false);
+        for mode in ["--v2-wrong-phase", "--v2-duplicate"] {
+            let mut session = SplitV2Session::spawn(&executable, &[mode],
+                Duration::from_secs(5)).unwrap();
+            assert_eq!(session.exchange(&start(), &cancel), Err(SessionError::InvalidResponse));
+            assert_eq!(session.exchange(&finish(), &cancel), Err(SessionError::InvalidResponse));
+        }
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+    }
     #[test]
     fn split_phase_worker_preserves_child_and_rejects_replay() {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/session_worker_fixture.rs");
