@@ -330,6 +330,135 @@ mod v2_boundary_tests {
     }
 }
 
+/// Offline-only split-phase v2 session. A single child survives the time
+/// between Start and Finish. This is deliberately test-gated: caller-selected
+/// executables and Apple native libraries are not enabled in release builds.
+#[cfg(test)]
+struct SplitV2Session {
+    child: std::process::Child,
+    commands: Option<mpsc::Sender<Vec<u8>>>,
+    writes: mpsc::Receiver<bool>,
+    replies: mpsc::Receiver<Option<Vec<u8>>>,
+    deadline: Instant,
+    phase: u8,
+}
+#[cfg(test)]
+impl SplitV2Session {
+    fn spawn(executable: &Path, args: &[&str], timeout: Duration) -> Result<Self, SessionError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(10) { return Err(SessionError::InvalidTimeout); }
+        crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
+            .map_err(|_| SessionError::Spawn)?;
+        #[cfg(unix)]
+        let identity = crate::adi_worker_lifecycle::worker_file_identity(executable)
+            .map_err(|_| SessionError::Spawn)?;
+        let mut command = Command::new(executable);
+        command.args(args).env_clear().current_dir("/")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        crate::adi_worker_lifecycle::verify_worker_executable(executable, executable)
+            .map_err(|_| SessionError::Spawn)?;
+        #[cfg(unix)]
+        if crate::adi_worker_lifecycle::worker_file_identity(executable)
+            .map_err(|_| SessionError::Spawn)? != identity { return Err(SessionError::Spawn); }
+        let mut child = command.spawn().map_err(|_| SessionError::Spawn)?;
+        let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            terminate_and_reap(&mut child);
+            return Err(SessionError::Transport);
+        };
+        let (command_tx, command_rx) = mpsc::channel::<Vec<u8>>();
+        let (write_tx, write_rx) = mpsc::channel();
+        let (read_tx, read_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for frame in command_rx {
+                let ok = stdin.write_all(&frame).and_then(|_| stdin.flush()).is_ok();
+                if write_tx.send(ok).is_err() || !ok { break; }
+            }
+        });
+        thread::spawn(move || loop {
+            let reply = crate::adi_worker_framing::read_frame(&mut stdout).ok();
+            let terminal = reply.is_none();
+            if read_tx.send(reply).is_err() || terminal { break; }
+        });
+        Ok(Self { child, commands: Some(command_tx), writes: write_rx,
+            replies: read_rx, deadline: Instant::now() + timeout, phase: 0 })
+    }
+    fn exchange(&mut self, request: &crate::adi_worker_wire_v2::Request,
+        cancel: &AtomicBool) -> Result<crate::adi_worker_wire_v2::Response, SessionError> {
+        use crate::adi_worker_wire_v2::{decode_response, encode_request, Request, Response};
+        if cancel.load(Ordering::Acquire) { return Err(SessionError::Cancelled); }
+        let expected = match request {
+            Request::Start { .. } if self.phase == 0 => 1,
+            Request::Finish { .. } if self.phase == 1 => 2,
+            _ => return Err(SessionError::InvalidResponse),
+        };
+        // Never retry an ambiguous native operation, even on a transport error.
+        self.phase = 3;
+        let payload = encode_request(request).map_err(|_| SessionError::InvalidResponse)?;
+        let mut frame = Vec::new();
+        crate::adi_worker_framing::write_frame(&mut frame, &payload)
+            .map_err(|_| SessionError::InvalidResponse)?;
+        self.commands.as_ref().ok_or(SessionError::Transport)?
+            .send(frame).map_err(|_| SessionError::Transport)?;
+        if !receive(&self.writes, self.deadline, cancel)? { return Err(SessionError::Transport); }
+        let reply = receive(&self.replies, self.deadline, cancel)?
+            .ok_or(SessionError::InvalidResponse)?;
+        let response = decode_response(&reply, request).map_err(|_| SessionError::InvalidResponse)?;
+        if !matches!((&response, expected),
+            (Response::Started(_), 1) | (Response::Finished(_), 2)) {
+            return Err(SessionError::InvalidResponse);
+        }
+        self.phase = expected;
+        if expected == 2 {
+            // Fixture requires stdin EOF before it sends the final reply;
+            // a native worker may instead send the reply immediately.
+            self.commands.take();
+        }
+        Ok(response)
+    }
+}
+#[cfg(test)]
+impl Drop for SplitV2Session {
+    fn drop(&mut self) {
+        self.commands.take();
+        terminate_and_reap(&mut self.child);
+    }
+}
+
+#[cfg(test)]
+mod split_v2_tests {
+    use super::*;
+    use crate::adi_worker_wire_v2::{Request, Response};
+    #[test]
+    fn split_phase_worker_preserves_child_and_rejects_replay() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!("zag-split-v2-{}-{:?}",
+            std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temp.join("fixture");
+        assert!(Command::new("rustc").args(["--edition=2021", "-o"])
+            .arg(&executable).arg(&source).status().unwrap().success());
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut session = SplitV2Session::spawn(&executable, &["--v2"], Duration::from_secs(5)).unwrap();
+        let pid = session.child.id();
+        let cancel = AtomicBool::new(false);
+        let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
+        let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
+        assert_eq!(session.exchange(&start, &cancel), Ok(Response::Started(vec![0, 255])));
+        assert_eq!(session.child.id(), pid);
+        assert_eq!(session.exchange(&start, &cancel), Err(SessionError::InvalidResponse));
+        // The fixture waits for stdin EOF before responding to Finish. The
+        // split-phase adapter must close its command channel before awaiting
+        // the final reply; this test deliberately exposes that requirement.
+        drop(session);
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&temp);
+        let _ = finish;
+    }
+}
+
 /// Offline test-only v2 supervisor. The executable is caller-selected and therefore
 /// this is NOT an approved production launch path.
 #[cfg(test)]
