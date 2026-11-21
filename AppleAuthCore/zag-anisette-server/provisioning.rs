@@ -371,6 +371,36 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     #[test]
+    fn persistent_subprocess_rejects_bad_reply_and_terminates_provisioning() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/session_worker_fixture.rs");
+        let temp = std::env::temp_dir().join(format!(
+            "zag-provider-bad-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temp.join("fixture");
+        assert!(std::process::Command::new("rustc")
+            .args(["--edition=2021", "-o"]).arg(&executable).arg(&source)
+            .status().unwrap().success());
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let transport = OfflineSplitChildTransport::spawn(&executable,
+            &["--v2-wrong-phase"], std::time::Duration::from_secs(5)).unwrap();
+        let mut session = Session::new(AdiBackend::new(SessionOwnedAdiProvider::new(transport)));
+        assert_eq!(session.receive(ClientMessage::Identifier("-2".into())),
+            Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("00ff".into())),
+            Err(ProtocolError::BackendUnavailable));
+        assert_eq!(session.phase(), Phase::Failed);
+        assert_eq!(session.receive(ClientMessage::Finish {
+            ptm: "ff00".into(), tk: "80".into(),
+        }), Err(ProtocolError::InvalidTransition));
+        drop(session);
+        std::fs::remove_file(&executable).unwrap();
+        std::fs::remove_dir(&temp).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
     fn persistent_subprocess_drives_complete_provisioning_protocol() {
         use std::os::unix::fs::PermissionsExt;
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
