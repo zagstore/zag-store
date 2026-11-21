@@ -135,6 +135,10 @@ mod v2_boundary_tests {
             .join("tests/session_worker_fixture.rs");
         let temp = std::env::temp_dir().join(format!("zag-v2-fixture-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&temp).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-worker-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
@@ -168,6 +172,10 @@ mod v2_boundary_tests {
             .join("tests/session_worker_fixture.rs");
         let temp = std::env::temp_dir().join(format!("zag-v2-midcancel-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&temp).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-midcancel-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
         let executable = std::fs::canonicalize(&executable).unwrap();
@@ -195,6 +203,10 @@ mod v2_boundary_tests {
             .join("tests/session_worker_fixture.rs");
         let temp = std::env::temp_dir().join(format!("zag-v2-supervised-stall-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&temp).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-supervised-stall-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
@@ -216,6 +228,10 @@ mod v2_boundary_tests {
             .join("tests/session_worker_fixture.rs");
         let temp = std::env::temp_dir().join(format!("zag-v2-duplicate-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&temp).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-duplicate-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
         let mut child = Command::new(std::fs::canonicalize(&executable).unwrap())
@@ -239,6 +255,10 @@ mod v2_boundary_tests {
             .join("tests/session_worker_fixture.rs");
         let temp = std::env::temp_dir().join(format!("zag-v2-phase-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&temp).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-phase-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
         let mut child = Command::new(std::fs::canonicalize(&executable).unwrap())
@@ -262,6 +282,10 @@ mod v2_boundary_tests {
             .join("tests/session_worker_fixture.rs");
         let temp = std::env::temp_dir().join(format!("zag-v2-stall-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&temp).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-stall-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
         let mut command = Command::new(std::fs::canonicalize(&executable).unwrap());
@@ -644,6 +668,10 @@ mod tests {
             std::process::id(), std::thread::current().id()
         ));
         std::fs::create_dir_all(&temp).unwrap();
+
+        #[cfg(unix)]
+
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("session-fixture");
         let compile = Command::new("rustc")
             .args(["--edition=2021", "-o"])
