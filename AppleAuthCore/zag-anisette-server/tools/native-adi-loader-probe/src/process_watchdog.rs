@@ -2,7 +2,7 @@
 //! Owns the child handle and reaps it on deadline; never signals a raw PID.
 //! Not wired to the production service or a live provisioning CLI.
 use std::io;
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 #[cfg(test)]
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -17,7 +17,16 @@ pub(crate) fn run_bounded(command: &mut Command, deadline: Duration) -> io::Resu
     }
     // Respect caller-specified stdio. The coordinator inherits identity JSON
     // through stdin; no identity material is placed in argv or the environment.
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
+    wait_bounded(child, deadline)
+}
+
+pub(crate) fn wait_bounded(mut child: Child, deadline: Duration) -> io::Result<ExitStatus> {
+    if deadline.is_zero() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero process deadline"));
+    }
     let end = Instant::now() + deadline;
     loop {
         match child.try_wait() {
