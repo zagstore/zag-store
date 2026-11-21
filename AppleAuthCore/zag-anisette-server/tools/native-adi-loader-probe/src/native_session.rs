@@ -1,7 +1,8 @@
 //! Native ADI lifecycle bridge for the isolated, operator-run probe.
 //!
 //! This module resolves the audited StoreServicesCore entry points. It does
-//! not issue requests, generate provisioning material, or modify live services.
+//! not issue requests or modify live services; provisioning material only
+//! passes through it from a supervised coordinator.
 //! Keep the mapped AndroidLibrary alive longer than NativeFunctions and Session.
 use android_loader::android_library::AndroidLibrary;
 use android_loader::sysv64_type;
@@ -13,6 +14,11 @@ type StartFn = sysv64_type!(fn(i64, *const u8, u32, *mut *const u8, *mut u32, *m
 type EndFn = sysv64_type!(fn(u32, *const u8, u32, *const u8, u32) -> i32);
 type DestroyFn = sysv64_type!(fn(u32) -> i32);
 type DisposeFn = sysv64_type!(fn(*const u8) -> i32);
+type LoginCodeFn = sysv64_type!(fn(i64) -> i32);
+type OtpFn = sysv64_type!(fn(i64, *mut *const u8, *mut u32, *mut *const u8, *mut u32) -> i32);
+
+/// ADIGetLoginCode result for a state directory that holds no provisioning.
+pub const NOT_PROVISIONED: i32 = -45061;
 
 fn native_failure(phase: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, phase)
@@ -28,6 +34,8 @@ pub struct NativeFunctions<'a> {
     end: EndFn,
     destroy: DestroyFn,
     dispose: DisposeFn,
+    login_code: LoginCodeFn,
+    otp: OtpFn,
 }
 
 impl<'a> NativeFunctions<'a> {
@@ -41,7 +49,38 @@ impl<'a> NativeFunctions<'a> {
             end: unsafe { std::mem::transmute::<*const (), EndFn>(symbol("uv5t6nhkui")?) },
             destroy: unsafe { std::mem::transmute::<*const (), DestroyFn>(symbol("fy34trz2st")?) },
             dispose: unsafe { std::mem::transmute::<*const (), DisposeFn>(symbol("jk24uiwqrg")?) },
+            login_code: unsafe { std::mem::transmute::<*const (), LoginCodeFn>(symbol("aslgmuibau")?) },
+            otp: unsafe { std::mem::transmute::<*const (), OtpFn>(symbol("qi864985u0")?) },
         })
+    }
+
+    /// Whether the configured state directory holds provisioning for ds_id.
+    /// Any status other than success or NOT_PROVISIONED is an error.
+    pub fn is_provisioned(&self, ds_id: i64) -> io::Result<bool> {
+        match (self.login_code)(ds_id) {
+            0 => Ok(true),
+            NOT_PROVISIONED => Ok(false),
+            _ => Err(native_failure("native ADI login-code query returned error")),
+        }
+    }
+
+    /// Proves the configured state can generate headers: requests one OTP
+    /// and machine identifier, checks both are present, and disposes them
+    /// without exposing their contents. Returns nothing on purpose.
+    pub fn check_otp(&self, ds_id: i64) -> io::Result<()> {
+        let (mut mid_ptr, mut mid_len): (*const u8, u32) = (std::ptr::null(), 0);
+        let (mut otp_ptr, mut otp_len): (*const u8, u32) = (std::ptr::null(), 0);
+        let code = (self.otp)(ds_id, &mut mid_ptr, &mut mid_len, &mut otp_ptr, &mut otp_len);
+        let _mid = NativeAllocation { ptr: mid_ptr, dispose: self.dispose };
+        let _otp = NativeAllocation { ptr: otp_ptr, dispose: self.dispose };
+        if code != 0 {
+            return Err(native_failure("native ADI OTP request returned error"));
+        }
+        if mid_ptr.is_null() || otp_ptr.is_null() || mid_len == 0 || otp_len == 0
+            || mid_len as usize > MAX_MATERIAL || otp_len as usize > MAX_MATERIAL {
+            return Err(invalid("invalid OTP material returned by native ADI"));
+        }
+        Ok(())
     }
 
     /// The caller must first initialize CoreADI, set its state directory and

@@ -1,10 +1,18 @@
-//! Operator-invoked, offline-worker-compatible Apple provisioning coordinator.
-//! No Apple credentials are accepted. The coordinator talks only to Apple's
-//! approved HTTPS hosts, and the native worker is a separate local child.
+//! Operator-invoked Apple provisioning coordinator. No Apple credentials are
+//! accepted. The coordinator talks only to Apple's approved HTTPS hosts, and
+//! the native worker is a separate local child that owns the ADI session.
+//!
+//! Request headers mirror the Zag Store v3 client (zag-isideload
+//! remote_v3::provision and GrandSlam::base_headers), so a state produced here
+//! is provisioned exactly as the client would provision it.
 use crate::offline_v2_bridge::wire::{self, Request, Response};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use plist::{Dictionary, Value};
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -14,7 +22,12 @@ use url::Url;
 const LOOKUP: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 const MAX_HTTP_BYTES: usize = 128 * 1024;
 const WORKER_DEADLINE: Duration = Duration::from_secs(45);
-const EXCHANGE_DEADLINE: Duration = Duration::from_secs(90);
+pub(crate) const EXCHANGE_DEADLINE: Duration = Duration::from_secs(90);
+/// AuthKit's fixed account-independent ds_id for machine provisioning.
+const DS_ID: &str = "-2";
+// Sent by GrandSlam::base_headers on every client request.
+const XCODE_VERSION: &str = "27.0 (27A5218g)";
+const APP_INFO: &str = "com.apple.gs.xcode.auth";
 
 fn remaining(end: Instant) -> io::Result<Duration> {
     let left = end.checked_duration_since(Instant::now())
@@ -25,6 +38,40 @@ fn remaining(end: Instant) -> io::Result<Duration> {
 
 const MAX_BINARY_BYTES: usize = 12 * 1024;
 const MAX_FRAME: usize = wire::MAX_FRAME;
+
+/// The provisioning step a failure belongs to. Names are stable: operators
+/// and scripts match on them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stage { Lookup, StartProvisioning, NativeStart, FinishProvisioning, NativeFinish, Persist }
+impl Stage {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Stage::Lookup => "lookup",
+            Stage::StartProvisioning => "start-provisioning",
+            Stage::NativeStart => "native-start",
+            Stage::FinishProvisioning => "finish-provisioning",
+            Stage::NativeFinish => "native-finish",
+            Stage::Persist => "persist",
+        }
+    }
+}
+
+/// A failure tagged with its stage. The reason comes only from this
+/// module's fixed messages, OS error text or an Apple status code; Apple
+/// bodies, identity values and provisioning material never reach it.
+#[derive(Debug)]
+pub(crate) struct StageError { pub(crate) stage: Stage, pub(crate) reason: String }
+impl fmt::Display for StageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.stage.name(), self.reason)
+    }
+}
+pub(crate) fn safe_reason(error: &io::Error) -> String {
+    error.to_string().chars().filter(|c| !c.is_control()).take(160).collect()
+}
+fn at(stage: Stage) -> impl Fn(io::Error) -> StageError {
+    move |error| StageError { stage, reason: safe_reason(&error) }
+}
 
 /// Only known Apple GrandSlam provisioning hosts may be used. Deliberately
 /// refuse redirects and credential-bearing URLs. Any host additions require review.
@@ -56,6 +103,9 @@ fn invalid(message: &'static str) -> io::Error {
 fn transport() -> io::Error {
     io::Error::new(io::ErrorKind::Other, "Apple provisioning transport failed")
 }
+fn worker_io() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "native worker channel failed")
+}
 fn xml_bytes(dict: Dictionary) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     Value::Dictionary(dict).to_writer_xml(&mut output).map_err(|_| invalid("invalid plist encoding"))?;
@@ -78,6 +128,18 @@ fn decoded_field(dict: &Dictionary, key: &str) -> io::Result<Vec<u8>> {
     let decoded = STANDARD.decode(encoded).map_err(|_| invalid("invalid provisioning base64"))?;
     if decoded.is_empty() || decoded.len() > MAX_BINARY_BYTES { return Err(invalid("invalid provisioning bytes")); }
     Ok(decoded)
+}
+/// The `Response` dictionary of a provisioning reply, refused when Apple's
+/// own status carries an error code. Only the numeric code is reported.
+fn apple_response(reply: &Dictionary) -> io::Result<&Dictionary> {
+    let response = dictionary_field(reply, "Response")?;
+    if let Some(status) = response.get("Status").and_then(Value::as_dictionary) {
+        let code = status.get("ec").and_then(Value::as_signed_integer).unwrap_or(0);
+        if code != 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("Apple status error {code}")));
+        }
+    }
+    Ok(response)
 }
 fn empty_request() -> io::Result<Vec<u8>> {
     let mut root = Dictionary::new();
@@ -102,31 +164,60 @@ fn framed_request(req: &Request) -> io::Result<Vec<u8>> {
 }
 fn framed_response<R: Read>(reader: &mut R, request: &Request) -> io::Result<Response> {
     let mut length = [0u8; 4];
-    reader.read_exact(&mut length)?;
+    reader.read_exact(&mut length).map_err(|_| worker_io())?;
     let size = u32::from_be_bytes(length) as usize;
     if size == 0 || size > MAX_FRAME { return Err(invalid("invalid worker frame")); }
     let mut bytes = vec![0; size];
-    reader.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes).map_err(|_| worker_io())?;
     wire::decode_response(&bytes, request).map_err(|_| invalid("invalid worker response"))
 }
 
-pub(crate) fn validate_identity(device_id: &str, client_info: &str, local_user: &str, serial: &str) -> io::Result<()> {
-    AppleHttp::new(device_id, client_info, local_user, serial).map(|_| ())
+/// The CoreADI Android identifier for a client device ID. Matches the v3
+/// reference server (anisette-v3-server): the first 16 characters of the
+/// upper-cased UUID. Header generation must derive it the same way, or the
+/// provisioned state does not belong to the device that later uses it.
+pub(crate) fn android_identifier(device_id: &str) -> io::Result<String> {
+    let bytes = device_id.as_bytes();
+    if bytes.len() != 36 || ![8, 13, 18, 23].iter().all(|&i| bytes[i] == b'-')
+        || !bytes.iter().enumerate().all(|(i, b)| [8, 13, 18, 23].contains(&i) || b.is_ascii_hexdigit()) {
+        return Err(invalid("device ID must be a canonical UUID"));
+    }
+    Ok(device_id[..16].to_ascii_uppercase())
 }
 
-struct AppleHttp {
+/// The client identity sent with provisioning. Serial is optional because
+/// the v3 client never sends X-Apple-I-SRL-NO while provisioning; when an
+/// operator supplies one, it is validated and sent.
+pub(crate) struct ClientIdentity<'a> {
+    pub(crate) device_id: &'a str,
+    pub(crate) client_info: &'a str,
+    pub(crate) local_user: &'a str,
+    pub(crate) serial: Option<&'a str>,
+    pub(crate) user_agent: &'a str,
+}
+
+pub(crate) fn validate_identity(identity: &ClientIdentity<'_>) -> io::Result<()> {
+    AppleHttp::new(identity).map(|_| ())
+}
+
+/// The coordinator's only way to reach Apple. `device` adds the device
+/// headers, which the v3 client sends on provisioning calls but not on the
+/// URL bag lookup.
+pub(crate) trait AppleTransport {
+    fn send(&self, url: &Url, body: Option<&[u8]>, device: bool, end: Instant) -> io::Result<Dictionary>;
+}
+
+pub(crate) struct AppleHttp {
     agent: ureq::Agent,
     device_id: String,
     client_info: String,
     local_user: String,
-    serial: String,
+    serial: Option<String>,
     user_agent: String,
 }
 impl AppleHttp {
-    fn new(device_id: &str, client_info: &str, local_user: &str, serial: &str) -> io::Result<Self> {
-        Self::new_with_user_agent(device_id, client_info, local_user, serial, "akd/1.0 CFNetwork/808.1.4")
-    }
-    fn new_with_user_agent(device_id: &str, client_info: &str, local_user: &str, serial: &str, user_agent: &str) -> io::Result<Self> {
+    pub(crate) fn new(identity: &ClientIdentity<'_>) -> io::Result<Self> {
+        let ClientIdentity { device_id, client_info, local_user, serial, user_agent } = *identity;
         if user_agent.is_empty() || user_agent.len() > 512 || user_agent.chars().any(char::is_control) {
             return Err(invalid("invalid configured user agent"));
         }
@@ -137,10 +228,14 @@ impl AppleHttp {
         }
         // Never synthesize identity headers or accept control characters.
         // Values must be stable operator-provided test identities.
-        if local_user.len() != 64 || !local_user.bytes().all(|b| b.is_ascii_hexdigit())
-            || serial.is_empty() || serial.len() > 64
-            || !serial.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        if local_user.len() != 64 || !local_user.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(invalid("invalid Apple identity headers"));
+        }
+        if let Some(serial) = serial {
+            if serial.is_empty() || serial.len() > 64
+                || !serial.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return Err(invalid("invalid Apple identity headers"));
+            }
         }
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(8))
@@ -149,31 +244,42 @@ impl AppleHttp {
             .redirects(0)
             .build();
         Ok(Self { agent, device_id: device_id.to_owned(), client_info: client_info.to_owned(),
-            local_user: local_user.to_owned(), serial: serial.to_owned(), user_agent: user_agent.to_owned() })
+            local_user: local_user.to_owned(), serial: serial.map(str::to_owned), user_agent: user_agent.to_owned() })
     }
-    fn get(&self, url: &str, end: Instant) -> io::Result<Dictionary> { self.send(url, None, end) }
-    fn post(&self, url: &str, body: &[u8], end: Instant) -> io::Result<Dictionary> { self.send(url, Some(body), end) }
-    fn send(&self, target: &str, body: Option<&[u8]>, end: Instant) -> io::Result<Dictionary> {
-        let url = validated_endpoint(target)?;
+}
+impl AppleTransport for AppleHttp {
+    fn send(&self, url: &Url, body: Option<&[u8]>, device: bool, end: Instant) -> io::Result<Dictionary> {
+        let url = validated_endpoint(url.as_str())?;
         let budget = remaining(end)?;
-        let req = match body {
+        let mut req = match body {
             Some(_) => self.agent.post(url.as_str()),
             None => self.agent.get(url.as_str()),
         }
             .timeout(budget)
-            .set("User-Agent", &self.user_agent)
-            .set("X-Mme-Device-Id", &self.device_id)
+            .set("Content-Type", "text/x-xml-plist")
+            .set("Accept", "text/x-xml-plist")
             .set("X-Mme-Client-Info", &self.client_info)
-            .set("X-Apple-I-MD-LU", &self.local_user)
-            .set("X-Apple-I-SRL-NO", &self.serial)
-            .set("Content-Type", "text/x-xml-plist");
+            .set("User-Agent", &self.user_agent)
+            .set("X-Xcode-Version", XCODE_VERSION)
+            .set("X-Apple-App-Info", APP_INFO)
+            .set("Connection", "close");
+        if device {
+            req = req.set("X-Apple-I-MD-LU", &self.local_user)
+                .set("X-Mme-Device-Id", &self.device_id);
+            if let Some(serial) = &self.serial { req = req.set("X-Apple-I-SRL-NO", serial); }
+        }
         // ureq's default TLS verification is retained; no insecure opt-out.
         // Any redirect is rejected by redirects(0) and status validation.
         let result = match body {
             Some(bytes) => req.send_bytes(bytes),
             None => req.call(),
-        }.map_err(|_| transport())?;
-        if result.status() != 200 { return Err(transport()); }
+        }.map_err(|error| match error {
+            ureq::Error::Status(code, _) => io::Error::new(io::ErrorKind::Other, format!("Apple HTTP status {code}")),
+            ureq::Error::Transport(_) => transport(),
+        })?;
+        if result.status() != 200 {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("Apple HTTP status {}", result.status())));
+        }
         let mut bounded = result.into_reader().take((MAX_HTTP_BYTES + 1) as u64);
         let mut bytes = Vec::new();
         bounded.read_to_end(&mut bytes).map_err(|_| transport())?;
@@ -208,42 +314,21 @@ fn supervise_child(
     })
 }
 
-/// Native child remains in its own process. Only a single local worker
-/// executable and operator-supplied empty private directory are allowed.
-/// The child is not registered as a production service.
-#[allow(dead_code)]
-pub fn provision_with_worker(
-    worker_binary: &std::path::Path,
-    runtime_root: &std::path::Path,
-    fresh_state_dir: &std::path::Path,
-    device_id: &str,
-    client_info: &str,
-    local_user: &str,
-    serial: &str,
-    user_agent: &str,
-) -> io::Result<Vec<u8>> {
-    if !worker_binary.is_file() || !runtime_root.is_dir() || !fresh_state_dir.is_absolute() {
-        return Err(invalid("invalid isolated worker configuration"));
+/// How to launch the native worker: the probe itself in --native-v2-session
+/// mode in production, a fixture in the offline integration tests.
+pub(crate) struct WorkerCommand { pub(crate) program: PathBuf, pub(crate) args: Vec<OsString> }
+impl WorkerCommand {
+    pub(crate) fn native(worker_binary: &Path, runtime_root: &Path, state_dir: &Path, android_id: &str) -> Self {
+        Self {
+            program: worker_binary.to_owned(),
+            args: vec![runtime_root.into(), "--native-v2-session".into(), state_dir.into(), android_id.into()],
+        }
     }
-    if fresh_state_dir.exists() { return Err(invalid("state directory already exists")); }
-    let end = Instant::now() + EXCHANGE_DEADLINE;
-    let http = AppleHttp::new_with_user_agent(device_id, client_info, local_user, serial, user_agent)?;
-    let lookup = http.get(LOOKUP, end)?;
-    let bag = dictionary_field(&lookup, "urls")?;
-    let start_url = validated_endpoint(string_field(bag, "midStartProvisioning")?)?;
-    let finish_url = validated_endpoint(string_field(bag, "midFinishProvisioning")?)?;
-    let start_body = empty_request()?;
-    let start_reply = http.post(start_url.as_str(), &start_body, end)?;
-    let spim = decoded_field(dictionary_field(&start_reply, "Response")?, "spim")?;
+}
 
-    // Do not start a native worker once the Apple exchange budget has expired.
-    let worker_budget = WORKER_DEADLINE.min(remaining(end)?);
-    let mut worker_command = Command::new(worker_binary);
-    worker_command
-        .arg(runtime_root)
-        .arg("--native-v2-session")
-        .arg(fresh_state_dir)
-        .arg(device_id)
+fn spawn_worker(worker: &WorkerCommand) -> io::Result<Child> {
+    let mut command = Command::new(&worker.program);
+    command.args(&worker.args)
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::piped()).stdout(Stdio::piped())
@@ -257,7 +342,7 @@ pub fn provision_with_worker(
         use std::os::unix::process::CommandExt;
         let coordinator_pid = unsafe { libc::getpid() };
         unsafe {
-            worker_command.pre_exec(move || {
+            command.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -268,56 +353,129 @@ pub fn provision_with_worker(
             });
         }
     }
-    let mut child = worker_command.spawn().map_err(|_| transport())?;
+    command.spawn().map_err(|_| io::Error::new(io::ErrorKind::Other, "native worker failed to start"))
+}
+
+/// Confirms that the worker's reported state is exactly the adi.pb in the
+/// claimed directory (no symlink, regular, non-empty), then makes it
+/// owner-only and durable. Returns its SHA-256 (hex), which binds the
+/// supervisor's later checks to these exact bytes.
+fn persist_state(state_dir: &Path, reported: &[u8]) -> io::Result<String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
+        .open(state_dir.join("adi.pb")).map_err(|_| invalid("native worker left no ADI state file"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_FRAME as u64 {
+        return Err(invalid("invalid ADI state file"));
+    }
+    let mut stored = Vec::new();
+    (&mut file).take(MAX_FRAME as u64 + 1).read_to_end(&mut stored)?;
+    if stored != reported { return Err(invalid("ADI state file differs from worker result")); }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.sync_all()?;
+    fs::File::open(state_dir)?.sync_all()?;
+    Ok(sha256_hex(&stored))
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Runs the complete provisioning exchange for one claimed, empty state
+/// directory: URL bag lookup, midStartProvisioning, native Start,
+/// midFinishProvisioning, native End, and verified persistence of adi.pb.
+/// The native worker lives only inside this call and is reaped on every path.
+/// Returns the SHA-256 (hex) of the persisted adi.pb.
+pub(crate) fn provision<T: AppleTransport>(
+    apple: &T,
+    worker: &WorkerCommand,
+    state_dir: &Path,
+    deadline: Duration,
+) -> Result<String, StageError> {
+    let end = Instant::now() + deadline;
+    let lookup = (|| {
+        let bag = apple.send(&validated_endpoint(LOOKUP)?, None, false, end)?;
+        let urls = dictionary_field(&bag, "urls")?;
+        Ok((validated_endpoint(string_field(urls, "midStartProvisioning")?)?,
+            validated_endpoint(string_field(urls, "midFinishProvisioning")?)?))
+    })();
+    let (start_url, finish_url) = lookup.map_err(at(Stage::Lookup))?;
+    let spim = (|| {
+        let reply = apple.send(&start_url, Some(&empty_request()?), true, end)?;
+        decoded_field(apple_response(&reply)?, "spim")
+    })().map_err(at(Stage::StartProvisioning))?;
+
+    // Do not start a native worker once the Apple exchange budget has expired.
+    let worker_budget = WORKER_DEADLINE.min(remaining(end).map_err(at(Stage::NativeStart))?);
+    let mut child = spawn_worker(worker).map_err(at(Stage::NativeStart))?;
     // Extract pipes before transferring exclusive Child ownership to the
     // supervisor. All process termination/reaping occurs in that thread.
-    let mut stdin = Some(child.stdin.take().ok_or_else(transport)?);
-    let mut stdout = child.stdout.take().ok_or_else(transport)?;
+    let mut stdin = child.stdin.take();
+    let stdout = child.stdout.take();
     let abort = Arc::new(AtomicBool::new(false));
     // The native worker cannot outlive the remaining exchange budget.
     let supervisor = supervise_child(child, worker_budget, Arc::clone(&abort));
+    let mut stdout = stdout;
     let result = (|| {
-        let start = Request::Start { identifier: "-2".into(), spim };
-        remaining(end)?;
-        stdin.as_mut().ok_or_else(transport)?.write_all(&framed_request(&start)?)?;
-        stdin.as_mut().ok_or_else(transport)?.flush()?;
-        let cpim = match framed_response(&mut stdout, &start)? {
-            Response::Started(data) => data,
-            _ => return Err(invalid("worker rejected Start")),
+        let (Some(input), Some(output)) = (stdin.as_mut(), stdout.as_mut()) else {
+            return Err(at(Stage::NativeStart)(worker_io()));
         };
-        remaining(end)?;
-        let body = finish_request(&cpim)?;
-        let finish_reply = http.post(finish_url.as_str(), &body, end)?;
-        let reply = dictionary_field(&finish_reply, "Response")?;
-        let ptm = decoded_field(reply, "ptm")?;
-        let tk = decoded_field(reply, "tk")?;
+        let start = Request::Start { identifier: DS_ID.into(), spim };
+        let cpim = (|| {
+            input.write_all(&framed_request(&start)?).map_err(|_| worker_io())?;
+            input.flush().map_err(|_| worker_io())?;
+            match framed_response(output, &start)? {
+                Response::Started(data) => Ok(data),
+                _ => Err(invalid("native worker rejected Start")),
+            }
+        })().map_err(at(Stage::NativeStart))?;
+        let (ptm, tk) = (|| {
+            let reply = apple.send(&finish_url, Some(&finish_request(&cpim)?), true, end)?;
+            let response = apple_response(&reply)?;
+            Ok((decoded_field(response, "ptm")?, decoded_field(response, "tk")?))
+        })().map_err(at(Stage::FinishProvisioning))?;
         let finish = Request::Finish { ptm, tk };
-        remaining(end)?;
-        stdin.as_mut().ok_or_else(transport)?.write_all(&framed_request(&finish)?)?;
-        stdin.as_mut().ok_or_else(transport)?.flush()?;
-        drop(stdin.take());
-        let adi_pb = match framed_response(&mut stdout, &finish)? {
-            Response::Finished(data) => data,
-            _ => return Err(invalid("worker rejected Finish")),
-        };
-        remaining(end)?;
-        let mut extra = [0u8; 1];
-        if stdout.read(&mut extra)? != 0 { return Err(invalid("worker trailing output")); }
-        Ok(adi_pb)
+        (|| {
+            remaining(end)?;
+            input.write_all(&framed_request(&finish)?).map_err(|_| worker_io())?;
+            input.flush().map_err(|_| worker_io())?;
+            let adi_pb = match framed_response(output, &finish)? {
+                Response::Finished(data) => data,
+                _ => return Err(invalid("native worker rejected Finish")),
+            };
+            let mut extra = [0u8; 1];
+            if output.read(&mut extra).map_err(|_| worker_io())? != 0 {
+                return Err(invalid("native worker trailing output"));
+            }
+            Ok(adi_pb)
+        })().map_err(at(Stage::NativeFinish))
     })();
     if result.is_err() { abort.store(true, Ordering::Release); }
     drop(stdin.take());
     drop(stdout);
-    let (status, timed_out) = supervisor.join().map_err(|_| transport())??;
-    if timed_out { return Err(io::Error::new(io::ErrorKind::TimedOut, "native worker deadline exceeded")); }
-    if !status.success() { return Err(transport()); }
-    remaining(end)?;
-    result
+    // The stage that failed first is the one reported; the worker's exit
+    // after an abort is a consequence, not a separate failure.
+    let joined = supervisor.join();
+    let adi_pb = result?;
+    let (status, timed_out) = joined
+        .map_err(|_| at(Stage::NativeFinish)(worker_io()))?
+        .map_err(at(Stage::NativeFinish))?;
+    if timed_out {
+        return Err(at(Stage::NativeFinish)(io::Error::new(io::ErrorKind::TimedOut, "native worker deadline exceeded")));
+    }
+    if !status.success() {
+        return Err(at(Stage::NativeFinish)(io::Error::new(io::ErrorKind::Other, "native worker exited with failure")));
+    }
+    persist_state(state_dir, &adi_pb).map_err(at(Stage::Persist))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
+
     #[cfg(unix)]
     #[test]
     fn supervisor_reaps_hung_child_without_raw_pid_signals() {
@@ -334,58 +492,45 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn supervisor_preserves_successful_exit() {
-        let child = Command::new("/bin/sh").args(["-c", "exit 0"])
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().unwrap();
-        let worker = supervise_child(child, Duration::from_secs(2),
-            Arc::new(AtomicBool::new(false)));
-        let (status, timed_out) = worker.join().unwrap().unwrap();
-        assert!(status.success());
-        assert!(!timed_out);
-    }
-
-    #[test]
-    fn worker_budget_is_never_longer_than_exchange_budget() {
-        let end = Instant::now() + Duration::from_millis(500);
-        let budget = WORKER_DEADLINE.min(remaining(end).unwrap());
-        assert!(budget <= Duration::from_millis(500));
-        assert!(budget <= WORKER_DEADLINE);
-    }
-
     #[test]
     fn expired_exchange_budget_fails_closed() {
         let end = Instant::now() - Duration::from_millis(1);
         assert_eq!(remaining(end).unwrap_err().kind(), io::ErrorKind::TimedOut);
         let user = "A".repeat(64);
-        let http = AppleHttp::new("device", "client", &user, "TEST").unwrap();
-        assert_eq!(http.get(LOOKUP, end).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let http = AppleHttp::new(&identity("device", "client", &user, Some("TEST"), "agent")).unwrap();
+        let error = http.send(&validated_endpoint(LOOKUP).unwrap(), None, false, end).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    fn identity<'a>(device_id: &'a str, client_info: &'a str, local_user: &'a str,
+                    serial: Option<&'a str>, user_agent: &'a str) -> ClientIdentity<'a> {
+        ClientIdentity { device_id, client_info, local_user, serial, user_agent }
     }
 
     #[test]
     fn identity_headers_reject_missing_or_injected_values() {
         let user = "A".repeat(64);
-        assert!(AppleHttp::new("device", "client", &user, "TEST-123").is_ok());
-        assert!(AppleHttp::new("device", "client", "", "TEST-123").is_err());
-        assert!(AppleHttp::new("device", "client", &user, "").is_err());
-        assert!(AppleHttp::new("device", "client", &user, "TEST\r\nInjected").is_err());
-        assert!(AppleHttp::new("device", "client\nInjected", &user, "TEST").is_err());
-        assert!(AppleHttp::new("device", "client", &("A".repeat(63) + "Z"), "TEST").is_err());
+        let ok = |id: ClientIdentity<'_>| AppleHttp::new(&id).is_ok();
+        assert!(ok(identity("device", "client", &user, Some("TEST-123"), "agent")));
+        // The v3 client sends no serial while provisioning.
+        assert!(ok(identity("device", "client", &user, None, "agent")));
+        assert!(!ok(identity("device", "client", "", None, "agent")));
+        assert!(!ok(identity("device", "client", &user, Some(""), "agent")));
+        assert!(!ok(identity("device", "client", &user, Some("TEST\r\nInjected"), "agent")));
+        assert!(!ok(identity("device", "client\nInjected", &user, None, "agent")));
+        assert!(!ok(identity("device", "", &user, None, "agent")));
+        assert!(!ok(identity("device", "client", &("A".repeat(63) + "Z"), None, "agent")));
+        for agent in ["", "bad\r\nInjected", "bad\0agent", &"x".repeat(513)] {
+            assert!(!ok(identity("device", "client", &user, None, agent)));
+        }
     }
 
     #[test]
-    fn configured_user_agent_is_validated_and_retained() {
-        let local_user = "a".repeat(64);
-        let make = |agent: &str| AppleHttp::new_with_user_agent(
-            "device", "client", &local_user, "TEST-123", agent
-        );
-        assert_eq!(make("Zag-Offline-Test/1.0").unwrap().user_agent, "Zag-Offline-Test/1.0");
-        for invalid_agent in ["", "bad\r\nInjected", "bad\nInjected", "bad\0agent"] {
-            assert!(make(invalid_agent).is_err());
+    fn android_identifier_matches_reference_derivation() {
+        assert_eq!(android_identifier("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(), "00010203-0405-06");
+        for bad in ["", "not-a-uuid", "00010203-0405-0607-0809-0a0b0c0d0e0g", "000102030405060708090a0b0c0d0e0f"] {
+            assert!(android_identifier(bad).is_err());
         }
-        assert!(make(&"x".repeat(513)).is_err());
     }
 
     #[test]
@@ -402,6 +547,169 @@ mod tests {
             "https://gsa.apple.com/a#fragment", "file:///etc/passwd",
         ] { assert!(validated_endpoint(bad).is_err()); }
     }
+
+    // ---- Offline integration of the whole exchange ----
+    //
+    // A scripted Apple and a fixture worker (tests/fixtures/fake_native_worker.py)
+    // run the real coordinator, framing, supervision and persistence code.
+    // Nothing here contacts Apple or loads native libraries.
+
+    const SPIM: &[u8] = b"offline-spim";
+    const CPIM: &[u8] = b"offline-cpim";
+    const PTM: &[u8] = b"offline-ptm";
+    const TK: &[u8] = b"offline-tk";
+    const ADI_PB: &[u8] = b"offline-adi-pb";
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum AppleScript { Ok, BadBag, StartStatus, NoSpim, FinishHttp, NoTk, SlowFinish }
+
+    struct FakeApple { script: AppleScript, calls: RefCell<Vec<(String, bool, Option<Vec<u8>>)>> }
+    impl FakeApple {
+        fn new(script: AppleScript) -> Self { Self { script, calls: RefCell::new(Vec::new()) } }
+    }
+    fn reply(entries: &[(&str, Value)]) -> Dictionary {
+        let mut response = Dictionary::new();
+        for (key, value) in entries { response.insert((*key).into(), value.clone()); }
+        let mut root = Dictionary::new();
+        root.insert("Response".into(), Value::Dictionary(response));
+        root
+    }
+    fn status(code: i64) -> Value {
+        let mut status = Dictionary::new();
+        status.insert("ec".into(), Value::Integer(code.into()));
+        Value::Dictionary(status)
+    }
+    impl AppleTransport for FakeApple {
+        fn send(&self, url: &Url, body: Option<&[u8]>, device: bool, end: Instant) -> io::Result<Dictionary> {
+            self.calls.borrow_mut().push((url.path().to_owned(), device, body.map(<[u8]>::to_vec)));
+            remaining(end)?;
+            let b64 = |bytes: &[u8]| Value::String(STANDARD.encode(bytes));
+            Ok(match url.path() {
+                "/grandslam/GsService2/lookup" => {
+                    let mut urls = Dictionary::new();
+                    let finish = if self.script == AppleScript::BadBag { "https://evil.example/finish" }
+                                 else { "https://gsa.apple.com/grandslam/MidService/finishProvisioning" };
+                    urls.insert("midStartProvisioning".into(), "https://gsa.apple.com/grandslam/MidService/startProvisioning".into());
+                    urls.insert("midFinishProvisioning".into(), finish.into());
+                    let mut root = Dictionary::new();
+                    root.insert("urls".into(), Value::Dictionary(urls));
+                    root
+                }
+                "/grandslam/MidService/startProvisioning" => match self.script {
+                    AppleScript::StartStatus => reply(&[("Status", status(-5000)), ("spim", b64(SPIM))]),
+                    AppleScript::NoSpim => reply(&[("Status", status(0))]),
+                    _ => reply(&[("Status", status(0)), ("spim", b64(SPIM))]),
+                },
+                "/grandslam/MidService/finishProvisioning" => match self.script {
+                    AppleScript::FinishHttp => return Err(io::Error::new(io::ErrorKind::Other, "Apple HTTP status 503")),
+                    AppleScript::NoTk => reply(&[("ptm", b64(PTM))]),
+                    AppleScript::SlowFinish => {
+                        thread::sleep(Duration::from_millis(400));
+                        remaining(end)?;
+                        unreachable!("deadline must expire first")
+                    }
+                    _ => reply(&[("Status", status(0)), ("ptm", b64(PTM)), ("tk", b64(TK))]),
+                },
+                _ => panic!("unexpected endpoint"),
+            })
+        }
+    }
+
+    fn claimed_dir() -> PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zag-adi-e2e-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+    fn fixture(script: &str, state: &Path) -> WorkerCommand {
+        WorkerCommand {
+            program: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_native_worker.py"),
+            args: vec![script.into(), state.into()],
+        }
+    }
+    fn run(apple: AppleScript, worker: &str, deadline: Duration) -> (Result<String, StageError>, PathBuf, FakeApple) {
+        let state = claimed_dir();
+        let apple = FakeApple::new(apple);
+        let result = provision(&apple, &fixture(worker, &state), &state, deadline);
+        (result, state, apple)
+    }
+
+    #[test]
+    fn offline_exchange_persists_verified_state_in_client_order() {
+        let (result, state, apple) = run(AppleScript::Ok, "ok", EXCHANGE_DEADLINE);
+        assert_eq!(result.unwrap(), sha256_hex(ADI_PB));
+        let stored = state.join("adi.pb");
+        assert_eq!(fs::read(&stored).unwrap(), ADI_PB);
+        assert_eq!(fs::metadata(&stored).unwrap().permissions().mode() & 0o777, 0o600);
+        let calls = apple.calls.borrow();
+        let paths: Vec<_> = calls.iter().map(|(p, d, _)| (p.as_str(), *d)).collect();
+        assert_eq!(paths, [
+            ("/grandslam/GsService2/lookup", false),
+            ("/grandslam/MidService/startProvisioning", true),
+            ("/grandslam/MidService/finishProvisioning", true),
+        ]);
+        // The finish request carries exactly the worker's CPIM.
+        let finish = plist_response(calls[2].2.as_deref().unwrap()).unwrap();
+        let request = dictionary_field(&finish, "Request").unwrap();
+        assert_eq!(decoded_field(request, "cpim").unwrap(), CPIM);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn offline_exchange_reports_the_failing_stage_and_reaps_the_worker() {
+        let cases = [
+            (AppleScript::BadBag, "ok", Stage::Lookup),
+            (AppleScript::StartStatus, "ok", Stage::StartProvisioning),
+            (AppleScript::NoSpim, "ok", Stage::StartProvisioning),
+            (AppleScript::Ok, "reject-start", Stage::NativeStart),
+            (AppleScript::Ok, "exit-at-start", Stage::NativeStart),
+            (AppleScript::FinishHttp, "ok", Stage::FinishProvisioning),
+            (AppleScript::NoTk, "ok", Stage::FinishProvisioning),
+            (AppleScript::FinishHttp, "hang-after-start", Stage::FinishProvisioning),
+            (AppleScript::Ok, "reject-finish", Stage::NativeFinish),
+            (AppleScript::Ok, "fail-after-finish", Stage::NativeFinish),
+            (AppleScript::Ok, "no-state", Stage::Persist),
+            (AppleScript::Ok, "mismatched-state", Stage::Persist),
+        ];
+        for (apple, worker, stage) in cases {
+            let started = Instant::now();
+            let (result, state, _) = run(apple, worker, EXCHANGE_DEADLINE);
+            let error = result.expect_err(worker);
+            assert_eq!(error.stage, stage, "{worker}: {error}");
+            // Aborted workers are killed, not waited out.
+            assert!(started.elapsed() < Duration::from_secs(5), "{worker}");
+            // No material ever appears in a reported reason.
+            for secret in [SPIM, CPIM, PTM, TK, ADI_PB] {
+                assert!(!error.reason.contains(std::str::from_utf8(secret).unwrap()));
+            }
+            if matches!(stage, Stage::Lookup | Stage::StartProvisioning) {
+                assert!(fs::read_dir(&state).unwrap().next().is_none(), "no worker before SPIM");
+            }
+            fs::remove_dir_all(state).unwrap();
+        }
+        let (result, state, _) = run(AppleScript::StartStatus, "ok", EXCHANGE_DEADLINE);
+        assert_eq!(result.unwrap_err().reason, "Apple status error -5000");
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn offline_exchange_deadline_cancels_hung_worker_and_slow_apple() {
+        for (apple, worker, stage) in [
+            (AppleScript::Ok, "hang-at-start", Stage::NativeStart),
+            (AppleScript::SlowFinish, "ok", Stage::FinishProvisioning),
+        ] {
+            let started = Instant::now();
+            let (result, state, _) = run(apple, worker, Duration::from_millis(300));
+            let error = result.unwrap_err();
+            assert_eq!(error.stage, stage, "{worker}: {error}");
+            assert!(started.elapsed() < Duration::from_secs(3), "{worker}");
+            fs::remove_dir_all(state).unwrap();
+        }
+    }
+
     #[test]
     fn plist_contract_rejects_missing_and_invalid_material() {
         let bytes = empty_request().unwrap();
