@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some("--native-verify-state") => {
                         if !native.is_provisioned(DS_ID)? { return Err("state is not provisioned".into()); }
                         native.check_otp(DS_ID)?;
-                        println!("PASS: native state reports provisioned and generated one OTP (contents withheld)");
+                        println!("{}", probe_cli::VERIFIED_LINE);
                         return Ok(());
                     }
                     Some("--native-offline-check") => {

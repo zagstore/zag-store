@@ -38,22 +38,36 @@ operator ─▶ supervisor (probe --provision-client-supervised)
 | Stage | Meaning |
 | --- | --- |
 | `configuration` | identity JSON, client metadata file, paths |
-| `state-directory` | atomic 0700 claim of a fresh directory |
+| `state-directory` | atomic 0700 claim of `.<name>.incomplete` |
 | `lookup` | URL bag fetch and endpoint allow-list |
 | `start-provisioning` | `midStartProvisioning` (Apple status `ec` checked) |
 | `native-start` | CoreADI Start in the worker |
 | `finish-provisioning` | `midFinishProvisioning` |
 | `native-finish` | CoreADI End and worker exit |
-| `persist` | adi.pb identical to the worker result, 0600, fsync |
-| `validate` | separate process: provisioned and generates an OTP |
-| `record` | `client-identity.json` written beside adi.pb |
+| `persist` | adi.pb identical to the worker result, 0600, fsync; digest reported to the supervisor and rechecked by it |
+| `validate` | separate process, on a private copy of exactly those bytes: provisioned and generates an OTP |
+| `record` | `client-identity.json` (with `adi_pb_sha256`) written beside adi.pb |
+| `publish` | no-replace atomic rename of `.<name>.incomplete` to `<name>` |
 | `cancelled` / `coordinator` | operator signal / coordinator crash |
 
 Failure output is one line, `FAIL stage=<stage> reason=<reason>`. Reasons are
 fixed messages, OS errors, `Apple HTTP status N` or `Apple status error N`.
 They never contain identity values, tokens, SPIM/CPIM/PTM/TK or adi.pb.
-After the claim, any failure, timeout (95 s total) or SIGINT/SIGTERM/SIGHUP
-removes the claimed directory. A state directory is never reused.
+Process supervision: the coordinator and the verifier each lead their own
+process group (and on Linux die with the supervisor). Exit, timeout (95 s
+coordinator, 30 s verifier) or SIGINT/SIGTERM/SIGHUP kills the whole group
+before it is reaped, so no descendant or inherited pipe outlives a stage.
+
+State lifecycle: the final `<name>` appears only through the publish rename,
+after verification and fsync, so it always holds a complete, verified state.
+Any failure removes the attempt's `.incomplete` and `.verify` directories,
+but only while they are still the directories this run created (checked by
+device and inode); a directory or symlink put in their place is never
+removed or followed. A supervisor killed outright (SIGKILL, power loss) can
+leave `.<name>.incomplete`; it is never treated as provisioned, and it
+blocks a rerun under the same name until the operator inspects and removes it.
+Neither an existing `<name>` nor an existing attempt directory is reused or
+overwritten.
 
 ## Running it
 
@@ -99,6 +113,6 @@ provisioning run into `<dir>/adi-state-<UTC time>`.
    libraries stay open; this tool does not resolve them.
 3. A one-off 0700 state parent outside production paths.
 
-A success prints `PASS` for provisioning, validate and record, and then
+A success prints `PASS` for provisioning, validate, record and publish, and then
 `RESULT provisioned state at <dir>`. Anything else is a failure at the named
 stage.

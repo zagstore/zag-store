@@ -358,8 +358,9 @@ fn spawn_worker(worker: &WorkerCommand) -> io::Result<Child> {
 
 /// Confirms that the worker's reported state is exactly the adi.pb in the
 /// claimed directory (no symlink, regular, non-empty), then makes it
-/// owner-only and durable.
-fn persist_state(state_dir: &Path, reported: &[u8]) -> io::Result<()> {
+/// owner-only and durable. Returns its SHA-256 (hex), which binds the
+/// supervisor's later checks to these exact bytes.
+fn persist_state(state_dir: &Path, reported: &[u8]) -> io::Result<String> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
         .open(state_dir.join("adi.pb")).map_err(|_| invalid("native worker left no ADI state file"))?;
@@ -372,19 +373,26 @@ fn persist_state(state_dir: &Path, reported: &[u8]) -> io::Result<()> {
     if stored != reported { return Err(invalid("ADI state file differs from worker result")); }
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.sync_all()?;
-    fs::File::open(state_dir)?.sync_all()
+    fs::File::open(state_dir)?.sync_all()?;
+    Ok(sha256_hex(&stored))
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Runs the complete provisioning exchange for one claimed, empty state
 /// directory: URL bag lookup, midStartProvisioning, native Start,
 /// midFinishProvisioning, native End, and verified persistence of adi.pb.
 /// The native worker lives only inside this call and is reaped on every path.
+/// Returns the SHA-256 (hex) of the persisted adi.pb.
 pub(crate) fn provision<T: AppleTransport>(
     apple: &T,
     worker: &WorkerCommand,
     state_dir: &Path,
     deadline: Duration,
-) -> Result<(), StageError> {
+) -> Result<String, StageError> {
     let end = Instant::now() + deadline;
     let lookup = (|| {
         let bag = apple.send(&validated_endpoint(LOOKUP)?, None, false, end)?;
@@ -622,7 +630,7 @@ mod tests {
             args: vec![script.into(), state.into()],
         }
     }
-    fn run(apple: AppleScript, worker: &str, deadline: Duration) -> (Result<(), StageError>, PathBuf, FakeApple) {
+    fn run(apple: AppleScript, worker: &str, deadline: Duration) -> (Result<String, StageError>, PathBuf, FakeApple) {
         let state = claimed_dir();
         let apple = FakeApple::new(apple);
         let result = provision(&apple, &fixture(worker, &state), &state, deadline);
@@ -632,7 +640,7 @@ mod tests {
     #[test]
     fn offline_exchange_persists_verified_state_in_client_order() {
         let (result, state, apple) = run(AppleScript::Ok, "ok", EXCHANGE_DEADLINE);
-        result.unwrap();
+        assert_eq!(result.unwrap(), sha256_hex(ADI_PB));
         let stored = state.join("adi.pb");
         assert_eq!(fs::read(&stored).unwrap(), ADI_PB);
         assert_eq!(fs::metadata(&stored).unwrap().permissions().mode() & 0o777, 0o600);
