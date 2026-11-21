@@ -141,6 +141,7 @@ mod v2_boundary_tests {
         { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-worker-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
         let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
         let cancel = AtomicBool::new(false);
@@ -178,6 +179,7 @@ mod v2_boundary_tests {
         { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-midcancel-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = std::fs::canonicalize(&executable).unwrap();
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
         let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
@@ -209,6 +211,7 @@ mod v2_boundary_tests {
         { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-supervised-stall-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255] };
         let finish = Request::Finish { ptm: vec![255, 0], tk: vec![128] };
         let cancel = AtomicBool::new(false);
@@ -234,6 +237,7 @@ mod v2_boundary_tests {
         { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-duplicate-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let mut child = Command::new(std::fs::canonicalize(&executable).unwrap())
             .arg("--v2-duplicate").env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
             .spawn().unwrap();
@@ -261,6 +265,7 @@ mod v2_boundary_tests {
         { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-phase-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let mut child = Command::new(std::fs::canonicalize(&executable).unwrap())
             .arg("--v2-wrong-phase").env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
             .spawn().unwrap();
@@ -288,6 +293,7 @@ mod v2_boundary_tests {
         { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let executable = temp.join("v2-stall-fixture");
         assert!(Command::new("rustc").args(["--edition=2021", "-o"]).arg(&executable).arg(&source).status().unwrap().success());
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let mut command = Command::new(std::fs::canonicalize(&executable).unwrap());
         command.arg("--v2-stall").env_clear().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
         #[cfg(unix)]
@@ -677,6 +683,7 @@ mod tests {
             .args(["--edition=2021", "-o"])
             .arg(&executable).arg(&source).status().unwrap();
         assert!(compile.success(), "standalone fixture must compile");
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         // macOS /var is a symlink to /private/var; executable validation
         // deliberately rejects noncanonical paths.
         let canonical_executable = std::fs::canonicalize(&executable).unwrap();
@@ -706,7 +713,7 @@ mod tests {
         );
         // Test harness stdout includes its own reporting; the strict
         // supervisor must reject it rather than accept mixed protocol output.
-        assert!(matches!(result, Err(SessionError::InvalidResponse | SessionError::Transport | SessionError::NonZeroExit)),
+        assert!(matches!(result, Err(SessionError::Spawn | SessionError::InvalidResponse | SessionError::Transport | SessionError::NonZeroExit)),
             "untrusted child stdout must fail closed: {result:?}");
     }
     #[test]
