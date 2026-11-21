@@ -36,7 +36,7 @@ fn run() -> io::Result<()> {
     }
     send(&mut output, r#"{"version":1,"type":"finished","adi_pb":"mock"}"#)
 }
-fn run_v2() -> io::Result<()> {
+fn run_v2(require_eof: bool) -> io::Result<()> {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let start = read_frame(&mut input)?;
@@ -45,12 +45,13 @@ fn run_v2() -> io::Result<()> {
     let finish = read_frame(&mut input)?;
     if finish != r#"{"ptm_hex":"ff00","tk_hex":"80","type":"finish","version":2}"# { return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 finish")); }
     let mut trailing = [0u8; 1];
-    if input.read(&mut trailing)? != 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 trailing")); }
+    if require_eof && input.read(&mut trailing)? != 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 trailing")); }
     send(&mut output, r#"{"version":2,"type":"finished","adi_pb_hex":"ff00"}"#)
 }
 fn main() {
     let result = match std::env::args().nth(1).as_deref() {
-        Some("--v2") => run_v2(),
+        Some("--v2") => run_v2(true),
+        Some("--v2-split") => run_v2(false),
         Some("--v2-duplicate") => {
             let mut input = io::stdin().lock();
             let mut output = io::stdout().lock();
