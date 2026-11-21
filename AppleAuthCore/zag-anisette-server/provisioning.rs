@@ -178,6 +178,30 @@ impl<T: NativeSessionTransport> Drop for SessionOwnedAdiProvider<T> {
     }
 }
 
+/// Offline-only adapter for the existing session-scoped worker backend.
+/// This exercises the same native-session ownership contract without loading
+/// Apple libraries or enabling the HTTP listener. It is not a subprocess.
+#[cfg(test)]
+pub struct OfflineSessionTransport<B: crate::session_worker::SessionBackend> {
+    session: crate::session_worker::Session<B>,
+}
+#[cfg(test)]
+impl<B: crate::session_worker::SessionBackend> OfflineSessionTransport<B> {
+    pub fn new(backend: B) -> Self {
+        Self { session: crate::session_worker::Session::new(backend) }
+    }
+}
+#[cfg(test)]
+impl<B: crate::session_worker::SessionBackend> NativeSessionTransport for OfflineSessionTransport<B> {
+    fn start(&mut self, identifier: &str, spim: &str) -> Result<String, ProtocolError> {
+        self.session.start(identifier, spim).map_err(|_| ProtocolError::BackendUnavailable)
+    }
+    fn finish(&mut self, ptm: &str, tk: &str) -> Result<String, ProtocolError> {
+        self.session.finish(ptm, tk).map_err(|_| ProtocolError::BackendUnavailable)
+    }
+    fn abort(&mut self) { self.session.cancel(); }
+}
+
 /// Safe default: provider never produces Apple provisioning material.
 pub struct DisabledAdiProvider;
 impl AdiProvider for DisabledAdiProvider {
@@ -283,6 +307,37 @@ pub fn process_text_frame<B: ProvisioningBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_owned_adapter_drives_existing_worker_state_machine() {
+        let transport = OfflineSessionTransport::new(crate::session_worker::MockBackend::default());
+        let provider = SessionOwnedAdiProvider::new(transport);
+        let mut session = Session::new(AdiBackend::new(provider));
+        assert_eq!(session.receive(ClientMessage::Identifier("offline-id".into())),
+            Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("offline-spim".into())),
+            Ok(ServerMessage::GiveEndProvisioningData { cpim: "offline-cpim".into() }));
+        assert_eq!(session.receive(ClientMessage::Finish {
+            ptm: "offline-ptm".into(), tk: "offline-tk".into(),
+        }), Ok(ServerMessage::ProvisioningSuccess { adi_pb: "offline-adi-pb".into() }));
+        assert_eq!(session.phase(), Phase::Complete);
+        assert_eq!(session.receive(ClientMessage::Finish {
+            ptm: "offline-ptm".into(), tk: "offline-tk".into(),
+        }), Err(ProtocolError::InvalidTransition));
+    }
+    #[test]
+    fn session_owned_adapter_fails_closed_on_bad_worker_start() {
+        let transport = OfflineSessionTransport::new(crate::session_worker::MockBackend::default());
+        let provider = SessionOwnedAdiProvider::new(transport);
+        let mut session = Session::new(AdiBackend::new(provider));
+        assert_eq!(session.receive(ClientMessage::Identifier("offline-id".into())),
+            Ok(ServerMessage::GiveStartProvisioningData));
+        assert_eq!(session.receive(ClientMessage::Spim("".into())),
+            Err(ProtocolError::InvalidField));
+        // Invalid input cannot advance to native Finish.
+        assert_eq!(session.receive(ClientMessage::Finish {
+            ptm: "ptm".into(), tk: "tk".into(),
+        }), Err(ProtocolError::InvalidTransition));
+    }
     #[derive(Default)]
     struct MockNativeTransport {
         counts: std::sync::Arc<std::sync::Mutex<(usize, usize, usize)>>,
