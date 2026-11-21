@@ -30,12 +30,6 @@ fn write_response<W: Write>(output: &mut W, response: &wire::Response) -> io::Re
     output.write_all(&payload)?;
     output.flush()
 }
-fn no_extra_input<R: Read>(input: &mut R) -> io::Result<()> {
-    let mut byte = [0u8; 1];
-    if input.read(&mut byte)? != 0 { return Err(invalid("trailing input")); }
-    Ok(())
-}
-
 /// Refuse a preexisting state file: stale or unrelated ADI bytes must never
 /// be returned as the result of the current provisioning session.
 fn state_must_be_new(state_file: &Path) -> io::Result<()> {
@@ -98,7 +92,9 @@ where
         wire::decode_request(&second).map_err(|_| invalid("invalid Finish request"))?
     else { return Err(invalid("Finish required")); };
     finish(&mut session, &ptm, &tk)?;
-    no_extra_input(input)?;
+    // The supervisor closes stdin only after receiving Finished. Waiting for
+    // EOF here would deadlock the split-phase request/response protocol.
+    // The session is terminal after this response; the child then exits.
     let state = read_new_state(state_file)?;
     write_response(output, &wire::Response::Finished(state))
 }
@@ -174,6 +170,43 @@ mod tests {
     struct CountedHandle(std::rc::Rc<std::cell::Cell<u32>>);
     impl Drop for CountedHandle {
         fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+    }
+
+    #[test]
+    fn finish_response_does_not_wait_for_stdin_eof() {
+        struct NoEofReader<'a>(&'a [u8]);
+        impl Read for NoEofReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                        "stdin remains open while supervisor awaits Finished"));
+                }
+                self.0.read(buf)
+            }
+        }
+        let state = fresh_test_state();
+        let mut input = request_frame(&wire::Request::Start {
+            identifier: "-2".into(), spim: vec![1],
+        });
+        input.extend(request_frame(&wire::Request::Finish {
+            ptm: vec![2], tk: vec![3],
+        }));
+        let mut reader = NoEofReader(&input);
+        let mut output = Vec::new();
+        let state_for_finish = state.clone();
+        assert!(run_two_phase(&state, &mut reader, &mut output,
+            |_, _| Ok(((), vec![4])),
+            move |_, _, _| fs::write(&state_for_finish, [5]),
+        ).is_ok());
+        let mut replies = output.as_slice();
+        let first = wire::Request::Start { identifier: "-2".into(), spim: vec![1] };
+        let second = wire::Request::Finish { ptm: vec![2], tk: vec![3] };
+        assert_eq!(wire::decode_response(&read_frame(&mut replies).unwrap(), &first),
+            Ok(wire::Response::Started(vec![4])));
+        assert_eq!(wire::decode_response(&read_frame(&mut replies).unwrap(), &second),
+            Ok(wire::Response::Finished(vec![5])));
+        fs::remove_file(&state).unwrap();
+        fs::remove_dir(state.parent().unwrap()).unwrap();
     }
 
     #[test]
