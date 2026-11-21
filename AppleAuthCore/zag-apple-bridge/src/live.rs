@@ -180,7 +180,10 @@ impl IsideloadBackend {
 
     /// A provider over one account's anisette device state.
     fn provider(&self, scope: &str) -> Result<RemoteV3AnisetteProvider, Report> {
-        RemoteV3AnisetteProvider::new(&self.anisette_url, Box::new(KeychainStorage::new(self.storage, scope)?), self.device_serial.clone())
+        // The scope also names the provisioning lock: two sessions for one
+        // account never provision its device independently.
+        Ok(RemoteV3AnisetteProvider::new(&self.anisette_url, Box::new(KeychainStorage::new(self.storage, scope)?), self.device_serial.clone())?
+            .set_state_scope(scope))
     }
 }
 

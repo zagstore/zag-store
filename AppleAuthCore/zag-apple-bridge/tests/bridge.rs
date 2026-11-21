@@ -360,3 +360,15 @@ fn time_window_exports_configure_once_and_report_pending() {
     assert_eq!(zag_bridge_configure_time_window(1_000, 3_000, 600), 1, "a second, different window is refused");
     assert_eq!(zag_bridge_time_gate_status(), 2);
 }
+
+#[test]
+fn anisette_state_counts_are_data_free_numbers() {
+    // Every known kind is a count (nothing has happened in this process);
+    // unknown kinds are 0 rather than another kind's count.
+    for kind in 0..=4 {
+        assert_eq!(zag_bridge_anisette_state_count(kind), 0);
+    }
+    for kind in [-1, 5, i32::MAX] {
+        assert_eq!(zag_bridge_anisette_state_count(kind), 0);
+    }
+}

@@ -16,7 +16,7 @@ pub struct AnisetteClientInfo {
     pub user_agent: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnisetteData {
     machine_id: String,
     one_time_password: String,
@@ -25,6 +25,17 @@ pub struct AnisetteData {
     device_unique_identifier: String,
     _local_user_id: String,
     generated_at: SystemTime,
+}
+
+/// Zag Store fork: the one-time password, machine and device identifiers
+/// and routing info are never shown.
+impl std::fmt::Debug for AnisetteData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnisetteData")
+            .field("values", &"<withheld>")
+            .field("generated_at", &self.generated_at)
+            .finish()
+    }
 }
 
 // Some headers don't seem to be required. I guess not including them is technically more efficient soooo
@@ -267,6 +278,20 @@ mod tests {
         );
         assert!(ra.is_ok() && rb.is_ok() && rc.is_ok());
         provisions.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn debug_output_withholds_anisette_values() {
+        let mut secret = data();
+        secret.one_time_password = "OTP-SECRET".into();
+        secret.machine_id = "MID-SECRET".into();
+        secret.device_unique_identifier = "DEV-SECRET".into();
+        secret.routing_info = "RINFO-SECRET".into();
+        let rendered = format!("{secret:?}");
+        assert!(!rendered.contains("SECRET"), "{rendered}");
+        let state = remote_v3::state_for_tests([0xab; 16], Some(vec![0xcd; 4]));
+        let rendered = format!("{state:?}");
+        assert!(!rendered.to_lowercase().contains("ab") && !rendered.contains("171") && rendered.contains("provisioned: true"), "{rendered}");
     }
 
     #[tokio::test]
