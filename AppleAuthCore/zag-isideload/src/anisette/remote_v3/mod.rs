@@ -288,7 +288,8 @@ impl RemoteV3AnisetteProvider {
                 WsMessage::Text(t) => t,
             };
 
-            debug!("Received provisioning message: {}", text);
+            // Provisioning messages may carry CPIM, PTM, TK, or ADI state.
+            // Never log raw payloads, even at debug level.
             let provision_msg: ProvisioningMessage = serde_json::from_str(&text)?;
 
             match provision_msg {
