@@ -1,0 +1,179 @@
+import Combine
+import Foundation
+
+/// Presentation state for connecting a user-owned App Store Connect API key.
+///
+/// The user imports their `.p8` file and types the Key ID and Issuer ID; the
+/// model validates the shape, mints a token and makes one read-only check that
+/// the key can reach the Provisioning endpoints, then stores the credential in
+/// the Keychain. The `.p8` text is held in a private field, never published to
+/// the view and never logged; it is cleared as soon as it is stored or the
+/// screen is dismissed.
+///
+/// When the feature gate is closed (every release build), `connect()` does
+/// nothing but report that the feature is unavailable: no key is read, no
+/// request is made and nothing is stored.
+@MainActor
+final class ZagDeveloperAccountOnboardingModel: ObservableObject {
+	enum Phase: Equatable {
+		case idle
+		case validating
+		case connected(keyID: String, sampleTotal: Int)
+		/// Connected input but an unusable key (e.g. no provisioning access).
+		case needsAttention(String)
+		case failed(String)
+	}
+
+	@Published var keyID = ""
+	@Published var issuerID = ""
+	@Published var teamID = ""
+	@Published private(set) var importedKeyFileName: String?
+	@Published private(set) var phase: Phase = .idle
+	@Published private(set) var isBusy = false
+
+	/// The imported `.p8` contents. Private on purpose: never a `@Published`
+	/// property, never shown, never logged.
+	private var privateKeyPEM: String?
+
+	let account: UUID
+	let store: ZagDeveloperAccountStore
+	let gate: ZagDeveloperAccountGate
+	/// Builds a client for a credential (captures the transport). Tests inject
+	/// a client backed by a mock transport.
+	private let makeClient: @Sendable (ZagDeveloperAccountCredential) -> ZagASCClient
+
+	init(
+		account: UUID,
+		store: ZagDeveloperAccountStore,
+		gate: ZagDeveloperAccountGate = .production,
+		makeClient: @escaping @Sendable (ZagDeveloperAccountCredential) -> ZagASCClient
+	) {
+		self.account = account
+		self.store = store
+		self.gate = gate
+		self.makeClient = makeClient
+	}
+
+	var hasImportedKey: Bool { privateKeyPEM != nil }
+
+	var canConnect: Bool {
+		!isBusy
+			&& privateKeyPEM != nil
+			&& ZagDeveloperAccountCredential.isValidKeyID(keyID.trimmingCharacters(in: .whitespacesAndNewlines))
+			&& ZagDeveloperAccountCredential.isValidIssuerID(issuerID.trimmingCharacters(in: .whitespacesAndNewlines))
+			&& ZagDeveloperTeam.isValidIdentifier(teamID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased())
+	}
+
+	/// What the Signing Methods list should show for this method.
+	var methodStatus: ZagDeveloperAccountStatus {
+		switch phase {
+		case .idle: return store.isConnected(account: account) ? .connected(keyID: keyID) : .notConnected
+		case .validating: return .connecting
+		case .connected(let keyID, _): return .connected(keyID: keyID)
+		case .needsAttention(let message): return .needsAttention(message)
+		case .failed(let message): return .needsAttention(message)
+		}
+	}
+
+	// MARK: Actions
+
+	/// Loads a previously stored credential (not its key) so the screen opens
+	/// in the connected state.
+	func restore() {
+		guard let credential = try? store.load(account: account) else { return }
+		keyID = credential.keyID
+		issuerID = credential.issuerID
+		teamID = credential.teamID
+		phase = .connected(keyID: credential.keyID, sampleTotal: 0)
+	}
+
+	/// Accepts the imported `.p8` file. Validates the envelope only; the key is
+	/// parsed when a token is minted.
+	func importKey(contents: String, fileName: String) {
+		guard ZagDeveloperAccountCredential.looksLikePrivateKeyPEM(contents) else {
+			privateKeyPEM = nil
+			importedKeyFileName = nil
+			phase = .failed("That file is not an App Store Connect API private key (.p8).")
+			return
+		}
+		privateKeyPEM = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+		importedKeyFileName = fileName
+		if case .failed = phase { phase = .idle }
+	}
+
+	/// Validates input and confirms the key can reach the Provisioning
+	/// endpoints, then stores it. No certificate, device or profile is created.
+	func connect() async {
+		guard gate.isOpen else {
+			phase = .failed("Developer Account signing is not available in this version of Zag Store.")
+			return
+		}
+		guard !isBusy else { return }
+		guard let pem = privateKeyPEM else {
+			phase = .failed("Import your App Store Connect API key (.p8) first.")
+			return
+		}
+		let credential: ZagDeveloperAccountCredential
+		do {
+			credential = try ZagDeveloperAccountCredential(issuerID: issuerID, keyID: keyID, teamID: teamID, privateKeyPEM: pem)
+		} catch ZagDeveloperAccountCredential.Problem.invalidKeyID {
+			phase = .failed("The Key ID should be ten letters or digits, from App Store Connect.")
+			return
+		} catch ZagDeveloperAccountCredential.Problem.invalidIssuerID {
+			phase = .failed("The Issuer ID should be the UUID shown above your keys in App Store Connect.")
+			return
+		} catch ZagDeveloperAccountCredential.Problem.invalidTeamID {
+			phase = .failed("The Team ID should be the ten-character ID from your Apple Developer membership page.")
+			return
+		} catch {
+			phase = .failed("That file is not an App Store Connect API private key (.p8).")
+			return
+		}
+
+		isBusy = true
+		phase = .validating
+		defer { isBusy = false }
+		do {
+			let connection = try await makeClient(credential).connectionCheck()
+			try store.save(credential, account: account)
+			privateKeyPEM = nil
+			phase = .connected(keyID: credential.keyID, sampleTotal: connection.sampleTotal)
+		} catch let error as ZagASCError {
+			phase = Self.phase(for: error)
+		} catch {
+			phase = .failed("Zag Store could not reach App Store Connect. Check your connection and try again.")
+		}
+	}
+
+	/// Disconnects: removes the stored credential and clears the screen.
+	func disconnect() {
+		try? store.remove(account: account)
+		privateKeyPEM = nil
+		importedKeyFileName = nil
+		keyID = ""
+		issuerID = ""
+		teamID = ""
+		phase = .idle
+	}
+
+	static func phase(for error: ZagASCError) -> Phase {
+		switch error {
+		case .forbidden:
+			return .needsAttention("This key can't manage Certificates, Identifiers & Profiles. Create a team key with the Admin role in App Store Connect.")
+		case .unauthorized:
+			return .failed("App Store Connect did not accept this key. Check the Key ID, Issuer ID and that the .p8 matches.")
+		case .rateLimited:
+			return .failed("App Store Connect is rate-limiting this key. Try again in a little while.")
+		case .tokenUnavailable:
+			return .failed("That .p8 could not be used to sign a request. Re-download the key from App Store Connect.")
+		case .server:
+			return .failed("App Store Connect is having trouble right now. Try again later.")
+		case .transport(let reason):
+			return reason == .offline
+				? .failed("You appear to be offline. Check your connection and try again.")
+				: .failed("Zag Store could not reach App Store Connect. Try again.")
+		case .notFound, .malformedRequest, .malformedResponse, .unexpected, .conflict:
+			return .failed("App Store Connect returned something Zag Store does not understand.")
+		}
+	}
+}

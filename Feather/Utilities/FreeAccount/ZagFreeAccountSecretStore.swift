@@ -24,6 +24,11 @@ enum ZagFreeAccountSecretKind: String, CaseIterable, Sendable {
 	/// new key stays pending until its certificate is issued, verified and
 	/// stored, so a failed request never replaces a working identity.
 	case pendingSigningKey
+	/// A user-owned App Store Connect API key (`ZagDeveloperAccountCredential`:
+	/// the issuer ID, key ID and the `.p8` private key), for the paid
+	/// developer-account signing method. Held per account, this device only,
+	/// never synced and never sent to any Zag Store server.
+	case developerAPIKey
 }
 
 /// Secrets are owned by one account, and optionally by one of its teams

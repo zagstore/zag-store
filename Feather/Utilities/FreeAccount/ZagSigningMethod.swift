@@ -12,12 +12,14 @@ enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 	case freeAppleAccount
 	case importedCertificate
 	case byoc
+	case developerAccount
 
 	var title: String {
 		switch self {
 		case .freeAppleAccount: return "Free Apple Account"
 		case .importedCertificate: return "Imported Certificate"
 		case .byoc: return "BYOC"
+		case .developerAccount: return "Developer Account"
 		}
 	}
 
@@ -29,6 +31,8 @@ enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 			return "Sign with a .p12 certificate and provisioning profile you already have."
 		case .byoc:
 			return "Bring your own certificate to the Zag Store website and install from there."
+		case .developerAccount:
+			return "Sign with your own paid Apple Developer account, using an App Store Connect API key kept on this device."
 		}
 	}
 
@@ -53,9 +57,19 @@ enum ZagSigningMethodAvailability {
 	/// services and a device (phases 2-4 of docs/free-developer-accounts).
 	static let freeAccountEnabled = false
 
+	/// Developer Account (App Store Connect API) signing is not listed until
+	/// its milestones (ASC_API_ARCHITECTURE.md) are built and validated against
+	/// Apple. Milestone 1 is onboarding, a token and a client, offline only.
+	static let developerAccountEnabled = false
+
 	/// Methods to list, in display order.
-	static func listedMethods(freeAccountEnabled: Bool = freeAccountEnabled) -> [ZagSigningMethod] {
-		ZagSigningMethod.allCases.filter { $0 != .freeAppleAccount || freeAccountEnabled }
+	static func listedMethods(
+		freeAccountEnabled: Bool = freeAccountEnabled,
+		developerAccountEnabled: Bool = developerAccountEnabled
+	) -> [ZagSigningMethod] {
+		ZagSigningMethod.allCases.filter {
+			($0 != .freeAppleAccount || freeAccountEnabled) && ($0 != .developerAccount || developerAccountEnabled)
+		}
 	}
 
 	/// Summary of the imported certificates, read from storage by the caller.
@@ -69,9 +83,17 @@ enum ZagSigningMethodAvailability {
 		of method: ZagSigningMethod,
 		imported: ImportedCertificates,
 		freeAccount: ZagFreeAccountState,
+		developerAccount: ZagDeveloperAccountStatus = .notConnected,
 		now: Date = Date()
 	) -> ZagSigningMethodStatus {
 		switch method {
+		case .developerAccount:
+			switch developerAccount {
+			case .notConnected: return .actionRequired("Add your App Store Connect API key")
+			case .connecting: return .actionRequired("Connecting…")
+			case .connected(let keyID): return .ready(detail: "Key \(keyID)")
+			case .needsAttention(let message): return .actionRequired(message)
+			}
 		case .importedCertificate:
 			guard imported.total > 0 else { return .actionRequired("Import a certificate") }
 			guard imported.usable > 0 else {
