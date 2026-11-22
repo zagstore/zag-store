@@ -10,8 +10,9 @@
 #   --preflight         offline: libraries, metadata, identity, existing states,
 #                       native NOT_PROVISIONED check; ends with what blocks --live
 #   --live              preflight, then one supervised provisioning run that
-#                       contacts Apple; requires --authorize-apple-contact, and
-#                       --accept-unverified-metadata unless the metadata is verified
+#                       contacts Apple; requires --authorize-apple-contact,
+#                       --accept-unverified-metadata unless the metadata is verified,
+#                       and --accept-platform-mismatch unless it is an Android identity
 #
 # The metadata file is the one the native server serves at /v3/client_info
 # (ZAG_ANISETTE_CLIENT_INFO_FILE); provisioning reads the same file.
@@ -26,11 +27,11 @@ Usage: native-adi-provision.sh --probe BIN MODE [options]
   --discover          [--client-metadata FILE] [--identity FILE] [--state-parent DIR] [--metadata-dir DIR]
   --prepare-metadata  --client-metadata OUT (--from-candidate ID | --from-file FILE [--source TEXT] [--apple-verified])
   --preflight         --runtime DIR --state-parent DIR --identity FILE --client-metadata FILE
-  --live              (as --preflight) --authorize-apple-contact [--accept-unverified-metadata]
+  --live              (as --preflight) --authorize-apple-contact [--accept-unverified-metadata] [--accept-platform-mismatch]
 EOF
   exit 2
 }
-probe='' runtime='' parent='' identity='' metadata='' metadata_dir='' mode='' authorized=0 accept_unverified=0
+probe='' runtime='' parent='' identity='' metadata='' metadata_dir='' mode='' authorized=0 accept_unverified=0 accept_mismatch=0
 prepare=()
 while (($#)); do
   case "$1" in
@@ -45,6 +46,7 @@ while (($#)); do
     --discover|--prepare-metadata|--preflight|--live) [[ -z "$mode" ]] || usage; mode=${1#--}; shift ;;
     --authorize-apple-contact) authorized=1; shift ;;
     --accept-unverified-metadata) accept_unverified=1; shift ;;
+    --accept-platform-mismatch) accept_mismatch=1; shift ;;
     *) usage ;;
   esac
 done
@@ -132,6 +134,10 @@ case "$readiness" in
   *'PASS: private client metadata is readable and well-formed: unverified'*)
     ((accept_unverified)) || blockers+=("metadata is not Apple-verified: a live attempt needs --accept-unverified-metadata (it is an experiment)") ;;
 esac
+case "$readiness" in
+  *'WARNING: platform'*)
+    ((accept_mismatch)) || blockers+=("metadata platform does not match the Android CoreADI libraries (Apple reports -29003): only a diagnostic attempt with --accept-platform-mismatch") ;;
+esac
 ((authorized)) || blockers+=("operator authorization for Apple contact: --live --authorize-apple-contact")
 
 if [[ "$mode" == preflight ]]; then
@@ -149,4 +155,5 @@ state="$parent/adi-state-$(date -u +%Y%m%dT%H%M%SZ)"
 echo "== supervised provisioning (contacts Apple) -> $state"
 flags=()
 ((accept_unverified)) && flags+=(--accept-unverified-metadata)
+((accept_mismatch)) && flags+=(--accept-platform-mismatch)
 "$probe" --provision-client-supervised "$runtime" "$state" "${flags[@]}" < "$identity"

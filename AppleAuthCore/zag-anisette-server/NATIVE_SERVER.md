@@ -29,7 +29,7 @@ Zag Store client ──HTTPS──▶ reverse proxy ──▶ zag-anisette-serve
 | `POST /v3/get_headers` | Takes `{identifier, adi_pb[, sim, device_id, md_lu]}`. On success it returns `{"result":"Headers","X-Apple-I-MD","X-Apple-I-MD-M","X-Apple-I-MD-RINFO":"17106176"}`, otherwise `{"result":"GetHeadersError","message"}`. A state Apple never provisioned produces a message containing `-45061`, which the client turns into `IncorrectlyProvisioned` and re-provisions. The resync fields are accepted and ignored, as upstream does. |
 | `GET /v3/provisioning_session` (WebSocket) | `GiveIdentifier` → `{identifier}` → `GiveStartProvisioningData` → `{spim}` → `GiveEndProvisioningData{cpim}` → `{ptm,tk}` → `ProvisioningSuccess{adi_pb}`. The failure tags are `InvalidIdentifier`, `StartProvisioningError`, `EndProvisioningError` and `Timeout`. |
 | `GET /healthz` | Liveness, backend and worker counts. |
-| `GET /readyz` | 200 only when the native readiness check passed and the client metadata is readable. |
+| `GET /readyz` | 200 only when the native readiness check passed and the client metadata is readable and advertises the ADI's own platform (Android). Otherwise 503 with a reason, e.g. `client_metadata_platform_mismatch`: Apple rejects desktop identities with Android CoreADI. |
 
 **The server stores no client state.** As with every v3 server, the client
 keeps its `adi.pb` and sends it with each `get_headers` request.
