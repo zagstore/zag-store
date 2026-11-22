@@ -15,12 +15,9 @@ struct ZagDeveloperAccountApp: Sendable {
 	let name: String
 	var entitlements: ZagEntitlementSet
 
-	/// App extensions and app groups are not supported by this method yet.
-	var hasExtensions: Bool {
-		let plugins = url.appendingPathComponent("PlugIns", isDirectory: true)
-		let contents = (try? FileManager.default.contentsOfDirectory(atPath: plugins.path)) ?? []
-		return contents.contains { $0.hasSuffix(".appex") }
-	}
+	/// Nested bundles (extensions in PlugIns/ or Extensions/, App Clips,
+	/// watch apps) are not supported by this method yet.
+	var hasExtensions: Bool { !ZagFreeAccountSigningAdapter.nestedBundles(in: url).isEmpty }
 }
 
 struct ZagDeveloperAccountService: Sendable {
@@ -32,6 +29,13 @@ struct ZagDeveloperAccountService: Sendable {
 		var installer: ZagFreeAccountInstaller
 		var gate: ZagDeveloperAccountGate = .production
 		var now: @Sendable () -> Date = { Date() }
+		/// Deletes every Keychain signing key of an account, whatever its team
+		/// (the app: `ZagKeychainSigningKeys.deleteAll`). Nil: by the stored
+		/// credential's team only.
+		var discardAllKeys: (@Sendable (UUID) throws -> Void)?
+		/// Where the app is copied to be signed; the Library's copy is never
+		/// modified.
+		var workRoot = FileManager.default.temporaryDirectory
 		/// Tests only: decodes a mock ASC API's profiles. The app uses the
 		/// real `.mobileprovision` parser.
 		var decodeProfile: (@Sendable (Data) throws -> ZagIssuedProfile)?
@@ -67,6 +71,19 @@ struct ZagDeveloperAccountService: Sendable {
 		guard let credential = try? store.load(account: account) else { return .notConnected }
 		guard !app.hasExtensions, app.entitlements.dictionary[Self.appGroupsKey] == nil else { return .unsupportedApp }
 
+		// Sign a private copy: the adapter signs in place, and the Library's
+		// copy is what every other signing method starts from.
+		let fileManager = FileManager.default
+		let work = dependencies.workRoot.appendingPathComponent("zag-developer-account-\(UUID().uuidString)", isDirectory: true)
+		let copy = work.appendingPathComponent(app.url.lastPathComponent, isDirectory: true)
+		defer { try? fileManager.removeItem(at: work) }
+		do {
+			try fileManager.createDirectory(at: work, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+			try fileManager.copyItem(at: app.url, to: copy)
+		} catch {
+			return .failed(.signing)
+		}
+
 		let wrote = ZagWriteFlag()
 		var portal = ZagASCDeveloperPortal(client: client(for: credential) { wrote.set() })
 		if let decode = dependencies.decodeProfile { portal.decodeProfile = decode }
@@ -80,7 +97,7 @@ struct ZagDeveloperAccountService: Sendable {
 		)
 		let outcome = await coordinator.install(
 			app: .init(originalBundleIdentifier: app.originalBundleIdentifier, name: app.name, entitlements: app.entitlements),
-			account: account, team: credential.team, device: device, appAt: app.url
+			account: account, team: credential.team, device: device, appAt: copy
 		)
 		if wrote.value { try? store.markProvisioningVerified(account: account, at: dependencies.now()) }
 		switch outcome {
@@ -93,11 +110,21 @@ struct ZagDeveloperAccountService: Sendable {
 	/// Removes the developer account from this device: the API key, the
 	/// signing identity and its Keychain keys. Nothing is changed at Apple
 	/// (certificates, devices, bundle IDs and profiles stay on the team).
+	///
+	/// Every deletion is attempted even if one fails (the first failure is
+	/// thrown), and keys are found by account, so a disconnected account
+	/// (no credential, hence no team) is removed completely too.
 	func removeAccount() throws {
-		if let team = (try? store.load(account: account))?.teamID {
-			try dependencies.keys.discardKeys(account: account, team: team, except: [])
-		}
-		try dependencies.secrets.deleteAll(account: account)
+		var failure: Error?
+		do {
+			if let discardAllKeys = dependencies.discardAllKeys {
+				try discardAllKeys(account)
+			} else if let team = (try? store.load(account: account))?.teamID {
+				try dependencies.keys.discardKeys(account: account, team: team, except: [])
+			}
+		} catch { failure = error }
+		do { try dependencies.secrets.deleteAll(account: account) } catch { failure = failure ?? error }
+		if let failure { throw failure }
 	}
 
 	static let appGroupsKey = "com.apple.security.application-groups"

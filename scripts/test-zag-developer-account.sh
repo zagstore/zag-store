@@ -46,12 +46,19 @@ import re, sys
 root = Path(sys.argv[1])
 asc = sorted((root / "Feather/Utilities/FreeAccount").glob("ZagASC*.swift")) + [
        root / "Feather/Utilities/FreeAccount/ZagDeveloperAccount.swift",
-       root / "Feather/Utilities/FreeAccount/ZagDeveloperAccountOnboardingModel.swift"]
-assert len(asc) == 7, [p.name for p in asc]
+       root / "Feather/Utilities/FreeAccount/ZagDeveloperAccountOnboardingModel.swift",
+       root / "Feather/Utilities/FreeAccount/ZagDeveloperAccountService.swift",
+       root / "Feather/Utilities/FreeAccount/ZagDeveloperAccountInstallModel.swift",
+       root / "Feather/Utilities/ZagDeveloperAccountLive.swift",
+       root / "Feather/Views/Settings/DeveloperAccount/ZagDeveloperAccountOnboardingView.swift",
+       root / "Feather/Views/Settings/DeveloperAccount/ZagSigningMethodsSection.swift"]
+assert len(asc) == 12, [p.name for p in asc]
 sources = "\n".join(p.read_text() for p in asc)
 assert not re.search(r'"https?://[^"]*apple\.com', sources), "an Apple URL string in the ASC code"
-for forbidden in ["print(", "NSLog", "os_log", "URLSession", "serverTrust", "allowsArbitraryLoads"]:
+for forbidden in ["print(", "NSLog", "os_log", "debugPrint", "dump(", "serverTrust", "allowsArbitraryLoads"]:
     assert forbidden not in sources, forbidden
+# No session of its own: only the transport file's ZagURLSessionTransport.
+assert not re.search(r"(?<![A-Za-z])URLSession\b", sources), "URLSession"
 assert not re.search(r"(?<![A-Za-z])Logger\b", sources), "Logger"
 # The gate is closed by default and the production gate follows it.
 method = (root / "Feather/Utilities/FreeAccount/ZagSigningMethod.swift").read_text()
@@ -59,7 +66,12 @@ assert "static let developerAccountEnabled = false" in method, "the gate must de
 # Opened only by the live-test condition, which cannot build without strict
 # Keychain-key signing; nothing else in the app or project sets it.
 assert re.search(r"#if ZAG_DEVELOPER_ACCOUNT_LIVE_TEST\s*\n\s*#if !ZAG_ZSIGN_STRICT\s*\n\s*#error\(", method)
-assert "ZAG_DEVELOPER_ACCOUNT_LIVE_TEST" not in (root / "Feather.xcodeproj/project.pbxproj").read_text(), "the project must not set the live-test condition"
+# No build input sets it: project, xcconfigs, schemes, Makefile, packager, CI.
+inputs = [root / "Feather.xcodeproj/project.pbxproj", root / "Makefile", root / "ZagStore-Package.zsh"]
+inputs += list(root.rglob("*.xcconfig")) + list(root.rglob("*.xcscheme")) + list((root / ".github").rglob("*"))
+for path in inputs:
+    if path.is_file() and ".git/" not in str(path):
+        assert "ZAG_DEVELOPER_ACCOUNT_LIVE_TEST" not in path.read_text(errors="ignore"), f"{path.name} sets the live-test condition"
 assert [p.name for p in (root / "Feather").rglob("*.swift") if "ZAG_DEVELOPER_ACCOUNT_LIVE_TEST" in p.read_text()] == ["ZagSigningMethod.swift"]
 assert "ZagDeveloperAccountGate(isOpen: ZagSigningMethodAvailability.developerAccountEnabled)" in sources
 adapter = (root / "Feather/Utilities/FreeAccount/ZagFreeAccountSigningAdapter.swift").read_text()

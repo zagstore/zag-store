@@ -646,6 +646,11 @@ import Foundation
 		let renewed = await run(expiring)
 		check(expiring.asc.profiles.count == 1 && expiring.asc.count("DELETE /v1/profiles/") == 1 && renewed?.app.profile.expiresAt == fixedNow + 365 * 86_400,
 			  "profiles: a profile within 30 days of expiry is replaced, not duplicated")
+		let order = expiring.asc.requestLog.filter { $0.hasPrefix("POST /v1/profiles") || $0.hasPrefix("DELETE /v1/profiles/") }
+		check(order.suffix(2).first?.hasPrefix("POST") == true && order.last?.hasPrefix("DELETE") == true,
+			  "profiles: the replacement is created before the old profile is deleted")
+		await run(expiring)
+		check(expiring.asc.count("POST /v1/profiles") == 2 && expiring.asc.profiles.count == 1, "profiles: the replacement (second name) is then reused")
 
 		let grown = world()
 		await run(grown)
@@ -665,15 +670,34 @@ import Foundation
 		await run(two, udid: "00008030-SECONDDEVICE0000")
 		check(two.asc.profiles.count == 2 && two.asc.profiles.contains { $0.id == other }, "profiles: replacing one App ID's profile never touches another's")
 
-		// Interrupted between removing the stale profile and creating its replacement.
+		// The replacement cannot be created: the working profile must survive.
 		let interrupted = world()
 		interrupted.asc.profileLifetime = 10 * 86_400
 		await run(interrupted)
+		let working = interrupted.asc.profiles.map(\.id)
 		interrupted.asc.profileLifetime = 365 * 86_400
 		interrupted.asc.failNext("POST /v1/profiles") { MockASC.reply(500, ["errors": [["status": "500"]]]) }
-		check(await run(interrupted) == nil && interrupted.asc.profiles.isEmpty, "profiles: a failure after removing the stale profile leaves none")
-		check(await run(interrupted) != nil && interrupted.asc.profiles.count == 1, "profiles: the next run creates exactly one")
-		check(interrupted.asc.schemaProblems.isEmpty && interrupted.asc.tokenProblems.isEmpty, "profiles: list and delete requests match the schema and are signed")
+		check(await run(interrupted) == nil && interrupted.asc.profiles.map(\.id) == working,
+			  "profiles: a failed replacement leaves the existing profile in place")
+		interrupted.asc.failNext("POST /v1/profiles") { MockASC.reply(409, ["errors": [["status": "409", "code": "ENTITY_ERROR"]]]) }
+		check(await run(interrupted) == nil && interrupted.asc.profiles.map(\.id) == working, "profiles: a rejected replacement (409) deletes nothing")
+		check(await run(interrupted) != nil && interrupted.asc.profiles.count == 1, "profiles: the next run replaces it, leaving exactly one")
+
+		// The replacement exists but the old one cannot be deleted: success, at most two.
+		let sticky = world()
+		sticky.asc.profileLifetime = 10 * 86_400
+		await run(sticky)
+		sticky.asc.profileLifetime = 365 * 86_400
+		sticky.asc.failNext("DELETE /v1/profiles/") { MockASC.reply(500, ["errors": [["status": "500"]]]) }
+		check(await run(sticky) != nil && sticky.asc.profiles.count == 2, "profiles: a failed cleanup does not fail an install that has its profile")
+		check(await run(sticky) != nil && sticky.asc.count("POST /v1/profiles") == 2, "profiles: the new profile is reused while the stale one waits")
+		// Both names taken and neither usable: only the least useful is removed first.
+		sticky.asc.profileLifetime = 365 * 86_400
+		sticky.asc.invalidateProfiles()
+		check(await run(sticky) != nil && sticky.asc.profiles.count == 1 && sticky.asc.activeProfiles.count == 1,
+			  "profiles: with both names taken, one is replaced and the other removed; never more than two")
+		check(interrupted.asc.schemaProblems.isEmpty && interrupted.asc.tokenProblems.isEmpty && sticky.asc.schemaProblems.isEmpty,
+			  "profiles: list and delete requests match the schema and are signed")
 	}
 
 	// MARK: - The app wiring: service, models, removal
@@ -705,10 +729,12 @@ import Foundation
 		return w
 	}
 
-	static func libraryApp(extensions: Bool = false, entitlements: [String: Any] = [:]) -> ZagDeveloperAccountApp {
+	static func libraryApp(extensions: Bool = false, nested: String? = nil, entitlements: [String: Any] = [:]) -> ZagDeveloperAccountApp {
 		let url = FileManager.default.temporaryDirectory.appendingPathComponent("zag-asc-app-\(UUID().uuidString)/Notes.app")
 		try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+		try! Data("original".utf8).write(to: url.appendingPathComponent("Info.plist"))
 		if extensions { try! FileManager.default.createDirectory(at: url.appendingPathComponent("PlugIns/Widget.appex"), withIntermediateDirectories: true) }
+		if let nested { try! FileManager.default.createDirectory(at: url.appendingPathComponent(nested), withIntermediateDirectories: true) }
 		return ZagDeveloperAccountApp(url: url, originalBundleIdentifier: "com.example.notes", name: "Notes", entitlements: try! ZagEntitlementSet(entitlements))
 	}
 
@@ -783,6 +809,44 @@ import Foundation
 			  "wiring: an app with extensions is refused before anything is created")
 		check(await plugins.service().install(libraryApp(entitlements: ["com.apple.security.application-groups": ["group.x"]]), on: iPhone) == .unsupportedApp,
 			  "wiring: an app with app groups is refused")
+		for nested in ["Extensions/Share.appex", "Watch/Watch.app", "AppClips/Clip.app"] {
+			check(await plugins.service().install(libraryApp(nested: nested), on: iPhone) == .unsupportedApp, "wiring: an app with \(nested) is refused")
+		}
+		check(plugins.asc.requestCount == 0, "wiring: refused apps send nothing")
+
+		// Ownership: the Library's copy is never signed in place.
+		let owned = serviceWorld()
+		let original = libraryApp()
+		let signer = InPlaceSigner()
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("zag-asc-work-\(UUID().uuidString)")
+		try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+		var service = owned.service(signer: signer)
+		service = ZagDeveloperAccountService(account: service.account, dependencies: { var d = service.dependencies; d.workRoot = root; return d }())
+		if case .installed = await service.install(original, on: iPhone) {} else { check(false, "ownership: installs") }
+		check((try? String(contentsOf: original.url.appendingPathComponent("Info.plist"), encoding: .utf8)) == "original",
+			  "ownership: the Library's app is unchanged after signing")
+		check(signer.signedAt.map { $0.path.hasPrefix(root.path) } == true && signer.signedAt?.lastPathComponent == "Notes.app",
+			  "ownership: the signer is given a private copy")
+		check(((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? ["?"]).isEmpty, "ownership: the work copy is removed afterwards")
+		let failedRoot = root.appendingPathComponent("failed")
+		try! FileManager.default.createDirectory(at: failedRoot, withIntermediateDirectories: true)
+		service = ZagDeveloperAccountService(account: service.account, dependencies: {
+			var d = owned.service(signer: StubSigner(fails: true, now: fixedNow)).dependencies; d.workRoot = failedRoot; return d }())
+		_ = await service.install(original, on: iPhone)
+		check(((try? FileManager.default.contentsOfDirectory(atPath: failedRoot.path)) ?? ["?"]).isEmpty, "ownership: the work copy is removed after a failure too")
+
+		// Entitlements: only what the issued profile grants reaches the signer.
+		let filtered = serviceWorld()
+		let recorder = InPlaceSigner()
+		_ = await filtered.service(signer: recorder).install(libraryApp(entitlements: [
+			"aps-environment": "development", "get-task-allow": true,
+			ZagFreeAccountEntitlements.applicationIdentifierKey: "OLDTEAM123.com.example.notes"
+		]), on: iPhone)
+		let signed = recorder.result?.app.entitlements.dictionary ?? [:]
+		check(signed["aps-environment"] == nil && recorder.result?.app.rejected.contains { $0.key == "aps-environment" } == true,
+			  "entitlements: an entitlement the profile does not grant is dropped and reported")
+		check(signed[ZagFreeAccountEntitlements.applicationIdentifierKey] as? String == "\(teamID).com.example.notes.\(teamID)",
+			  "entitlements: the application identifier is the team's, never the original signer's")
 
 		// Account removal: key, signing identity and Keychain keys; another account untouched.
 		let removal = serviceWorld()
@@ -799,6 +863,27 @@ import Foundation
 		check(await removal.service().install(app, on: iPhone) == .notConnected && removal.asc.requestCount == before,
 			  "removal: after removal nothing can be provisioned")
 		check(removal.asc.certificates.count == 1 && removal.asc.devices.count == 1, "removal: nothing is changed at Apple")
+
+		// Disconnected first (credential gone, so no team): still removed completely.
+		let disconnected2 = serviceWorld()
+		_ = await disconnected2.service().install(app, on: iPhone)
+		try! disconnected2.store.remove(account: disconnected2.account)
+		let wiped = AccountKeyRecorder()
+		var deps = disconnected2.service().dependencies
+		deps.discardAllKeys = { try wiped.discard($0) }
+		try! ZagDeveloperAccountService(account: disconnected2.account, dependencies: deps).removeAccount()
+		check(wiped.accounts == [disconnected2.account]
+			  && ((try? disconnected2.secrets.load(.signingPrivateKey, account: disconnected2.account, team: teamID)) ?? nil) == nil,
+			  "removal: after Disconnect Key, removal still deletes the identity and the account's Keychain keys")
+
+		// A Keychain key that cannot be deleted does not stop the rest.
+		let stuck = serviceWorld()
+		_ = await stuck.service().install(app, on: iPhone)
+		var stuckDeps = stuck.service().dependencies
+		stuckDeps.discardAllKeys = { _ in throw TestFailure() }
+		let threw = (try? ZagDeveloperAccountService(account: stuck.account, dependencies: stuckDeps).removeAccount()) == nil
+		check(threw && stuck.stored == nil && ((try? stuck.secrets.load(.signingPrivateKey, account: stuck.account, team: teamID)) ?? nil) == nil,
+			  "removal: a key-deletion failure is reported, and the API key and identity are deleted anyway")
 
 		// The live transport reaches App Store Connect only.
 		let live = ZagURLSessionTransport.appStoreConnect()
@@ -1200,7 +1285,8 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 			return Self.reply(201, ["data": json(certificate)])
 		case ("GET", "/v1/profiles"):
 			if let type = query["filter[profileType]"], type != "IOS_APP_DEVELOPMENT" { return page([]) }
-			return page(profiles.filter { p in query["filter[name]"].map { $0 == p.name } ?? true }.map(profileJSON))
+			let names = query["filter[name]"].map { Set($0.split(separator: ",").map(String.init)) }
+			return page(profiles.filter { p in names.map { $0.contains(p.name) } ?? true }.map(profileJSON))
 		case ("DELETE", _) where path.hasPrefix("/v1/profiles/"):
 			let id = String(path.dropFirst("/v1/profiles/".count))
 			guard let index = profiles.firstIndex(where: { $0.id == id }) else { return Self.reply(404, ["errors": [["status": "404", "code": "NOT_FOUND"]]]) }
@@ -1298,4 +1384,25 @@ final class RecordingKeyFactory: ZagSigningKeyFactory, @unchecked Sendable {
 struct FailingInstaller: ZagFreeAccountInstaller {
 	func install(signedApp: URL, bundleIdentifier: String) async throws { throw TestFailure() }
 	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification { .notInstalled }
+}
+
+/// Signs in place, as the real adapter does, and records where.
+final class InPlaceSigner: ZagAppSigning, @unchecked Sendable {
+	private let lock = NSLock()
+	private var url: URL?
+	private var given: ZagProvisioningResult?
+	var signedAt: URL? { lock.withLock { url } }
+	var result: ZagProvisioningResult? { lock.withLock { given } }
+	func sign(appAt app: URL, with result: ZagProvisioningResult, identity: ZagSigningIdentity, authorization: ZagSigningAuthorization, now: Date) throws -> ZagSignedAppRecord {
+		lock.withLock { url = app; given = result }
+		try Data("signed".utf8).write(to: app.appendingPathComponent("Info.plist"))
+		return try StubSigner(fails: false, now: now).sign(appAt: app, with: result, identity: identity, authorization: authorization, now: now)
+	}
+}
+
+final class AccountKeyRecorder: @unchecked Sendable {
+	private let lock = NSLock()
+	private var list: [UUID] = []
+	var accounts: [UUID] { lock.withLock { list } }
+	func discard(_ account: UUID) throws { lock.withLock { list.append(account) } }
 }

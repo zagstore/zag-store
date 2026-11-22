@@ -25,7 +25,8 @@ enum ZagDeveloperAccountLive {
 			secrets: secrets,
 			keys: ZagKeychainSigningKeyFactory(keys: keys),
 			signer: ZagFreeAccountSigningAdapter(signer: ZagZsignCodeSigner(), gate: .developerAccount, keychainKeys: keys),
-			installer: installer
+			installer: installer,
+			discardAllKeys: { try keys.deleteAll(account: $0) }
 		))
 	}
 

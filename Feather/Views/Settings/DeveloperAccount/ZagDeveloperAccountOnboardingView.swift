@@ -75,7 +75,6 @@ struct ZagDeveloperAccountOnboardingView: View {
 			Section {
 				if model.isConnected {
 					Button("Disconnect Key", role: .destructive) { model.disconnect() }
-					Button("Remove Developer Account", role: .destructive) { confirmingRemoval = true }
 				} else {
 					Button {
 						Task { await model.connect() }
@@ -87,6 +86,12 @@ struct ZagDeveloperAccountOnboardingView: View {
 					}
 					.disabled(!model.canConnect)
 				}
+			}
+
+			// Always offered: a disconnected account can still hold this
+			// device's signing identity and Keychain key.
+			Section {
+				Button("Remove Developer Account", role: .destructive) { confirmingRemoval = true }
 			}
 		}
 		.navigationTitle("Developer Account")

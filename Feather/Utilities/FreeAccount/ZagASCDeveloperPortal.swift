@@ -136,36 +136,67 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 	// MARK: Profiles
 
 	/// Zag Store keeps one development profile per App ID, under a fixed name,
-	/// so a refresh can find it again instead of adding another.
+	/// so a refresh can find it again instead of adding another. A replacement
+	/// is made under the second name before the old profile is removed, so a
+	/// working profile is never deleted until its replacement exists; there
+	/// are never more than two.
 	static func profileName(for bundleIdentifier: String) -> String { "Zag Store \(bundleIdentifier)" }
+	static func profileNames(for bundleIdentifier: String) -> [String] {
+		let name = profileName(for: bundleIdentifier)
+		return [name, name + " B"]
+	}
 
 	func developmentProfile(
 		for appID: ZagRegisteredAppID, team: String, deviceUDID: String, certificateSerial: String, validUntil: Date
 	) async throws -> (profile: ZagIssuedProfile, created: Bool) {
-		let name = Self.profileName(for: appID.bundleIdentifier)
+		let names = Self.profileNames(for: appID.bundleIdentifier)
 		let (listed, _) = try await mapping {
-			try await client.list(.profiles, as: ZagASCProfile.self, filters: ["name": name, "profileType": "IOS_APP_DEVELOPMENT"])
+			try await client.list(.profiles, as: ZagASCProfile.self, filters: ["name": names.joined(separator: ","), "profileType": "IOS_APP_DEVELOPMENT"])
 		}
 		// Apple's name filter is not documented as exact; only ours count.
-		let ours = listed.filter { $0.attributes?.name == name }
-		for record in ours where record.attributes?.profileState == "ACTIVE" {
-			guard let profile = try? decodedProfile(record.attributes) else { continue }
+		let ours = listed.filter { names.contains($0.attributes?.name ?? "") }
+		var usable: [ZagIssuedProfile?] = []
+		for record in ours {
+			let profile = record.attributes?.profileState == "ACTIVE" ? try? decodedProfile(record.attributes) : nil
+			usable.append(profile)
+			guard let profile else { continue }
 			let problem = ZagProvisioningProfileCheck.check(
 				profile, team: team, bundleIdentifier: appID.bundleIdentifier,
 				deviceUDID: deviceUDID, certificateSerial: certificateSerial, now: client.now()
 			)
 			if problem == nil, profile.expiresAt >= validUntil { return (profile, false) }
 		}
-		// None qualifies (new device or certificate, expiring, or invalid):
-		// replace ours, so the App ID still has exactly one Zag Store profile.
-		// Apps already installed keep the profile embedded in them.
-		for record in ours {
-			try await mapping { try await client.delete(.profiles, id: record.id) }
+		// None qualifies (new device or certificate, expiring, or invalid).
+		// Create the replacement under a free name first. Only when both names
+		// are taken (an earlier cleanup did not finish) is one removed first:
+		// the one least useful now (invalid, else expiring soonest).
+		let taken = Set(ours.compactMap { $0.attributes?.name })
+		let slot: String
+		if let free = names.first(where: { !taken.contains($0) }) {
+			slot = free
+		} else {
+			let worst = zip(ours, usable).min { a, b in
+				(a.1?.expiresAt ?? .distantPast) < (b.1?.expiresAt ?? .distantPast)
+			}!.0
+			slot = worst.attributes?.name ?? names[0]
+			for record in ours where record.attributes?.name == slot {
+				try await mapping { try await client.delete(.profiles, id: record.id) }
+			}
 		}
-		return (try await profile(for: appID, team: team), true)
+		let replacement = try await createProfile(for: appID, name: slot)
+		// Then remove the superseded ones. The replacement already exists, so
+		// a failure here is left for the next replacement to tidy.
+		for record in ours where record.attributes?.name != slot {
+			try? await client.delete(.profiles, id: record.id)
+		}
+		return (replacement, true)
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
+		try await createProfile(for: appID, name: Self.profileName(for: appID.bundleIdentifier))
+	}
+
+	private func createProfile(for appID: ZagRegisteredAppID, name: String) async throws -> ZagIssuedProfile {
 		guard let bundleIDRecordID = try await bundleIDRecordID(appID.bundleIdentifier) else { throw ZagPortalError.malformedResponse }
 		let certificateIDs = try await mapping {
 			try await client.list(.certificates, as: ZagASCCertificate.self, filters: ["certificateType": "IOS_DEVELOPMENT"]).records.map(\.id)
@@ -175,7 +206,6 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 		}
 		guard !certificateIDs.isEmpty, !deviceIDs.isEmpty else { throw ZagPortalError.malformedResponse }
 
-		let name = Self.profileName(for: appID.bundleIdentifier)
 		let relationships: [String: Any] = [
 			"bundleId": ["data": ["type": "bundleIds", "id": bundleIDRecordID]],
 			"certificates": ["data": certificateIDs.map { ["type": "certificates", "id": $0] }],
