@@ -75,6 +75,29 @@ verification are driven through it. The ASC integration reuses that seam:
   `ZagSignedAppRecord`. Its authorisation is a new, additive
   `ZagSigningAuthorization.developerAccount(...)` factory; the free-account
   directory and the G5 experiment are untouched.
+- **`ZagDeveloperAccountService`** — the app wiring for one connected account
+  (stored credential → client → provisioner → coordinator), with every
+  dependency injected. `ZagDeveloperAccountLive` supplies the real ones: the
+  App Store Connect-only transport (made in the transport file), a dedicated
+  Keychain store and Keychain-held signing keys, the existing adapter on its
+  strict Keychain-key path, and the existing RPPairing installer, which reads
+  the device's installed profiles back so an install is verified. Adapter and
+  installer run behind their own `.developerAccount` gates, so free-account
+  signing stays closed.
+- **UI** — a *Signing Methods* section in the existing Signing screen, shown
+  only while the gate is open, opens the Developer Account screen: connect a
+  key, install a Library app (cancellable), disconnect, or remove the account.
+
+**Profiles are idempotent.** Zag Store keeps one development profile per App
+ID under a fixed name (`Zag Store <bundle ID>`). A refresh reuses it while it
+is `ACTIVE`, names this device and signing certificate, and stays valid for at
+least 30 more days; otherwise it is deleted and replaced, so profiles never
+accumulate. Apps already installed keep the profile embedded in them.
+
+**Status is precise.** The connection check is read-only, so it reports
+*Credentials validated — provisioning unverified*; *Provisioning verified* is
+shown only after a write with the key (device, bundle ID, certificate or
+profile) has succeeded.
 
 Apps receive a team-suffixed bundle identifier (e.g. `com.example.app.TEAMID`),
 exactly as on the free path, so an app keeps its data across refreshes and
@@ -114,9 +137,15 @@ Zsign signer and the installer — all of which Zag Store already has or adds in
 - **M3 — sign + install (done, offline).** The coordinator reusing the existing
   adapter + installer + verification; the additive developer-account
   authorisation.
+- **Integration (done, offline).** App wiring, precise status, idempotent
+  profiles, and every request checked against Apple's published OpenAPI
+  document (`scripts/zag-asc-openapi-check.py`, version 4.6.1). Tests:
+  `scripts/test-zag-developer-account.sh` (177 offline checks over a stateful
+  mock of the ASC API).
 - **Live validation (gated, not in this work).** Point the same code at one
-  real paid account and one device, behind explicit authorisation. Only after a
-  verified install + refresh would `developerAccountEnabled` be flipped.
+  real paid account and one device, behind explicit authorisation, in a
+  live-test build (§8). Only after a verified install + refresh would the gate
+  be opened for releases.
 
 ## 7. Remaining Apple Developer Program restrictions
 
@@ -138,17 +167,24 @@ authorisation plus the owner's own paid account and device. When authorised:
 1. In App Store Connect → Users and Access → Integrations, create a **Team Key**
    with the **Admin** role; download the `.p8` once; note the **Key ID** and the
    **Issuer ID**. Note the ten-character **Team ID** from the membership page.
-2. In a development build with `developerAccountEnabled` set, open the
-   Developer Account screen, import the `.p8`, enter the Key ID, Issuer ID and
-   Team ID, and Connect. A green "Connected" confirms the key can provision.
-3. Pick one single-target app (no extensions, no app groups) and one paired
-   device, and run one install.
-4. Confirm on the device that the app launches and that the installed profile's
-   team, App ID and ~1-year expiry match. That is the one genuine signed,
-   installed IPA.
+2. Build a live-test app: Release with
+   `SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) ZAG_ZSIGN_STRICT ZAG_DEVELOPER_ACCOUNT_LIVE_TEST'`
+   (the live-test condition is a compile error without `ZAG_ZSIGN_STRICT`;
+   nothing in the project sets either). Sign and install it as a personal test
+   build only.
+3. Settings → Signing → Signing Methods → Developer Account: import the `.p8`,
+   enter the Key ID, Issuer ID and Team ID, and Connect. The status reads
+   *Credentials validated — provisioning unverified*: a read-only check cannot
+   show that the key may create anything.
+4. With the iPhone paired, choose one single-target Library app (no
+   extensions, no app groups) and Install. The first successful write turns
+   the status into *Provisioning verified*.
+5. Confirm the app launches. The screen reports *Installed and verified* only
+   when the device's installed profile matches the team, App ID and expiry.
+   Install again: it should reuse everything and make no writes.
 
-Expected first-run failures and what they mean: `403` → the key is not a team
-key with Admin access; `invalidTeamID` → the Team ID is wrong; profile
+Expected first-run failures and what they mean: `403` on the first write →
+the key can read but not provision (not a team key with the Admin role); `invalidTeamID` → the Team ID is wrong; profile
 `certificateMissing`/`deviceMissing` → the device or certificate was not yet
 registered when the profile was cut (re-run). There are open developer reports
 of `POST /v1/certificates` intermittently failing (~Jan 2026); confirm against
