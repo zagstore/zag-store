@@ -214,6 +214,14 @@ provisioned state are accepted at sign-in.
 
 ## Licence
 
+> **PRELIMINARY ASSESSMENT — PENDING SPECIALIST LEGAL REVIEW.** The analysis
+> below was prepared by reading Apple's own agreements. It is not legal
+> advice and is not a licence clearance. No one may rely on it to deploy,
+> to host a service or to make a live Apple request. The unresolved
+> questions at the end require a qualified lawyer in the operator's
+> jurisdiction. Until counsel signs off, PRs #46, #47 and #48 stay in
+> draft/review, unmerged and undeployed.
+
 The licence ships in the installer: `License.rtf`, English variants, "iTUNES
 FOR WINDOWS SOFTWARE LICENSE AGREEMENT", EA1827, dated 1/31/2023. Its terms
 apply to the DLLs it ships, including `CoreADI64.dll`. Quoted:
@@ -245,20 +253,98 @@ apply to the DLLs it ships, including `CoreADI64.dll`. Quoted:
   conflicts with 2C, unless an applicable-law exception covers it.
 - Hosting or shipping the DLL conflicts with 3.
 
-**Unresolved, for the owner and counsel:**
-- whether an interoperability exception applies to the analysis and to
-  this use, under the operator's jurisdiction;
-- whether any form of hosted service is compatible with 2B at all;
-- whether the Apple Media Services or iCloud terms (section 5) add limits
-  on the service side.
+### Restrictions specific to hosted, multi-user use
+
+The multi-user service this project is ultimately for is the hardest case,
+and no reading makes it clearly permitted:
+
+- **iTunes for Windows SLA 2B** bars making the Apple Software "available
+  over a network where it could be used by multiple computers at the same
+  time". A hosted anisette service is exactly that. Running the DLL on
+  genuine, licensed Windows instead of on Ubuntu does not cure this: 2B
+  restricts the *network service*, not the host OS.
+- **The "Apple DLLs … only … with the Apple Software" clause (2B)** means
+  even a genuine, licensed copy does not authorise using `CoreADI64.dll`
+  outside iTunes, which is what every backend variant here does.
+- **The genuine-macOS alternative is not a way out.** The macOS Sequoia SLA
+  (`https://www.apple.com/legal/sla/docs/macOSSequoia.pdf`) permits hosting
+  only under section 3, "Leasing for Permitted Developer Services", and only
+  when "the leased Apple Software must be used for the sole purpose of
+  providing Permitted Developer Services", each lease is "a minimum period
+  of twenty-four (24) consecutive hours", and "the End User Lessee must have
+  sole and exclusive use and control". "Permitted Developer Services means
+  continuous integration services …". A shared authentication service is
+  neither CI nor compatible with one lessee's sole and exclusive control.
+  Section 2B separately forbids using virtualised macOS "in connection with
+  service bureau, time-sharing, terminal sharing, relay service or other
+  similar types of services".
+
+In short: **technical feasibility is not licence permission.** The Windows
+CoreADI, genuine-Windows and genuine-macOS architectures are all feasible
+and none is, as written, licensable as a multi-user hosted authentication
+service. See the architecture table in the owner's decision report.
+
+### Unresolved interoperability and licence questions (for counsel)
+
+- Whether an **interoperability exception** (for example under EU software
+  law, or a comparable doctrine in the operator's jurisdiction) legitimises
+  both the offline analysis (2C) and the interoperable use, and whether it
+  can override the contractual terms at all.
+- Whether the **EU DMA's** alternative-distribution regime bears on
+  free-account provisioning.
+- Whether **any** hosted, multi-user form is compatible with iTunes SLA 2B,
+  or whether only a per-user "bring your own licensed device and credentials,
+  under your own sole control" model could be.
+- Whether the **Apple Media Services / iCloud terms** (SLA section 5) add
+  service-side limits.
+- Whether **GrandSlam/anisette endpoints** carry any third-party server
+  licence at all (they appear to be private and unlicensed for this use).
 
 **Rules until resolved:**
 - Never commit, release or upload any Apple DLL. The repository contains
   none; the worker loads the operator's own copy.
 - Never deploy publicly.
 - The installer refuses `--platform windows` without `--licence-reviewed`.
+  That flag is an operator attestation only; it is **not** permission and
+  does not represent a completed legal review.
 
 The Android backend's licence review (G2/G3) is separate and also open.
+
+## App Store Connect API — the officially supported alternative
+
+Apple provides an **official, licensed** mechanism for the
+developer-provisioning functions Zag Store needs: the **App Store Connect
+API** (`https://developer.apple.com/app-store-connect/api/`), authenticated
+with a JWT signed by an API key, and governed by the **Apple Developer
+Program License Agreement** (not the iTunes or macOS SLAs above).
+
+Its *Provisioning* endpoints cover the resources the signing flow needs:
+- **Bundle IDs** — register and manage app identifiers and their
+  capabilities.
+- **Certificates** — create, download and revoke development and
+  distribution signing certificates.
+- **Devices** — register devices for development and testing.
+- **Profiles** — create, download and delete provisioning profiles
+  (referencing a bundle ID, certificates and devices).
+
+Because it is Apple's sanctioned API, it needs no reverse engineering, no
+Apple DLL and no anisette, and it does not implicate the iTunes or macOS
+SLA clauses above.
+
+**It does not replace free-account anisette authentication.** Two limits
+matter:
+- The App Store Connect API requires a **paid Apple Developer Program
+  membership**; its keys and provisioning act on **paid** developer
+  accounts.
+- There is **no official server-side equivalent for the free-Apple-account
+  flow**. The free-account, 7-day re-sign model that anisette/GrandSlam
+  exists to serve has no sanctioned hosted API. The ASC API is therefore a
+  licensable path for a *paid-account* provisioning product, not a drop-in
+  substitute for the current free-account design.
+
+A technical feasibility assessment for integrating the ASC API into Zag
+Store's existing bring-your-own-credentials (BYOC) architecture is tracked
+separately (`ASC_API_FEASIBILITY.md`).
 
 ## Before one authorized live attempt
 
