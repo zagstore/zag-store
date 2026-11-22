@@ -29,6 +29,10 @@ struct ZagFreeAccountSigningGate: Equatable, Sendable {
 	private init(isOpen: Bool) { self.isOpen = isOpen }
 
 	static let production = ZagFreeAccountSigningGate(isOpen: ZagFreeAccountSigning.isEnabled)
+	/// The adapter as the paid developer-account method uses it: open only with
+	/// that method's own gate, so it never depends on (or opens) free-account
+	/// signing. Closed in every release build.
+	static let developerAccount = ZagFreeAccountSigningGate(isOpen: ZagSigningMethodAvailability.developerAccountEnabled)
 	#if DEBUG
 	static let simulationOnly = ZagFreeAccountSigningGate(isOpen: true)
 	#endif
@@ -41,6 +45,20 @@ protocol ZagCodeSigner: Sendable {
 
 /// A signer's own failure message (Zsign's lists the files it could not sign).
 struct ZagSignerFailure: Error, Equatable { let message: String }
+
+/// The signing step of the pipeline: a provisioned app plus its identity and
+/// authorisation become a signed-app record. `ZagFreeAccountSigningAdapter` is
+/// the production implementation (Zsign); a coordinator depends on this seam so
+/// it can be tested without running a real signer.
+protocol ZagAppSigning: Sendable {
+	func sign(
+		appAt app: URL,
+		with result: ZagProvisioningResult,
+		identity: ZagSigningIdentity,
+		authorization: ZagSigningAuthorization,
+		now: Date
+	) throws -> ZagSignedAppRecord
+}
 
 #if canImport(ZsignSwift) || ZAG_ZSIGN_TESTS
 /// The existing Zsign signer, called as `ZsignHandler` calls it. Zsign reads
@@ -535,3 +553,6 @@ struct ZagFreeAccountLifecycle: Sendable {
 		}
 	}
 }
+
+/// The production signer used by `ZagASCSigningCoordinator`.
+extension ZagFreeAccountSigningAdapter: ZagAppSigning {}

@@ -2230,6 +2230,11 @@ private struct ZagExperimentalSigningView: View {
 
 	var body: some View {
 		Form {
+			// Developer Account signing: listed only when its gate is open
+			// (closed in every release build).
+			if ZagSigningMethodAvailability.developerAccountEnabled {
+				ZagSigningMethodsSection()
+			}
 			Section {
 				Toggle(isOn: $optionsManager.options.experiment_replaceSubstrateWithEllekit) {
 					Label("Replace Substrate with ElleKit", systemImage: "pencil")

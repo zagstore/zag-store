@@ -147,6 +147,18 @@ struct ZagSigningAuthorization: Equatable, Sendable {
 
 	var limits: ZagTeamLimits { .forTeam(teamKind) }
 	func isValid(at now: Date) -> Bool { now < validUntil }
+
+	/// An authorisation to sign for a connected App Store Connect developer
+	/// account (the paid Developer Account method). Its proof is not a GrandSlam
+	/// session but a stored, validated ASC API key held on this device
+	/// (`ZagDeveloperAccountOnboardingModel`), whose connection check confirmed
+	/// provisioning access. Gated by
+	/// `ZagSigningMethodAvailability.developerAccountEnabled`, which is closed in
+	/// release builds, so this cannot be used until the feature is enabled.
+	/// The free-account directory and its authorisations are unaffected.
+	static func developerAccount(scope: ZagSigningScope, teamKind: ZagDeveloperTeam.Kind, validUntil: Date) -> ZagSigningAuthorization {
+		ZagSigningAuthorization(scope: scope, teamKind: teamKind, validUntil: validUntil)
+	}
 }
 
 /// What removing an account would affect. The confirmation must name the
