@@ -81,6 +81,10 @@ pub enum StateChange {
     /// The anisette server reported the device as not provisioned (-45061):
     /// a new device was made.
     Reset,
+    /// Zag Store fork: the effective client-info identity for this endpoint
+    /// differs from the one the stored state was recorded under. The stable
+    /// endpoint still keys the slot; this only surfaces the change.
+    ClientIdentityChanged,
 }
 
 /// Process-wide counts of `StateChange`s, for diagnostics.
@@ -88,7 +92,7 @@ pub mod diagnostics {
     use super::StateChange;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
     fn index(change: StateChange) -> usize {
         match change {
@@ -97,6 +101,7 @@ pub mod diagnostics {
             StateChange::Created => 2,
             StateChange::ReplacedCorrupt => 3,
             StateChange::Reset => 4,
+            StateChange::ClientIdentityChanged => 5,
         }
     }
 
@@ -144,6 +149,10 @@ pub struct RemoteV3AnisetteProvider {
     serial_number: String,
     client: reqwest_middleware::ClientWithMiddleware,
     client_info_override: Option<AnisetteClientInfo>,
+    /// Zag Store fork: the effective `/v3/client_info` identity, captured
+    /// before provisioning (outside the storage lock) so it can be recorded
+    /// against the stored state without a network call inside coordination.
+    effective_client_info: Option<String>,
     /// The account whose stored state this provider uses: providers with the
     /// same scope provision one at a time (`coordination`). `None`: only this
     /// provider's own calls are serialised.
@@ -172,6 +181,7 @@ impl RemoteV3AnisetteProvider {
             serial_number,
             client: Self::build_reqwest_client(url)?,
             client_info_override: None,
+            effective_client_info: None,
             state_scope: None,
             #[cfg(test)]
             test_exchange: None,
@@ -249,13 +259,55 @@ impl RemoteV3AnisetteProvider {
     }
 
     /// Zag Store fork: records this identity as the owner of the legacy slot,
-    /// once its state is stored there, so a later, different identity gets its
-    /// own slot. Nothing is written on a failed or cancelled provisioning.
+    /// so a later, different identity gets its own slot. Written before the
+    /// state (see get_state) and only on a path that reaches a usable state,
+    /// never on a failed or cancelled provisioning.
     fn claim_state_slot(&self, claim: &Option<String>) -> Result<(), Report> {
         if let Some(fingerprint) = claim {
             self.storage
                 .store_data(ANISETTE_IDENTITY_KEY, fingerprint.as_bytes())
                 .context("Failed to record the anisette identity marker")?;
+        }
+        Ok(())
+    }
+
+    /// Zag Store fork: a non-secret fingerprint of the effective client-info
+    /// identity, when it has been captured (before provisioning, outside the
+    /// storage lock). `None` when it is not yet known (e.g. before the first
+    /// client-info fetch), in which case nothing is recorded.
+    fn client_fingerprint(&self) -> Option<String> {
+        self.effective_client_info.as_ref().map(|info| {
+            let mut hasher = Sha256::new();
+            hasher.update(info.as_bytes());
+            hex::encode(&hasher.finalize()[..16])
+        })
+    }
+
+    /// Zag Store fork: records (and verifies) the effective client-info
+    /// identity a slot's state was provisioned under. The slot stays keyed by
+    /// the stable endpoint, so a benign change in the server-advertised client
+    /// info does not orphan the state; a genuine change is surfaced as a
+    /// diagnostic. Stored beside the state, never inside it; no secret or
+    /// provisioning blob is part of it. Fail-closed: a record that cannot be
+    /// read stops the caller rather than being silently overwritten.
+    fn record_client_identity(&self, state_key: &str) -> Result<(), Report> {
+        let Some(current) = self.client_fingerprint() else {
+            return Ok(());
+        };
+        let key = format!("{state_key}::client");
+        let previous = self
+            .storage
+            .retrieve_data(&key)
+            .context("Failed to read the client-identity record")?
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        if previous.as_deref().is_some_and(|p| p != current) {
+            diagnostics::record(StateChange::ClientIdentityChanged);
+            warn!("The anisette client identity for this endpoint has changed");
+        }
+        if previous.as_deref() != Some(current.as_str()) {
+            self.storage
+                .store_data(&key, current.as_bytes())
+                .context("Failed to record the client-identity record")?;
         }
         Ok(())
     }
@@ -290,7 +342,11 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
     }
 
     async fn provision(&mut self, gs: &Arc<GrandSlam>, force_reset: bool) -> Result<(), Report> {
-        self.get_client_info().await?;
+        // Zag Store fork: capture the effective client-info identity here,
+        // before get_state takes the storage lock, so the slot's state can be
+        // bound to it without any network call inside coordination.
+        let client_info = self.get_client_info().await?;
+        self.effective_client_info = Some(client_info.client_info);
         self.get_state(gs, force_reset).await?;
         Ok(())
     }
@@ -392,7 +448,14 @@ impl RemoteV3AnisetteProvider {
             let adopted = self.state.as_ref().is_some_and(|own| own.keychain_identifier != state.keychain_identifier);
             diagnostics::record(if adopted { StateChange::Adopted } else { StateChange::Loaded });
             info!("Using stored anisette state");
+            // Zag Store fork: adopting pre-existing, unmarked legacy state is a
+            // one-time migration to this identity. It is recorded, not silent;
+            // after it, any different identity is routed to its own slot.
+            if claim.is_some() && state_key == ANISETTE_STATE_KEY {
+                warn!("Migrating unmarked legacy anisette state to this provider/client identity");
+            }
             self.claim_state_slot(&claim)?;
+            self.record_client_identity(&state_key)?;
             return Ok(self.state.insert(state));
         }
 
@@ -423,8 +486,13 @@ impl RemoteV3AnisetteProvider {
         }
         let mut bytes = Vec::new();
         plist::to_writer_xml(&mut bytes, &state)?;
-        self.storage.store_data(&state_key, &bytes)?;
+        // Zag Store fork: write the ownership marker BEFORE the state, so a
+        // failure between the two writes can only leave a marked slot with no
+        // state (the owner re-provisions) — never state without a marker, which
+        // a different provider could then adopt.
         self.claim_state_slot(&claim)?;
+        self.storage.store_data(&state_key, &bytes)?;
+        self.record_client_identity(&state_key)?;
         let state = self.state.insert(state);
         Ok(state)
     }
@@ -993,5 +1061,92 @@ mod persistence_tests {
         let id = a.get_state(&gs, false).await.unwrap().keychain_identifier;
         let mut b = sharing_url(&storage, "acct", "https://a.example", never_exchange);
         assert_eq!(b.get_state(&gs, false).await.unwrap().keychain_identifier, id, "normalised to the same identity");
+    }
+
+    // --- Follow-up hardening (PR #54 review): effective client identity,
+    // conservative legacy ownership, and partial-write safety.
+
+    #[tokio::test]
+    async fn effective_client_identity_is_recorded_and_a_change_is_surfaced() {
+        // The effective /v3/client_info identity is recorded beside the state.
+        // A later, different client identity on the SAME endpoint does not
+        // orphan the device (the slot stays keyed by the stable endpoint), but
+        // the change is surfaced as a diagnostic.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut a = sharing_url(&storage, "acct", "https://a.example", provision_exchange);
+        a.effective_client_info = Some("iPhone16,2 <MacOS;15.0;24A1>".into());
+        let id = a.get_state(&gs, false).await.unwrap().keychain_identifier;
+
+        let before = diagnostics::count(StateChange::ClientIdentityChanged);
+        let mut b = sharing_url(&storage, "acct", "https://a.example", never_exchange);
+        b.effective_client_info = Some("iPhone16,2 <MacOS;15.1;24B5>".into());
+        assert_eq!(
+            b.get_state(&gs, false).await.unwrap().keychain_identifier, id,
+            "a benign client-info change does not re-provision the device",
+        );
+        assert!(
+            diagnostics::count(StateChange::ClientIdentityChanged) > before,
+            "the client-identity change is surfaced",
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_switch_during_upgrade_preserves_legacy_and_isolates_the_new_provider() {
+        // Pre-upgrade: legacy state under the legacy slot, no marker.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let legacy = AnisetteState { keychain_identifier: [21; 16], adi_pb: Some(vec![4, 2]) };
+        storage.store_data(ANISETTE_STATE_KEY, &stored(&legacy)).unwrap();
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+
+        // First post-upgrade run keeps the same endpoint: the legacy device is
+        // migrated to it, not re-provisioned (no session is invalidated).
+        let mut original = sharing_url(&storage, "acct", "https://a.example", never_exchange);
+        assert_eq!(original.get_state(&gs, false).await.unwrap().keychain_identifier, [21; 16]);
+
+        // The user then switches to a different anisette provider: it must not
+        // reuse or overwrite the original's device.
+        let mut switched = sharing_url(&storage, "acct", "https://b.example", corrupt_exchange);
+        let switched_id = switched.get_state(&gs, false).await.unwrap().keychain_identifier;
+        assert_ne!(switched_id, [21; 16], "the switched provider provisions its own device");
+        assert_eq!(stored_identity(&storage), [21; 16], "the original provider's legacy device is preserved");
+    }
+
+    /// A Keychain that fails to write the state blob but allows other writes,
+    /// to model a crash between the marker write and the state write.
+    struct FailStateWrite(Arc<crate::util::storage::InMemoryStorage>);
+    impl SideloadingStorage for FailStateWrite {
+        fn store(&self, key: &str, value: &str) -> Result<(), Report> {
+            if key == ANISETTE_STATE_KEY {
+                return Err(report!("state write failed"));
+            }
+            self.0.store(key, value)
+        }
+        fn retrieve(&self, key: &str) -> Result<Option<String>, Report> {
+            self.0.retrieve(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_between_marker_and_state_writes_leaves_no_adoptable_unmarked_state() {
+        // The marker is written before the state. If the state write then
+        // fails, the slot is marked but empty (the owner re-provisions) — there
+        // is never state without a marker for another provider to adopt.
+        let backing = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut a = RemoteV3AnisetteProvider::new("https://a.example", Box::new(FailStateWrite(backing.clone())), "S".into())
+            .unwrap()
+            .set_state_scope("acct");
+        a.test_exchange = Some(provision_exchange);
+        assert!(a.get_state(&gs, false).await.is_err(), "the state write failed");
+        assert!(backing.retrieve_data(ANISETTE_STATE_KEY).unwrap().is_none(), "no unmarked state remains at the legacy slot");
+        assert!(backing.retrieve_data(ANISETTE_IDENTITY_KEY).unwrap().is_some(), "the slot is marked");
+
+        // A different provider is routed to its own slot and never adopts the
+        // legacy slot.
+        let mut b = sharing_url(&backing, "acct", "https://b.example", provision_exchange);
+        assert!(b.get_state(&gs, false).await.is_ok(), "a different provider provisions its own device");
+        assert!(backing.retrieve_data(ANISETTE_STATE_KEY).unwrap().is_none(), "the legacy slot stays empty; nothing was adopted");
     }
 }
