@@ -60,6 +60,16 @@ fn normalize_endpoint(url: &str) -> String {
     }
 }
 
+/// Zag Store fork: normalises an effective client-identity string for
+/// comparison. Only whitespace is collapsed — the one change that is provably
+/// non-semantic. Everything else is compared verbatim, because without an
+/// authoritative description of how Apple's ADI provisioning binds to the
+/// client identity we cannot classify a sub-field change as cosmetic, and the
+/// safe default for an unprovable change is isolation, not reuse.
+fn normalize_client_identity(info: &str) -> String {
+    info.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 pub(crate) fn state_for_tests(keychain_identifier: [u8; 16], adi_pb: Option<Vec<u8>>) -> AnisetteState {
     AnisetteState { keychain_identifier, adi_pb }
@@ -81,10 +91,6 @@ pub enum StateChange {
     /// The anisette server reported the device as not provisioned (-45061):
     /// a new device was made.
     Reset,
-    /// Zag Store fork: the effective client-info identity for this endpoint
-    /// differs from the one the stored state was recorded under. The stable
-    /// endpoint still keys the slot; this only surfaces the change.
-    ClientIdentityChanged,
 }
 
 /// Process-wide counts of `StateChange`s, for diagnostics.
@@ -92,7 +98,7 @@ pub mod diagnostics {
     use super::StateChange;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
     fn index(change: StateChange) -> usize {
         match change {
@@ -101,7 +107,6 @@ pub mod diagnostics {
             StateChange::Created => 2,
             StateChange::ReplacedCorrupt => 3,
             StateChange::Reset => 4,
-            StateChange::ClientIdentityChanged => 5,
         }
     }
 
@@ -220,18 +225,31 @@ impl RemoteV3AnisetteProvider {
         self
     }
 
+    /// Zag Store fork: the effective client identity this provider is using —
+    /// the captured `/v3/client_info` value, or the explicit override when one
+    /// is set and the fetch has not run (e.g. tests). `None` when not yet
+    /// known.
+    fn effective_identity(&self) -> Option<String> {
+        self.effective_client_info
+            .clone()
+            .or_else(|| self.client_info_override.as_ref().map(|info| info.client_info.clone()))
+    }
+
     /// Zag Store fork: a stable, non-secret fingerprint of this provider's
-    /// anisette endpoint and any explicit client-info override. The endpoint
-    /// is normalised (lowercased scheme and host, no trailing slash). No
-    /// secret, device identifier or provisioning blob is ever part of it.
+    /// anisette endpoint and effective client identity — the discriminator for
+    /// which stored-state slot it may use. The endpoint is normalised
+    /// (lowercased scheme and host, no trailing slash); the client identity is
+    /// normalised only for whitespace (the one provably non-semantic case) and
+    /// otherwise compared verbatim, so a change that cannot be shown to
+    /// preserve the provisioning identity routes to a different slot rather
+    /// than reusing possibly-incompatible state. No secret, device identifier
+    /// or provisioning blob is ever part of it.
     fn identity_fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(normalize_endpoint(&self.url).as_bytes());
-        if let Some(info) = self.client_info_override.as_ref() {
+        if let Some(identity) = self.effective_identity() {
             hasher.update([0]);
-            hasher.update(info.client_info.as_bytes());
-            hasher.update([0]);
-            hasher.update(info.user_agent.as_bytes());
+            hasher.update(normalize_client_identity(&identity).as_bytes());
         }
         hex::encode(&hasher.finalize()[..16])
     }
@@ -271,46 +289,6 @@ impl RemoteV3AnisetteProvider {
         Ok(())
     }
 
-    /// Zag Store fork: a non-secret fingerprint of the effective client-info
-    /// identity, when it has been captured (before provisioning, outside the
-    /// storage lock). `None` when it is not yet known (e.g. before the first
-    /// client-info fetch), in which case nothing is recorded.
-    fn client_fingerprint(&self) -> Option<String> {
-        self.effective_client_info.as_ref().map(|info| {
-            let mut hasher = Sha256::new();
-            hasher.update(info.as_bytes());
-            hex::encode(&hasher.finalize()[..16])
-        })
-    }
-
-    /// Zag Store fork: records (and verifies) the effective client-info
-    /// identity a slot's state was provisioned under. The slot stays keyed by
-    /// the stable endpoint, so a benign change in the server-advertised client
-    /// info does not orphan the state; a genuine change is surfaced as a
-    /// diagnostic. Stored beside the state, never inside it; no secret or
-    /// provisioning blob is part of it. Fail-closed: a record that cannot be
-    /// read stops the caller rather than being silently overwritten.
-    fn record_client_identity(&self, state_key: &str) -> Result<(), Report> {
-        let Some(current) = self.client_fingerprint() else {
-            return Ok(());
-        };
-        let key = format!("{state_key}::client");
-        let previous = self
-            .storage
-            .retrieve_data(&key)
-            .context("Failed to read the client-identity record")?
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-        if previous.as_deref().is_some_and(|p| p != current) {
-            diagnostics::record(StateChange::ClientIdentityChanged);
-            warn!("The anisette client identity for this endpoint has changed");
-        }
-        if previous.as_deref() != Some(current.as_str()) {
-            self.storage
-                .store_data(&key, current.as_bytes())
-                .context("Failed to record the client-identity record")?;
-        }
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
@@ -455,7 +433,6 @@ impl RemoteV3AnisetteProvider {
                 warn!("Migrating unmarked legacy anisette state to this provider/client identity");
             }
             self.claim_state_slot(&claim)?;
-            self.record_client_identity(&state_key)?;
             return Ok(self.state.insert(state));
         }
 
@@ -492,7 +469,6 @@ impl RemoteV3AnisetteProvider {
         // a different provider could then adopt.
         self.claim_state_slot(&claim)?;
         self.storage.store_data(&state_key, &bytes)?;
-        self.record_client_identity(&state_key)?;
         let state = self.state.insert(state);
         Ok(state)
     }
@@ -1066,29 +1042,63 @@ mod persistence_tests {
     // --- Follow-up hardening (PR #54 review): effective client identity,
     // conservative legacy ownership, and partial-write safety.
 
+    /// A provider over one account's Keychain, for a named endpoint AND a
+    /// named effective client identity.
+    fn sharing_client(
+        storage: &Arc<crate::util::storage::InMemoryStorage>,
+        scope: &str,
+        url: &str,
+        client_info: &str,
+        exchange: fn(&mut AnisetteState) -> Result<(), Report>,
+    ) -> RemoteV3AnisetteProvider {
+        let mut provider = sharing_url(storage, scope, url, exchange);
+        provider.effective_client_info = Some(client_info.to_string());
+        provider
+    }
+
     #[tokio::test]
-    async fn effective_client_identity_is_recorded_and_a_change_is_surfaced() {
-        // The effective /v3/client_info identity is recorded beside the state.
-        // A later, different client identity on the SAME endpoint does not
-        // orphan the device (the slot stays keyed by the stable endpoint), but
-        // the change is surfaced as a diagnostic.
+    async fn same_client_identity_reuses_state() {
+        // Scenario 1: same provider and unchanged client identity → reuse.
         let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
         let gs = Arc::new(GrandSlam::offline_for_tests());
-        let mut a = sharing_url(&storage, "acct", "https://a.example", provision_exchange);
-        a.effective_client_info = Some("iPhone16,2 <MacOS;15.0;24A1>".into());
+        let info = "iPhone16,2 <macOS;15.0;24A1> <akd/1>";
+        let mut a = sharing_client(&storage, "acct", "https://a.example", info, provision_exchange);
         let id = a.get_state(&gs, false).await.unwrap().keychain_identifier;
+        let mut b = sharing_client(&storage, "acct", "https://a.example", info, never_exchange);
+        assert_eq!(b.get_state(&gs, false).await.unwrap().keychain_identifier, id, "the same client identity reuses the device");
+    }
 
-        let before = diagnostics::count(StateChange::ClientIdentityChanged);
-        let mut b = sharing_url(&storage, "acct", "https://a.example", never_exchange);
-        b.effective_client_info = Some("iPhone16,2 <MacOS;15.1;24B5>".into());
-        assert_eq!(
-            b.get_state(&gs, false).await.unwrap().keychain_identifier, id,
-            "a benign client-info change does not re-provision the device",
-        );
-        assert!(
-            diagnostics::count(StateChange::ClientIdentityChanged) > before,
-            "the client-identity change is surfaced",
-        );
+    #[tokio::test]
+    async fn whitespace_equivalent_client_identity_reuses_state() {
+        // Scenario 2: semantically equivalent metadata (whitespace only) →
+        // reuse, because whitespace is the one provably non-semantic change.
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut a = sharing_client(&storage, "acct", "https://a.example", "iPhone16,2 <macOS;15.0;24A1>", provision_exchange);
+        let id = a.get_state(&gs, false).await.unwrap().keychain_identifier;
+        let mut b = sharing_client(&storage, "acct", "https://a.example", "  iPhone16,2   <macOS;15.0;24A1> ", never_exchange);
+        assert_eq!(b.get_state(&gs, false).await.unwrap().keychain_identifier, id, "whitespace-only differences reuse the device");
+    }
+
+    #[tokio::test]
+    async fn materially_different_client_identity_is_isolated_and_each_recovers() {
+        // Scenarios 3/4 (material or unprovable change → no silent reuse) and
+        // 5 (switching back recovers the original state).
+        let storage = Arc::new(crate::util::storage::InMemoryStorage::new());
+        let gs = Arc::new(GrandSlam::offline_for_tests());
+        let mut x = sharing_client(&storage, "acct", "https://a.example", "iPhone16,2 <macOS;15.0;24A1>", provision_exchange);
+        let id_x = x.get_state(&gs, false).await.unwrap().keychain_identifier;
+        // A materially different client identity (different model) on the same
+        // endpoint must provision its own device, not reuse X's.
+        let mut y = sharing_client(&storage, "acct", "https://a.example", "iPad14,1 <macOS;15.0;24A1>", corrupt_exchange);
+        let id_y = y.get_state(&gs, false).await.unwrap().keychain_identifier;
+        assert_eq!(stored_identity(&storage), id_x, "X's state (the legacy slot) is preserved, not overwritten");
+
+        // Each identity recovers its own state on a later run (no re-provision).
+        let mut x2 = sharing_client(&storage, "acct", "https://a.example", "iPhone16,2 <macOS;15.0;24A1>", never_exchange);
+        assert_eq!(x2.get_state(&gs, false).await.unwrap().keychain_identifier, id_x, "X recovers its own device");
+        let mut y2 = sharing_client(&storage, "acct", "https://a.example", "iPad14,1 <macOS;15.0;24A1>", never_exchange);
+        assert_eq!(y2.get_state(&gs, false).await.unwrap().keychain_identifier, id_y, "Y recovers its own device");
     }
 
     #[tokio::test]
