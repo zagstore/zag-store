@@ -54,7 +54,7 @@ fn claimed_state_dir(arg: Option<std::ffi::OsString>, provisioned: bool) -> Resu
 macro_rules! report {
     ($($args:tt)*) => {
         if std::env::args_os().nth(2).as_deref().and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|m| matches!(m, "--native-v2-session" | "--native-verify-state" | "--native-offline-check")) {
+            .is_some_and(|m| matches!(m, "--native-v2-session" | "--native-verify-state" | "--native-offline-check" | "--native-headers")) {
             eprintln!($($args)*);
         } else {
             println!($($args)*);
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::args_os().nth(2);
     let mode = mode.as_deref().and_then(std::ffi::OsStr::to_str);
     // Modes that act on a state directory claimed by the supervisor.
-    let claimed = matches!(mode, Some("--native-v2-session" | "--native-verify-state" | "--native-offline-check"));
+    let claimed = matches!(mode, Some("--native-v2-session" | "--native-verify-state" | "--native-offline-check" | "--native-headers"));
     if mode == Some("--initialize-core") || mode == Some("--configure-state") || mode == Some("--native-abi-preflight") || claimed {
         // All calls are explicitly opt-in. Only --native-v2-session handles
         // provisioning material, and only from its supervised coordinator.
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if mode == Some("--configure-state") || mode == Some("--native-abi-preflight") || claimed {
             // Use an absolute, private test directory. Never reuse production ADI state.
             let state = if claimed {
-                claimed_state_dir(std::env::args_os().nth(3), mode == Some("--native-verify-state"))?
+                claimed_state_dir(std::env::args_os().nth(3), matches!(mode, Some("--native-verify-state" | "--native-headers")))?
             } else {
                 let state = root.join("probe-state");
                 std::fs::create_dir_all(&state)?;
@@ -180,6 +180,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !native.is_provisioned(DS_ID)? { return Err("state is not provisioned".into()); }
                         native.check_otp(DS_ID)?;
                         println!("{}", probe_cli::VERIFIED_LINE);
+                        return Ok(());
+                    }
+                    Some("--native-headers") => {
+                        // One OTP for a loaded state, as one wire frame on
+                        // stdout (the server's /v3/get_headers). Material
+                        // never reaches stderr; a native error is a reply,
+                        // not a crash, so the server can tell them apart.
+                        use offline_v2_bridge::wire::{encode_headers, Headers};
+                        let reply = match native.is_provisioned(DS_ID) {
+                            Ok(false) => Headers::NotProvisioned,
+                            Ok(true) => match native.otp(DS_ID) {
+                                Ok((machine_id, otp)) => Headers::Ready { machine_id, otp },
+                                Err(_) => Headers::NativeFailure,
+                            },
+                            Err(_) => Headers::NativeFailure,
+                        };
+                        let payload = encode_headers(&reply).map_err(|_| "headers encoding failed")?;
+                        let mut out = std::io::stdout().lock();
+                        use std::io::Write as _;
+                        out.write_all(&(payload.len() as u32).to_be_bytes())?;
+                        out.write_all(&payload)?;
+                        out.flush()?;
                         return Ok(());
                     }
                     Some("--native-offline-check") => {

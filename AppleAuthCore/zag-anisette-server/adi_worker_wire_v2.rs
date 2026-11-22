@@ -127,9 +127,58 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>, WireError> {
     Ok(encoded)
 }
 
+/// The one reply of a worker in headers mode (`--native-headers`): OTP
+/// material for a loaded state, or why the state cannot produce it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Headers {
+    Ready { machine_id: Vec<u8>, otp: Vec<u8> },
+    /// ADIGetLoginCode reported -45061 for the loaded state.
+    NotProvisioned,
+    /// Any other native failure (corrupt, foreign or expired state).
+    NativeFailure,
+}
+
+pub fn encode_headers(reply: &Headers) -> Result<Vec<u8>, WireError> {
+    let value = match reply {
+        Headers::Ready { machine_id, otp } =>
+            json!({"version":VERSION,"type":"headers","machine_id_hex":encode_hex(machine_id)?,"otp_hex":encode_hex(otp)?}),
+        Headers::NotProvisioned => json!({"version":VERSION,"type":"error","code":"not_provisioned"}),
+        Headers::NativeFailure => json!({"version":VERSION,"type":"error","code":"native_failure"}),
+    };
+    serde_json::to_vec(&value).map_err(|_| WireError::Invalid)
+}
+
+pub fn decode_headers(bytes: &[u8]) -> Result<Headers, WireError> {
+    let obj = parse(bytes)?;
+    match obj.get("type").and_then(Value::as_str) {
+        Some("headers") => {
+            exact(&obj, &["version", "type", "machine_id_hex", "otp_hex"])?;
+            Ok(Headers::Ready { machine_id: material(&obj, "machine_id_hex")?, otp: material(&obj, "otp_hex")? })
+        }
+        Some("error") => {
+            exact(&obj, &["version", "type", "code"])?;
+            match obj.get("code").and_then(Value::as_str) {
+                Some("not_provisioned") => Ok(Headers::NotProvisioned),
+                Some("native_failure") => Ok(Headers::NativeFailure),
+                _ => Err(WireError::Invalid),
+            }
+        }
+        _ => Err(WireError::Phase),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn headers_reply_round_trips_and_is_strict() {
+        for reply in [Headers::Ready { machine_id: vec![1, 2], otp: vec![0, 255] }, Headers::NotProvisioned, Headers::NativeFailure] {
+            assert_eq!(decode_headers(&encode_headers(&reply).unwrap()).unwrap(), reply);
+        }
+        assert!(decode_headers(br#"{"version":2,"type":"headers","machine_id_hex":"01"}"#).is_err());
+        assert!(decode_headers(br#"{"version":2,"type":"error","code":"backend_unavailable"}"#).is_err());
+        assert_eq!(decode_headers(br#"{"version":2,"type":"started","cpim_hex":"01"}"#), Err(WireError::Phase));
+    }
     #[test]
     fn binary_round_trip_and_phase() {
         let start = Request::Start { identifier: "-2".into(), spim: vec![0, 255, 128] };
