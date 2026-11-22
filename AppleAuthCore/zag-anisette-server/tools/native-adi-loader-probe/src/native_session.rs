@@ -65,14 +65,21 @@ impl<'a> NativeFunctions<'a> {
     }
 
     /// Proves the configured state can generate headers: requests one OTP
-    /// and machine identifier, checks both are present, and disposes them
+    /// and machine identifier, checks both are present, and discards them
     /// without exposing their contents. Returns nothing on purpose.
     pub fn check_otp(&self, ds_id: i64) -> io::Result<()> {
+        self.otp(ds_id).map(drop)
+    }
+
+    /// One machine identifier and one-time password (`X-Apple-I-MD-M`,
+    /// `X-Apple-I-MD`), copied out of the native buffers, which are then
+    /// disposed. The caller must never log either value.
+    pub fn otp(&self, ds_id: i64) -> io::Result<(Vec<u8>, Vec<u8>)> {
         let (mut mid_ptr, mut mid_len): (*const u8, u32) = (std::ptr::null(), 0);
         let (mut otp_ptr, mut otp_len): (*const u8, u32) = (std::ptr::null(), 0);
         let code = (self.otp)(ds_id, &mut mid_ptr, &mut mid_len, &mut otp_ptr, &mut otp_len);
-        let _mid = NativeAllocation { ptr: mid_ptr, dispose: self.dispose };
-        let _otp = NativeAllocation { ptr: otp_ptr, dispose: self.dispose };
+        let mid = NativeAllocation { ptr: mid_ptr, dispose: self.dispose };
+        let otp = NativeAllocation { ptr: otp_ptr, dispose: self.dispose };
         if code != 0 {
             return Err(native_failure("native ADI OTP request returned error"));
         }
@@ -80,7 +87,9 @@ impl<'a> NativeFunctions<'a> {
             || mid_len as usize > MAX_MATERIAL || otp_len as usize > MAX_MATERIAL {
             return Err(invalid("invalid OTP material returned by native ADI"));
         }
-        Ok(())
+        let copy = |allocation: &NativeAllocation, len: u32|
+            unsafe { std::slice::from_raw_parts(allocation.ptr, len as usize) }.to_vec();
+        Ok((copy(&mid, mid_len), copy(&otp, otp_len)))
     }
 
     /// The caller must first initialize CoreADI, set its state directory and

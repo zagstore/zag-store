@@ -1,7 +1,12 @@
-//! Zag-owned minimal anisette HTTP service scaffold.
-//! Offline-only: provisioning endpoints deliberately return 503 until a reviewed backend exists.
-//! It never answers a WebSocket upgrade with 101, contacts nothing, stores
-//! nothing and logs no request data. No third-party server source code is used.
+//! Zag-owned anisette HTTP service.
+//!
+//! Without the native backend configured it is offline-only, as before: the
+//! provisioning endpoints return 503 and it never answers an upgrade with 101.
+//! With `ZAG_ANISETTE_NATIVE_WORKER`, `ZAG_ANISETTE_NATIVE_RUNTIME` and
+//! `ZAG_ANISETTE_STATE_DIR` set, `native_backend` serves `/v3/get_headers`
+//! and the provisioning WebSocket with real CoreADI in supervised workers.
+//! Either way it contacts nothing, keeps no client state and logs no request
+//! data. No third-party server source code is used.
 //!
 //! The routes are those of the Zag Store fork's v3 client
 //! (`zag-isideload/src/anisette/remote_v3`): `GET /v3/client_info`,
@@ -10,14 +15,15 @@
 //! client stop: `error_for_status` fails, and a non-101 upgrade fails.
 mod client_info_config;
 mod adi_process;
-#[cfg(test)]
 mod adi_worker_wire_v2;
+mod native_backend;
 mod adi_worker_protocol;
 mod adi_worker_framing;
 mod adi_worker_lifecycle;
 mod provisioning;
 mod websocket_transport;
 
+use native_backend::NativeBackend;
 use std::{
     borrow::Cow,
     io::{Read, Write},
@@ -202,6 +208,8 @@ fn route(head: &Head) -> Response {
     match head.path.as_str() {
         "/healthz" if method == "GET" => reply("200 OK", r#"{"status":"offline_only"}"#),
         "/healthz" => not_allowed("GET"),
+        "/readyz" if method == "GET" => reply("503 Service Unavailable", r#"{"ready":false,"backend":"offline"}"#),
+        "/readyz" => not_allowed("GET"),
         "/v3/client_info" if method == "GET" => match client_info_config::configured_response() {
             Some(metadata) => reply("200 OK", metadata),
             None => reply("503 Service Unavailable", OFFLINE),
@@ -257,11 +265,50 @@ fn offline_socket_enabled() -> bool {
     std::env::var("ZAG_ANISETTE_OFFLINE_WS_TEST").ok().as_deref() == Some("1")
 }
 
-fn handle(stream: TcpStream) -> std::io::Result<()> {
-    handle_with_offline_mode(stream, offline_socket_enabled())
+fn handle(stream: TcpStream, native: Option<&NativeBackend>) -> std::io::Result<()> {
+    handle_with(stream, offline_socket_enabled(), native)
 }
 
-fn handle_with_offline_mode(mut stream: TcpStream, offline_mode: bool) -> std::io::Result<()> {
+#[cfg(test)]
+fn handle_with_offline_mode(stream: TcpStream, offline_mode: bool) -> std::io::Result<()> {
+    handle_with(stream, offline_mode, None)
+}
+
+/// Native-backend answers for routes that passed `route`'s validation.
+fn native_status(native: &NativeBackend) -> Response {
+    let metadata = client_info_config::configured_response().is_some();
+    let body = serde_json::json!({
+        "status": "ok", "backend": "native", "ready": native.ready() && metadata,
+        "client_metadata": metadata,
+        "workers": {"active": native.active_workers(), "max": native.max_workers()},
+    }).to_string();
+    reply("200 OK", body)
+}
+
+fn native_ready(native: &NativeBackend) -> Response {
+    match (native.ready(), client_info_config::configured_response().is_some()) {
+        (true, true) => reply("200 OK", r#"{"ready":true}"#),
+        (_, false) => reply("503 Service Unavailable", r#"{"ready":false,"reason":"client_metadata_unavailable"}"#),
+        (false, _) => reply("503 Service Unavailable", r#"{"ready":false,"reason":"native_backend_not_ready"}"#),
+    }
+}
+
+/// Reads the declared body (part of which may already be in `buf`) within
+/// the request deadline.
+fn read_body(stream: &mut TcpStream, already: &[u8], length: usize, deadline: Instant) -> Option<Vec<u8>> {
+    let mut body = already[..already.len().min(length)].to_vec();
+    body.resize(length, 0);
+    let mut filled = already.len().min(length);
+    while filled < length {
+        match read_before(stream, &mut body[filled..], deadline) {
+            Ok(0) | Err(_) => { body.fill(0); return None; }
+            Ok(n) => filled += n,
+        }
+    }
+    Some(body)
+}
+
+fn handle_with(mut stream: TcpStream, offline_mode: bool, native: Option<&NativeBackend>) -> std::io::Result<()> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let mut buf = vec![0u8; MAX_HEADER];
@@ -287,6 +334,52 @@ fn handle_with_offline_mode(mut stream: TcpStream, offline_mode: bool) -> std::i
         None => (reply("431 Request Header Fields Too Large", r#"{"error":"header_limit"}"#), 0),
         Some(i) => respond(&buf[..i]),
     };
+    if let (Some(native), Some(i)) = (native, end) {
+        if let Ok(head) = parse(&buf[..i]) {
+            let validated = response.status == "503 Service Unavailable" && response.body == OFFLINE;
+            let answer = match (head.path.as_str(), head.method.as_str()) {
+                ("/healthz", "GET") => Some(native_status(native)),
+                ("/readyz", "GET") => Some(native_ready(native)),
+                ("/v3/get_headers", "POST") if validated => {
+                    let result = match read_body(&mut stream, &buf[i + 4..count], body, deadline) {
+                        Some(mut bytes) => {
+                            let parsed = native_backend::parse_headers_request(&bytes);
+                            bytes.fill(0);
+                            parsed.and_then(|(identifier, mut adi_pb)| {
+                                let headers = native.headers(&identifier, &adi_pb);
+                                adi_pb.fill(0);
+                                headers
+                            })
+                        }
+                        None => Err(native_backend::BackendError::InvalidInput),
+                    };
+                    let (status, body) = native_backend::headers_response(result);
+                    buf.fill(0);
+                    let _ = stream.write_all(&reply(status, body).bytes());
+                    let _ = stream.shutdown(Shutdown::Write);
+                    return Ok(());
+                }
+                ("/v3/provisioning_session", "GET") if validated && body == 0 && is_websocket_upgrade(&head) => {
+                    let Ok(_permit) = native.permit() else {
+                        buf.fill(0);
+                        let _ = stream.write_all(&reply("503 Service Unavailable", r#"{"error":"busy"}"#).bytes());
+                        return Ok(());
+                    };
+                    let prefix = buf[..count].to_vec();
+                    buf.fill(0);
+                    return websocket_transport::serve_native_socket(stream, prefix, native)
+                        .map_err(std::io::Error::other);
+                }
+                _ => None,
+            };
+            if let Some(answer) = answer {
+                buf.fill(0);
+                stream.write_all(&answer.bytes())?;
+                let _ = stream.shutdown(Shutdown::Write);
+                return Ok(());
+            }
+        }
+    }
     // Explicit loopback-only test mode. The request bytes consumed by the
     // HTTP parser are replayed to Tungstenite, including any coalesced data.
     // The only backend available here is OfflineBackend, which cannot
@@ -345,7 +438,12 @@ fn bind_address(configured: Option<&str>) -> Result<SocketAddr, String> {
     Ok(address)
 }
 
+#[cfg(test)]
 fn serve(listener: TcpListener) {
+    serve_with(listener, None)
+}
+
+fn serve_with(listener: TcpListener, native: Option<Arc<NativeBackend>>) {
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
@@ -362,8 +460,9 @@ fn serve(listener: TcpListener) {
             continue;
         }
         let active = Arc::clone(&active);
+        let native = native.clone();
         thread::spawn(move || {
-            let _ = handle(stream);
+            let _ = handle(stream, native.as_deref());
             active.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -384,9 +483,26 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // The only output: no request data is ever written anywhere.
-    eprintln!("zag-anisette-server: offline-only, listening on {address}");
-    serve(listener);
+    // Startup messages are the only output; no request data is ever written.
+    let native = match native_backend::NativeConfig::from_env() {
+        Ok(None) => None,
+        Ok(Some(config)) => match NativeBackend::open(config) {
+            Ok(backend) => Some(Arc::new(backend)),
+            Err(error) => {
+                eprintln!("zag-anisette-server: native backend refused: {}", error.reason());
+                std::process::exit(1);
+            }
+        },
+        Err(reason) => {
+            eprintln!("zag-anisette-server: {reason}");
+            std::process::exit(2);
+        }
+    };
+    match &native {
+        Some(backend) => eprintln!("zag-anisette-server: native ADI backend ready ({} workers), listening on {address}", backend.max_workers()),
+        None => eprintln!("zag-anisette-server: offline-only, listening on {address}"),
+    }
+    serve_with(listener, native);
 }
 
 #[cfg(test)]
@@ -519,7 +635,7 @@ mod tests {
     fn writes_no_request_data() {
         let source = include_str!("main.rs");
         let production = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
-        assert_eq!(production.matches("eprintln!").count(), 3, "only the startup and bind-failure messages");
+        assert_eq!(production.matches("eprintln!").count(), 6, "only the startup, configuration and bind-failure messages");
         assert!(!production.replace("eprintln!(", "").contains("println!("));
         for forbidden in ["dbg!(", "log::", "tracing::", "std::fs", "File::", "TcpStream::connect", "UdpSocket"] {
             assert!(!production.contains(forbidden), "{forbidden}");
