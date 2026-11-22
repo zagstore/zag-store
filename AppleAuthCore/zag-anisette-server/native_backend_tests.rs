@@ -131,7 +131,12 @@ fn startup_refuses_unsafe_configuration_and_recovers_the_work_area() {
     let broken = temp("broken-readiness");
     fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).unwrap();
     let good = runtime("runtime");
-    for name in ["lib", "lib/x86_64"] { fs::create_dir_all(broken.join(name)).unwrap(); }
+    for name in ["lib", "lib/x86_64"] {
+        // Explicit modes: a umask of 002 would leave these group-writable,
+        // which startup rightly refuses before the readiness check.
+        fs::DirBuilder::new().mode(0o755).create(broken.join(name)).unwrap();
+        fs::set_permissions(broken.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
     for name in LIBRARIES { fs::copy(good.join("lib/x86_64").join(name), broken.join("lib/x86_64").join(name)).unwrap(); }
     assert_eq!(NativeBackend::open(config(broken, temp("state"), 1)).err(),
         Some(BackendError::Config("native readiness check failed")));
