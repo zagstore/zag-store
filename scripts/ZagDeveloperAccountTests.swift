@@ -40,6 +40,10 @@ import Foundation
 		await mockASCCoordinator()
 		realAdapter()
 		redaction()
+		await mockASCProfiles()
+		await serviceWiring()
+		await installModel()
+		await onboardingRemoval()
 		print("SUCCESS: \(passed) developer-account (M1–M3) checks passed")
 	}
 
@@ -216,15 +220,17 @@ import Foundation
 		check(closedTransport.count == 0, "onboarding: a closed gate makes no request")
 		check(closedSecrets.items.isEmpty, "onboarding: a closed gate stores nothing")
 
-		// Gate open and the key works: connected and stored, key cleared.
+		// Gate open and the key works: validated (not "connected": a read
+		// proves nothing about provisioning), stored, key cleared.
 		let openSecrets = MemorySecrets()
 		let m = model(secrets: openSecrets, gate: .testingOpen, transport: MockTransport(.success(response(200, certificatesPage))))
 		m.keyID = keyID; m.issuerID = issuerID; m.teamID = teamID
 		m.importKey(contents: pem, fileName: "AuthKey.p8")
 		check(m.canConnect, "onboarding: valid input can connect")
 		await m.connect()
-		if case .connected(let k, let total) = m.phase { check(k == keyID && total == 2, "onboarding: a working key connects") }
-		else { check(false, "onboarding: a working key must connect") }
+		if case .credentialsValidated(let k, let total) = m.phase { check(k == keyID && total == 2, "onboarding: a working key is validated") }
+		else { check(false, "onboarding: a working key must be validated") }
+		check(m.methodStatus == .credentialsValidated(keyID: keyID), "onboarding: a read-only check never claims provisioning")
 		check(ZagDeveloperAccountStore(secrets: openSecrets).isConnected(account: m.account), "onboarding: the credential is stored")
 		check(!m.hasImportedKey, "onboarding: the private key is cleared once stored")
 
@@ -289,7 +295,10 @@ import Foundation
 		}
 		check(status(.notConnected) == .actionRequired("Add your App Store Connect API key"), "method: not connected asks for a key")
 		check(status(.connecting) == .actionRequired("Connecting…"), "method: connecting is shown")
-		check(status(.connected(keyID: keyID)) == .ready(detail: "Key \(keyID)"), "method: connected shows the key ID")
+		check(status(.credentialsValidated(keyID: keyID)) == .ready(detail: "Credentials validated — provisioning unverified"),
+			  "method: a validated key says provisioning is unverified")
+		check(status(.provisioningVerified(keyID: keyID)) == .ready(detail: "Key \(keyID) · Provisioning verified"),
+			  "method: provisioning is verified only after a write")
 		check(status(.needsAttention("fix me")) == .actionRequired("fix me"), "method: needs-attention surfaces the message")
 		// The existing imported-certificate status is unaffected by the new parameter.
 		check(ZagSigningMethodAvailability.status(of: .byoc, imported: none, freeAccount: .signedOut) == .external("Signed on zagstore.app"),
@@ -501,7 +510,7 @@ import Foundation
 		let before = w.asc.requestLog.count
 		guard case .success(let second) = await w.provisioner.provision(w.request()) else { return check(false, "mock ASC: a second run succeeds") }
 		let writes = w.asc.requestLog.dropFirst(before).filter { !$0.hasPrefix("GET") }
-		check(writes == ["POST /v1/profiles"], "mock ASC: a second run reuses device, certificate and bundle ID and only cuts a profile")
+		check(writes.isEmpty, "mock ASC: a second run reuses device, certificate, bundle ID and profile: no writes at all")
 		check(!second.changes.createdCertificate && !second.changes.registeredDevice && second.changes.registeredAppIDs.isEmpty,
 			  "mock ASC: a second run reports no new resources")
 
@@ -612,6 +621,231 @@ import Foundation
 		let wrong = CountingInstaller(verification: .mismatch("another profile"))
 		let outcome = await coordinator(mismatch, installer: wrong).install(app: component, account: mismatch.account, team: team, device: device, appAt: app)
 		check(outcome == .failed(.notVerified), "coordinator + mock ASC: a profile mismatch on the device is never success")
+	}
+
+	// MARK: - Idempotent profile management
+
+	static func mockASCProfiles() async {
+		@discardableResult func run(_ w: World, _ original: String = "com.example.notes", udid: String = "00008110-000A1B2C3D4E5F60") async -> ZagProvisioningResult? {
+			if case .success(let result) = await w.provisioner.provision(w.request(original, udid: udid)) { return result }
+			return nil
+		}
+		let mapped = "com.example.notes.\(teamID)"
+
+		let steady = world()
+		await run(steady)
+		check(steady.asc.profiles.count == 1 && steady.asc.profiles[0].name == "Zag Store \(mapped)", "profiles: one Zag Store profile per App ID, under a fixed name")
+		for _ in 0..<3 { await run(steady) }
+		check(steady.asc.count("POST /v1/profiles") == 1 && steady.asc.count("DELETE") == 0 && steady.asc.profiles.count == 1,
+			  "profiles: three refreshes reuse the profile instead of creating one each time")
+
+		let expiring = world()
+		expiring.asc.profileLifetime = 10 * 86_400
+		await run(expiring)
+		expiring.asc.profileLifetime = 365 * 86_400
+		let renewed = await run(expiring)
+		check(expiring.asc.profiles.count == 1 && expiring.asc.count("DELETE /v1/profiles/") == 1 && renewed?.app.profile.expiresAt == fixedNow + 365 * 86_400,
+			  "profiles: a profile within 30 days of expiry is replaced, not duplicated")
+
+		let grown = world()
+		await run(grown)
+		await run(grown, udid: "00008030-SECONDDEVICE0000")
+		check(grown.asc.profiles.count == 1 && grown.asc.profiles[0].deviceIDs.count == 2, "profiles: a new device replaces the profile with one naming both devices")
+
+		let invalid = world()
+		await run(invalid)
+		invalid.asc.invalidateProfiles()
+		await run(invalid)
+		check(invalid.asc.profiles.count == 1 && invalid.asc.activeProfiles.count == 1, "profiles: an INVALID profile (e.g. revoked certificate) is replaced")
+
+		let two = world()
+		await run(two)
+		await run(two, "com.example.other")
+		let other = two.asc.profiles.first { $0.name.hasSuffix("com.example.other.\(teamID)") }?.id
+		await run(two, udid: "00008030-SECONDDEVICE0000")
+		check(two.asc.profiles.count == 2 && two.asc.profiles.contains { $0.id == other }, "profiles: replacing one App ID's profile never touches another's")
+
+		// Interrupted between removing the stale profile and creating its replacement.
+		let interrupted = world()
+		interrupted.asc.profileLifetime = 10 * 86_400
+		await run(interrupted)
+		interrupted.asc.profileLifetime = 365 * 86_400
+		interrupted.asc.failNext("POST /v1/profiles") { MockASC.reply(500, ["errors": [["status": "500"]]]) }
+		check(await run(interrupted) == nil && interrupted.asc.profiles.isEmpty, "profiles: a failure after removing the stale profile leaves none")
+		check(await run(interrupted) != nil && interrupted.asc.profiles.count == 1, "profiles: the next run creates exactly one")
+		check(interrupted.asc.schemaProblems.isEmpty && interrupted.asc.tokenProblems.isEmpty, "profiles: list and delete requests match the schema and are signed")
+	}
+
+	// MARK: - The app wiring: service, models, removal
+
+	struct ServiceWorld {
+		let asc: MockASC
+		let secrets: MemorySecrets
+		let keys: RecordingKeyFactory
+		let account = UUID()
+		let credential: ZagDeveloperAccountCredential
+
+		func service(signer: ZagAppSigning = StubSigner(fails: false, now: Tests.fixedNow), installer: ZagFreeAccountInstaller = CountingInstaller(),
+					 gate: ZagDeveloperAccountGate = .testingOpen) -> ZagDeveloperAccountService {
+			ZagDeveloperAccountService(account: account, dependencies: .init(
+				transport: asc, secrets: secrets, keys: keys, signer: signer, installer: installer,
+				gate: gate, now: { Tests.fixedNow }, decodeProfile: MockASC.decodeProfile
+			))
+		}
+		var store: ZagDeveloperAccountStore { ZagDeveloperAccountStore(secrets: secrets) }
+		var stored: ZagDeveloperAccountCredential? { (try? store.load(account: account)) ?? nil }
+	}
+
+	static func serviceWorld(connected: Bool = true) -> ServiceWorld {
+		let key = P256.Signing.PrivateKey()
+		let credential = try! ZagDeveloperAccountCredential(issuerID: issuerID, keyID: keyID, teamID: teamID, privateKeyPEM: key.pemRepresentation, addedAt: fixedNow)
+		let w = ServiceWorld(asc: MockASC(teamID: teamID, keyID: keyID, issuerID: issuerID, publicKey: key.publicKey, now: fixedNow),
+							 secrets: MemorySecrets(), keys: RecordingKeyFactory(), credential: credential)
+		if connected { try! w.store.save(credential, account: w.account) }
+		return w
+	}
+
+	static func libraryApp(extensions: Bool = false, entitlements: [String: Any] = [:]) -> ZagDeveloperAccountApp {
+		let url = FileManager.default.temporaryDirectory.appendingPathComponent("zag-asc-app-\(UUID().uuidString)/Notes.app")
+		try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+		if extensions { try! FileManager.default.createDirectory(at: url.appendingPathComponent("PlugIns/Widget.appex"), withIntermediateDirectories: true) }
+		return ZagDeveloperAccountApp(url: url, originalBundleIdentifier: "com.example.notes", name: "Notes", entitlements: try! ZagEntitlementSet(entitlements))
+	}
+
+	static let iPhone = ZagTargetDevice(udid: "00008110-000A1B2C3D4E5F60", name: "Test iPhone")
+
+	static func serviceWiring() async {
+		let app = libraryApp()
+
+		let closed = serviceWorld()
+		check(await closed.service(gate: .production).install(app, on: iPhone) == .failed(.disabled) && closed.asc.requestCount == 0,
+			  "wiring: with the gate closed nothing is requested, signed or installed")
+
+		let disconnected = serviceWorld(connected: false)
+		check(await disconnected.service().install(app, on: iPhone) == .notConnected && disconnected.asc.requestCount == 0,
+			  "wiring: with no stored key it asks to connect and sends nothing")
+
+		let happy = serviceWorld()
+		let installer = CountingInstaller()
+		if case .installed(let record) = await happy.service(installer: installer).install(app, on: iPhone) {
+			check(record.bundleIdentifier == "com.example.notes.\(teamID)" && installer.installs == 1, "wiring: stored key → ASC → provisioner → signer → installer installs and verifies")
+		} else { check(false, "wiring: the happy path installs") }
+		check(happy.stored?.provisioningVerifiedAt == fixedNow, "wiring: the first successful write marks provisioning verified")
+		check(happy.asc.tokenProblems.isEmpty && happy.asc.schemaProblems.isEmpty, "wiring: every request is signed with the stored key and well-formed")
+		let writes = happy.asc.requestLog.filter { !$0.hasPrefix("GET") }.count
+		if case .installed = await happy.service(installer: installer).install(app, on: iPhone) {} else { check(false, "wiring: a refresh installs") }
+		check(happy.asc.requestLog.filter { !$0.hasPrefix("GET") }.count == writes && installer.installs == 2, "wiring: a refresh writes nothing to Apple")
+
+		// Verification needs a write; a run that only reuses resources proves nothing new.
+		let reused = serviceWorld()
+		_ = await reused.service().install(app, on: iPhone)
+		var unverified = reused.credential
+		unverified.provisioningVerifiedAt = nil
+		try! reused.store.save(unverified, account: reused.account)
+		_ = await reused.service().install(app, on: iPhone)
+		check(reused.stored?.provisioningVerifiedAt == nil, "wiring: a run with no writes never claims provisioning is verified")
+
+		let readOnly = serviceWorld()
+		readOnly.asc.readOnlyKey = true
+		check(await readOnly.service().install(app, on: iPhone) == .failed(.provisioning(.sessionRejected)) && readOnly.stored?.provisioningVerifiedAt == nil,
+			  "wiring: a key that may read but not write fails, and stays unverified")
+
+		let unsigned = serviceWorld()
+		let noInstall = CountingInstaller()
+		check(await unsigned.service(signer: StubSigner(fails: true, now: fixedNow), installer: noInstall).install(app, on: iPhone) == .failed(.signing)
+			  && noInstall.installs == 0, "wiring: a signing failure installs nothing")
+		check(unsigned.stored?.provisioningVerifiedAt != nil, "wiring: provisioning that succeeded before the signing failure still counts")
+
+		let refused = serviceWorld()
+		check(await refused.service(installer: FailingInstaller()).install(app, on: iPhone) == .failed(.install), "wiring: an installation failure is reported")
+
+		let blind = serviceWorld()
+		if case .installedUnverified = await blind.service(installer: CountingInstaller(verification: .unverifiable("no readback"))).install(app, on: iPhone) {} else {
+			check(false, "wiring: an install the device cannot confirm is never reported as verified")
+		}
+
+		let revoked = serviceWorld()
+		revoked.asc.revoked = true
+		let revokedOutcome = await revoked.service().install(app, on: iPhone)
+		check(revokedOutcome == .failed(.provisioning(.sessionRejected)) && ZagDeveloperAccountInstallModel.message(for: revokedOutcome).contains("revoked"),
+			  "wiring: a revoked key is reported as possibly revoked")
+
+		let interrupted = serviceWorld()
+		interrupted.asc.failNext("POST /v1/profiles") { withUnsafeCurrentTask { $0?.cancel() }; throw CancellationError() }
+		let cancelInstaller = CountingInstaller()
+		let cancelled = await Task { await interrupted.service(installer: cancelInstaller).install(app, on: iPhone) }.value
+		check(cancelled == .failed(.cancelled) && cancelInstaller.installs == 0, "wiring: cancelling stops before signing and installs nothing")
+		if case .installed = await interrupted.service(installer: cancelInstaller).install(app, on: iPhone) {} else { check(false, "wiring: the next attempt installs") }
+		check(interrupted.asc.certificates.count == 1, "wiring: the resumed attempt reuses what the cancelled one created")
+
+		let plugins = serviceWorld()
+		check(await plugins.service().install(libraryApp(extensions: true), on: iPhone) == .unsupportedApp && plugins.asc.requestCount == 0,
+			  "wiring: an app with extensions is refused before anything is created")
+		check(await plugins.service().install(libraryApp(entitlements: ["com.apple.security.application-groups": ["group.x"]]), on: iPhone) == .unsupportedApp,
+			  "wiring: an app with app groups is refused")
+
+		// Account removal: key, signing identity and Keychain keys; another account untouched.
+		let removal = serviceWorld()
+		_ = await removal.service().install(app, on: iPhone)
+		let bystander = UUID()
+		try! removal.secrets.save(Data("other".utf8), kind: .developerAPIKey, account: bystander)
+		check(((try? removal.secrets.load(.signingPrivateKey, account: removal.account, team: teamID)) ?? nil) != nil, "removal: an identity exists before removal")
+		try! removal.service().removeAccount()
+		check(removal.stored == nil && ((try? removal.secrets.load(.signingPrivateKey, account: removal.account, team: teamID)) ?? nil) == nil,
+			  "removal: the API key and the signing identity are deleted")
+		check(removal.keys.discarded == [teamID], "removal: the team's Keychain signing keys are deleted")
+		check(((try? removal.secrets.load(.developerAPIKey, account: bystander)) ?? nil) != nil, "removal: another account's data is untouched")
+		let before = removal.asc.requestCount
+		check(await removal.service().install(app, on: iPhone) == .notConnected && removal.asc.requestCount == before,
+			  "removal: after removal nothing can be provisioned")
+		check(removal.asc.certificates.count == 1 && removal.asc.devices.count == 1, "removal: nothing is changed at Apple")
+
+		// The live transport reaches App Store Connect only.
+		let live = ZagURLSessionTransport.appStoreConnect()
+		check(live.policy.allowedHosts == [ZagASCClient.host], "wiring: the live transport allows only the App Store Connect host")
+		let elsewhere = ZagHTTPRequest(url: URL(string: "https://example.com/v1/devices")!)
+		check((try? live.policy.validate(elsewhere)) == nil, "wiring: the live transport refuses any other host")
+	}
+
+	@MainActor
+	static func installModel() async {
+		let w = serviceWorld()
+		let model = ZagDeveloperAccountInstallModel(service: w.service())
+		model.start(libraryApp(), on: nil)
+		check(model.phase == .finished("Pair this iPhone first (Settings › Pairing).", succeeded: false), "install model: an unpaired iPhone is asked to pair")
+
+		model.start(libraryApp(), on: iPhone)
+		check(model.isRunning, "install model: an install runs")
+		await model.wait()
+		if case .finished(let message, true) = model.phase { check(message.hasPrefix("Installed and verified"), "install model: success is reported") }
+		else { check(false, "install model: success is reported") }
+
+		let cancelInstaller = CountingInstaller()
+		let cancelling = ZagDeveloperAccountInstallModel(service: serviceWorld().service(installer: cancelInstaller))
+		cancelling.start(libraryApp(), on: iPhone)
+		cancelling.cancel()
+		await cancelling.wait()
+		if case .finished(let message, false) = cancelling.phase {
+			check(message.hasPrefix("Cancelled") && cancelInstaller.installs == 0, "install model: Cancel stops the install and nothing is installed")
+		} else { check(false, "install model: Cancel is reported") }
+	}
+
+	@MainActor
+	static func onboardingRemoval() async {
+		let w = serviceWorld()
+		_ = await w.service().install(libraryApp(), on: iPhone)
+		let model = ZagDeveloperAccountOnboardingModel(account: w.account, store: w.store, gate: .testingOpen,
+													   makeClient: { w.service().client(for: $0) }, removeAll: { try w.service().removeAccount() })
+		model.restore()
+		check(model.phase == .provisioningVerified(keyID: keyID) && model.methodStatus == .provisioningVerified(keyID: keyID),
+			  "onboarding: after a successful write the screen shows provisioning verified")
+		model.removeAccount()
+		check(model.phase == .idle && w.stored == nil && w.keys.discarded == [teamID], "onboarding: Remove Developer Account clears the key, identity and keys")
+
+		let failing = ZagDeveloperAccountOnboardingModel(account: w.account, store: w.store, gate: .testingOpen,
+														 makeClient: { w.service().client(for: $0) }, removeAll: { throw TestFailure() })
+		failing.removeAccount()
+		check({ if case .failed = failing.phase { return true }; return false }(), "onboarding: a failed removal is reported, not hidden")
 	}
 
 	// MARK: - The real signing adapter accepts the developer-account authorisation
@@ -772,7 +1006,7 @@ struct StubInstaller: ZagFreeAccountInstaller {
 final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 	struct Device { let id: String; let udid: String; let name: String; var status: String }
 	struct Certificate { let id: String; let serial: String }
-	struct Profile { let id: String; let bundleID: String; let certificateIDs: [String]; let deviceIDs: [String] }
+	struct Profile { let id: String; let name: String; let bundleID: String; let certificateIDs: [String]; let deviceIDs: [String]; let expires: Date; var state: String }
 
 	private let lock = NSLock()
 	let teamID: String, keyID: String, issuerID: String
@@ -780,6 +1014,11 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 	let now: Date
 	var certificateLimit = 2
 	var revoked = false
+	/// A key that may read but not write (e.g. a Developer-role key): every
+	/// write is 403.
+	var readOnlyKey = false
+	/// How long new profiles last (development profiles: a year).
+	var profileLifetime: TimeInterval = 365 * 86_400
 	private(set) var devices: [Device] = []
 	private(set) var bundleIDs: [(id: String, identifier: String)] = []
 	private(set) var certificates: [Certificate] = []
@@ -799,6 +1038,8 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 	func failNext(_ prefix: String, _ action: @escaping @Sendable () throws -> ZagHTTPResponse) { failures.append((prefix, action)) }
 	func seedBundleIDs(_ identifiers: [String]) { for id in identifiers { bundleIDs.append((next("BID"), id)) } }
 	func seedDevice(udid: String, status: String) { devices.append(Device(id: next("DEV"), udid: udid, name: "Old", status: status)) }
+	func invalidateProfiles() { for index in profiles.indices { profiles[index].state = "INVALID" } }
+	var activeProfiles: [Profile] { profiles.filter { $0.state == "ACTIVE" } }
 
 	private func next(_ prefix: String) -> String { serial += 1; return "\(prefix)\(serial)" }
 
@@ -812,6 +1053,7 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 		guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
 			  let uuid = object["uuid"] as? String, let team = object["team"] as? String, let bundle = object["bundle"] as? String,
 			  let serials = object["serials"] as? [String], let udids = object["udids"] as? [String] else { throw ZagPortalError.malformedResponse }
+		let expires = (object["expires"] as? Double).map(Date.init(timeIntervalSince1970:)) ?? Tests.fixedNow + 365 * 86_400
 		let entitlements: [String: Any] = [
 			ZagFreeAccountEntitlements.applicationIdentifierKey: "\(team).\(bundle)",
 			"com.apple.developer.team-identifier": team,
@@ -819,11 +1061,49 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 		]
 		return ZagIssuedProfile(uuid: uuid, teamIdentifier: team, bundleIdentifier: bundle, certificateSerials: serials, deviceUDIDs: udids,
 								entitlements: try ZagEntitlementSet(entitlements), createdAt: Tests.fixedNow,
-								expiresAt: Tests.fixedNow + 365 * 86_400, data: data)
+								expiresAt: expires, data: data)
 	}
 
 	func send(_ request: ZagHTTPRequest) async throws -> ZagHTTPResponse {
-		try lock.withLock { try handle(request) }
+		try lock.withLock {
+			let response = Self.withLinks(try handle(request), path: request.url.path)
+			Self.dump(request, response)
+			return response
+		}
+	}
+
+	/// Adds the `links` members Apple's documents mark as required (the
+	/// client ignores them), so mock responses keep Apple's documented shape.
+	private static func withLinks(_ response: ZagHTTPResponse, path: String) -> ZagHTTPResponse {
+		guard (200..<300).contains(response.statusCode),
+			  var object = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any], let data = object["data"] else { return response }
+		let base = "https://" + ZagASCClient.host
+		func linked(_ resource: Any) -> Any {
+			guard var resource = resource as? [String: Any], let type = resource["type"] as? String, let id = resource["id"] as? String else { return resource }
+			resource["links"] = ["self": "\(base)/v1/\(type)/\(id)"]
+			return resource
+		}
+		object["data"] = (data as? [Any]).map { $0.map(linked) } ?? linked(data)
+		object["links"] = ["self": base + path]
+		return ZagHTTPResponse(statusCode: response.statusCode, headers: response.headers, body: try! JSONSerialization.data(withJSONObject: object))
+	}
+
+	/// With ZAG_ASC_REQUEST_DUMP set, each exchange is appended as a JSON line
+	/// for validation against Apple's published OpenAPI document (the runner's
+	/// optional step). The token is never written.
+	private static func dump(_ request: ZagHTTPRequest, _ response: ZagHTTPResponse) {
+		guard let path = ProcessInfo.processInfo.environment["ZAG_ASC_REQUEST_DUMP"] else { return }
+		let query = (URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { [$0.name, $0.value ?? ""] }
+		let line: [String: Any] = [
+			"method": request.method, "path": request.url.path, "query": query,
+			"body": request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
+			"status": response.statusCode,
+			"response": (try? JSONSerialization.jsonObject(with: response.body)) ?? NSNull()
+		]
+		guard var data = try? JSONSerialization.data(withJSONObject: line) else { return }
+		data.append(0x0A)
+		if let handle = FileHandle(forWritingAtPath: path) { handle.seekToEndOfFile(); handle.write(data); handle.closeFile() }
+		else { FileManager.default.createFile(atPath: path, contents: data) }
 	}
 
 	private func handle(_ request: ZagHTTPRequest) throws -> ZagHTTPResponse {
@@ -837,6 +1117,7 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 			return try failures.remove(at: index).action()
 		}
 		if revoked { return Self.reply(401, ["errors": [["status": "401", "code": "NOT_AUTHORIZED"]]]) }
+		if readOnlyKey, request.method != "GET" { return Self.reply(403, ["errors": [["status": "403", "code": "FORBIDDEN_ERROR"]]]) }
 
 		let query = Dictionary((URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
 		let data = (request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any])?["data"] as? [String: Any]
@@ -853,6 +1134,18 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 		}
 		func json(_ d: Device) -> [String: Any] {
 			["type": "devices", "id": d.id, "attributes": ["udid": d.udid, "name": d.name, "status": d.status, "platform": "IOS", "deviceClass": "IPHONE"]]
+		}
+		func profileJSON(_ p: Profile) -> [String: Any] {
+			let bundle = bundleIDs.first { $0.id == p.bundleID }?.identifier ?? ""
+			let content = try! JSONSerialization.data(withJSONObject: [
+				"uuid": p.id, "team": teamID, "bundle": bundle, "expires": p.expires.timeIntervalSince1970,
+				"serials": certificates.filter { p.certificateIDs.contains($0.id) }.map(\.serial),
+				"udids": devices.filter { p.deviceIDs.contains($0.id) }.map(\.udid)
+			])
+			return ["type": "profiles", "id": p.id, "attributes": [
+				"name": p.name, "platform": "IOS", "profileType": "IOS_APP_DEVELOPMENT", "profileState": p.state, "uuid": p.id,
+				"expirationDate": ISO8601DateFormatter().string(from: p.expires), "profileContent": content.base64EncodedString()
+			]]
 		}
 		func json(_ c: Certificate) -> [String: Any] {
 			["type": "certificates", "id": c.id, "attributes": ["name": "iOS Development", "certificateType": "IOS_DEVELOPMENT", "serialNumber": c.serial,
@@ -905,6 +1198,14 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 			let certificate = Certificate(id: next("CER"), serial: "SER\(certificates.count + 1)")
 			certificates.append(certificate)
 			return Self.reply(201, ["data": json(certificate)])
+		case ("GET", "/v1/profiles"):
+			if let type = query["filter[profileType]"], type != "IOS_APP_DEVELOPMENT" { return page([]) }
+			return page(profiles.filter { p in query["filter[name]"].map { $0 == p.name } ?? true }.map(profileJSON))
+		case ("DELETE", _) where path.hasPrefix("/v1/profiles/"):
+			let id = String(path.dropFirst("/v1/profiles/".count))
+			guard let index = profiles.firstIndex(where: { $0.id == id }) else { return Self.reply(404, ["errors": [["status": "404", "code": "NOT_FOUND"]]]) }
+			profiles.remove(at: index)
+			return ZagHTTPResponse(statusCode: 204, headers: [:], body: Data())
 		case ("POST", "/v1/profiles"):
 			guard expect("profiles"), attributes["profileType"] as? String == "IOS_APP_DEVELOPMENT", (attributes["name"] as? String)?.isEmpty == false,
 				  let relationships = data?["relationships"] as? [String: Any] else { return bad("profile create body") }
@@ -921,17 +1222,12 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 				  certificateIDs.allSatisfy({ id in certificates.contains { $0.id == id } }) else { return bad("profile certificates relationship") }
 			guard let deviceIDs = ids("devices", "devices", many: true),
 				  deviceIDs.allSatisfy({ id in devices.contains { $0.id == id && $0.status == "ENABLED" } }) else { return bad("profile devices relationship") }
-			let profile = Profile(id: next("PRO"), bundleID: bundleRow.id, certificateIDs: certificateIDs, deviceIDs: deviceIDs)
+			let name = attributes["name"] as! String
+			if profiles.contains(where: { $0.name == name }) { return conflict }   // assume names are unique per team (strictest case)
+			let profile = Profile(id: next("PRO"), name: name, bundleID: bundleRow.id, certificateIDs: certificateIDs, deviceIDs: deviceIDs,
+								  expires: now + profileLifetime, state: "ACTIVE")
 			profiles.append(profile)
-			let content = try! JSONSerialization.data(withJSONObject: [
-				"uuid": profile.id, "team": teamID, "bundle": bundleRow.identifier,
-				"serials": certificates.filter { certificateIDs.contains($0.id) }.map(\.serial),
-				"udids": devices.filter { deviceIDs.contains($0.id) }.map(\.udid)
-			])
-			return Self.reply(201, ["data": ["type": "profiles", "id": profile.id, "attributes": [
-				"name": attributes["name"]!, "profileType": "IOS_APP_DEVELOPMENT", "uuid": profile.id,
-				"expirationDate": "2027-11-18T09:00:00Z", "profileContent": content.base64EncodedString()
-			]]])
+			return Self.reply(201, ["data": profileJSON(profile)])
 		default:
 			return Self.reply(404, ["errors": [["status": "404"]]])
 		}
@@ -984,4 +1280,22 @@ final class NoopCodeSigner: ZagCodeSigner, @unchecked Sendable {
 	private var count = 0
 	var calls: Int { lock.withLock { count } }
 	func sign(app: URL, profile: URL, privateKey: URL, entitlements: URL, bundleIdentifier: String) throws { lock.withLock { count += 1 } }
+}
+
+struct TestFailure: Error {}
+
+/// The simulated key factory, recording which teams' keys were discarded.
+final class RecordingKeyFactory: ZagSigningKeyFactory, @unchecked Sendable {
+	private let lock = NSLock()
+	private var teams: [String] = []
+	private let base = ZagSimulatedSigningKeyFactory()
+	var discarded: [String] { lock.withLock { teams } }
+	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest) { try base.makeKey(commonName: commonName) }
+	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck { base.check(certificate: certificate, privateKey: privateKey) }
+	func discardKeys(account: UUID, team: String, except keeping: Set<String?>) throws { lock.withLock { teams.append(team) } }
+}
+
+struct FailingInstaller: ZagFreeAccountInstaller {
+	func install(signedApp: URL, bundleIdentifier: String) async throws { throw TestFailure() }
+	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification { .notInstalled }
 }

@@ -66,6 +66,15 @@ struct ZagTransportPolicy: Sendable {
 /// URLSession without cookies, cache or stored credentials. Server trust is
 /// left to the system: no delegate method overrides TLS validation. Redirects
 /// are followed only to allowed HTTPS hosts.
+extension ZagURLSessionTransport {
+	/// The developer-account method's transport: HTTPS to the App Store
+	/// Connect API host only (redirects must stay on it), the system's TLS
+	/// validation, and the shared request rules. The one place it is made.
+	static func appStoreConnect() -> ZagURLSessionTransport {
+		ZagURLSessionTransport(policy: ZagTransportPolicy(allowedHosts: [ZagASCClient.host]))
+	}
+}
+
 final class ZagURLSessionTransport: NSObject, ZagHTTPTransport, URLSessionTaskDelegate, @unchecked Sendable {
 	let policy: ZagTransportPolicy
 	private var session: URLSession!

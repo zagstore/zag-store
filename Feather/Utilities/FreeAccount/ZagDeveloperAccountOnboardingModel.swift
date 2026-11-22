@@ -3,10 +3,11 @@ import Foundation
 
 /// Presentation state for connecting a user-owned App Store Connect API key.
 ///
-/// The user imports their `.p8` file and types the Key ID and Issuer ID; the
-/// model validates the shape, mints a token and makes one read-only check that
-/// the key can reach the Provisioning endpoints, then stores the credential in
-/// the Keychain. The `.p8` text is held in a private field, never published to
+/// The user imports their `.p8` file and types the Key ID, Issuer ID and Team
+/// ID; the model validates the shape, mints a token and makes one read-only
+/// check that Apple accepts the key, then stores the credential in the
+/// Keychain. A read cannot prove the key may create anything, so the state is
+/// "credentials validated — provisioning unverified" until a write succeeds. The `.p8` text is held in a private field, never published to
 /// the view and never logged; it is cleared as soon as it is stored or the
 /// screen is dismissed.
 ///
@@ -18,7 +19,10 @@ final class ZagDeveloperAccountOnboardingModel: ObservableObject {
 	enum Phase: Equatable {
 		case idle
 		case validating
-		case connected(keyID: String, sampleTotal: Int)
+		/// The read-only check passed; provisioning rights are not proven.
+		case credentialsValidated(keyID: String, sampleTotal: Int)
+		/// A write with this key has succeeded.
+		case provisioningVerified(keyID: String)
 		/// Connected input but an unusable key (e.g. no provisioning access).
 		case needsAttention(String)
 		case failed(String)
@@ -41,20 +45,33 @@ final class ZagDeveloperAccountOnboardingModel: ObservableObject {
 	/// Builds a client for a credential (captures the transport). Tests inject
 	/// a client backed by a mock transport.
 	private let makeClient: @Sendable (ZagDeveloperAccountCredential) -> ZagASCClient
+	/// Removes the whole account from this device (key, signing identity and
+	/// its Keychain keys). Without one, removal deletes the key only.
+	private let removeAll: (@Sendable () throws -> Void)?
 
 	init(
 		account: UUID,
 		store: ZagDeveloperAccountStore,
 		gate: ZagDeveloperAccountGate = .production,
-		makeClient: @escaping @Sendable (ZagDeveloperAccountCredential) -> ZagASCClient
+		makeClient: @escaping @Sendable (ZagDeveloperAccountCredential) -> ZagASCClient,
+		removeAll: (@Sendable () throws -> Void)? = nil
 	) {
 		self.account = account
 		self.store = store
 		self.gate = gate
 		self.makeClient = makeClient
+		self.removeAll = removeAll
 	}
 
 	var hasImportedKey: Bool { privateKeyPEM != nil }
+
+	/// A credential is stored (validated, verified or not).
+	var isConnected: Bool {
+		switch phase {
+		case .credentialsValidated, .provisioningVerified: return true
+		default: return false
+		}
+	}
 
 	var canConnect: Bool {
 		!isBusy
@@ -67,9 +84,10 @@ final class ZagDeveloperAccountOnboardingModel: ObservableObject {
 	/// What the Signing Methods list should show for this method.
 	var methodStatus: ZagDeveloperAccountStatus {
 		switch phase {
-		case .idle: return store.isConnected(account: account) ? .connected(keyID: keyID) : .notConnected
+		case .idle: return store.isConnected(account: account) ? .credentialsValidated(keyID: keyID) : .notConnected
 		case .validating: return .connecting
-		case .connected(let keyID, _): return .connected(keyID: keyID)
+		case .credentialsValidated(let keyID, _): return .credentialsValidated(keyID: keyID)
+		case .provisioningVerified(let keyID): return .provisioningVerified(keyID: keyID)
 		case .needsAttention(let message): return .needsAttention(message)
 		case .failed(let message): return .needsAttention(message)
 		}
@@ -84,7 +102,9 @@ final class ZagDeveloperAccountOnboardingModel: ObservableObject {
 		keyID = credential.keyID
 		issuerID = credential.issuerID
 		teamID = credential.teamID
-		phase = .connected(keyID: credential.keyID, sampleTotal: 0)
+		phase = credential.provisioningVerifiedAt == nil
+			? .credentialsValidated(keyID: credential.keyID, sampleTotal: 0)
+			: .provisioningVerified(keyID: credential.keyID)
 	}
 
 	/// Accepts the imported `.p8` file. Validates the envelope only; the key is
@@ -137,7 +157,7 @@ final class ZagDeveloperAccountOnboardingModel: ObservableObject {
 			let connection = try await makeClient(credential).connectionCheck()
 			try store.save(credential, account: account)
 			privateKeyPEM = nil
-			phase = .connected(keyID: credential.keyID, sampleTotal: connection.sampleTotal)
+			phase = .credentialsValidated(keyID: credential.keyID, sampleTotal: connection.sampleTotal)
 		} catch let error as ZagASCError {
 			phase = Self.phase(for: error)
 		} catch {
@@ -145,9 +165,32 @@ final class ZagDeveloperAccountOnboardingModel: ObservableObject {
 		}
 	}
 
-	/// Disconnects: removes the stored credential and clears the screen.
+	/// Disconnects: removes the stored API key and clears the screen. The
+	/// signing certificate stays, so reconnecting the same team reuses it.
 	func disconnect() {
 		try? store.remove(account: account)
+		clear()
+	}
+
+	/// Removes the developer account from this device: the API key, the
+	/// signing identity and its keys. Nothing is changed at Apple.
+	func removeAccount() {
+		do {
+			if let removeAll { try removeAll() } else { try store.remove(account: account) }
+		} catch {
+			phase = .failed("Some of this account's data could not be removed from the Keychain. Try again.")
+			return
+		}
+		clear()
+	}
+
+	/// Reloads the status after an install may have verified provisioning.
+	func refreshStatus() {
+		guard isConnected else { return }
+		restore()
+	}
+
+	private func clear() {
 		privateKeyPEM = nil
 		importedKeyFileName = nil
 		keyID = ""
@@ -172,7 +215,7 @@ final class ZagDeveloperAccountOnboardingModel: ObservableObject {
 			return reason == .offline
 				? .failed("You appear to be offline. Check your connection and try again.")
 				: .failed("Zag Store could not reach App Store Connect. Try again.")
-		case .notFound, .malformedRequest, .malformedResponse, .unexpected, .conflict:
+		case .notFound, .malformedRequest, .malformedResponse, .unexpected, .conflict, .invalidRequest:
 			return .failed("App Store Connect returned something Zag Store does not understand.")
 		}
 	}

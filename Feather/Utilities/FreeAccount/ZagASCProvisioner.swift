@@ -18,6 +18,9 @@ struct ZagASCProvisioner: Sendable {
 	let secrets: ZagFreeAccountSecretStore
 	var limits: ZagTeamLimits = .forTeam(.individualPaid)
 	var now: @Sendable () -> Date = { Date() }
+	/// A profile is reused only while it stays valid this long; a refresh
+	/// closer to its expiry replaces it. Development profiles last a year.
+	var profileReuseMargin: TimeInterval = 30 * 86_400
 
 	typealias Failure = ZagProvisioningFailure
 
@@ -88,7 +91,12 @@ struct ZagASCProvisioner: Sendable {
 		var results: [ZagProvisioningResult.Component] = []
 		for component in components {
 			guard let appID = appIDs[component.bundle] else { throw Failure(kind: .unexpectedResponse, step: .profiles) }
-			let profile = try await portalCall(.profiles) { try await portal.profile(for: appID, team: team) }
+			let (profile, _) = try await portalCall(.profiles) {
+				try await portal.developmentProfile(
+					for: appID, team: team, deviceUDID: request.deviceUDID,
+					certificateSerial: identity.serialNumber, validUntil: now().addingTimeInterval(profileReuseMargin)
+				)
+			}
 			if let problem = ZagProvisioningProfileCheck.check(
 				profile, team: team, bundleIdentifier: component.bundle,
 				deviceUDID: request.deviceUDID, certificateSerial: identity.serialNumber, now: now()

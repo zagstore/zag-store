@@ -27,6 +27,10 @@ struct ZagDeveloperAccountCredential: Codable, Equatable, Sendable {
 	/// The `.p8` file's contents (PKCS #8 PEM). Sensitive: never logged or sent.
 	let privateKeyPEM: String
 	let addedAt: Date
+	/// When a write to Apple with this key first succeeded (a device, bundle
+	/// ID, certificate or profile). Until then the key's provisioning rights
+	/// are unproven: the connection check is read-only.
+	var provisioningVerifiedAt: Date?
 
 	/// The development team this credential signs for. Treated as an individual
 	/// paid membership (its provisioning limits match an organization's for the
@@ -94,7 +98,8 @@ extension ZagDeveloperAccountCredential: CustomStringConvertible, CustomDebugStr
 	var description: String { "ZagDeveloperAccountCredential(keyID: \(keyID), teamID: \(teamID), privateKey: [redacted])" }
 	var debugDescription: String { description }
 	var customMirror: Mirror {
-		Mirror(self, children: ["keyID": keyID, "issuerID": issuerID, "teamID": teamID, "privateKeyPEM": "[redacted]"], displayStyle: .struct)
+		Mirror(self, children: ["keyID": keyID, "issuerID": issuerID, "teamID": teamID, "privateKeyPEM": "[redacted]",
+								"provisioningVerifiedAt": provisioningVerifiedAt as Any], displayStyle: .struct)
 	}
 }
 
@@ -125,6 +130,14 @@ struct ZagDeveloperAccountStore: Sendable {
 		try secrets.delete(.developerAPIKey, account: account)
 	}
 
+	/// Records that a write with this key succeeded (once; later calls keep
+	/// the first date).
+	func markProvisioningVerified(account: UUID, at date: Date) throws {
+		guard var credential = try load(account: account), credential.provisioningVerifiedAt == nil else { return }
+		credential.provisioningVerifiedAt = date
+		try save(credential, account: account)
+	}
+
 	func isConnected(account: UUID) -> Bool {
 		((try? secrets.load(.developerAPIKey, account: account)) ?? nil) != nil
 	}
@@ -137,11 +150,18 @@ struct ZagDeveloperAccountStore: Sendable {
 enum ZagDeveloperAccountStatus: Equatable, Sendable {
 	case notConnected
 	case connecting
-	case connected(keyID: String)
+	/// The key signed a read that Apple accepted. Whether it may create
+	/// certificates, devices, bundle IDs and profiles is not yet known.
+	case credentialsValidated(keyID: String)
+	/// A write with this key has succeeded: it can provision.
+	case provisioningVerified(keyID: String)
 	/// Connected input, but the key cannot be used as is (e.g. it lacks
 	/// Certificates, Identifiers & Profiles access). The string is shown to
 	/// the user.
 	case needsAttention(String)
+
+	/// Shown until a write proves the key can provision.
+	static let credentialsValidatedText = "Credentials validated — provisioning unverified"
 }
 
 // MARK: - Gate

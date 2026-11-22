@@ -58,9 +58,21 @@ enum ZagSigningMethodAvailability {
 	static let freeAccountEnabled = false
 
 	/// Developer Account (App Store Connect API) signing is not listed until
-	/// its milestones (ASC_API_ARCHITECTURE.md) are built and validated against
-	/// Apple. Milestone 1 is onboarding, a token and a client, offline only.
+	/// its milestones (ASC_API_ARCHITECTURE.md) are validated against Apple
+	/// with a real paid account and device. Builds that open it for a live
+	/// test also need ZAG_ZSIGN_STRICT (Keychain-key signing).
+	///
+	/// Only a live-test build (ZAG_DEVELOPER_ACCOUNT_LIVE_TEST, which requires
+	/// ZAG_ZSIGN_STRICT) opens it; every other build, Release included, has it
+	/// closed, and the optimiser removes the method's live path entirely.
+	#if ZAG_DEVELOPER_ACCOUNT_LIVE_TEST
+	#if !ZAG_ZSIGN_STRICT
+	#error("ZAG_DEVELOPER_ACCOUNT_LIVE_TEST needs ZAG_ZSIGN_STRICT: developer-account keys stay in the Keychain")
+	#endif
+	static let developerAccountEnabled = true
+	#else
 	static let developerAccountEnabled = false
+	#endif
 
 	/// Methods to list, in display order.
 	static func listedMethods(
@@ -91,7 +103,8 @@ enum ZagSigningMethodAvailability {
 			switch developerAccount {
 			case .notConnected: return .actionRequired("Add your App Store Connect API key")
 			case .connecting: return .actionRequired("Connecting…")
-			case .connected(let keyID): return .ready(detail: "Key \(keyID)")
+			case .credentialsValidated: return .ready(detail: ZagDeveloperAccountStatus.credentialsValidatedText)
+			case .provisioningVerified(let keyID): return .ready(detail: "Key \(keyID) · Provisioning verified")
 			case .needsAttention(let message): return .actionRequired(message)
 			}
 		case .importedCertificate:

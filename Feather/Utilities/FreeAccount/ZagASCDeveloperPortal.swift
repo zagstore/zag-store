@@ -13,7 +13,24 @@ import Foundation
 /// App Store Connect portal only. The free-account portal does not conform, so
 /// a free account's certificate requests can never bypass the free-account
 /// provisioner and its certificate budget (G5 T11).
-protocol ZagASCProvisioningPortal: ZagDeveloperPortalService {}
+protocol ZagASCProvisioningPortal: ZagDeveloperPortalService {
+	/// A development profile for `appID` that names `deviceUDID` and the
+	/// certificate `certificateSerial` and is valid until at least
+	/// `validUntil`: the existing Zag Store profile when it qualifies (no
+	/// write), otherwise a new one that replaces it. `created` says which.
+	func developmentProfile(
+		for appID: ZagRegisteredAppID, team: String, deviceUDID: String, certificateSerial: String, validUntil: Date
+	) async throws -> (profile: ZagIssuedProfile, created: Bool)
+}
+
+extension ZagASCProvisioningPortal {
+	/// Portals that cannot list profiles cut a new one each time.
+	func developmentProfile(
+		for appID: ZagRegisteredAppID, team: String, deviceUDID: String, certificateSerial: String, validUntil: Date
+	) async throws -> (profile: ZagIssuedProfile, created: Bool) {
+		(try await profile(for: appID, team: team), true)
+	}
+}
 
 struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 	let client: ZagASCClient
@@ -118,6 +135,36 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 
 	// MARK: Profiles
 
+	/// Zag Store keeps one development profile per App ID, under a fixed name,
+	/// so a refresh can find it again instead of adding another.
+	static func profileName(for bundleIdentifier: String) -> String { "Zag Store \(bundleIdentifier)" }
+
+	func developmentProfile(
+		for appID: ZagRegisteredAppID, team: String, deviceUDID: String, certificateSerial: String, validUntil: Date
+	) async throws -> (profile: ZagIssuedProfile, created: Bool) {
+		let name = Self.profileName(for: appID.bundleIdentifier)
+		let (listed, _) = try await mapping {
+			try await client.list(.profiles, as: ZagASCProfile.self, filters: ["name": name, "profileType": "IOS_APP_DEVELOPMENT"])
+		}
+		// Apple's name filter is not documented as exact; only ours count.
+		let ours = listed.filter { $0.attributes?.name == name }
+		for record in ours where record.attributes?.profileState == "ACTIVE" {
+			guard let profile = try? decodedProfile(record.attributes) else { continue }
+			let problem = ZagProvisioningProfileCheck.check(
+				profile, team: team, bundleIdentifier: appID.bundleIdentifier,
+				deviceUDID: deviceUDID, certificateSerial: certificateSerial, now: client.now()
+			)
+			if problem == nil, profile.expiresAt >= validUntil { return (profile, false) }
+		}
+		// None qualifies (new device or certificate, expiring, or invalid):
+		// replace ours, so the App ID still has exactly one Zag Store profile.
+		// Apps already installed keep the profile embedded in them.
+		for record in ours {
+			try await mapping { try await client.delete(.profiles, id: record.id) }
+		}
+		return (try await profile(for: appID, team: team), true)
+	}
+
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
 		guard let bundleIDRecordID = try await bundleIDRecordID(appID.bundleIdentifier) else { throw ZagPortalError.malformedResponse }
 		let certificateIDs = try await mapping {
@@ -128,7 +175,7 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 		}
 		guard !certificateIDs.isEmpty, !deviceIDs.isEmpty else { throw ZagPortalError.malformedResponse }
 
-		let name = "Zag Store \(appID.bundleIdentifier) \(Int(client.now().timeIntervalSince1970))"
+		let name = Self.profileName(for: appID.bundleIdentifier)
 		let relationships: [String: Any] = [
 			"bundleId": ["data": ["type": "bundleIds", "id": bundleIDRecordID]],
 			"certificates": ["data": certificateIDs.map { ["type": "certificates", "id": $0] }],
@@ -142,7 +189,11 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 				as: ZagASCProfile.self
 			)
 		}
-		guard let content = record.attributes?.profileContent,
+		return try decodedProfile(record.attributes)
+	}
+
+	private func decodedProfile(_ attributes: ZagASCProfile?) throws -> ZagIssuedProfile {
+		guard let content = attributes?.profileContent,
 			  let data = Data(base64Encoded: content, options: .ignoreUnknownCharacters), !data.isEmpty else {
 			throw ZagPortalError.malformedResponse
 		}

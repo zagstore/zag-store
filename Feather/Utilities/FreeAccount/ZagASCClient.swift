@@ -30,6 +30,9 @@ enum ZagASCError: Error, Equatable, Sendable {
 	/// 409: the resource conflicts with an existing one (e.g. an identifier
 	/// another team owns, or one that already exists), with Apple's code.
 	case conflict(code: String?)
+	/// 400 or 422: Apple rejected the request's content (Apple's documented
+	/// validation errors), with Apple's code.
+	case invalidRequest(code: String?)
 	/// 429: Apple is rate-limiting this key.
 	case rateLimited
 	case server(status: Int)
@@ -78,6 +81,8 @@ struct ZagASCProfile: Decodable, Sendable, Equatable {
 	let profileType: String?
 	let uuid: String?
 	let expirationDate: String?
+	/// `ACTIVE` or `INVALID` (e.g. its certificate was revoked).
+	let profileState: String?
 	/// Base64 of the signed `.mobileprovision`.
 	let profileContent: String?
 }
@@ -113,6 +118,10 @@ struct ZagASCClient: Sendable {
 	/// The clock and lifetime used to mint each request's token.
 	var now: @Sendable () -> Date = { Date() }
 	var tokenLifetime: TimeInterval = 10 * 60
+	/// Called after each successful write (POST, PATCH, DELETE). It is how the
+	/// developer-account method establishes that the key can really provision
+	/// (a read-only check cannot), never with any request data.
+	var writeObserver: (@Sendable () -> Void)?
 
 	private struct Collection<Attributes: Decodable & Sendable>: Decodable {
 		struct Meta: Decodable { struct Paging: Decodable { let total: Int? }; let paging: Paging? }
@@ -188,7 +197,7 @@ struct ZagASCClient: Sendable {
 		attributes: [String: Any],
 		as _: Attributes.Type
 	) async throws -> ZagASCRecord<Attributes> {
-		guard !id.isEmpty, id.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || $0 == "-" }),
+		guard Self.isValidID(id),
 			  let body = try? JSONSerialization.data(withJSONObject: ["data": ["type": resource.type, "id": id, "attributes": attributes]]) else {
 			throw ZagASCError.malformedRequest
 		}
@@ -199,6 +208,17 @@ struct ZagASCClient: Sendable {
 		return single.data
 	}
 
+	/// Deletes a resource (`DELETE`, 204). A resource that is already gone is
+	/// not an error.
+	func delete(_ resource: ZagASCResource, id: String) async throws {
+		guard Self.isValidID(id) else { throw ZagASCError.malformedRequest }
+		do {
+			_ = try await perform(method: "DELETE", path: resource.rawValue + "/" + id)
+		} catch ZagASCError.notFound {
+			return
+		}
+	}
+
 	/// Wraps a DER certificate signing request as the PEM text ASC expects for
 	/// `csrContent`.
 	static func pemCSR(_ der: Data) -> String {
@@ -207,6 +227,11 @@ struct ZagASCClient: Sendable {
 	}
 
 	// MARK: Internals
+
+	/// ASC resource IDs are opaque but path-safe: letters, digits and dashes.
+	static func isValidID(_ id: String) -> Bool {
+		!id.isEmpty && id.count <= 64 && id.unicodeScalars.allSatisfy { ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0) || $0 == "-" }
+	}
 
 	private func perform(method: String, path: String, query: [URLQueryItem] = [], body: Data? = nil) async throws -> ZagHTTPResponse {
 		let token: String
@@ -245,7 +270,10 @@ struct ZagASCClient: Sendable {
 		}
 		switch response.statusCode {
 		case 200..<300:
+			if method != "GET" { writeObserver?() }
 			return response
+		case 400, 422:
+			throw ZagASCError.invalidRequest(code: Self.code(response.body))
 		case 401:
 			throw ZagASCError.unauthorized
 		case 403:
