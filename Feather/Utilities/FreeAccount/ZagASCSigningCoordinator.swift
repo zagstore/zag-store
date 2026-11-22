@@ -29,6 +29,10 @@ enum ZagASCSigningError: Equatable, Sendable {
 	case notVerified
 	/// The task was cancelled; the next run resumes from what was created.
 	case cancelled
+	/// Both Zag Store profile names for the app are held by profiles that
+	/// still work, and Apple refused a replacement beside them. Nothing was
+	/// deleted; removing one of them at Apple lets the next attempt proceed.
+	case profileReplacementBlocked(profileNames: [String])
 }
 
 struct ZagASCSigningCoordinator: Sendable {
@@ -68,10 +72,13 @@ struct ZagASCSigningCoordinator: Sendable {
 			installedFreeAccountApps: []
 		)
 		let result: ZagProvisioningResult
-		switch await provisioner.provision(request) {
+		switch await provisioner.provisionForSigning(request) {
 		case .success(let value): result = value
-		case .failure(let failure):
-			return .failed(failure.kind == .cancelled || Task.isCancelled ? .cancelled : .provisioning(failure.kind))
+		case .failure(let blocked as ZagASCProfileReplacementBlocked):
+			return .failed(Task.isCancelled ? .cancelled : .profileReplacementBlocked(profileNames: blocked.profileNames))
+		case .failure(let error):
+			let kind = (error as? ZagProvisioningFailure)?.kind ?? .unexpectedResponse
+			return .failed(kind == .cancelled || Task.isCancelled ? .cancelled : .provisioning(kind))
 		}
 		if Task.isCancelled { return .failed(.cancelled) }
 		guard let identity = loadIdentity(account: account, team: team.identifier) else { return .failed(.noIdentity) }

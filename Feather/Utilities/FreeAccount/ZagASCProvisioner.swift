@@ -25,8 +25,17 @@ struct ZagASCProvisioner: Sendable {
 	typealias Failure = ZagProvisioningFailure
 
 	func provision(_ request: ZagProvisioningRequest) async -> Result<ZagProvisioningResult, Failure> {
+		await provisionForSigning(request).mapError { error in
+			error as? Failure ?? Failure(kind: .unexpectedResponse, step: .profiles)
+		}
+	}
+
+	/// As `provision`, but a blocked profile replacement stays its own
+	/// error (`ZagASCProfileReplacementBlocked`), so it can be explained.
+	func provisionForSigning(_ request: ZagProvisioningRequest) async -> Result<ZagProvisioningResult, Error> {
 		do { return .success(try await run(request)) }
 		catch let failure as Failure { return .failure(failure) }
+		catch let blocked as ZagASCProfileReplacementBlocked { return .failure(blocked) }
 		catch { return .failure(Failure(kind: ZagFreeAccountProvisioner.kind(for: error), step: .request)) }
 	}
 
@@ -203,6 +212,8 @@ struct ZagASCProvisioner: Sendable {
 			return try await body()
 		} catch let failure as Failure {
 			throw failure
+		} catch let blocked as ZagASCProfileReplacementBlocked {
+			throw blocked
 		} catch let portal as ZagPortalError {
 			switch portal {
 			case .identifierUnavailable, .certificateLimitReached: throw portal

@@ -32,6 +32,14 @@ extension ZagASCProvisioningPortal {
 	}
 }
 
+/// Both of an App ID's Zag Store profile names are held by profiles that can
+/// still sign, and Apple refused a replacement alongside them. Nothing was
+/// deleted. Recoverable: removing one of the named profiles at Apple frees a
+/// name for the next attempt.
+struct ZagASCProfileReplacementBlocked: Error, Equatable, Sendable {
+	let profileNames: [String]
+}
+
 struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 	let client: ZagASCClient
 	/// Decodes a downloaded `.mobileprovision` into the checked profile. The
@@ -157,8 +165,9 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 		let ours = listed.filter { names.contains($0.attributes?.name ?? "") }
 		var usable: [ZagIssuedProfile?] = []
 		for record in ours {
+			// Usable: active, readable and unexpired, so it can still sign.
 			let profile = record.attributes?.profileState == "ACTIVE" ? try? decodedProfile(record.attributes) : nil
-			usable.append(profile)
+			usable.append(profile.flatMap { $0.expiresAt > client.now() ? $0 : nil })
 			guard let profile else { continue }
 			let problem = ZagProvisioningProfileCheck.check(
 				profile, team: team, bundleIdentifier: appID.bundleIdentifier,
@@ -167,36 +176,44 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 			if problem == nil, profile.expiresAt >= validUntil { return (profile, false) }
 		}
 		// None qualifies (new device or certificate, expiring, or invalid).
-		// Create the replacement under a free name first. Only when both names
-		// are taken (an earlier cleanup did not finish) is one removed first:
-		// the one least useful now (invalid, else expiring soonest).
+		// A usable profile is never deleted before its replacement exists.
 		let taken = Set(ours.compactMap { $0.attributes?.name })
-		let slot: String
+		let replacement: ZagIssuedProfile
+		let replacementID: String
 		if let free = names.first(where: { !taken.contains($0) }) {
-			slot = free
+			(replacement, replacementID) = try await createProfile(for: appID, name: free)
+		} else if let unusable = zip(ours, usable).first(where: { $0.1 == nil })?.0 {
+			// Both names taken (an earlier cleanup did not finish), one by a
+			// profile that can no longer sign: removing it first loses nothing.
+			try await mapping { try await client.delete(.profiles, id: unusable.id) }
+			(replacement, replacementID) = try await createProfile(for: appID, name: unusable.attributes?.name ?? names[0])
 		} else {
-			let worst = zip(ours, usable).min { a, b in
-				(a.1?.expiresAt ?? .distantPast) < (b.1?.expiresAt ?? .distantPast)
-			}!.0
-			slot = worst.attributes?.name ?? names[0]
-			for record in ours where record.attributes?.name == slot {
-				try await mapping { try await client.delete(.profiles, id: record.id) }
-			}
+			// Both names taken by usable profiles. Try the create with nothing
+			// deleted (under the older one's name, which Apple may allow); if
+			// Apple refuses, both stay and the user is told how to recover.
+			let older = zip(ours, usable).min { ($0.1?.expiresAt ?? .distantPast) < ($1.1?.expiresAt ?? .distantPast) }!.0
+			(replacement, replacementID) = try await createProfile(
+				for: appID, name: older.attributes?.name ?? names[0],
+				refused: ZagASCProfileReplacementBlocked(profileNames: names)
+			)
 		}
-		let replacement = try await createProfile(for: appID, name: slot)
 		// Then remove the superseded ones. The replacement already exists, so
 		// a failure here is left for the next replacement to tidy.
-		for record in ours where record.attributes?.name != slot {
+		for record in ours where record.id != replacementID {
 			try? await client.delete(.profiles, id: record.id)
 		}
 		return (replacement, true)
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
-		try await createProfile(for: appID, name: Self.profileName(for: appID.bundleIdentifier))
+		try await createProfile(for: appID, name: Self.profileName(for: appID.bundleIdentifier)).profile
 	}
 
-	private func createProfile(for appID: ZagRegisteredAppID, name: String) async throws -> ZagIssuedProfile {
+	/// Creates a profile named `name`. With `refused`, Apple rejecting the
+	/// request itself (409, 400/422) throws that error instead.
+	private func createProfile(
+		for appID: ZagRegisteredAppID, name: String, refused: Error? = nil
+	) async throws -> (profile: ZagIssuedProfile, id: String) {
 		guard let bundleIDRecordID = try await bundleIDRecordID(appID.bundleIdentifier) else { throw ZagPortalError.malformedResponse }
 		let certificateIDs = try await mapping {
 			try await client.list(.certificates, as: ZagASCCertificate.self, filters: ["certificateType": "IOS_DEVELOPMENT"]).records.map(\.id)
@@ -211,15 +228,22 @@ struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 			"certificates": ["data": certificateIDs.map { ["type": "certificates", "id": $0] }],
 			"devices": ["data": deviceIDs.map { ["type": "devices", "id": $0] }]
 		]
-		let record = try await mapping {
-			try await client.create(
+		let record: ZagASCRecord<ZagASCProfile>
+		do {
+			record = try await client.create(
 				.profiles,
 				attributes: ["name": name, "profileType": "IOS_APP_DEVELOPMENT"],
 				relationships: relationships,
 				as: ZagASCProfile.self
 			)
+		} catch ZagASCError.conflict where refused != nil {
+			throw refused!
+		} catch ZagASCError.invalidRequest where refused != nil {
+			throw refused!
+		} catch {
+			throw Self.portalError(error)
 		}
-		return try decodedProfile(record.attributes)
+		return (try decodedProfile(record.attributes), record.id)
 	}
 
 	private func decodedProfile(_ attributes: ZagASCProfile?) throws -> ZagIssuedProfile {

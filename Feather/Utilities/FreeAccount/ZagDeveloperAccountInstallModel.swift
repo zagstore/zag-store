@@ -83,6 +83,9 @@ final class ZagDeveloperAccountInstallModel: ObservableObject {
 		case .signing: return "The app could not be signed."
 		case .install: return "The device did not accept the app. Check that it is paired, unlocked and in Developer Mode."
 		case .notVerified: return "The app was installed, but the device reports a different profile. Try again."
+		case .profileReplacementBlocked(let names):
+			return "Apple would not create a new profile while both of Zag Store's profiles for this app still exist. Nothing was deleted. "
+				+ "Remove one of them (\(names.joined(separator: " or "))) under Profiles in the Apple Developer website, then try again."
 		case .provisioning(let kind):
 			switch kind {
 			case .sessionRejected:

@@ -696,8 +696,71 @@ import Foundation
 		sticky.asc.invalidateProfiles()
 		check(await run(sticky) != nil && sticky.asc.profiles.count == 1 && sticky.asc.activeProfiles.count == 1,
 			  "profiles: with both names taken, one is replaced and the other removed; never more than two")
+		await bothSlotsOccupied()
 		check(interrupted.asc.schemaProblems.isEmpty && interrupted.asc.tokenProblems.isEmpty && sticky.asc.schemaProblems.isEmpty,
 			  "profiles: list and delete requests match the schema and are signed")
+	}
+
+	/// Both profile names held by usable profiles (an earlier cleanup failed),
+	/// then a refresh that needs a new profile (another device).
+	static func bothSlotsOccupied() async {
+		let other = ZagTargetDevice(udid: "00008030-SECONDDEVICE0000", name: "Second iPhone")
+		let app = libraryApp()
+		func occupied() async -> (ServiceWorld, [String]) {
+			let w = serviceWorld()
+			w.asc.profileLifetime = 10 * 86_400
+			_ = await w.service().install(app, on: iPhone)
+			w.asc.profileLifetime = 365 * 86_400
+			w.asc.failNext("DELETE /v1/profiles/") { MockASC.reply(500, ["errors": [["status": "500"]]]) }
+			_ = await w.service().install(app, on: iPhone)
+			return (w, w.asc.profiles.map(\.id).sorted())
+		}
+		let names = ZagASCDeveloperPortal.profileNames(for: "com.example.notes.\(teamID)")
+
+		// Apple refuses the replacement (names unique): nothing deleted, clear error.
+		let (refused, before) = await occupied()
+		check(before.count == 2 && refused.asc.activeProfiles.count == 2, "both slots: set up with two usable Zag Store profiles")
+		let deletes = refused.asc.count("DELETE")
+		let outcome = await refused.service().install(app, on: other)
+		check(outcome == .failed(.profileReplacementBlocked(profileNames: names)),
+			  "both slots: a refused replacement is reported as a recoverable blocked replacement")
+		check(refused.asc.profiles.map(\.id).sorted() == before && refused.asc.count("DELETE") == deletes,
+			  "both slots: when Apple cannot create the replacement, neither usable profile is deleted")
+		let message = ZagDeveloperAccountInstallModel.message(for: outcome)
+		check(message.contains("Nothing was deleted") && message.contains(names[0]) && message.contains(names[1]),
+			  "both slots: the message names both profiles and how to recover")
+		check(refused.stored?.provisioningVerifiedAt != nil, "both slots: earlier verified provisioning is unaffected")
+
+		// Any other create failure: also nothing deleted, reported as before.
+		let (failing, kept) = await occupied()
+		failing.asc.failNext("POST /v1/profiles") { MockASC.reply(500, ["errors": [["status": "500"]]]) }
+		check(await failing.service().install(app, on: other) == .failed(.provisioning(.unexpectedResponse))
+			  && failing.asc.profiles.map(\.id).sorted() == kept, "both slots: a failed create (500) deletes nothing")
+
+		// Recovery: the user removes one at Apple; the next attempt replaces both.
+		let (recovered, _) = await occupied()
+		_ = await recovered.service().install(app, on: other)
+		recovered.asc.removeProfileAtApple(recovered.asc.profiles[0].id)
+		if case .installed = await recovered.service().install(app, on: other) {} else { check(false, "both slots: installs after one is removed at Apple") }
+		check(recovered.asc.profiles.count == 1 && recovered.asc.profiles[0].deviceIDs.count == 2,
+			  "both slots: after the user frees a name, one profile naming both devices remains")
+
+		// Apple allows duplicate names: replaced without deleting first.
+		let (duplicates, _) = await occupied()
+		duplicates.asc.uniqueProfileNames = false
+		if case .installed = await duplicates.service().install(app, on: other) {} else { check(false, "both slots: replaced when Apple allows the name") }
+		check(duplicates.asc.profiles.count == 1 && duplicates.asc.profiles[0].deviceIDs.count == 2, "both slots: then the superseded two are removed")
+
+		// One of the two can no longer sign: only that one is removed first,
+		// and a failed create still leaves the usable one.
+		let (mixed, ids) = await occupied()
+		mixed.asc.setProfileState(ids[0], "INVALID")
+		mixed.asc.failNext("POST /v1/profiles") { MockASC.reply(500, ["errors": [["status": "500"]]]) }
+		_ = await mixed.service().install(app, on: other)
+		check(mixed.asc.profiles.map(\.id) == [ids[1]] && mixed.asc.activeProfiles.count == 1,
+			  "both slots: only an unusable profile is removed before the create; the usable one survives a failed create")
+		if case .installed = await mixed.service().install(app, on: other) {} else { check(false, "both slots: the next attempt installs") }
+		check(mixed.asc.profiles.count == 1 && mixed.asc.profiles[0].deviceIDs.count == 2, "both slots: and leaves one profile")
 	}
 
 	// MARK: - The app wiring: service, models, removal
@@ -1124,6 +1187,12 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 	func seedBundleIDs(_ identifiers: [String]) { for id in identifiers { bundleIDs.append((next("BID"), id)) } }
 	func seedDevice(udid: String, status: String) { devices.append(Device(id: next("DEV"), udid: udid, name: "Old", status: status)) }
 	func invalidateProfiles() { for index in profiles.indices { profiles[index].state = "INVALID" } }
+	/// The user deleting a profile in the Apple Developer website.
+	func removeProfileAtApple(_ id: String) { profiles.removeAll { $0.id == id } }
+	func setProfileState(_ id: String, _ state: String) { for index in profiles.indices where profiles[index].id == id { profiles[index].state = state } }
+	/// Apple's rule for duplicate profile names is undocumented; the default
+	/// assumes the strictest (unique per team).
+	var uniqueProfileNames = true
 	var activeProfiles: [Profile] { profiles.filter { $0.state == "ACTIVE" } }
 
 	private func next(_ prefix: String) -> String { serial += 1; return "\(prefix)\(serial)" }
@@ -1309,7 +1378,7 @@ final class MockASC: ZagHTTPTransport, @unchecked Sendable {
 			guard let deviceIDs = ids("devices", "devices", many: true),
 				  deviceIDs.allSatisfy({ id in devices.contains { $0.id == id && $0.status == "ENABLED" } }) else { return bad("profile devices relationship") }
 			let name = attributes["name"] as! String
-			if profiles.contains(where: { $0.name == name }) { return conflict }   // assume names are unique per team (strictest case)
+			if uniqueProfileNames, profiles.contains(where: { $0.name == name }) { return conflict }
 			let profile = Profile(id: next("PRO"), name: name, bundleID: bundleRow.id, certificateIDs: certificateIDs, deviceIDs: deviceIDs,
 								  expires: now + profileLifetime, state: "ACTIVE")
 			profiles.append(profile)
