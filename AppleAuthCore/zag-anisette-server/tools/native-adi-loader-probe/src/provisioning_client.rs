@@ -328,6 +328,55 @@ impl AppleHttp {
         })
     }
 }
+impl AppleHttp {
+    /// Every header of one request, in order: the client's GrandSlam base
+    /// headers, plus the two provisioning headers when `device` is set
+    /// (zag-isideload `GrandSlam::base_headers` and
+    /// `RemoteV3AnisetteProvider::provisioning_headers`).
+    fn headers(&self, device: bool) -> io::Result<Vec<(&'static str, &str)>> {
+        let mut headers = vec![
+            ("Content-Type", "text/x-xml-plist"),
+            ("Accept", "text/x-xml-plist"),
+            ("X-Mme-Client-Info", self.client_info.as_str()),
+            ("User-Agent", self.user_agent.as_str()),
+            ("X-Xcode-Version", XCODE_VERSION),
+            ("X-Apple-App-Info", APP_INFO),
+            ("Connection", "close"),
+        ];
+        if device {
+            let ids = self.device.as_ref().ok_or_else(|| invalid("lookup-only client has no device headers"))?;
+            headers.push(("X-Apple-I-MD-LU", ids.local_user.as_str()));
+            headers.push(("X-Mme-Device-Id", ids.device_id.as_str()));
+            if let Some(serial) = &ids.serial { headers.push(("X-Apple-I-SRL-NO", serial.as_str())); }
+        }
+        Ok(headers)
+    }
+}
+
+/// Apple's numeric status from a rejected response body, read from
+/// `Response.Status.ec` or `Status.ec`. Only the integer is kept: the
+/// message text and every other field are discarded unread.
+fn rejection_status(bytes: &[u8]) -> Option<i64> {
+    let root = Value::from_reader_xml(bytes).ok()?.into_dictionary()?;
+    let response = root.get("Response").and_then(Value::as_dictionary).unwrap_or(&root);
+    response.get("Status").and_then(Value::as_dictionary)?.get("ec")?.as_signed_integer()
+}
+
+/// "Apple HTTP status N" plus what the bounded body says, so a policy
+/// rejection (a plist with an Apple status code) is distinguishable from
+/// a gateway or proxy error (no plist).
+fn http_rejection(code: u16, response: ureq::Response) -> io::Error {
+    let mut bytes = Vec::new();
+    let read = response.into_reader().take(MAX_HTTP_BYTES as u64).read_to_end(&mut bytes);
+    let detail = match (read, rejection_status(&bytes)) {
+        (_, Some(ec)) => format!("Apple status {ec}"),
+        (Ok(_), None) if bytes.is_empty() => "empty body".to_owned(),
+        (Ok(_), None) => "no Apple status in body".to_owned(),
+        (Err(_), None) => "body unreadable".to_owned(),
+    };
+    io::Error::new(io::ErrorKind::Other, format!("Apple HTTP status {code} ({detail})"))
+}
+
 impl AppleTransport for AppleHttp {
     fn send(&self, url: &Url, body: Option<&[u8]>, device: bool, end: Instant) -> io::Result<Dictionary> {
         let url = validated_endpoint(url.as_str())?;
@@ -336,27 +385,15 @@ impl AppleTransport for AppleHttp {
             Some(_) => self.agent.post(url.as_str()),
             None => self.agent.get(url.as_str()),
         }
-            .timeout(budget)
-            .set("Content-Type", "text/x-xml-plist")
-            .set("Accept", "text/x-xml-plist")
-            .set("X-Mme-Client-Info", &self.client_info)
-            .set("User-Agent", &self.user_agent)
-            .set("X-Xcode-Version", XCODE_VERSION)
-            .set("X-Apple-App-Info", APP_INFO)
-            .set("Connection", "close");
-        if device {
-            let headers = self.device.as_ref().ok_or_else(|| invalid("lookup-only client has no device headers"))?;
-            req = req.set("X-Apple-I-MD-LU", &headers.local_user)
-                .set("X-Mme-Device-Id", &headers.device_id);
-            if let Some(serial) = &headers.serial { req = req.set("X-Apple-I-SRL-NO", serial); }
-        }
+            .timeout(budget);
+        for (name, value) in self.headers(device)? { req = req.set(name, value); }
         // ureq's default TLS verification is retained; no insecure opt-out.
         // Any redirect is rejected by redirects(0) and status validation.
         let result = match body {
             Some(bytes) => req.send_bytes(bytes),
             None => req.call(),
         }.map_err(|error| match error {
-            ureq::Error::Status(code, _) => io::Error::new(io::ErrorKind::Other, format!("Apple HTTP status {code}")),
+            ureq::Error::Status(code, response) => http_rejection(code, response),
             ureq::Error::Transport(error) => io::Error::new(io::ErrorKind::Other, transport_reason(&error)),
         })?;
         if result.status() != 200 {
@@ -831,5 +868,53 @@ mod tests {
         response.insert("spim".to_string(), Value::String("invalid!!".into()));
         assert!(decoded_field(&response, "spim").is_err());
         assert!(finish_request(&[]).is_err());
+    }
+
+    /// The bodies Dadoum/Provision@main lib/provision/adi.d posts
+    /// (ProvisioningSession.provision), as an offline reference fixture.
+    const PROVISION_START: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Header</key>\n\t<dict/>\n\t<key>Request</key>\n\t<dict/>\n</dict>\n</plist>";
+    const PROVISION_FINISH: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Header</key>\n\t<dict/>\n\t<key>Request</key>\n\t<dict>\n\t\t<key>cpim</key>\n\t\t<string>%s</string>\n\t</dict>\n</dict>\n</plist>";
+
+    #[test]
+    fn provisioning_requests_match_the_reference_implementations() {
+        // Bodies: the same plist as Provision's, with CPIM as standard base64
+        // of the native Start output (anisette-v3-server Base64.encode).
+        let cpim = [0u8, 1, 2, 250, 251, 255];
+        assert_eq!(plist_response(&empty_request().unwrap()).unwrap(),
+            plist_response(PROVISION_START.as_bytes()).unwrap());
+        let finish = PROVISION_FINISH.replace("%s", &STANDARD.encode(cpim));
+        assert_eq!(plist_response(&finish_request(&cpim).unwrap()).unwrap(),
+            plist_response(finish.as_bytes()).unwrap());
+        // Headers: exactly the client's GrandSlam base headers, plus MD-LU and
+        // Device-Id only on provisioning requests, and no serial unless given.
+        let user = "a".repeat(64);
+        let http = AppleHttp::new(&identity("device", "client", &user, None, "agent")).unwrap();
+        let names = |device| http.headers(device).unwrap().into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        let base = ["Content-Type", "Accept", "X-Mme-Client-Info", "User-Agent", "X-Xcode-Version", "X-Apple-App-Info", "Connection"];
+        assert_eq!(names(false), base);
+        assert_eq!(names(true), [&base[..], &["X-Apple-I-MD-LU", "X-Mme-Device-Id"]].concat());
+        let values: std::collections::HashMap<_, _> = http.headers(true).unwrap().into_iter().collect();
+        assert_eq!((values["X-Apple-I-MD-LU"], values["X-Mme-Device-Id"]), (user.as_str(), "device"));
+        assert_eq!((values["X-Mme-Client-Info"], values["User-Agent"]), ("client", "agent"));
+        // The lookup-only client never has device headers.
+        assert!(AppleHttp::lookup_only("client", "agent").unwrap().headers(true).is_err());
+    }
+
+    #[test]
+    fn rejected_responses_keep_only_apple_status_code() {
+        let mut status = Dictionary::new();
+        status.insert("ec".into(), Value::Integer((-29002).into()));
+        status.insert("em".into(), Value::String("private message".into()));
+        let mut response = Dictionary::new();
+        response.insert("Status".into(), Value::Dictionary(status.clone()));
+        let mut nested = Dictionary::new();
+        nested.insert("Response".into(), Value::Dictionary(response));
+        assert_eq!(rejection_status(&xml_bytes(nested).unwrap()), Some(-29002));
+        let mut top = Dictionary::new();
+        top.insert("Status".into(), Value::Dictionary(status));
+        assert_eq!(rejection_status(&xml_bytes(top).unwrap()), Some(-29002));
+        for body in [&b""[..], b"<html>Unauthorized</html>", b"<plist><dict/></plist>"] {
+            assert_eq!(rejection_status(body), None);
+        }
     }
 }

@@ -33,6 +33,33 @@ operator ─▶ supervisor (probe --provision-client-supervised)
   it identically, or the state does not match the device.
 * ds_id is AuthKit's fixed `-2`.
 
+## Finish-provisioning HTTP 401 (22 November 2026)
+
+The first attempt with the pinned root reached `finish-provisioning` and
+then failed with `Apple HTTP status 401`.
+
+**Our requests match the references.** Offline fixtures check this in
+`provisioning_requests_match_the_reference_implementations`:
+- The bodies parse to the same plists that Dadoum/Provision posts, with
+  standard base64 CPIM.
+- The headers are exactly the Zag Store client's GrandSlam base headers,
+  plus `X-Apple-I-MD-LU` and `X-Mme-Device-Id`. That is what zag-isideload
+  sends with every v3 server.
+- The native sequence matches anisette-v3-server's `/v3/provisioning_session`:
+  provisioning path, then the 16-character Android ID, then
+  `Start(-2, spim)` and `End(session, ptm, tk)`.
+
+**The same 401 appears across the ecosystem.** Since 17 November 2026,
+public reports show this exact 401 at `finishMachineProvisioning` from
+several public anisette servers, including Mac-ADI ones. The 401 is
+therefore not shown to be caused by Android CoreADI with a macOS client
+info.
+
+**Diagnostics now separate the rejection kinds.** A rejection is reported
+as `Apple HTTP status N (Apple status EC)`, or with `no Apple status in
+body`, `empty body` or `body unreadable`. Only the integer status is kept;
+Apple's message text and the body are discarded.
+
 ## TLS trust
 
 GrandSlam (`gsa.apple.com`, `gsas.apple.com`) chains to Apple Root CA
