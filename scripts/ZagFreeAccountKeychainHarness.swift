@@ -48,7 +48,17 @@ import SwiftUI
 			var refusedTeam = false
 			do { try store.save(Data("x".utf8), kind: .signingPrivateKey, account: a, team: "bad.team*") } catch { refusedTeam = true }
 			check(refusedTeam, "a malformed team ID is refused")
+			// The developer-account (.p8) credential: same protection, removed
+			// with its account, and on its own by a disconnect.
+			try store.save(Data("asc-credential".utf8), kind: .developerAPIKey, account: a)
+			try store.save(Data("asc-credential-b".utf8), kind: .developerAPIKey, account: b)
+			check(store.accessibility(.developerAPIKey, account: a) == (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String),
+				  "the developer-account key is after-first-unlock, this device only")
+			try store.delete(.developerAPIKey, account: b)
+			let disconnected = try store.load(.developerAPIKey, account: b), kept = try store.load(.session, account: b)
+			check(disconnected == nil && kept == Data("other".utf8), "disconnecting removes only the developer-account key")
 			try store.deleteAll(account: a)
+			check(store.accessibility(.developerAPIKey, account: a) == nil, "removing an account deletes its developer-account key")
 			check(try store.load(.session, account: a) == nil && store.accessibility(.signingPrivateKey, account: a) == nil
 				  && store.accessibility(.signingPrivateKey, account: a, team: "SIMTEAM001") == nil
 				  && store.accessibility(.signingPrivateKey, account: a, team: "SIMORG0001") == nil,

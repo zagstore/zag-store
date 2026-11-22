@@ -88,6 +88,16 @@ struct ZagDeveloperAccountCredential: Codable, Equatable, Sendable {
 	}
 }
 
+/// The credential's text forms (`print`, string interpolation, `dump`, the
+/// debugger) name the key and team only; the `.p8` never appears.
+extension ZagDeveloperAccountCredential: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+	var description: String { "ZagDeveloperAccountCredential(keyID: \(keyID), teamID: \(teamID), privateKey: [redacted])" }
+	var debugDescription: String { description }
+	var customMirror: Mirror {
+		Mirror(self, children: ["keyID": keyID, "issuerID": issuerID, "teamID": teamID, "privateKeyPEM": "[redacted]"], displayStyle: .struct)
+	}
+}
+
 // MARK: - Storage
 
 /// Reads and writes one account's ASC credential through the shared

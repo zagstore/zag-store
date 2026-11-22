@@ -9,7 +9,13 @@ import Foundation
 // App groups are not part of Milestone 2; an app that requests them fails
 // cleanly rather than being signed without them.
 
-struct ZagASCDeveloperPortal: ZagDeveloperPortalService {
+/// The portals the ASC provisioner may submit certificate requests to: the
+/// App Store Connect portal only. The free-account portal does not conform, so
+/// a free account's certificate requests can never bypass the free-account
+/// provisioner and its certificate budget (G5 T11).
+protocol ZagASCProvisioningPortal: ZagDeveloperPortalService {}
+
+struct ZagASCDeveloperPortal: ZagASCProvisioningPortal {
 	let client: ZagASCClient
 	/// Decodes a downloaded `.mobileprovision` into the checked profile. The
 	/// default parses the real file; tests inject a decoder for canned content.
@@ -17,8 +23,13 @@ struct ZagASCDeveloperPortal: ZagDeveloperPortalService {
 
 	// MARK: Devices
 
+	/// The team's enabled iOS devices. A disabled device cannot be put in a
+	/// profile, so it is not "registered" for planning; `registerDevice`
+	/// re-enables it.
 	func devices(team: String) async throws -> [ZagRegisteredDevice] {
-		let (records, _) = try await mapping { try await client.list(.devices, as: ZagASCDevice.self) }
+		let (records, _) = try await mapping {
+			try await client.list(.devices, as: ZagASCDevice.self, filters: ["platform": "IOS", "status": "ENABLED"])
+		}
 		return records.compactMap { record in
 			guard let udid = record.attributes?.udid, !udid.isEmpty else { return nil }
 			return ZagRegisteredDevice(udid: udid, name: record.attributes?.name ?? "Device")
@@ -30,11 +41,16 @@ struct ZagASCDeveloperPortal: ZagDeveloperPortalService {
 			let record = try await client.create(.devices, attributes: ["name": name, "platform": "IOS", "udid": udid], as: ZagASCDevice.self)
 			return ZagRegisteredDevice(udid: record.attributes?.udid ?? udid, name: record.attributes?.name ?? name)
 		} catch ZagASCError.conflict {
-			// Already registered (ASC never deletes a device): find and reuse it.
-			if let existing = try await devices(team: team).first(where: { $0.udid.lowercased() == udid.lowercased() }) {
-				return existing
+			// Already on the team (ASC never deletes a device, only disables
+			// one): find it in any state and re-enable it if it was disabled.
+			let (records, _) = try await mapping { try await client.list(.devices, as: ZagASCDevice.self, filters: ["udid": udid]) }
+			guard let existing = records.first(where: { $0.attributes?.udid?.lowercased() == udid.lowercased() }) else {
+				throw ZagPortalError.malformedResponse
 			}
-			throw ZagPortalError.malformedResponse
+			if existing.attributes?.status == "DISABLED" {
+				_ = try await mapping { try await client.update(.devices, id: existing.id, attributes: ["status": "ENABLED"], as: ZagASCDevice.self) }
+			}
+			return ZagRegisteredDevice(udid: existing.attributes?.udid ?? udid, name: existing.attributes?.name ?? name)
 		} catch { throw Self.portalError(error) }
 	}
 
@@ -60,8 +76,10 @@ struct ZagASCDeveloperPortal: ZagDeveloperPortalService {
 			return ZagRegisteredAppID(identifier: identifier, bundleIdentifier: identifier, expiresAt: nil)
 		} catch ZagASCError.conflict {
 			// Either this team already owns it (reuse) or another team does.
-			if let mine = try await appIDs(team: team).first(where: { $0.bundleIdentifier == bundleIdentifier }) {
-				return mine
+			// Looked up by identifier, so a team with more bundle IDs than one
+			// page still finds its own.
+			if try await bundleIDRecordID(bundleIdentifier) != nil {
+				return ZagRegisteredAppID(identifier: bundleIdentifier, bundleIdentifier: bundleIdentifier, expiresAt: nil)
 			}
 			throw ZagPortalError.identifierUnavailable(bundleIdentifier)
 		} catch { throw Self.portalError(error) }
@@ -101,12 +119,13 @@ struct ZagASCDeveloperPortal: ZagDeveloperPortalService {
 	// MARK: Profiles
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
-		let bundleIDRecordID = try await resourceID(.bundleIDs, as: ZagASCBundleID.self, where: { $0.identifier == appID.bundleIdentifier })
-		guard let bundleIDRecordID else { throw ZagPortalError.malformedResponse }
+		guard let bundleIDRecordID = try await bundleIDRecordID(appID.bundleIdentifier) else { throw ZagPortalError.malformedResponse }
 		let certificateIDs = try await mapping {
 			try await client.list(.certificates, as: ZagASCCertificate.self, filters: ["certificateType": "IOS_DEVELOPMENT"]).records.map(\.id)
 		}
-		let deviceIDs = try await mapping { try await client.list(.devices, as: ZagASCDevice.self).records.map(\.id) }
+		let deviceIDs = try await mapping {
+			try await client.list(.devices, as: ZagASCDevice.self, filters: ["platform": "IOS", "status": "ENABLED"]).records.map(\.id)
+		}
 		guard !certificateIDs.isEmpty, !deviceIDs.isEmpty else { throw ZagPortalError.malformedResponse }
 
 		let name = "Zag Store \(appID.bundleIdentifier) \(Int(client.now().timeIntervalSince1970))"
@@ -136,11 +155,11 @@ struct ZagASCDeveloperPortal: ZagDeveloperPortalService {
 
 	// MARK: Helpers
 
-	private func resourceID<Attributes: Decodable & Sendable>(
-		_ resource: ZagASCResource, as _: Attributes.Type, where match: (Attributes) -> Bool
-	) async throws -> String? {
-		let (records, _) = try await mapping { try await client.list(resource, as: Attributes.self) }
-		return records.first { $0.attributes.map(match) ?? false }?.id
+	/// The ASC record ID of a bundle ID, matched exactly (Apple's identifier
+	/// filter also matches longer identifiers that contain it).
+	private func bundleIDRecordID(_ identifier: String) async throws -> String? {
+		let (records, _) = try await mapping { try await client.list(.bundleIDs, as: ZagASCBundleID.self, filters: ["identifier": identifier]) }
+		return records.first { $0.attributes?.identifier == identifier }?.id
 	}
 
 	private static func certificate(from attributes: ZagASCCertificate?) -> ZagDevelopmentCertificate? {
@@ -165,13 +184,24 @@ struct ZagASCDeveloperPortal: ZagDeveloperPortalService {
 		do { return try await body() } catch { throw Self.portalError(error) }
 	}
 
-	static func portalError(_ error: Error) -> ZagPortalError {
+	/// The portal error for an ASC failure. Cancellation stays cancellation
+	/// (`CancellationError`), so it is never reported as a network problem.
+	static func portalError(_ error: Error) -> Error {
+		switch error {
+		case is CancellationError, ZagASCError.transport(.cancelled): return CancellationError()
+		default: return mappedPortalError(error)
+		}
+	}
+
+	private static func mappedPortalError(_ error: Error) -> ZagPortalError {
 		switch error {
 		case let portal as ZagPortalError: return portal
 		case ZagASCError.unauthorized, ZagASCError.forbidden: return .sessionRejected
 		case ZagASCError.rateLimited: return .rateLimited
-		case ZagASCError.conflict(let code):
-			return code.map(ZagPortalError.identifierUnavailable) ?? .malformedResponse
+		// Conflicts the portal understands (an existing device, bundle ID or
+		// the certificate limit) are handled where they happen; any other is
+		// unexpected, and Apple's code is never shown as an identifier.
+		case ZagASCError.conflict: return .malformedResponse
 		case ZagASCError.transport(.offline), ZagASCError.transport(.timedOut): return .network
 		case ZagASCError.transport: return .network
 		case ZagASCError.server: return .malformedResponse

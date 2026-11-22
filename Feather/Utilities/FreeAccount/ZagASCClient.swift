@@ -180,6 +180,25 @@ struct ZagASCClient: Sendable {
 		return single.data
 	}
 
+	/// Changes attributes of an existing resource (`PATCH`), returning the
+	/// updated record. Used to re-enable a disabled device.
+	func update<Attributes: Decodable & Sendable>(
+		_ resource: ZagASCResource,
+		id: String,
+		attributes: [String: Any],
+		as _: Attributes.Type
+	) async throws -> ZagASCRecord<Attributes> {
+		guard !id.isEmpty, id.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || $0 == "-" }),
+			  let body = try? JSONSerialization.data(withJSONObject: ["data": ["type": resource.type, "id": id, "attributes": attributes]]) else {
+			throw ZagASCError.malformedRequest
+		}
+		let response = try await perform(method: "PATCH", path: resource.rawValue + "/" + id, body: body)
+		guard let single = try? JSONDecoder().decode(Single<Attributes>.self, from: response.body) else {
+			throw ZagASCError.malformedResponse
+		}
+		return single.data
+	}
+
 	/// Wraps a DER certificate signing request as the PEM text ASC expects for
 	/// `csrContent`.
 	static func pemCSR(_ der: Data) -> String {
@@ -219,6 +238,8 @@ struct ZagASCClient: Sendable {
 			response = try await transport.send(request)
 		} catch let error as ZagTransportError {
 			throw ZagASCError.transport(error)
+		} catch is CancellationError {
+			throw ZagASCError.transport(.cancelled)
 		} catch {
 			throw ZagASCError.transport(.failed(code: 0))
 		}
@@ -245,4 +266,9 @@ struct ZagASCClient: Sendable {
 	private static func code(_ body: Data) -> String? {
 		(try? JSONDecoder().decode(ErrorEnvelope.self, from: body))?.errors.first?.code
 	}
+}
+
+/// `dump`, `print` and the debugger show the key ID only, never the `.p8`.
+extension ZagASCClient: CustomReflectable {
+	var customMirror: Mirror { Mirror(self, children: ["keyID": credential.keyID], displayStyle: .struct) }
 }

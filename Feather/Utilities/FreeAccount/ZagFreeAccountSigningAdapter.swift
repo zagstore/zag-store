@@ -29,6 +29,10 @@ struct ZagFreeAccountSigningGate: Equatable, Sendable {
 	private init(isOpen: Bool) { self.isOpen = isOpen }
 
 	static let production = ZagFreeAccountSigningGate(isOpen: ZagFreeAccountSigning.isEnabled)
+	/// The adapter as the paid developer-account method uses it: open only with
+	/// that method's own gate, so it never depends on (or opens) free-account
+	/// signing. Closed in every release build.
+	static let developerAccount = ZagFreeAccountSigningGate(isOpen: ZagSigningMethodAvailability.developerAccountEnabled)
 	#if DEBUG
 	static let simulationOnly = ZagFreeAccountSigningGate(isOpen: true)
 	#endif

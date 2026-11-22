@@ -35,6 +35,11 @@ import Foundation
 		await portal()
 		await provisioning()
 		await coordinator()
+		await mockASCProvisioning()
+		await mockASCRecovery()
+		await mockASCCoordinator()
+		realAdapter()
+		redaction()
 		print("SUCCESS: \(passed) developer-account (M1–M3) checks passed")
 	}
 
@@ -431,8 +436,7 @@ import Foundation
 			return await coordinator.install(app: component, account: UUID(), team: team, device: ZagTargetDevice(udid: "00000000-DEVICE", name: "iPhone"), appAt: URL(fileURLWithPath: "/tmp/x.app"))
 		}
 
-		if case .failed(.disabled) = await run(gate: .production) {} else { check(false, "coordinator: a closed gate is disabled") }
-		check(true, "coordinator: a closed gate signs nothing")
+		check(await run(gate: .production) == .failed(.disabled), "coordinator: a closed gate signs nothing")
 
 		switch await run(gate: .testingOpen) {
 		case .installed(let record):
@@ -444,6 +448,241 @@ import Foundation
 		if case .installedUnverified = await run(gate: .testingOpen, verification: .unverifiable("no readback")) {} else { check(false, "coordinator: an unverifiable install is recorded unverified") }
 		if case .failed(.signing) = await run(gate: .testingOpen, signerFails: true) {} else { check(false, "coordinator: a signer failure is reported") }
 		if case .failed(.provisioning) = await run(gate: .testingOpen, failDevices: true) {} else { check(false, "coordinator: a provisioning failure is reported") }
+	}
+
+	// MARK: - End to end against a stateful mock of the ASC API
+
+	struct World {
+		let asc: MockASC
+		let secrets: MemorySecrets
+		let provisioner: ZagASCProvisioner
+		let account = UUID()
+
+		func request(_ original: String = "com.example.notes", udid: String = "00008110-000A1B2C3D4E5F60") -> ZagProvisioningRequest {
+			ZagProvisioningRequest(
+				accountID: account, team: Tests.teamID, deviceUDID: udid, deviceName: "Test iPhone",
+				app: .init(originalBundleIdentifier: original, name: "Notes", entitlements: try! ZagEntitlementSet([:])),
+				extensions: [], installedFreeAccountApps: []
+			)
+		}
+
+		func identityStored() -> Bool {
+			((try? secrets.load(.signingPrivateKey, account: account, team: Tests.teamID)) ?? nil) != nil
+		}
+	}
+
+	static func world() -> World {
+		let key = P256.Signing.PrivateKey()
+		let credential = try! ZagDeveloperAccountCredential(issuerID: issuerID, keyID: keyID, teamID: teamID, privateKeyPEM: key.pemRepresentation)
+		let asc = MockASC(teamID: teamID, keyID: keyID, issuerID: issuerID, publicKey: key.publicKey, now: fixedNow)
+		var portal = ZagASCDeveloperPortal(client: ZagASCClient(transport: asc, credential: credential, now: { fixedNow }))
+		portal.decodeProfile = MockASC.decodeProfile
+		let secrets = MemorySecrets()
+		return World(asc: asc, secrets: secrets, provisioner: ZagASCProvisioner(portal: portal, keys: ZagSimulatedSigningKeyFactory(), secrets: secrets, now: { fixedNow }))
+	}
+
+	static func mockASCProvisioning() async {
+		let w = world()
+		let mapped = "com.example.notes.\(teamID)"
+		guard case .success(let first) = await w.provisioner.provision(w.request()) else { return check(false, "mock ASC: a fresh team provisions") }
+		check(first.app.bundleIdentifier == mapped && first.team == teamID, "mock ASC: a fresh team provisions the team-mapped bundle ID")
+		check(w.asc.count("POST /v1/devices") == 1 && w.asc.count("POST /v1/certificates") == 1
+			  && w.asc.count("POST /v1/bundleIds") == 1 && w.asc.count("POST /v1/profiles") == 1,
+			  "mock ASC: one device, one certificate, one bundle ID and one profile are created")
+		let profile = w.asc.profiles[0]
+		check(profile.bundleID == w.asc.bundleIDs.first { $0.identifier == mapped }?.id, "mock ASC: the profile's bundleId relationship is the app's bundle ID")
+		check(profile.certificateIDs.contains(w.asc.certificates[0].id) && first.certificateSerial == w.asc.certificates[0].serial,
+			  "mock ASC: the profile names the issued certificate, and it is the signing certificate")
+		check(profile.deviceIDs == [w.asc.devices[0].id], "mock ASC: the profile names the registered device")
+		check(w.identityStored(), "mock ASC: the signing identity is stored only after the certificate is issued")
+		check(w.asc.tokenProblems.isEmpty && w.asc.requestCount > 0, "mock ASC: every request carries a valid ES256 team-key JWT (\(w.asc.requestCount) verified)")
+		check(w.asc.schemaProblems.isEmpty, "mock ASC: every request body matches the ASC JSON:API schema")
+
+		let before = w.asc.requestLog.count
+		guard case .success(let second) = await w.provisioner.provision(w.request()) else { return check(false, "mock ASC: a second run succeeds") }
+		let writes = w.asc.requestLog.dropFirst(before).filter { !$0.hasPrefix("GET") }
+		check(writes == ["POST /v1/profiles"], "mock ASC: a second run reuses device, certificate and bundle ID and only cuts a profile")
+		check(!second.changes.createdCertificate && !second.changes.registeredDevice && second.changes.registeredAppIDs.isEmpty,
+			  "mock ASC: a second run reports no new resources")
+
+		// A team with more bundle IDs than one page still finds its own.
+		let busy = world()
+		busy.asc.seedBundleIDs((0..<250).map { "com.other.app\($0)" } + [mapped])
+		guard case .success = await busy.provisioner.provision(busy.request()) else { return check(false, "mock ASC: a team with 251 bundle IDs reuses its own") }
+		check(busy.asc.bundleIDs.count == 251, "mock ASC: a bundle ID beyond the first page is reused, not reported as another team's")
+
+		// A disabled device is re-enabled; other disabled devices stay out of the profile.
+		let disabled = world()
+		disabled.asc.seedDevice(udid: "00008110-000A1B2C3D4E5F60", status: "DISABLED")
+		disabled.asc.seedDevice(udid: "00008020-OTHERDEVICE00000", status: "DISABLED")
+		guard case .success = await disabled.provisioner.provision(disabled.request()) else { return check(false, "mock ASC: a disabled device is re-enabled") }
+		check(disabled.asc.count("PATCH /v1/devices/") == 1 && disabled.asc.devices[0].status == "ENABLED" && disabled.asc.devices[1].status == "DISABLED",
+			  "mock ASC: the target device is re-enabled, and only it")
+		check(disabled.asc.profiles.last?.deviceIDs == [disabled.asc.devices[0].id], "mock ASC: a profile never includes a disabled device")
+		check(disabled.asc.schemaProblems.isEmpty, "mock ASC: the PATCH body matches the ASC schema")
+	}
+
+	static func mockASCRecovery() async {
+		func kind(_ w: World, _ original: String = "com.example.notes") async -> ZagProvisioningFailure.Kind? {
+			if case .failure(let failure) = await w.provisioner.provision(w.request(original)) { return failure.kind }
+			return nil
+		}
+
+		// Cancelled after the certificate was issued: the next run reuses it.
+		let cancelled = world()
+		cancelled.asc.failNext("POST /v1/bundleIds") { throw ZagTransportError.cancelled }
+		check(await kind(cancelled) == .cancelled, "recovery: a cancelled request fails as cancelled")
+		check(cancelled.asc.certificates.count == 1 && cancelled.identityStored(), "recovery: the certificate issued before the cancel is kept with its key")
+		guard case .success(let resumed) = await cancelled.provisioner.provision(cancelled.request()) else { return check(false, "recovery: the next run succeeds") }
+		check(!resumed.changes.createdCertificate && cancelled.asc.certificates.count == 1, "recovery: the next run reuses that certificate instead of creating another")
+
+		let swiftCancel = world()
+		swiftCancel.asc.failNext("GET /v1/devices") { throw CancellationError() }
+		check(await kind(swiftCancel) == .cancelled, "recovery: Swift task cancellation maps to cancelled")
+
+		// A transient failure while cutting the profile.
+		let flaky = world()
+		flaky.asc.failNext("POST /v1/profiles") { MockASC.reply(500, ["errors": [["status": "500"]]]) }
+		check(await kind(flaky) == .unexpectedResponse, "recovery: a server error while cutting the profile fails cleanly")
+		guard case .success = await flaky.provisioner.provision(flaky.request()) else { return check(false, "recovery: the retry succeeds") }
+		check(flaky.asc.certificates.count == 1 && flaky.asc.devices.count == 1 && flaky.asc.bundleIDs.count == 1, "recovery: the retry creates nothing twice")
+
+		// Errors the user acts on.
+		let limit = world()
+		limit.asc.certificateLimit = 0
+		if case .certificateMustBeRevoked = await kind(limit) {} else { check(false, "recovery: the certificate limit asks the user to revoke") }
+		check(!limit.identityStored(), "recovery: the certificate limit asks the user to revoke, and stores no identity")
+
+		let taken = world()
+		check(await kind(taken, "taken.app") == .identifierUnavailable("taken.app.\(teamID)"), "recovery: a bundle ID another team owns is reported as unavailable")
+
+		let revoked = world()
+		revoked.asc.revoked = true
+		check(await kind(revoked) == .sessionRejected, "recovery: a revoked key is a rejected session")
+		check(revoked.asc.requestLog.filter { !$0.hasPrefix("GET") }.isEmpty, "recovery: a revoked key creates nothing")
+
+		let limited = world()
+		limited.asc.failNext("GET /v1/devices") { MockASC.reply(429, ["errors": [["status": "429"]]]) }
+		check(await kind(limited) == .rateLimited, "recovery: rate limiting is reported as such")
+
+		let developerRole = world()
+		developerRole.asc.failNext("POST /v1/certificates") { MockASC.reply(403, ["errors": [["status": "403", "code": "FORBIDDEN_ERROR"]]]) }
+		check(await kind(developerRole) == .sessionRejected && !developerRole.identityStored(), "recovery: a key without provisioning rights fails before storing anything")
+	}
+
+	static func mockASCCoordinator() async {
+		func coordinator(_ w: World, signer: ZagAppSigning = StubSigner(fails: false, now: fixedNow), installer: CountingInstaller = CountingInstaller()) -> ZagASCSigningCoordinator {
+			ZagASCSigningCoordinator(provisioner: w.provisioner, secrets: w.secrets, signer: signer, installer: installer, gate: .testingOpen, now: { fixedNow })
+		}
+		let team = ZagDeveloperTeam(identifier: teamID, name: "Team", kind: .individualPaid)
+		let component = ZagProvisioningRequest.Component(originalBundleIdentifier: "com.example.notes", name: "Notes", entitlements: try! ZagEntitlementSet([:]))
+		let device = ZagTargetDevice(udid: "00008110-000A1B2C3D4E5F60", name: "Test iPhone")
+		let app = URL(fileURLWithPath: "/tmp/Notes.app")
+
+		let happy = world()
+		let installer = CountingInstaller()
+		if case .installed(let record) = await coordinator(happy, installer: installer).install(app: component, account: happy.account, team: team, device: device, appAt: app) {
+			check(record.bundleIdentifier == "com.example.notes.\(teamID)" && record.owner?.teamKind == .individualPaid && record.expiryVerified == true,
+				  "coordinator + mock ASC: provisions, signs, installs and verifies one app")
+			check(installer.installs == 1 && installer.lastExpectation?.teamIdentifier == teamID
+				  && installer.lastExpectation?.profileUUID == happy.asc.profiles.last?.id,
+				  "coordinator + mock ASC: the device is checked for the profile ASC issued")
+		} else { check(false, "coordinator + mock ASC: the happy path installs") }
+
+		// Cancelled while ASC is cutting the profile, then resumed.
+		let interrupted = world()
+		interrupted.asc.failNext("POST /v1/profiles") { withUnsafeCurrentTask { $0?.cancel() }; throw CancellationError() }
+		let resumeInstaller = CountingInstaller()
+		let first = await Task { await coordinator(interrupted, installer: resumeInstaller).install(app: component, account: interrupted.account, team: team, device: device, appAt: app) }.value
+		check(first == .failed(.cancelled) && resumeInstaller.installs == 0, "coordinator + mock ASC: a cancel during provisioning stops before signing or installing")
+		let second = await Task { await coordinator(interrupted, installer: resumeInstaller).install(app: component, account: interrupted.account, team: team, device: device, appAt: app) }.value
+		if case .installed = second {} else { check(false, "coordinator + mock ASC: the next run installs") }
+		check(interrupted.asc.certificates.count == 1 && resumeInstaller.installs == 1, "coordinator + mock ASC: the resumed run reuses the certificate and installs once")
+
+		// Cancelled after signing: nothing is installed.
+		let late = world()
+		let lateInstaller = CountingInstaller()
+		let lateOutcome = await Task {
+			await coordinator(late, signer: CancellingSigner(), installer: lateInstaller).install(app: component, account: late.account, team: team, device: device, appAt: app)
+		}.value
+		check(lateOutcome == .failed(.cancelled) && lateInstaller.installs == 0, "coordinator + mock ASC: a cancel after signing installs nothing")
+
+		// The device reports a different profile.
+		let mismatch = world()
+		let wrong = CountingInstaller(verification: .mismatch("another profile"))
+		let outcome = await coordinator(mismatch, installer: wrong).install(app: component, account: mismatch.account, team: team, device: device, appAt: app)
+		check(outcome == .failed(.notVerified), "coordinator + mock ASC: a profile mismatch on the device is never success")
+	}
+
+	// MARK: - The real signing adapter accepts the developer-account authorisation
+
+	static func realAdapter() {
+		check(!ZagFreeAccountSigningGate.developerAccount.isOpen, "adapter: the developer-account signing gate is closed")
+
+		let work = FileManager.default.temporaryDirectory.appendingPathComponent("zag-asc-adapter-\(UUID().uuidString)")
+		defer { try? FileManager.default.removeItem(at: work) }
+		let app = work.appendingPathComponent("Notes.app")
+		try! FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+		let info: [String: Any] = ["CFBundleIdentifier": "com.example.notes", "CFBundleExecutable": "Notes", "CFBundleName": "Notes",
+								   "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0", "CFBundlePackageType": "APPL"]
+		try! PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: app.appendingPathComponent("Info.plist"))
+		try! Data([0xCF, 0xFA, 0xED, 0xFE]).write(to: app.appendingPathComponent("Notes"))
+
+		let account = UUID()
+		let profileData = try! JSONSerialization.data(withJSONObject: ["uuid": "P-1", "team": teamID, "bundle": "com.example.notes.\(teamID)", "serials": ["SER1"], "udids": ["00008110-000A1B2C3D4E5F60"]])
+		let profile = try! MockASC.decodeProfile(profileData)
+		let result = ZagProvisioningResult(
+			team: teamID, certificateSerial: "SER1",
+			app: .init(originalBundleIdentifier: "com.example.notes", bundleIdentifier: "com.example.notes.\(teamID)", profile: profile, entitlements: try! ZagEntitlementSet([:]), rejected: []),
+			extensions: [], changes: .init()
+		)
+		let made = try! ZagSimulatedSigningKeyFactory().makeKey(commonName: "Zag Store")
+		let identity = ZagSigningIdentity(serialNumber: "SER1", certificate: Data("CERT-SER1".utf8), privateKey: made.privateKey, expiresAt: fixedNow + 365 * 86_400, keySlot: nil)
+		let authorization = ZagSigningAuthorization.developerAccount(scope: ZagSigningScope(accountID: account, teamID: teamID), teamKind: .individualPaid, validUntil: fixedNow + 600)
+
+		// The fake signer changes nothing, so the adapter must get past its gate,
+		// authorisation and identity checks, call the signer, and then refuse
+		// the unsigned result. (Real Zsign signing of a CMS profile is covered
+		// by test-zag-free-account-signing.sh; Apple-issued artifacts only live.)
+		let signer = NoopCodeSigner()
+		let open = ZagFreeAccountSigningAdapter(signer: signer, workRoot: work, gate: .simulationOnly, allowsKeyFiles: true)
+		do {
+			_ = try open.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: fixedNow)
+			check(false, "adapter: unsigned output is never success")
+		} catch ZagFreeAccountSigningError.verification {
+			check(signer.calls == 1, "adapter: the developer-account authorisation reaches the signer, and unsigned output is refused")
+		} catch {
+			check(false, "adapter: the developer-account authorisation is accepted (\(error))")
+		}
+		let closed = ZagFreeAccountSigningAdapter(signer: signer, workRoot: work, gate: .developerAccount, allowsKeyFiles: true)
+		check((try? closed.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: fixedNow)) == nil && signer.calls == 1,
+			  "adapter: with the developer-account gate closed nothing is signed")
+		check((try? open.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: fixedNow + 601)) == nil,
+			  "adapter: an expired developer-account authorisation is refused")
+		let otherTeam = ZagSigningAuthorization.developerAccount(scope: ZagSigningScope(accountID: account, teamID: "OTHER12345"), teamKind: .individualPaid, validUntil: fixedNow + 600)
+		check((try? open.sign(appAt: app, with: result, identity: identity, authorization: otherTeam, now: fixedNow)) == nil,
+			  "adapter: an authorisation for another team is refused")
+	}
+
+	// MARK: - Sensitive data never appears in text forms
+
+	static func redaction() {
+		let (pem, _) = makeKeyPEM()
+		let credential = try! ZagDeveloperAccountCredential(issuerID: issuerID, keyID: keyID, teamID: teamID, privateKeyPEM: pem)
+		let client = ZagASCClient(transport: MockTransport(.success(response(200, "{}"))), credential: credential)
+		var dumped = ""
+		dump(credential, to: &dumped)
+		dump(client, to: &dumped)
+		let forms = [String(describing: credential), String(reflecting: credential), "\(credential)", dumped,
+					 String(describing: client), String(reflecting: client)]
+		let body = pem.components(separatedBy: "\n").dropFirst().first ?? "missing"
+		check(forms.allSatisfy { !$0.contains("PRIVATE KEY") && !$0.contains(body) }, "redaction: no text form of the credential or client contains the .p8")
+		check(forms.allSatisfy { $0.contains(keyID) }, "redaction: the key ID is still shown, for support")
+
+		let errors: [ZagASCError] = [.unauthorized, .forbidden, .conflict(code: "ENTITY_ERROR"), .transport(.offline), .unexpected(status: 418, code: nil)]
+		check(errors.allSatisfy { !String(describing: $0).contains("Bearer") && !String(describing: $0).contains("eyJ") }, "redaction: errors carry no token")
+		check(ZagSensitiveRedactor.redact("Authorization: Bearer eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln") == "Authorization: [redacted]"
+			  && !ZagSensitiveRedactor.redact(pem).contains(body), "redaction: the shared redactor removes ASC tokens and .p8 keys")
 	}
 }
 
@@ -483,6 +722,9 @@ final class MockTransport: ZagHTTPTransport, @unchecked Sendable {
 	}
 }
 
+/// Tests only: the simulated portal stands in for ASC in the provisioner tests.
+extension ZagSimulatedDeveloperPortal: ZagASCProvisioningPortal {}
+
 final class RoutingTransport: ZagHTTPTransport, @unchecked Sendable {
 	private let handler: @Sendable (ZagHTTPRequest) -> Result<ZagHTTPResponse, ZagTransportError>
 	init(_ handler: @escaping @Sendable (ZagHTTPRequest) -> Result<ZagHTTPResponse, ZagTransportError>) { self.handler = handler }
@@ -519,4 +761,227 @@ struct StubInstaller: ZagFreeAccountInstaller {
 	let verification: ZagInstallVerification
 	func install(signedApp: URL, bundleIdentifier: String) async throws {}
 	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification { verification }
+}
+
+/// A deterministic, stateful stand-in for the App Store Connect provisioning
+/// API: devices, bundle IDs, certificates and profiles live in memory, every
+/// request's JWT is verified against the key's public half, and every write
+/// body is checked against the JSON:API shapes Apple documents. Profiles are
+/// JSON (decoded by `decodeProfile`) rather than signed CMS, so the provisioner
+/// runs unchanged with no certificate authority.
+final class MockASC: ZagHTTPTransport, @unchecked Sendable {
+	struct Device { let id: String; let udid: String; let name: String; var status: String }
+	struct Certificate { let id: String; let serial: String }
+	struct Profile { let id: String; let bundleID: String; let certificateIDs: [String]; let deviceIDs: [String] }
+
+	private let lock = NSLock()
+	let teamID: String, keyID: String, issuerID: String
+	let publicKey: P256.Signing.PublicKey
+	let now: Date
+	var certificateLimit = 2
+	var revoked = false
+	private(set) var devices: [Device] = []
+	private(set) var bundleIDs: [(id: String, identifier: String)] = []
+	private(set) var certificates: [Certificate] = []
+	private(set) var profiles: [Profile] = []
+	private(set) var requestLog: [String] = []
+	private(set) var schemaProblems: [String] = []
+	private(set) var tokenProblems: [String] = []
+	private(set) var requestCount = 0
+	private var failures: [(prefix: String, action: @Sendable () throws -> ZagHTTPResponse)] = []
+	private var serial = 0
+
+	init(teamID: String, keyID: String, issuerID: String, publicKey: P256.Signing.PublicKey, now: Date) {
+		self.teamID = teamID; self.keyID = keyID; self.issuerID = issuerID; self.publicKey = publicKey; self.now = now
+	}
+
+	func count(_ prefix: String) -> Int { requestLog.filter { $0.hasPrefix(prefix) }.count }
+	func failNext(_ prefix: String, _ action: @escaping @Sendable () throws -> ZagHTTPResponse) { failures.append((prefix, action)) }
+	func seedBundleIDs(_ identifiers: [String]) { for id in identifiers { bundleIDs.append((next("BID"), id)) } }
+	func seedDevice(udid: String, status: String) { devices.append(Device(id: next("DEV"), udid: udid, name: "Old", status: status)) }
+
+	private func next(_ prefix: String) -> String { serial += 1; return "\(prefix)\(serial)" }
+
+	static func reply(_ status: Int, _ object: [String: Any]) -> ZagHTTPResponse {
+		ZagHTTPResponse(statusCode: status, headers: ["Content-Type": "application/json"], body: try! JSONSerialization.data(withJSONObject: object))
+	}
+
+	/// The profile content this mock issues, decoded the way the real parser
+	/// would present a signed development profile.
+	static let decodeProfile: @Sendable (Data) throws -> ZagIssuedProfile = { data in
+		guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+			  let uuid = object["uuid"] as? String, let team = object["team"] as? String, let bundle = object["bundle"] as? String,
+			  let serials = object["serials"] as? [String], let udids = object["udids"] as? [String] else { throw ZagPortalError.malformedResponse }
+		let entitlements: [String: Any] = [
+			ZagFreeAccountEntitlements.applicationIdentifierKey: "\(team).\(bundle)",
+			"com.apple.developer.team-identifier": team,
+			"get-task-allow": true
+		]
+		return ZagIssuedProfile(uuid: uuid, teamIdentifier: team, bundleIdentifier: bundle, certificateSerials: serials, deviceUDIDs: udids,
+								entitlements: try ZagEntitlementSet(entitlements), createdAt: Tests.fixedNow,
+								expiresAt: Tests.fixedNow + 365 * 86_400, data: data)
+	}
+
+	func send(_ request: ZagHTTPRequest) async throws -> ZagHTTPResponse {
+		try lock.withLock { try handle(request) }
+	}
+
+	private func handle(_ request: ZagHTTPRequest) throws -> ZagHTTPResponse {
+		let path = request.url.path
+		let key = "\(request.method) \(path)"
+		requestLog.append(key)
+		requestCount += 1
+		verifyToken(request.headers["Authorization"], key)
+		if request.url.host != ZagASCClient.host || request.url.scheme != "https" { schemaProblems.append("\(key): wrong origin") }
+		if let index = failures.firstIndex(where: { key.hasPrefix($0.prefix) }) {
+			return try failures.remove(at: index).action()
+		}
+		if revoked { return Self.reply(401, ["errors": [["status": "401", "code": "NOT_AUTHORIZED"]]]) }
+
+		let query = Dictionary((URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
+		let data = (request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any])?["data"] as? [String: Any]
+		let attributes = data?["attributes"] as? [String: Any] ?? [:]
+		func bad(_ why: String) -> ZagHTTPResponse { schemaProblems.append("\(key): \(why)"); return Self.reply(422, ["errors": [["status": "422", "code": "PARAMETER_ERROR.INVALID"]]]) }
+		func expect(_ type: String) -> Bool {
+			request.headers["Content-Type"] == "application/json" && data?["type"] as? String == type
+		}
+		let conflict = Self.reply(409, ["errors": [["status": "409", "code": "ENTITY_ERROR.ATTRIBUTE.INVALID"]]])
+		func page(_ rows: [[String: Any]]) -> ZagHTTPResponse {
+			let limit = Int(query["limit"] ?? "") ?? 20
+			if limit < 1 || limit > 200 { schemaProblems.append("\(key): limit \(limit)") }
+			return Self.reply(200, ["data": Array(rows.prefix(limit)), "meta": ["paging": ["total": rows.count, "limit": limit]]])
+		}
+		func json(_ d: Device) -> [String: Any] {
+			["type": "devices", "id": d.id, "attributes": ["udid": d.udid, "name": d.name, "status": d.status, "platform": "IOS", "deviceClass": "IPHONE"]]
+		}
+		func json(_ c: Certificate) -> [String: Any] {
+			["type": "certificates", "id": c.id, "attributes": ["name": "iOS Development", "certificateType": "IOS_DEVELOPMENT", "serialNumber": c.serial,
+				"expirationDate": "2027-11-18T09:00:00.000+0000", "certificateContent": Data("CERT-\(c.serial)".utf8).base64EncodedString()]]
+		}
+
+		switch (request.method, path) {
+		case ("GET", "/v1/devices"):
+			return page(devices.filter { d in
+				(query["filter[udid]"].map { $0 == d.udid } ?? true) && (query["filter[status]"].map { $0 == d.status } ?? true)
+					&& (query["filter[platform]"].map { $0 == "IOS" } ?? true)
+			}.map(json))
+		case ("POST", "/v1/devices"):
+			guard expect("devices"), let udid = attributes["udid"] as? String, let name = attributes["name"] as? String,
+				  attributes["platform"] as? String == "IOS", attributes.count == 3 else { return bad("device create body") }
+			if devices.contains(where: { $0.udid == udid }) { return conflict }
+			let device = Device(id: next("DEV"), udid: udid, name: name, status: "ENABLED")
+			devices.append(device)
+			return Self.reply(201, ["data": json(device)])
+		case ("PATCH", _) where path.hasPrefix("/v1/devices/"):
+			let id = String(path.dropFirst("/v1/devices/".count))
+			guard expect("devices"), data?["id"] as? String == id, let status = attributes["status"] as? String, ["ENABLED", "DISABLED"].contains(status) else {
+				return bad("device update body")
+			}
+			guard let index = devices.firstIndex(where: { $0.id == id }) else { return Self.reply(404, ["errors": [["status": "404"]]]) }
+			devices[index].status = status
+			return Self.reply(200, ["data": json(devices[index])])
+		case ("GET", "/v1/bundleIds"):
+			// Apple's identifier filter matches identifiers containing the text.
+			return page(bundleIDs.filter { b in query["filter[identifier]"].map { b.identifier.contains($0) } ?? true }
+				.map { ["type": "bundleIds", "id": $0.id, "attributes": ["identifier": $0.identifier, "name": "App", "platform": "IOS"]] })
+		case ("POST", "/v1/bundleIds"):
+			guard expect("bundleIds"), let identifier = attributes["identifier"] as? String, attributes["name"] is String,
+				  attributes["platform"] as? String == "IOS" else { return bad("bundle ID create body") }
+			if identifier.hasPrefix("taken.") || bundleIDs.contains(where: { $0.identifier == identifier }) { return conflict }
+			let id = next("BID")
+			bundleIDs.append((id, identifier))
+			return Self.reply(201, ["data": ["type": "bundleIds", "id": id, "attributes": ["identifier": identifier, "name": "App", "platform": "IOS"]]])
+		case ("GET", "/v1/certificates"):
+			if let type = query["filter[certificateType]"], type != "IOS_DEVELOPMENT" { return page([]) }
+			return page(certificates.map(json))
+		case ("POST", "/v1/certificates"):
+			guard expect("certificates"), attributes["certificateType"] as? String == "IOS_DEVELOPMENT",
+				  let pem = attributes["csrContent"] as? String,
+				  pem.hasPrefix("-----BEGIN CERTIFICATE REQUEST-----\n"), pem.hasSuffix("\n-----END CERTIFICATE REQUEST-----"),
+				  let der = Data(base64Encoded: pem.components(separatedBy: "\n").dropFirst().dropLast().joined()), !der.isEmpty else {
+				return bad("certificate create body")
+			}
+			if certificates.count >= certificateLimit { return conflict }
+			let certificate = Certificate(id: next("CER"), serial: "SER\(certificates.count + 1)")
+			certificates.append(certificate)
+			return Self.reply(201, ["data": json(certificate)])
+		case ("POST", "/v1/profiles"):
+			guard expect("profiles"), attributes["profileType"] as? String == "IOS_APP_DEVELOPMENT", (attributes["name"] as? String)?.isEmpty == false,
+				  let relationships = data?["relationships"] as? [String: Any] else { return bad("profile create body") }
+			func ids(_ name: String, _ type: String, many: Bool) -> [String]? {
+				let value = (relationships[name] as? [String: Any])?["data"]
+				let items = many ? value as? [[String: Any]] : (value as? [String: Any]).map { [$0] }
+				guard let items, !items.isEmpty, items.allSatisfy({ $0["type"] as? String == type && $0["id"] is String }) else { return nil }
+				return items.compactMap { $0["id"] as? String }
+			}
+			guard let bundle = ids("bundleId", "bundleIds", many: false), let bundleRow = bundleIDs.first(where: { $0.id == bundle[0] }) else {
+				return bad("profile bundleId relationship")
+			}
+			guard let certificateIDs = ids("certificates", "certificates", many: true),
+				  certificateIDs.allSatisfy({ id in certificates.contains { $0.id == id } }) else { return bad("profile certificates relationship") }
+			guard let deviceIDs = ids("devices", "devices", many: true),
+				  deviceIDs.allSatisfy({ id in devices.contains { $0.id == id && $0.status == "ENABLED" } }) else { return bad("profile devices relationship") }
+			let profile = Profile(id: next("PRO"), bundleID: bundleRow.id, certificateIDs: certificateIDs, deviceIDs: deviceIDs)
+			profiles.append(profile)
+			let content = try! JSONSerialization.data(withJSONObject: [
+				"uuid": profile.id, "team": teamID, "bundle": bundleRow.identifier,
+				"serials": certificates.filter { certificateIDs.contains($0.id) }.map(\.serial),
+				"udids": devices.filter { deviceIDs.contains($0.id) }.map(\.udid)
+			])
+			return Self.reply(201, ["data": ["type": "profiles", "id": profile.id, "attributes": [
+				"name": attributes["name"]!, "profileType": "IOS_APP_DEVELOPMENT", "uuid": profile.id,
+				"expirationDate": "2027-11-18T09:00:00Z", "profileContent": content.base64EncodedString()
+			]]])
+		default:
+			return Self.reply(404, ["errors": [["status": "404"]]])
+		}
+	}
+
+	private func verifyToken(_ authorization: String?, _ key: String) {
+		func problem(_ why: String) { tokenProblems.append("\(key): \(why)") }
+		guard let authorization, authorization.hasPrefix("Bearer ") else { return problem("no bearer token") }
+		let parts = authorization.dropFirst(7).split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+		guard parts.count == 3 else { return problem("not a compact JWS") }
+		let header = (try? JSONSerialization.jsonObject(with: Tests.base64URLDecode(parts[0]))) as? [String: Any] ?? [:]
+		let claims = (try? JSONSerialization.jsonObject(with: Tests.base64URLDecode(parts[1]))) as? [String: Any] ?? [:]
+		if header["alg"] as? String != "ES256" || header["kid"] as? String != keyID || header["typ"] as? String != "JWT" { problem("header") }
+		if claims["iss"] as? String != issuerID || claims["aud"] as? String != "appstoreconnect-v1" || claims["sub"] != nil { problem("claims") }
+		guard let iat = claims["iat"] as? Int, let exp = claims["exp"] as? Int, exp > iat, exp - iat <= 1_200,
+			  Double(iat) <= now.timeIntervalSince1970 + 60, Double(exp) > now.timeIntervalSince1970 else { return problem("lifetime") }
+		guard let signature = try? P256.Signing.ECDSASignature(rawRepresentation: Tests.base64URLDecode(parts[2])),
+			  publicKey.isValidSignature(signature, for: Data((parts[0] + "." + parts[1]).utf8)) else { return problem("signature") }
+	}
+}
+
+final class CountingInstaller: ZagFreeAccountInstaller, @unchecked Sendable {
+	private let lock = NSLock()
+	private var count = 0
+	private var expectation: ZagInstallExpectation?
+	let verification: ZagInstallVerification?
+	init(verification: ZagInstallVerification? = nil) { self.verification = verification }
+	var installs: Int { lock.withLock { count } }
+	var lastExpectation: ZagInstallExpectation? { lock.withLock { expectation } }
+	func install(signedApp: URL, bundleIdentifier: String) async throws { lock.withLock { count += 1 } }
+	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification {
+		lock.withLock { self.expectation = expectation }
+		return verification ?? .verified(profileExpiresAt: expectation.profileExpiresAt, certificateExpiresAt: expectation.certificateExpiresAt)
+	}
+}
+
+/// Signs, then cancels the task it runs in (a user tapping Cancel right after
+/// signing finished).
+struct CancellingSigner: ZagAppSigning {
+	func sign(appAt app: URL, with result: ZagProvisioningResult, identity: ZagSigningIdentity, authorization: ZagSigningAuthorization, now: Date) throws -> ZagSignedAppRecord {
+		let record = try StubSigner(fails: false, now: now).sign(appAt: app, with: result, identity: identity, authorization: authorization, now: now)
+		withUnsafeCurrentTask { $0?.cancel() }
+		return record
+	}
+}
+
+/// A code signer that records the call and changes nothing.
+final class NoopCodeSigner: ZagCodeSigner, @unchecked Sendable {
+	private let lock = NSLock()
+	private var count = 0
+	var calls: Int { lock.withLock { count } }
+	func sign(app: URL, profile: URL, privateKey: URL, entitlements: URL, bundleIdentifier: String) throws { lock.withLock { count += 1 } }
 }

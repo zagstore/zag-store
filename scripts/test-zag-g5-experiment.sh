@@ -35,7 +35,14 @@ for name in ["recordSubmission(", "authorizeSubmission("]:
     callers = sorted(p.name for p, t in swift.items() if re.search(r"\.\s*" + re.escape(name), code(t)))
     assert callers == ["ZagCertificateBudget.swift"], (name, callers)
 callers = sorted({p.name for p, t in swift.items() if re.search(r"\.submitCertificateRequest\(", code(t))})
-assert callers == ["ZagFreeAccountProvisioner.swift"], callers
+assert callers == ["ZagASCProvisioner.swift", "ZagFreeAccountProvisioner.swift"], callers
+# The developer-account (ASC) provisioner submits only to an ASC portal: its
+# portal is typed ZagASCProvisioningPortal, and only the ASC portal conforms,
+# so the free-account portal (and its certificate budget) is out of its reach.
+asc_prov = code((fa / "ZagASCProvisioner.swift").read_text())
+assert "let portal: ZagASCProvisioningPortal" in asc_prov and "ZagDeveloperPortalService" not in asc_prov
+conformers = sorted(p.name for p, t in swift.items() if re.search(r"(struct|class|actor|extension)\s+\w+\s*:\s*[^{]*\bZagASCProvisioningPortal\b", code(t)))
+assert conformers == ["ZagASCDeveloperPortal.swift"], conformers
 print("PASS: T11 one submission path: the op string once, consume once and before the send, the budget only in ZagCertificateBudget")
 
 # G4 network invariants the experiment relies on (C5): every Apple request

@@ -13,7 +13,7 @@ import Foundation
 // The signing private key never leaves the device: only the CSR is sent, and
 // the issued certificate is checked against the key before it is stored.
 struct ZagASCProvisioner: Sendable {
-	let portal: ZagDeveloperPortalService
+	let portal: ZagASCProvisioningPortal
 	let keys: ZagSigningKeyFactory
 	let secrets: ZagFreeAccountSecretStore
 	var limits: ZagTeamLimits = .forTeam(.individualPaid)

@@ -8,7 +8,14 @@ import Foundation
 //
 // Nothing runs unless the feature gate is open (closed in every release
 // build), and the signing authorisation is the developer-account one
-// (`ZagSigningAuthorization.developerAccount`).
+// (`ZagSigningAuthorization.developerAccount`). The production signer is a
+// `ZagFreeAccountSigningAdapter` with the `.developerAccount` gate, so this
+// method never depends on free-account signing being enabled.
+//
+// Cancellation is checked between steps. A cancelled or failed run leaves
+// nothing half-used: what Apple already created (device, bundle ID,
+// certificate) is reused by the next run, and the stored identity is only
+// written once its certificate is issued and checked.
 
 enum ZagASCSigningError: Equatable, Sendable {
 	/// The developer-account feature gate is closed.
@@ -20,6 +27,8 @@ enum ZagASCSigningError: Equatable, Sendable {
 	case install
 	/// Installed, but the device did not confirm the expected profile.
 	case notVerified
+	/// The task was cancelled; the next run resumes from what was created.
+	case cancelled
 }
 
 struct ZagASCSigningCoordinator: Sendable {
@@ -61,8 +70,10 @@ struct ZagASCSigningCoordinator: Sendable {
 		let result: ZagProvisioningResult
 		switch await provisioner.provision(request) {
 		case .success(let value): result = value
-		case .failure(let failure): return .failed(.provisioning(failure.kind))
+		case .failure(let failure):
+			return .failed(failure.kind == .cancelled || Task.isCancelled ? .cancelled : .provisioning(failure.kind))
 		}
+		if Task.isCancelled { return .failed(.cancelled) }
 		guard let identity = loadIdentity(account: account, team: team.identifier) else { return .failed(.noIdentity) }
 
 		let authorization = ZagSigningAuthorization.developerAccount(
@@ -76,10 +87,11 @@ struct ZagASCSigningCoordinator: Sendable {
 		} catch {
 			return .failed(.signing)
 		}
+		if Task.isCancelled { return .failed(.cancelled) }
 		do {
 			try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier)
 		} catch {
-			return .failed(.install)
+			return .failed(Task.isCancelled ? .cancelled : .install)
 		}
 		let expectation = ZagInstallExpectation(
 			bundleIdentifier: record.bundleIdentifier,
