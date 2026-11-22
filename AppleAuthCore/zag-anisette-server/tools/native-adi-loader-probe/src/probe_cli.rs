@@ -149,13 +149,23 @@ fn state_record(identity: &TestIdentity, android_id: &str, configured: &ClientMe
 
 /// Provisioning binds a state to one sourced pair. An unverified pair is
 /// allowed only when the operator says so for this attempt.
-fn require_provisioning_metadata(metadata: &ClientMetadata, accept_unverified: bool) -> io::Result<()> {
+/// What the operator explicitly accepted for one provisioning attempt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Acceptance { unverified: bool, platform_mismatch: bool }
+
+fn require_provisioning_metadata(metadata: &ClientMetadata, accept: Acceptance) -> io::Result<()> {
     match &metadata.provenance {
-        None => Err(invalid("client metadata has no provenance; prepare it with --metadata-prepare")),
-        Some(p) if !p.apple_verified && !accept_unverified =>
-            Err(invalid("client metadata is not Apple-verified; pass --accept-unverified-metadata for this attempt")),
-        Some(_) => Ok(()),
+        None => return Err(invalid("client metadata has no provenance; prepare it with --metadata-prepare")),
+        Some(p) if !p.apple_verified && !accept.unverified =>
+            return Err(invalid("client metadata is not Apple-verified; pass --accept-unverified-metadata for this attempt")),
+        Some(_) => {}
     }
+    // Apple compares the advertised platform with the ADI that made the
+    // provisioning data; a mismatch is a diagnostic experiment at best.
+    if !metadata.matches_native_adi() && !accept.platform_mismatch {
+        return Err(invalid("client metadata platform does not match the Android CoreADI libraries (Apple reports -29003 environment mismatch); pass --accept-platform-mismatch only for a diagnostic attempt"));
+    }
+    Ok(())
 }
 
 fn validate_client_derived_identity(identity: &TestIdentity) -> io::Result<()> {
@@ -225,16 +235,19 @@ fn validate_paths(runtime: &Path, state: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// `<runtime> <state> [--accept-unverified-metadata]`
-fn paths<I: Iterator<Item = std::ffi::OsString>>(mut args: I) -> io::Result<(PathBuf, PathBuf, bool)> {
+/// `<runtime> <state> [--accept-unverified-metadata] [--accept-platform-mismatch]`
+fn paths<I: Iterator<Item = std::ffi::OsString>>(mut args: I) -> io::Result<(PathBuf, PathBuf, Acceptance)> {
     let runtime = PathBuf::from(args.next().ok_or_else(|| invalid("missing runtime root"))?);
     let state = PathBuf::from(args.next().ok_or_else(|| invalid("missing private state path"))?);
-    let accept = match args.next() {
-        None => false,
-        Some(flag) if flag == "--accept-unverified-metadata" => true,
-        Some(_) => return Err(invalid("unexpected provision arguments")),
-    };
-    if args.next().is_some() { return Err(invalid("unexpected provision arguments")); }
+    let mut accept = Acceptance::default();
+    for flag in args {
+        let slot = match flag.to_str() {
+            Some("--accept-unverified-metadata") => &mut accept.unverified,
+            Some("--accept-platform-mismatch") => &mut accept.platform_mismatch,
+            _ => return Err(invalid("unexpected provision arguments")),
+        };
+        if std::mem::replace(slot, true) { return Err(invalid("repeated provision argument")); }
+    }
     Ok((runtime, state, accept))
 }
 
@@ -563,6 +576,10 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
             invalid("BLOCKED: private client metadata is missing or invalid; no credentials required")
         })?;
         println!("PASS: private client metadata is readable and well-formed: {}", metadata::describe(&metadata));
+        if !metadata.matches_native_adi() {
+            println!("WARNING: platform {} does not match the Android CoreADI libraries; Apple reports -29003 (finishMachineProvisioning) and -80045 (sign-in) for this combination",
+                metadata.platform());
+        }
         return Ok(true);
     }
     if mode == "--diagnose-lookup" {
@@ -598,14 +615,14 @@ pub(crate) fn dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(true);
     }
 
-    let (runtime, state, accept_unverified) = paths(args)?;
+    let (runtime, state, accept) = paths(args)?;
     if mode.starts_with("--provision") {
         let result = (|| {
             validate_paths(&runtime, &state).map_err(fail("configuration"))?;
             let mut identity = read_identity(io::stdin().lock()).map_err(fail("configuration"))?;
             let configured = apply_configured_metadata(&mut identity).map_err(fail("configuration"))?
                 .ok_or_else(|| fail("configuration")(invalid("private client metadata configuration required")))?;
-            require_provisioning_metadata(&configured, accept_unverified).map_err(fail("configuration"))?;
+            require_provisioning_metadata(&configured, accept).map_err(fail("configuration"))?;
             let android_id = validate(&identity, client_derived, true).map_err(fail("configuration"))?;
             let identity_bytes = serde_json::to_vec(&identity)
                 .map_err(|_| fail("configuration")(invalid("invalid identity encoding")))?;
@@ -719,15 +736,21 @@ mod tests {
         identity.user_agent = None;
         identity.client_info = Some("<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.akd/1.0)>".into());
         assert!(apply_metadata_file(&mut identity, &path).is_err());
-        // Unverified needs the explicit flag; unsourced is never enough.
-        assert!(require_provisioning_metadata(&configured, false).is_err());
-        assert!(require_provisioning_metadata(&configured, true).is_ok());
+        // Unverified needs the explicit flag; unsourced is never enough. The
+        // candidate is a macOS identity: with the Android libraries it also
+        // needs the explicit platform-mismatch flag.
+        let both = Acceptance { unverified: true, platform_mismatch: true };
+        assert!(!configured.matches_native_adi());
+        assert!(require_provisioning_metadata(&configured, Acceptance::default()).is_err());
+        assert!(require_provisioning_metadata(&configured, Acceptance { unverified: true, ..Default::default() }).is_err());
+        assert!(require_provisioning_metadata(&configured, Acceptance { platform_mismatch: true, ..Default::default() }).is_err());
+        assert!(require_provisioning_metadata(&configured, both).is_ok());
         let mut unsourced = configured.clone();
         unsourced.provenance = None;
-        assert!(require_provisioning_metadata(&unsourced, true).is_err());
+        assert!(require_provisioning_metadata(&unsourced, both).is_err());
         let mut verified = configured;
         verified.provenance.as_mut().unwrap().apple_verified = true;
-        assert!(require_provisioning_metadata(&verified, false).is_ok());
+        assert!(require_provisioning_metadata(&verified, Acceptance { platform_mismatch: true, ..Default::default() }).is_ok());
         // A provisioned state's record matches only the pair it was made with.
         let state = root.join("state");
         fs::create_dir(&state).unwrap();
@@ -739,7 +762,11 @@ mod tests {
         changed.user_agent = "akd/1.0 CFNetwork/1404.0.5 Darwin/22.3.0".into();
         assert!(metadata::check_state(&state, &changed).is_err());
         let args = |extra: &str| paths(vec!["/r".into(), "/s".into(), extra.into()].into_iter());
-        assert!(args("--accept-unverified-metadata").unwrap().2);
+        assert!(args("--accept-unverified-metadata").unwrap().2.unverified);
+        assert!(args("--accept-platform-mismatch").unwrap().2.platform_mismatch);
+        let flags = paths(vec!["/r".into(), "/s".into(), "--accept-platform-mismatch".into(), "--accept-unverified-metadata".into()].into_iter()).unwrap().2;
+        assert_eq!(flags, Acceptance { unverified: true, platform_mismatch: true });
+        assert!(paths(vec!["/r".into(), "/s".into(), "--accept-unverified-metadata".into(), "--accept-unverified-metadata".into()].into_iter()).is_err());
         assert!(args("--accept").is_err());
         fs::remove_dir_all(root).unwrap();
     }
@@ -779,7 +806,7 @@ mod tests {
     #[test]
     fn provision_paths_reject_relative_existing_and_public_parents() {
         assert!(paths(vec!["/".into(), "/tmp/state".into(), "extra".into()].into_iter()).is_err());
-        assert!(!paths(vec!["/".into(), "/tmp/state".into()].into_iter()).unwrap().2);
+        assert_eq!(paths(vec!["/".into(), "/tmp/state".into()].into_iter()).unwrap().2, Acceptance::default());
         let root = private_dir("paths");
         assert!(validate_paths(Path::new("relative"), &root.join("state")).is_err());
         assert!(validate_paths(Path::new("/"), &root).is_err());
