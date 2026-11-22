@@ -18,7 +18,9 @@
 use std::{fs, io::{self, Read}, path::Path};
 
 const MAX_FILE_BYTES: u64 = 2048;
-/// The platform of the only native ADI libraries this project loads.
+/// The platform of the Apple Music for Android libraries that the loader
+/// probe and the server's default backend load. The server's Windows backend
+/// checks its own identity instead (`NativePlatform::accepts`).
 pub(crate) const NATIVE_ADI_PLATFORM: &str = "Android";
 
 #[derive(Clone, Debug, PartialEq, Eq)]

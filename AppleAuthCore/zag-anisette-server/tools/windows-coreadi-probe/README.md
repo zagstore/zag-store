@@ -81,17 +81,30 @@ target/release/zag-windows-coreadi-probe /private/CoreADI64.dll root [--trace]
 The DLL is Apple's and is never committed. Extract it yourself from the
 official installer.
 
+## As the server's worker
+
+The same binary is the server's Windows worker, selected with
+`ZAG_ANISETTE_NATIVE_PLATFORM=windows` and installed as
+`zag-native-adi-worker`. The worker:
+- runs `--native-offline-check`, `--native-headers` and `--native-v2-session`
+  (`src/worker.rs`);
+- derives its synthetic machine from the client identifier;
+- passes the client's state as a strict container of CoreADI's state files
+  (`src/state.rs`).
+
+`WINDOWS_NATIVE_BACKEND.md` covers the identity provenance, the machine
+binding, the robustness review, the offline validation, the licence and
+the live-testing gate.
+
 ## Not yet shown
 
 - **A provisioning exchange.** Start with a real SPIM, then Finish. That
   needs authorization for Apple contact.
-- **A matching identity.** `iTunes.exe` (which statically links AuthKitWin
-  `authkitwin-185.6`) contains the template
-  `<PC> <%@> <com.apple.AuthKitWin/%d (%@/%@)>`. The values it fills in
-  (Windows version field, AuthKitWin version, app bundle id and version)
-  have not been sourced yet.
-- **Which machine values bind the state.** No registry or volume query
-  happened before provisioning. They may happen during Start/Finish.
+- **That Apple accepts the identity.** The `client_info` template and three
+  of its values come from iTunes 12.13.12.3. Still open:
+  - the build number;
+  - `AuthKitWin/1` or `/2`;
+  - the User-Agent.
+- **Which machine values bind a provisioned state.** No registry or volume
+  query happened in any offline mode. They may happen during Finish or OTP.
 - **C++ exception paths.** Unsupported, and they abort if reached.
-- **Integration as a worker mode** behind the existing v3 server, with its
-  supervision and isolation.

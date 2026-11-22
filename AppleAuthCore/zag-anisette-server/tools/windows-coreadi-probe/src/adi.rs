@@ -8,11 +8,14 @@
 pub const INITIALIZE: u32 = 0x12db_31c5;
 pub const IS_MACHINE_PROVISIONED: u32 = 0xb0ed_a7af;
 pub const PROVISIONING_START: u32 = 0x716b_d86c;
+pub const PROVISIONING_END: u32 = 0x0b2b_3196;
 pub const REQUEST_OTP: u32 = 0xcfe0_b46a;
 pub const STORAGE_DISPOSE: u32 = 0x3e58_e7f9;
 pub const TEAR_DOWN: u32 = 0x08c0_fe9e;
 
 pub const NOT_PROVISIONED: i32 = -45061;
+/// Upper bound on any buffer the library returns (CPIM, machine id, OTP).
+const MAX_OUTPUT: usize = 16 * 1024;
 
 #[repr(C)]
 struct Parameters { payload: *mut u8, input_size: u32, output_size: u32, flags: u32 }
@@ -57,25 +60,46 @@ impl CoreAdi {
     pub fn is_machine_provisioned(&self, ds_id: i64) -> Status { self.call(IS_MACHINE_PROVISIONED, Message::new().i64(ds_id)) }
     pub fn tear_down(&self) -> Status { self.call(TEAR_DOWN, Message::new()) }
 
-    /// Returns the status and, on success, (machine id, OTP) lengths only.
-    pub fn request_otp(&self, ds_id: i64) -> (Status, Option<(usize, usize)>) {
+    /// Copies `len` bytes the library returned, then releases its buffer.
+    fn take(&self, p: *const u8, len: u32) -> Option<Vec<u8>> {
+        if p.is_null() { return None; }
+        let bytes = (len as usize <= MAX_OUTPUT).then(|| unsafe { std::slice::from_raw_parts(p, len as usize) }.to_vec());
+        self.call(STORAGE_DISPOSE, Message::new().ptr(p));
+        bytes
+    }
+
+    /// One OTP: the status and, on success, (machine id, OTP).
+    pub fn request_otp(&self, ds_id: i64) -> (Status, Option<(Vec<u8>, Vec<u8>)>) {
         let (mut mid, mut mid_len, mut otp, mut otp_len) = (std::ptr::null::<u8>(), 0u32, std::ptr::null::<u8>(), 0u32);
         let status = self.call(REQUEST_OTP, Message::new().i64(ds_id)
             .ptr(&mut mid as *mut _).ptr(&mut mid_len as *mut _).ptr(&mut otp as *mut _).ptr(&mut otp_len as *mut _));
+        let (mid, otp) = (self.take(mid, mid_len), self.take(otp, otp_len));
         if status.code() != 0 { return (status, None); }
-        let lengths = (mid_len as usize, otp_len as usize);
-        for p in [mid, otp] { if !p.is_null() { self.call(STORAGE_DISPOSE, Message::new().ptr(p)); } }
-        (status, Some(lengths))
+        match (mid, otp) {
+            (Some(mid), Some(otp)) if !mid.is_empty() && !otp.is_empty() => (status, Some((mid, otp))),
+            _ => (status, None),
+        }
     }
 
-    /// Starts provisioning with `spim`; returns the status and the CPIM length.
-    pub fn start_provisioning(&self, ds_id: i64, spim: &[u8]) -> (Status, Option<usize>) {
+    /// Starts provisioning with `spim`: the status and, on success, the CPIM
+    /// and the session number Finish needs.
+    pub fn start_provisioning(&self, ds_id: i64, spim: &[u8]) -> (Status, Option<(Vec<u8>, u32)>) {
         let (mut cpim, mut cpim_len, mut session) = (std::ptr::null::<u8>(), 0u32, 0u32);
         let status = self.call(PROVISIONING_START, Message::new().i64(ds_id).ptr(spim.as_ptr()).u32(spim.len() as u32)
             .ptr(&mut cpim as *mut _).ptr(&mut cpim_len as *mut _).ptr(&mut session as *mut _));
+        let cpim = self.take(cpim, cpim_len);
         if status.code() != 0 { return (status, None); }
-        if !cpim.is_null() { self.call(STORAGE_DISPOSE, Message::new().ptr(cpim)); }
-        (status, Some(cpim_len as usize))
+        match cpim {
+            Some(cpim) if !cpim.is_empty() => (status, Some((cpim, session))),
+            _ => (status, None),
+        }
+    }
+
+    /// Finishes provisioning with Apple's PTM and TK; CoreADI writes its
+    /// state files on success.
+    pub fn end_provisioning(&self, session: u32, ptm: &[u8], tk: &[u8]) -> Status {
+        self.call(PROVISIONING_END, Message::new().u32(session).ptr(ptm.as_ptr()).u32(ptm.len() as u32)
+            .ptr(tk.as_ptr()).u32(tk.len() as u32))
     }
 }
 

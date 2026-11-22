@@ -3,6 +3,9 @@
 //!
 //!   zag-windows-coreadi-probe <CoreADI64.dll> <private-root> [--trace]
 //!
+//! As the server's worker (see worker.rs) it is run as
+//!   zag-windows-coreadi-probe <runtime> --native-{offline-check,headers,v2-session} <work dir> <identifier hex>
+//!
 //! It maps the DLL, binds its imports to the host layer in `win.rs`, runs
 //! its CRT initialisation (DllMain), then calls the ADI dispatcher on an
 //! empty private machine: initialize, is-provisioned, an OTP request and a
@@ -13,7 +16,11 @@ compile_error!("the Windows CoreADI prototype runs on Linux x86_64 only");
 
 mod adi;
 mod pe;
+mod state;
 mod win;
+mod worker;
+#[path = "../../../adi_worker_wire_v2.rs"]
+mod wire;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -86,8 +93,8 @@ fn run(dll: PathBuf, root: PathBuf) -> Result<bool, String> {
     let s = adi.is_machine_provisioned(ANONYMOUS_DS_ID);
     check("is_machine_provisioned (empty machine)", s.code() == adi::NOT_PROVISIONED,
         format!("{s:?}, expected {} (not provisioned)", adi::NOT_PROVISIONED));
-    let (s, lengths) = adi.request_otp(ANONYMOUS_DS_ID);
-    check("request_otp (empty machine)", s.code() != 0 && lengths.is_none(),
+    let (s, otp) = adi.request_otp(ANONYMOUS_DS_ID);
+    check("request_otp (empty machine)", s.code() != 0 && otp.is_none(),
         format!("{s:?}; an unprovisioned machine must refuse an OTP"));
     let spim = b"zag offline test: bytes Apple never issued";
     let (s, cpim) = adi.start_provisioning(ANONYMOUS_DS_ID, spim);
@@ -117,6 +124,10 @@ fn run(dll: PathBuf, root: PathBuf) -> Result<bool, String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    // The supervised worker modes the anisette server runs.
+    if args.get(2).is_some_and(|mode| mode.starts_with("--native-")) {
+        return worker::main(&args);
+    }
     let trace = args.iter().any(|a| a == "--trace");
     let positional: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--trace").collect();
     let [dll, root] = positional.as_slice() else {
