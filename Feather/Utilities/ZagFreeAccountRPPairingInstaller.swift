@@ -6,13 +6,11 @@ import Zip
 /// call it; RPPairing itself is unchanged. Closed in this version: it refuses
 /// while the free-account signing gate is closed.
 ///
-/// Verification: the RPPairing core lists installed apps (bundle ID, version,
-/// signer), and reads the device's installed provisioning profiles through
-/// misagent (`readInstalledProfiles`, PR #25, now in `main`). This installer's
-/// own `installedProfiles` hook is not wired to that reader yet, so an install
-/// here is at best `.unverifiable` and a refresh is never reported as
-/// successful from it. The G5 experiment reads back separately
-/// (`experimentReadback`), keeping its four results distinct.
+/// Verification first checks the installed-app inventory, then reads the
+/// device's provisioning profiles via the existing misagent reader. The
+/// profile UUID, team, bundle identifier and expiry must match the expected
+/// signed app before installation can be reported as verified.
+/// The G5 experiment also records its separate four-way read-back result.
 struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 	enum Failure: Error, Equatable {
 		case disabled
@@ -22,11 +20,11 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 
 	var gate = ZagFreeAccountSigningGate.production
 	var workRoot = FileManager.default.temporaryDirectory
-	/// The device's installed provisioning profiles. Nil: not wired to the
-	/// RPPairing misagent reader (PR #25, in `main`); when it is, `verify`
-	/// can confirm the installed profile and its expiry instead of reporting
-	/// unverifiable.
-	var installedProfiles: (@Sendable () async -> Result<[Data], Error>)?
+	/// The paired device's profiles are read through misagent by default.
+	/// Tests can replace the callback; nil intentionally disables read-back.
+	var installedProfiles: (@Sendable () async -> Result<[Data], Error>)? = {
+		await ZagRPPairingFreeAccountInstaller.readProfiles()
+	}
 
 	func install(signedApp: URL, bundleIdentifier: String) async throws {
 		guard gate.isOpen else { throw Failure.disabled }
@@ -87,13 +85,22 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 			if let expected = expectation.signerCommonName, !app.signerIdentity.isEmpty, app.signerIdentity != expected {
 				return .mismatch("signer")
 			}
-			// Present and signed by this certificate. The profile and its
-			// expiry can be confirmed only by reading the device's installed
-			// profiles (the `installedProfiles` hook, not wired here).
+			// Presence alone is insufficient: use the device's actual installed
+			// profile to verify the UUID, identity and expiry.
 			guard let installedProfiles else { return .unverifiable("installed; profile expiry cannot be read back") }
 			switch await installedProfiles() {
 			case .success(let profiles): return ZagInstalledProfileCheck.verify(expectation, installedProfiles: profiles)
 			case .failure: return .unverifiable("installed; the device's profiles could not be read")
+			}
+		}
+	}
+
+	/// Fetch the actual installed profiles through the existing, read-only
+	/// RPPairing misagent transport. Never turn a failed read into success.
+	static func readProfiles(deviceIP: String = ZagDeviceLink.peerAddress) async -> Result<[Data], Error> {
+		await withCheckedContinuation { continuation in
+			Task { @MainActor in
+				ZagRPPairingCore.shared.readInstalledProfiles(deviceIP: deviceIP) { continuation.resume(returning: $0) }
 			}
 		}
 	}
@@ -121,14 +128,6 @@ extension ZagRPPairingFreeAccountInstaller {
 	/// is never a success.
 	static func experimentReadback(_ expectation: ZagInstallExpectation, deviceIP: String = ZagDeviceLink.peerAddress) async -> ZagExperimentReadback {
 		ZagExperimentReadback.classify(read: await readProfiles(deviceIP: deviceIP), expectation: expectation)
-	}
-
-	static func readProfiles(deviceIP: String = ZagDeviceLink.peerAddress) async -> Result<[Data], Error> {
-		await withCheckedContinuation { continuation in
-			Task { @MainActor in
-				ZagRPPairingCore.shared.readInstalledProfiles(deviceIP: deviceIP) { continuation.resume(returning: $0) }
-			}
-		}
 	}
 
 	/// §6: RPPairing's failure kinds in the closed failure enum (total).
