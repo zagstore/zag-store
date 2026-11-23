@@ -69,10 +69,11 @@ live Apple acceptance.
 
 `scripts/test-zag-free-account-e2e.sh` runs the existing per-stage suites in
 workflow order against synthetic fixtures and mock/offline backends — it reuses
-components and adds no parallel pipeline. Rust stages (2 anisette, 7 bridge)
-PASS via the harness; the Swift stages run under the Xcode toolchain and passed
-as the per-suite regression batch this session. The harness is explicit that it
-cannot prove Apple's live acceptance.
+components and adds no parallel pipeline. A full run on 2026-11-23 reported
+**PASS for every stage (1–11)** offline — sign-in/2FA, anisette, session,
+team, device, App ID, certificate, profile, Zsign, RPPairing, post-install
+verification. The harness is explicit that it cannot prove Apple's live
+acceptance; it validates only the local logic against synthetic inputs.
 
 ## Phase 5 — live procedure
 
