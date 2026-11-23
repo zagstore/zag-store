@@ -175,6 +175,39 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 											  try! PropertyListSerialization.data(fromPropertyList: result.extensions[0].entitlements.dictionary, format: .xml, options: 0))
 		check(Zsign.verifyComponents(appPath: app.path, certificate: identity.certificate, components: components) == nil, "the result verifies independently")
 
+		// End-to-end: the profiles the real signed app embeds are exactly what a
+		// device reports back through RPPairing misagent, so feed those real
+		// artifacts straight into the installed-profile check. This crosses the
+		// sign -> install -> verify boundary with the issued certificate and the
+		// CMS-signed profiles produced above; the only step that cannot run
+		// offline is the device transport itself (a real iPhone).
+		guard let appProfile = try? Certificate.decode(profileData: result.app.profile.data),
+			  let widgetProfile = try? Certificate.decode(profileData: result.extensions[0].profile.data) else {
+			return check(false, "end-to-end: the embedded app and extension profiles decode")
+		}
+		let installed = [result.app.profile.data, result.extensions[0].profile.data]
+		func expectation(profileExpiresAt: Date, bundleIdentifier: String = result.app.bundleIdentifier) -> ZagInstallExpectation {
+			ZagInstallExpectation(
+				bundleIdentifier: bundleIdentifier, profileUUID: appProfile.UUID,
+				profileExpiresAt: profileExpiresAt, certificateExpiresAt: appProfile.ExpirationDate,
+				signerCommonName: nil, teamIdentifier: team, extensionProfileUUIDs: [widgetProfile.UUID])
+		}
+		if case .verified = ZagInstalledProfileCheck.verify(expectation(profileExpiresAt: appProfile.ExpirationDate), installedProfiles: installed) {
+			check(true, "end-to-end: the profiles the device reports verify against the certificate and profiles that were signed and embedded")
+		} else {
+			check(false, "end-to-end: installed-profile verification of the real signed artifact")
+		}
+		if case .unverifiable = ZagInstalledProfileCheck.verify(expectation(profileExpiresAt: appProfile.ExpirationDate), installedProfiles: []) {
+			check(true, "end-to-end: an app whose profile the device does not report is not a successful install")
+		} else {
+			check(false, "end-to-end: a missing installed profile must be unverifiable")
+		}
+		if case .mismatch = ZagInstalledProfileCheck.verify(expectation(profileExpiresAt: appProfile.ExpirationDate.addingTimeInterval(86_400)), installedProfiles: installed) {
+			check(true, "end-to-end: a profile whose expiry differs from what was embedded is a mismatch, not a success")
+		} else {
+			check(false, "end-to-end: an expiry that differs from the embedded profile must be a mismatch")
+		}
+
 		// Refusals.
 		func refused(_ app: URL, _ label: String, gate: ZagFreeAccountSigningGate = .simulationOnly, intermediates: [Data] = [intermediate],
 					 signer: @escaping (Data) -> Data? = signer, matches: (Error) -> Bool) {
