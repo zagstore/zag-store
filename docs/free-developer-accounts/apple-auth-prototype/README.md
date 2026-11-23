@@ -80,3 +80,21 @@ result with `devicectl device copy from ... Documents/zag_result.json`.
 Set `PRODUCT_BUNDLE_IDENTIFIER`, `DEVELOPMENT_TEAM`, the entitlements
 `application-identifier`/`team-identifier`, the cert SHA1 and the device id to
 your own values.
+
+## 5. Client layer + supervised provisioning (for the live experiment)
+
+The provisioning experiment also builds apple-auth's **client** layer for iOS
+(the 9 sources in the CMake `add_library(apple_auth_client ...)` block), which
+adds nlohmann-json (header-only, pinned `v3.11.3`) and uses CoreFoundation for
+plist on Apple platforms (`src/client/apple_plist.cpp`) and the app-supplied
+transport (`src/client/external_transport.cpp`) — no curl, no libplist. Compile
+those 9 sources with the same flags plus `-DAPPLE_AUTH_CLIENT_STATIC_DEFINE`,
+link `-lapple_auth_client -lapple_auth_core -lmbedtls_all -lc++ -framework
+CoreFoundation`.
+
+`ProvisioningHarness.swift` drives apple-auth's own `aauth_client_provision`
+(lookup → midStartProvisioning → midFinishProvisioning) over a `URLSession`
+transport pinned to `https://*.apple.com`, capped at 3 requests, no redirects,
+no retries, no background. It runs **only** under `ZAG_RUN_PROVISION=1`; a normal
+launch runs the offline self-test and never contacts Apple. See
+`../APPLE-AUTH-PROVISIONING-EXPERIMENT-PLAN.md`.

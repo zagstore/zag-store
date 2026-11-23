@@ -10,7 +10,13 @@ struct ZagAuthProbeApp: App {
                 Text(report).font(.system(.footnote, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading).padding()
             }
-            .onAppear { report = runSelfTest() }
+            .onAppear {
+                if ProvisioningExperiment.isRequested {
+                    report = "SUPERVISED PROVISIONING ATTEMPT\n\n" + ProvisioningExperiment.run()
+                } else {
+                    report = runSelfTest()
+                }
+            }
         }
     }
     private func runSelfTest() -> String {
