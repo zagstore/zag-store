@@ -41,8 +41,10 @@ enum ZagSignInExperimentRunner {
 		// 3. One bounded sign-in attempt.
 		let machine = ZagAppleAuthMachine()
 		do {
-			let outcome = try await machine.signInExperiment(email: email, password: password, allowNetwork: live)
-			report["outcome"] = describe(outcome)
+			let signIn = try await machine.signInExperiment(email: email, password: password, allowNetwork: live)
+			report["outcome"] = describe(signIn.outcome)
+			if let stage = signIn.stage { report["stage"] = stage }
+			report["request_count"] = signIn.requestCount
 		} catch {
 			report["outcome"] = "error"
 		}
@@ -55,6 +57,7 @@ enum ZagSignInExperimentRunner {
 		case .authenticated: return "authenticated"
 		case .twoFactorRequired: return "two-factor-required (not submitted)"
 		case .rejected(let code): return "rejected(\(code))"
+		case .httpError(let status): return "http-error(\(status))"
 		case .transportFailed: return "transport-failed"
 		case .notProvisioned: return "not-provisioned"
 		}

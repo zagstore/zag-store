@@ -94,6 +94,11 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 	/// failure from a server rejection).
 	var reachedApple: Bool { lock.withLock { count > 0 } }
 
+	/// How many requests actually went to Apple. For the sign-in sequence this
+	/// identifies the stage a rejection occurred at (1 = lookup, 2 = SRP init,
+	/// 3 = SRP complete) without exposing any request content.
+	var requestCount: Int { lock.withLock { count } }
+
 	private lazy var session: URLSession = {
 		let cfg = URLSessionConfiguration.ephemeral
 		cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -276,12 +281,32 @@ actor ZagAppleAuthMachine {
 		}
 	}
 
-	/// The GrandSlam status code embedded in an apple-auth error message (e.g.
-	/// `-80045`). The code itself is a public, non-sensitive constant; the rest
-	/// of the message is never surfaced. Returns nil when no code is present.
+	/// The GrandSlam status code (`ec`) embedded in an apple-auth error message
+	/// (e.g. `-80045`). `ec` values are negative, so only a negative integer is
+	/// matched — an HTTP status or SRP iteration count is never misread as a
+	/// rejection code. The code is a public, non-sensitive constant; the rest of
+	/// the message is never surfaced. Returns nil when no `ec` is present.
 	static func grandSlamCode(_ text: String) -> Int? {
-		guard let r = text.range(of: "-?[0-9]{4,6}", options: .regularExpression) else { return nil }
+		guard let r = text.range(of: "-[0-9]{4,6}", options: .regularExpression) else { return nil }
 		return Int(text[r])
+	}
+
+	/// An Apple edge HTTP failure (e.g. 503 / 429) reported by apple-auth before
+	/// any `ec`, distinct from a GrandSlam rejection. Returns the status or nil.
+	static func grandSlamHTTPStatus(_ text: String) -> Int? {
+		guard let r = text.range(of: "HTTP [0-9]{3}", options: .regularExpression) else { return nil }
+		return Int(text[r].dropFirst(5))
+	}
+
+	/// The sign-in stage from the request count: 1 lookup, 2 SRP init, 3 SRP
+	/// complete. Non-sensitive.
+	static func signInStage(requestCount: Int) -> String {
+		switch requestCount {
+		case ..<1: return "pre-request"
+		case 1: return "lookup"
+		case 2: return "srp-init"
+		default: return "srp-complete"
+		}
 	}
 
 	/// EXPERIMENT-ONLY, gated. Performs at most one GrandSlam SRP sign-in using
@@ -292,9 +317,9 @@ actor ZagAppleAuthMachine {
 	/// account session is freed immediately and never persisted; the password
 	/// is used once and never stored, logged or returned. Returns only a
 	/// classification. Requires an authorised live run (`allowNetwork`).
-	func signInExperiment(email: String, password: String, allowNetwork: Bool) async throws -> ZagAppleAuthSignInOutcome {
+	func signInExperiment(email: String, password: String, allowNetwork: Bool) async throws -> ZagAppleAuthSignInReport {
 		#if canImport(ZagAppleAuth)
-		guard let persisted = try store.load(scope: scope) else { return .notProvisioned }
+		guard let persisted = try store.load(scope: scope) else { return ZagAppleAuthSignInReport(outcome: .notProvisioned) }
 		// Bounded: lookup + SRP init + SRP complete (+ a possible 2FA bootstrap),
 		// no retries. With allowNetwork false the transport refuses everything.
 		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: 6)
@@ -312,7 +337,7 @@ actor ZagAppleAuthMachine {
 
 	#if canImport(ZagAppleAuth)
 	private static func driveSignIn(persisted: Data, transport: ZagAppleAuthTransport,
-									email: String, password: String, sentinel: ZagTwoFactorSentinel) -> ZagAppleAuthSignInOutcome {
+									email: String, password: String, sentinel: ZagTwoFactorSentinel) -> ZagAppleAuthSignInReport {
 		let result: Result<ZagAppleAuthSignInOutcome, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport) { client in
 			// Ensure the profile is loaded (no-op for a provisioned profile; no HTTP).
 			let p = aauth_client_provision(client)
@@ -330,13 +355,15 @@ actor ZagAppleAuthMachine {
 			if let session { aauth_account_session_free(session) }   // never persisted
 			if sentinel.requested { return .success(.twoFactorRequired) }
 			if rc == AAUTH_OK { return .success(.authenticated) }
-			if let code = grandSlamCode(String(cString: aauth_client_last_error())) { return .success(.rejected(code: code)) }
+			let error = String(cString: aauth_client_last_error())
+			if let code = grandSlamCode(error) { return .success(.rejected(code: code)) }
+			if let http = grandSlamHTTPStatus(error) { return .success(.httpError(status: http)) }
 			return .success(transport.reachedApple ? .rejected(code: Int(rc.rawValue)) : .transportFailed)
 		}
-		switch result {
-		case .success(let outcome): return outcome
-		case .failure: return .transportFailed
-		}
+		let outcome: ZagAppleAuthSignInOutcome = { if case .success(let o) = result { return o }; return .transportFailed }()
+		return ZagAppleAuthSignInReport(outcome: outcome,
+										stage: Self.signInStage(requestCount: transport.requestCount),
+										requestCount: transport.requestCount)
 	}
 	#endif
 }
@@ -344,11 +371,21 @@ actor ZagAppleAuthMachine {
 /// The classified result of the gated sign-in experiment. Carries no account
 /// session, token, credential or anisette value — only what happened.
 enum ZagAppleAuthSignInOutcome: Equatable, Sendable {
-	case authenticated        // M2 verified, no 2FA requested
-	case twoFactorRequired    // Apple asked for a code; the harness did not submit one
-	case rejected(code: Int)  // Apple rejected the sign-in (e.g. -80045)
-	case transportFailed      // no Apple response (offline, blocked, network error)
-	case notProvisioned       // no machine profile to sign in with
+	case authenticated         // M2 verified, no 2FA requested
+	case twoFactorRequired     // Apple asked for a code; the harness did not submit one
+	case rejected(code: Int)   // Apple GrandSlam rejection, Status.ec (negative, e.g. -80045)
+	case httpError(status: Int)// Apple edge HTTP failure (e.g. 503/429), no ec
+	case transportFailed       // no Apple response (offline, blocked, network error)
+	case notProvisioned        // no machine profile to sign in with
+}
+
+/// A sanitized sign-in report: the outcome plus the stage and request count,
+/// which locate a rejection (lookup / SRP init / SRP complete) without exposing
+/// any request content, credential, token or anisette value.
+struct ZagAppleAuthSignInReport: Equatable, Sendable {
+	let outcome: ZagAppleAuthSignInOutcome
+	var stage: String? = nil
+	var requestCount: Int = 0
 }
 
 #if canImport(ZagAppleAuth)
