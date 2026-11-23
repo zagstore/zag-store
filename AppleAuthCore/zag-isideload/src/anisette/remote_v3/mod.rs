@@ -110,18 +110,50 @@ impl std::fmt::Display for ProvisioningFault {
 
 /// Zag Store fork: the fixed set of anisette/ADI numeric error codes a
 /// diagnostic may recognise. Extended only as codes are confirmed; recognition
-/// is exact-substring against this list, so no other text can ever leak.
+/// is by whole numeric token against this list, so no other text can ever leak.
 /// -45061: device not provisioned. -29003: ADI environment/identity mismatch.
 pub const KNOWN_ADI_CODES: &[i64] = &[-45061, -29003];
 
-/// Zag Store fork: recognises a known ADI code as an exact substring of a
-/// provisioning message. Returns only a value from `KNOWN_ADI_CODES`, never any
-/// surrounding text. This is deliberately not a general error-text parser.
+/// Zag Store fork: recognises a known ADI code appearing as a complete numeric
+/// token in a provisioning message, returning only a value from
+/// `KNOWN_ADI_CODES` and never any surrounding text.
+///
+/// The provisioning protocol does not expose a structured numeric field for
+/// these messages (only an opaque string), so this scans for whole integer
+/// tokens and matches them against the allow-list. A token is a maximal run of
+/// ASCII digits, taking an immediately preceding `-` as its sign only when that
+/// `-` is not itself glued to a digit. This rejects a code embedded in a longer
+/// number — `-290030` is the single token -290030, never -29003 — and a bare
+/// positive `29003` never matches the negative code. This is deliberately not a
+/// general error-text parser.
 pub fn known_adi_code(message: &str) -> Option<i64> {
-    KNOWN_ADI_CODES
-        .iter()
-        .copied()
-        .find(|code| message.contains(&code.to_string()))
+    let b = message.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // Maximal run of digits: [start, i).
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        // Include a leading '-' as a sign only when it is not glued to a digit
+        // (so "5-29003" does not read as a sign on 29003).
+        let token_start =
+            if start > 0 && b[start - 1] == b'-' && (start < 2 || !b[start - 2].is_ascii_digit()) {
+                start - 1
+            } else {
+                start
+            };
+        if let Ok(value) = message[token_start..i].parse::<i64>()
+            && KNOWN_ADI_CODES.contains(&value)
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -129,21 +161,51 @@ mod known_adi_code_tests {
     use super::{known_adi_code, KNOWN_ADI_CODES};
 
     #[test]
-    fn recognises_a_known_code_embedded_in_a_message() {
+    fn recognises_a_known_code_as_a_bounded_token() {
         assert_eq!(known_adi_code("error GsService -29003 (akd)"), Some(-29003));
         assert_eq!(known_adi_code("Device not provisioned: -45061"), Some(-45061));
+        // Adjacent to punctuation (not digits) still recognised.
+        assert_eq!(known_adi_code("(-29003)"), Some(-29003));
+        assert_eq!(known_adi_code("ec=-45061."), Some(-45061));
+        assert_eq!(known_adi_code("-29003"), Some(-29003));
+    }
+
+    #[test]
+    fn rejects_a_known_code_embedded_in_a_longer_number() {
+        // The whole token differs from the allow-listed code.
+        assert_eq!(known_adi_code("-290030"), None, "trailing digit");
+        assert_eq!(known_adi_code("-450610"), None, "trailing digit");
+        assert_eq!(known_adi_code("-129003"), None, "leading digit");
+        assert_eq!(known_adi_code("code -290031 akd"), None);
+        assert_eq!(known_adi_code("ref 1234506129003 end"), None, "code buried mid-number");
+    }
+
+    #[test]
+    fn a_bare_positive_number_is_not_a_negative_code() {
+        assert_eq!(known_adi_code("29003"), None);
+        assert_eq!(known_adi_code("status 45061 ok"), None);
     }
 
     #[test]
     fn returns_none_for_an_unknown_code_rather_than_inventing_one() {
         assert_eq!(known_adi_code("error -12345 something"), None);
         assert_eq!(known_adi_code("a long opaque server message with no known code"), None);
+        assert_eq!(known_adi_code(""), None);
+    }
+
+    #[test]
+    fn handles_ambiguous_and_malformed_messages_without_false_positives() {
+        // A digit glued before the sign must not read as a bounded code.
+        assert_eq!(known_adi_code("5-29003"), None);
+        // Multiple tokens: the first bounded match wins, unknowns are skipped.
+        assert_eq!(known_adi_code("tries=3 then -45061"), Some(-45061));
+        assert_eq!(known_adi_code("-290030 then -29003"), Some(-29003));
     }
 
     #[test]
     fn only_ever_returns_a_value_from_the_allowlist() {
         // Whatever the input, the result is one of the fixed known codes or None.
-        for message in ["-29003", "-45061", "noise", "", "code=0"] {
+        for message in ["-29003", "-45061", "noise", "", "code=0", "-290030", "99999"] {
             assert!(known_adi_code(message).is_none_or(|c| KNOWN_ADI_CODES.contains(&c)));
         }
     }
