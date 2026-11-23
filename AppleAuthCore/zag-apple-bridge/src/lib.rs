@@ -16,6 +16,7 @@
 //!   text from Apple or from the library.
 
 pub mod backend;
+pub mod diagnostics;
 pub mod ffi;
 pub mod slot;
 
