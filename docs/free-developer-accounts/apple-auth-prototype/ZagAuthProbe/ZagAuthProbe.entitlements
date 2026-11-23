@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Development entitlement. Automatic signing injects application-identifier
+	     and com.apple.developer.team-identifier for your own team; for a manual
+	     codesign, add those two keys as <TEAMID>.<bundle-id> and <TEAMID>. -->
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>
