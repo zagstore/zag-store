@@ -70,6 +70,85 @@ fn normalize_client_identity(info: &str) -> String {
     info.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Zag Store fork: the stage of the anisette provisioning exchange at which a
+/// failure occurred. Carries no message, identifier or blob — only which step
+/// failed, so a diagnostic can be actionable without exposing Apple's response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningStage {
+    /// The server asked for, or rejected, the device identifier.
+    Identifier,
+    /// The start-provisioning (`spim`) exchange.
+    StartProvisioning,
+    /// The end-provisioning (`cpim`/`ptm`/`tk`) exchange — where an Android-ADI
+    /// vs. claimed-platform mismatch (-29003) surfaces.
+    EndProvisioning,
+    /// Fetching anisette headers for an already-provisioned device.
+    HeaderFetch,
+}
+
+/// Zag Store fork: a privacy-preserving, typed hint attached to a provisioning
+/// failure. The caller reads the stage and, when present, a recognised numeric
+/// code — never the withheld message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvisioningFault {
+    pub stage: ProvisioningStage,
+    /// A recognised code from `KNOWN_ADI_CODES`, matched as an exact substring
+    /// of the server's message; `None` when none of the known codes is present.
+    /// Never arbitrary text parsed out of the message.
+    pub code: Option<i64>,
+}
+
+/// Safe to display: only the stage name and a recognised numeric code.
+impl std::fmt::Display for ProvisioningFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(f, "provisioning fault at {:?} (code {code})", self.stage),
+            None => write!(f, "provisioning fault at {:?}", self.stage),
+        }
+    }
+}
+
+/// Zag Store fork: the fixed set of anisette/ADI numeric error codes a
+/// diagnostic may recognise. Extended only as codes are confirmed; recognition
+/// is exact-substring against this list, so no other text can ever leak.
+/// -45061: device not provisioned. -29003: ADI environment/identity mismatch.
+pub const KNOWN_ADI_CODES: &[i64] = &[-45061, -29003];
+
+/// Zag Store fork: recognises a known ADI code as an exact substring of a
+/// provisioning message. Returns only a value from `KNOWN_ADI_CODES`, never any
+/// surrounding text. This is deliberately not a general error-text parser.
+pub fn known_adi_code(message: &str) -> Option<i64> {
+    KNOWN_ADI_CODES
+        .iter()
+        .copied()
+        .find(|code| message.contains(&code.to_string()))
+}
+
+#[cfg(test)]
+mod known_adi_code_tests {
+    use super::{known_adi_code, KNOWN_ADI_CODES};
+
+    #[test]
+    fn recognises_a_known_code_embedded_in_a_message() {
+        assert_eq!(known_adi_code("error GsService -29003 (akd)"), Some(-29003));
+        assert_eq!(known_adi_code("Device not provisioned: -45061"), Some(-45061));
+    }
+
+    #[test]
+    fn returns_none_for_an_unknown_code_rather_than_inventing_one() {
+        assert_eq!(known_adi_code("error -12345 something"), None);
+        assert_eq!(known_adi_code("a long opaque server message with no known code"), None);
+    }
+
+    #[test]
+    fn only_ever_returns_a_value_from_the_allowlist() {
+        // Whatever the input, the result is one of the fixed known codes or None.
+        for message in ["-29003", "-45061", "noise", "", "code=0"] {
+            assert!(known_adi_code(message).is_none_or(|c| KNOWN_ADI_CODES.contains(&c)));
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn state_for_tests(keychain_identifier: [u8; 16], adi_pb: Option<Vec<u8>>) -> AnisetteState {
     AnisetteState { keychain_identifier, adi_pb }
@@ -383,7 +462,9 @@ impl RemoteV3AnisetteProvider {
                     warn!("Server says anisette not provisioned");
                     return Ok(AnisetteDataResponse::IncorrectlyProvisioned);
                 }
-                Err(report!("Failed to get anisette headers ({} bytes withheld)", message.len()))
+                Err(report!("Failed to get anisette headers ({} bytes withheld)", message.len())
+                    .context(ProvisioningFault { stage: ProvisioningStage::HeaderFetch, code: known_adi_code(&message) })
+                    .into())
             }
         }
     }
@@ -640,15 +721,21 @@ impl RemoteV3AnisetteProvider {
                 }
                 ProvisioningMessage::Timeout => bail!("Anisette provisioning timed out"),
                 ProvisioningMessage::InvalidIdentifier => {
-                    bail!("Anisette provisioning failed: invalid identifier")
+                    return Err(report!("Anisette provisioning failed: invalid identifier")
+                        .context(ProvisioningFault { stage: ProvisioningStage::Identifier, code: None })
+                        .into());
                 }
                 // Zag Store fork: the server's message may echo Apple's
                 // response; only its length is reported.
                 ProvisioningMessage::StartProvisioningError { message } => {
-                    bail!("Anisette provisioning failed: start provisioning error ({} bytes withheld)", message.len());
+                    return Err(report!("Anisette provisioning failed: start provisioning error ({} bytes withheld)", message.len())
+                        .context(ProvisioningFault { stage: ProvisioningStage::StartProvisioning, code: known_adi_code(&message) })
+                        .into());
                 }
                 ProvisioningMessage::EndProvisioningError { message } => {
-                    bail!("Anisette provisioning failed: end provisioning error ({} bytes withheld)", message.len());
+                    return Err(report!("Anisette provisioning failed: end provisioning error ({} bytes withheld)", message.len())
+                        .context(ProvisioningFault { stage: ProvisioningStage::EndProvisioning, code: known_adi_code(&message) })
+                        .into());
                 }
             }
         }
