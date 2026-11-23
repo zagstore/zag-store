@@ -69,3 +69,14 @@ swiftc -parse-as-library -D DEBUG -D ZAG_ZSIGN_TESTS -D ZAG_ZSIGN_STRICT -target
 ZAG_PROFILE="$PROFILE" ZAG_APP="$WORK/Disposable.app" ZAG_XCODE_APP="$XCODE_APP" \
 	ZAG_INTERMEDIATES="$WORK/intermediates" ZAG_WORK="$WORK" ZAG_DEVICE_UDID="${ZAG_DEVICE_UDID:-}" \
 	"$WORK/proof"
+
+# Package the engine-signed app into a genuine IPA at a persistent path, for the
+# (separately approved) device install. The signature is the engine's, untouched.
+if [ -n "${ZAG_OUT_IPA:-}" ]; then
+	rm -rf "$WORK/Payload" && mkdir -p "$WORK/Payload"
+	cp -R "$WORK/Disposable.app" "$WORK/Payload/PTTeamProbe.app"
+	rm -f "$ZAG_OUT_IPA"
+	(cd "$WORK" && zip -qry "$ZAG_OUT_IPA" Payload)
+	echo "IPA: $ZAG_OUT_IPA"
+	codesign --verify --strict --verbose=2 "$WORK/Payload/PTTeamProbe.app" 2>&1 | sed 's/^/  verify: /'
+fi

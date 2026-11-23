@@ -36,6 +36,13 @@ struct ZagFreeAccountSigningGate: Equatable, Sendable {
 	#if DEBUG
 	static let simulationOnly = ZagFreeAccountSigningGate(isOpen: true)
 	#endif
+	#if ZAG_ZSIGN_STRICT
+	/// Zag Companion (macOS): free-account signing driven by a user-authorised,
+	/// Xcode-issued Keychain identity (`ZagExternalKeychainSigningKey`). Compiled
+	/// only with ZAG_ZSIGN_STRICT — never in the Xcode project's configurations,
+	/// so the shipping app cannot open it.
+	static let companion = ZagFreeAccountSigningGate(isOpen: true)
+	#endif
 }
 
 /// Signs a bundle in place.
