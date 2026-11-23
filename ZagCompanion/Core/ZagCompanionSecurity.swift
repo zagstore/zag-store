@@ -34,6 +34,37 @@ public enum ZagCompanionSafety {
 		let c = child.standardizedFileURL.resolvingSymlinksInPath().path
 		return c == r || c.hasPrefix(r.hasSuffix("/") ? r : r + "/")
 	}
+
+	/// Given a `unzip -Z` (zipinfo long) line, true if the entry is a type we
+	/// refuse to extract: a symbolic link (whose target could escape the work
+	/// directory or be followed by a later entry) or a special file (device,
+	/// fifo, socket). Only regular files (`-`) and directories (`d`) are allowed.
+	public static func isUnsafeZipEntryType(zipinfoLine line: String) -> Bool {
+		guard let perms = line.split(separator: " ", omittingEmptySubsequences: true).first,
+			  let kind = perms.first else { return false }   // header/other lines: ignored here
+		switch kind {
+		case "-", "d": return false
+		case "l", "b", "c", "p", "s": return true            // symlink / block / char / fifo / socket
+		default: return false
+		}
+	}
+
+	/// Walks an extracted tree and returns the first symbolic link whose target
+	/// resolves outside `root` (or any symlink at all, since iOS .app bundles
+	/// are flat and should contain none). Defence in depth after extraction.
+	public static func unsafeSymlink(under root: URL) -> URL? {
+		let keys: [URLResourceKey] = [.isSymbolicLinkKey]
+		guard let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
+													 options: [], errorHandler: nil) else { return nil }
+		for case let url as URL in e {
+			let isLink = (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
+			guard isLink else { continue }
+			// Any symlink in an iOS payload is treated as unsafe; if its target
+			// escapes root it certainly is.
+			return url
+		}
+		return nil
+	}
 }
 
 /// Redacts anything account-identifying from external-tool output before it is

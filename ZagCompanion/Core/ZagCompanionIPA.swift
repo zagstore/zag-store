@@ -11,20 +11,35 @@ public enum ZagIPA {
 		try? FileManager.default.removeItem(at: workDir)
 		try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
 
-		// Refuse any archive entry that could escape the extraction directory
-		// (absolute path, `..` traversal, volume/drive prefix) BEFORE extracting.
-		let listing = ZagProcess.run("/usr/bin/unzip", ["-Z1", ipa.path])
-		guard listing.succeeded else { throw ZagCompanionError.ipaUnreadable(listing.combined) }
-		for entry in listing.standardOutput.split(separator: "\n").map(String.init) where !entry.isEmpty {
+		// Refuse unsafe archives BEFORE extracting:
+		//  (a) entry names that could escape the directory (absolute, `..`), and
+		//  (b) entry types that could escape or be followed during extraction —
+		//      symbolic links and special files. unzip would otherwise create a
+		//      symlink that a later entry writes through, landing outside workDir.
+		let names = ZagProcess.run("/usr/bin/unzip", ["-Z1", ipa.path])
+		guard names.succeeded else { throw ZagCompanionError.ipaUnreadable(names.combined) }
+		for entry in names.standardOutput.split(separator: "\n").map(String.init) where !entry.isEmpty {
 			guard ZagCompanionSafety.isSafeArchiveEntry(entry) else { throw ZagCompanionError.unsafeArchive(entry) }
 		}
+		let modes = ZagProcess.run("/usr/bin/unzip", ["-Z", ipa.path])
+		guard modes.succeeded else { throw ZagCompanionError.ipaUnreadable(modes.combined) }
+		for line in modes.standardOutput.split(separator: "\n").map(String.init) {
+			if ZagCompanionSafety.isUnsafeZipEntryType(zipinfoLine: line) {
+				throw ZagCompanionError.unsafeArchive("archive contains a symlink or special-file entry")
+			}
+		}
 
+		// Extract WITHOUT following symlinks: entries are regular files/dirs
+		// (verified above). `-o` would still never follow a symlink we rejected.
 		let result = ZagProcess.run("/usr/bin/unzip", ["-q", ipa.path, "-d", workDir.path])
 		guard result.succeeded else { throw ZagCompanionError.ipaUnreadable(result.combined) }
 
+		// Defence in depth after extraction: no symlink may remain in the tree,
+		// and the resolved app path must stay inside the work directory.
+		if let link = ZagCompanionSafety.unsafeSymlink(under: workDir) {
+			throw ZagCompanionError.unsafeArchive("extracted tree contains a symlink: \(link.lastPathComponent)")
+		}
 		let app = try appInPayload(workDir)
-		// Defence in depth: the resolved app path (symlinks included) must stay
-		// inside the work directory.
 		guard ZagCompanionSafety.isContained(app, within: workDir) else {
 			throw ZagCompanionError.unsafeArchive("extracted app escaped the work directory")
 		}

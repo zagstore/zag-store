@@ -102,6 +102,11 @@ public final class ZagCompanionService {
 		}
 		progress(ZagCompanionProgress(.resolvingProfile, "Renewing \(app.displayName)…"))
 		let info = try ZagIPA.info(ipa)
+		// The source IPA on disk must still be the app we registered — never
+		// sign a different bundle ID under this managed app's profile.
+		guard info.bundleIdentifier == app.bundleIdentifier else {
+			throw ZagCompanionError.sourceBundleChanged(expected: app.bundleIdentifier, found: info.bundleIdentifier)
+		}
 
 		// 2. Decide from dates + authorisation (pure), then obtain the profile.
 		let candidate = ZagCompanionProvisioning.existingProfile(bundleID: app.bundleIdentifier, deviceUDID: device.udid, team: team.identifier, now: now)

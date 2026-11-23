@@ -118,6 +118,7 @@ public enum ZagCompanionError: Error, CustomStringConvertible {
 	case deviceMismatch(expectedUDIDSuffix: String)
 	case teamMismatch(expected: String, got: String)
 	case renewalNeedsAuthorization(bundleID: String)
+	case sourceBundleChanged(expected: String, found: String)
 
 	public var description: String {
 		switch self {
@@ -141,6 +142,7 @@ public enum ZagCompanionError: Error, CustomStringConvertible {
 		case let .deviceMismatch(suffix): return "The selected device is not the one this app was installed on (expected UDID …\(suffix))."
 		case let .teamMismatch(expected, got): return "The selected team \(got) does not match this app's team \(expected)."
 		case let .renewalNeedsAuthorization(b): return "\(b) is near expiry; renewing it needs a fresh profile from Xcode. Enable new provisioning to authorise it."
+		case let .sourceBundleChanged(expected, found): return "The source IPA's bundle ID is now \(found), not \(expected) as recorded — refusing to renew a different app under this profile."
 		}
 	}
 }

@@ -26,9 +26,55 @@ import CryptoKit
 		redaction()
 		pairingDisabled()
 		teamScopedResolution(tmp)
+		adversarialSymlinkArchive(tmp)
+		renewalSourceBundleGuard(tmp)
 
 		if failures == 0 { print("SUCCESS: companion core tests") }
 		exit(failures == 0 ? 0 : 1)
+	}
+
+	/// An IPA containing a symlink (e.g. pointing outside the tree) must be
+	/// rejected before extraction, so unzip never creates a link to follow.
+	static func adversarialSymlinkArchive(_ tmp: URL) {
+		let stage = tmp.appendingPathComponent("malstage")
+		let app = stage.appendingPathComponent("Payload/Evil.app")
+		try? FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+		let info: [String: Any] = ["CFBundleIdentifier": "com.example.evil", "CFBundleName": "Evil"]
+		if let d = try? PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0) { try? d.write(to: app.appendingPathComponent("Info.plist")) }
+		// A symlink whose target escapes the tree entirely.
+		_ = ZagProcess.run("/bin/ln", ["-s", "/etc/passwd", app.appendingPathComponent("escape").path])
+		let ipa = tmp.appendingPathComponent("malicious.ipa")
+		// -y stores symlinks AS symlinks (the dangerous case).
+		_ = ZagProcess.run("/usr/bin/zip", ["-qry", "-y", ipa.path, "Payload"], currentDirectory: stage)
+		do {
+			_ = try ZagIPA.unpack(ipa, into: tmp.appendingPathComponent("malout"))
+			check(false, "a symlink-bearing IPA should be rejected")
+		} catch { check(true, "a symlink-bearing IPA is rejected before extraction") }
+	}
+
+	/// Renewal must refuse when the source IPA on disk is no longer the app it
+	/// was registered as, rather than signing a different bundle ID.
+	static func renewalSourceBundleGuard(_ tmp: URL) {
+		let ipa = makeDemoIPA(tmp, bundleID: "com.example.demo", dir: "guardstage")
+		let svc = ZagCompanionService(config: ZagCompanionConfig(templateProjectURL: tmp, supportDirectory: tmp.appendingPathComponent("guardsupport")))
+		let managed = ZagManagedApp(bundleIdentifier: "com.example.other", displayName: "Other", deviceUDID: "UDIDX", deviceName: "iPhone",
+									teamIdentifier: "TEAMX", sourceIPAPath: ipa.path, certificateSerial: "C",
+									profileExpiresAt: Date().addingTimeInterval(86_400), installedAt: Date())
+		let device = ZagCompanionDevice(id: "x", name: "iPhone", model: "iPhone", udid: "UDIDX", connected: true)
+		let team = ZagCompanionTeam(identifier: "TEAMX", name: "t", isFree: true)
+		do { _ = try svc.renew(managed, on: device, team: team, allowNewProvisioning: false); check(false, "renew should reject a changed source bundle ID") }
+		catch { check(true, "renewal refuses a source IPA whose bundle ID no longer matches the managed app") }
+	}
+
+	static func makeDemoIPA(_ tmp: URL, bundleID: String, dir: String) -> URL {
+		let stage = tmp.appendingPathComponent(dir)
+		let app = stage.appendingPathComponent("Payload/Demo.app")
+		try? FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+		let info: [String: Any] = ["CFBundleIdentifier": bundleID, "CFBundleName": "Demo", "CFBundleShortVersionString": "1.0"]
+		if let d = try? PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0) { try? d.write(to: app.appendingPathComponent("Info.plist")) }
+		let ipa = tmp.appendingPathComponent("\(dir).ipa")
+		_ = ZagProcess.run("/usr/bin/zip", ["-qry", ipa.path, "Payload"], currentDirectory: stage)
+		return ipa
 	}
 
 	// Renewal decides purely from dates + authorisation, and never claims an
