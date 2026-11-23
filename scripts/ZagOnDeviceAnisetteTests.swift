@@ -61,6 +61,19 @@ struct ZagOnDeviceAnisetteTests {
 		catch let e as ZagAnisetteError { check(e == .liveProvidersDisabled, "broker falls back to disabled provider") }
 		catch { check(false, "broker error type: \(error)") }
 
+		// 7. GrandSlam status-code parsing (used to classify a sign-in rejection).
+		check(ZagAppleAuthMachine.grandSlamCode("AKAuthenticationError -80045 bad anisette") == -80045, "parses -80045")
+		check(ZagAppleAuthMachine.grandSlamCode("status=-20101;") == -20101, "parses -20101")
+		check(ZagAppleAuthMachine.grandSlamCode("HTTP 200 ok, no gsa code") == nil, "ignores short/HTTP numbers")
+		check(ZagAppleAuthMachine.grandSlamCode("transport failure, no code") == nil, "nil when no code present")
+
+		// 8. The gated sign-in experiment is inert when the module is unlinked.
+		let signInMachine = ZagAppleAuthMachine()
+		do { _ = try await signInMachine.signInExperiment(email: "test@example.com", password: "x", allowNetwork: false)
+			 check(false, "sign-in errors when module absent") }
+		catch let e as ZagAppleAuthError { check(e == .unavailable, "sign-in reports unavailable when unlinked") }
+		catch { check(false, "sign-in error type: \(error)") }
+
 		print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 		exit(failures == 0 ? 0 : 1)
 	}

@@ -63,10 +63,57 @@ Never log the password, SRP secrets, salt, M1/M2, DSID, session token, cookies
 or anisette values. Reuse `ZagSensitiveRedactor`. The result records
 pass/fail + the status code class, nothing identifying.
 
+## Harness (built, env-gated, not run against Apple)
+
+`docs/free-developer-accounts/apple-auth-prototype/ZagSignInProbe/`. It drives
+the **real** Phase C integration, not a parallel implementation:
+
+- `ZagOnDeviceAnisetteProvider` generates fresh on-device anisette, then
+- `ZagAppleAuthMachine.signInExperiment(email:password:allowNetwork:)` performs
+  one bounded GrandSlam SRP sign-in via apple-auth's `aauth_client_login`, using
+  the machine's existing Keychain-backed profile (no re-provisioning). The
+  transport is bounded (≤6 requests, no redirects, no retries); a 2FA code
+  callback and a phone-selection callback both only *mark and cancel*, so no
+  code is submitted and no SMS is triggered. The account session is freed
+  immediately; the password is used once and never stored, logged or returned.
+- `ZagSignInCredentialStore` keeps the test credentials in the this-device-only
+  Keychain, seeded through a `SecureField` entry screen — never via env var,
+  argv, log or result file.
+
+Three launch behaviours:
+
+- default launch → credential entry screen (no Apple contact);
+- plain launch of the self-check executable → `run(live: false)`, the whole path
+  with the transport refused (no Apple contact);
+- `ZAG_RUN_SIGNIN=1` → `run(live: true)`, the single authorised attempt.
+
+### Local validation (no Apple contact) — done
+
+Host logic tests cover outcome classification, `-80045`/`-20101` code parsing,
+and the unlinked/gated behaviour (15/15). The integration compiles and links for
+`arm64-apple-ios`. The offline self-check was executed on the stock iPhone:
+
+```json
+{ "mode": "selfcheck", "anisette_fresh": true, "anisette_header_count": 10,
+  "credential": "absent", "outcome": "transport-failed", "result": "ran" }
+```
+
+i.e. fresh anisette was generated on-device from the provisioned profile and the
+sign-in path ran with the transport refused — **zero Apple contact**.
+
+### Sanitized output format (both self-check and live)
+
+A JSON object with only: `mode`, `anisette_fresh`, `anisette_header_count`,
+`credential` (`present`/`absent`), `outcome` (`authenticated` /
+`two-factor-required (not submitted)` / `rejected(<code>)` / `transport-failed`
+/ `not-provisioned`), and `result`. No email, password, SRP value, salt, M1/M2,
+DSID, token, cookie or anisette value ever appears.
+
 ## What authorization is needed
 
 One sentence from the owner authorizing a single on-device GrandSlam sign-in
-attempt with a test Apple Account. The harness (to be built against
-`ZagAppleAuthMachine` + apple-auth's `aauth_client_login`) will be committed in
-draft, env-gated, and left un-run until that authorization is given — the same
-discipline as the provisioning experiment.
+attempt with the test Apple Account. On that authorization I will build and
+install the entry app, have the test credentials seeded in the Keychain, and
+then the live launch (`ZAG_RUN_SIGNIN=1`) is run once — the same discipline as
+the provisioning experiment. Until then the harness stays committed in draft and
+un-run against Apple.

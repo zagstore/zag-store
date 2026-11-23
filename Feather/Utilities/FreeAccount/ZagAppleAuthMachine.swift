@@ -83,9 +83,16 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 	private let lock = NSLock()
 	private var count = 0
 	private(set) var log: [String] = []
-	private let maxRequests = 3
+	private let maxRequests: Int
 
-	init(allowNetwork: Bool) { self.allowNetwork = allowNetwork }
+	init(allowNetwork: Bool, maxRequests: Int = 3) {
+		self.allowNetwork = allowNetwork
+		self.maxRequests = maxRequests
+	}
+
+	/// Whether any request actually went to Apple (distinguishes a transport
+	/// failure from a server rejection).
+	var reachedApple: Bool { lock.withLock { count > 0 } }
 
 	private lazy var session: URLSession = {
 		let cfg = URLSessionConfiguration.ephemeral
@@ -207,10 +214,12 @@ actor ZagAppleAuthMachine {
 	}
 
 	#if canImport(ZagAppleAuth)
-	/// Creates the client (restoring any snapshot into RAM), provisions if
-	/// needed and permitted, reads the headers, and returns them with a fresh
-	/// state snapshot. All synchronous apple-auth work happens here.
-	private static func drive(persisted: Data?, transport: ZagAppleAuthTransport) -> Result<([String: String], Data), ZagAppleAuthError> {
+	/// Creates an apple-auth client, restoring `persisted` state into RAM, runs
+	/// `body` with it, then frees it. The client pointer is valid only inside
+	/// `body`. Shared by the anisette and the gated sign-in paths so there is a
+	/// single apple-auth client implementation.
+	static func withClient<T>(persisted: Data?, transport: ZagAppleAuthTransport,
+		_ body: (OpaquePointer) -> Result<T, ZagAppleAuthError>) -> Result<T, ZagAppleAuthError> {
 		let ctx = Unmanaged.passUnretained(transport).toOpaque()
 		var options = aauth_client_options(transport: zagAppleAuthTransportCallback, observer: nil, clock: nil, context: ctx)
 		var client: OpaquePointer?
@@ -231,7 +240,13 @@ actor ZagAppleAuthMachine {
 		}
 		guard created == AAUTH_OK, let client else { return .failure(.provisioningFailed(Int(created.rawValue))) }
 		defer { aauth_client_free(client) }
+		return body(client)
+	}
 
+	/// Provisions if needed and permitted, reads the headers, and returns them
+	/// with a fresh state snapshot.
+	private static func drive(persisted: Data?, transport: ZagAppleAuthTransport) -> Result<([String: String], Data), ZagAppleAuthError> {
+		withClient(persisted: persisted, transport: transport) { client in
 		let p = aauth_client_provision(client)
 		guard p == AAUTH_OK else {
 			return .failure(transport.allowNetwork ? .provisioningFailed(Int(p.rawValue)) : .transportBlocked)
@@ -249,6 +264,7 @@ actor ZagAppleAuthMachine {
 		let snapshot = Data(bytes: sd, count: stateBuf.size)
 		aauth_client_buffer_free(&stateBuf)
 		return .success((headers, snapshot))
+		}
 	}
 	#endif
 
@@ -259,4 +275,103 @@ actor ZagAppleAuthMachine {
 			return l.hasPrefix("x-apple-") || l.hasPrefix("x-mme-")
 		}
 	}
+
+	/// The GrandSlam status code embedded in an apple-auth error message (e.g.
+	/// `-80045`). The code itself is a public, non-sensitive constant; the rest
+	/// of the message is never surfaced. Returns nil when no code is present.
+	static func grandSlamCode(_ text: String) -> Int? {
+		guard let r = text.range(of: "-?[0-9]{4,6}", options: .regularExpression) else { return nil }
+		return Int(text[r])
+	}
+
+	/// EXPERIMENT-ONLY, gated. Performs at most one GrandSlam SRP sign-in using
+	/// this machine's existing provisioned profile (no re-provisioning) and the
+	/// on-device anisette it already generates — the same apple-auth client as
+	/// the anisette path, never a parallel implementation. Detects a 2FA
+	/// challenge and cancels it (never submits a code or triggers an SMS). The
+	/// account session is freed immediately and never persisted; the password
+	/// is used once and never stored, logged or returned. Returns only a
+	/// classification. Requires an authorised live run (`allowNetwork`).
+	func signInExperiment(email: String, password: String, allowNetwork: Bool) async throws -> ZagAppleAuthSignInOutcome {
+		#if canImport(ZagAppleAuth)
+		guard let persisted = try store.load(scope: scope) else { return .notProvisioned }
+		// Bounded: lookup + SRP init + SRP complete (+ a possible 2FA bootstrap),
+		// no retries. With allowNetwork false the transport refuses everything.
+		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: 6)
+		let sentinel = ZagTwoFactorSentinel()
+		return await withCheckedContinuation { continuation in
+			DispatchQueue.global(qos: .userInitiated).async {
+				continuation.resume(returning: Self.driveSignIn(persisted: persisted, transport: transport,
+															   email: email, password: password, sentinel: sentinel))
+			}
+		}
+		#else
+		throw ZagAppleAuthError.unavailable
+		#endif
+	}
+
+	#if canImport(ZagAppleAuth)
+	private static func driveSignIn(persisted: Data, transport: ZagAppleAuthTransport,
+									email: String, password: String, sentinel: ZagTwoFactorSentinel) -> ZagAppleAuthSignInOutcome {
+		let result: Result<ZagAppleAuthSignInOutcome, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport) { client in
+			// Ensure the profile is loaded (no-op for a provisioned profile; no HTTP).
+			let p = aauth_client_provision(client)
+			guard p == AAUTH_OK else {
+				return .success(transport.reachedApple ? .rejected(code: Int(p.rawValue)) : .transportFailed)
+			}
+			let ctx = Unmanaged.passUnretained(sentinel).toOpaque()
+			var verification = aauth_verification_options(
+				method: AAUTH_VERIFY_AUTOMATIC, phone_number_id: 0,
+				code: zagTwoFactorCancelCallback, select_phone: zagPhoneSelectCancelCallback, context: ctx)
+			var session: OpaquePointer?
+			let rc: aauth_status = email.withCString { e in password.withCString { pw in
+				withUnsafePointer(to: &verification) { v in aauth_client_login(client, e, pw, v, &session) }
+			} }
+			if let session { aauth_account_session_free(session) }   // never persisted
+			if sentinel.requested { return .success(.twoFactorRequired) }
+			if rc == AAUTH_OK { return .success(.authenticated) }
+			if let code = grandSlamCode(String(cString: aauth_client_last_error())) { return .success(.rejected(code: code)) }
+			return .success(transport.reachedApple ? .rejected(code: Int(rc.rawValue)) : .transportFailed)
+		}
+		switch result {
+		case .success(let outcome): return outcome
+		case .failure: return .transportFailed
+		}
+	}
+	#endif
 }
+
+/// The classified result of the gated sign-in experiment. Carries no account
+/// session, token, credential or anisette value — only what happened.
+enum ZagAppleAuthSignInOutcome: Equatable, Sendable {
+	case authenticated        // M2 verified, no 2FA requested
+	case twoFactorRequired    // Apple asked for a code; the harness did not submit one
+	case rejected(code: Int)  // Apple rejected the sign-in (e.g. -80045)
+	case transportFailed      // no Apple response (offline, blocked, network error)
+	case notProvisioned       // no machine profile to sign in with
+}
+
+#if canImport(ZagAppleAuth)
+/// Records that a 2FA challenge occurred, so the experiment can report it
+/// without submitting anything.
+final class ZagTwoFactorSentinel: @unchecked Sendable {
+	private let lock = NSLock()
+	private var flag = false
+	var requested: Bool { lock.withLock { flag } }
+	func mark() { lock.withLock { flag = true } }
+}
+
+/// 2FA code callback: mark that a code was requested and cancel. Never writes a
+/// verification code.
+private let zagTwoFactorCancelCallback: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutablePointer<CChar>?, Int, UnsafeMutablePointer<Int>?) -> Int32 = { ctx, _, _, written in
+	if let ctx { Unmanaged<ZagTwoFactorSentinel>.fromOpaque(ctx).takeUnretainedValue().mark() }
+	written?.pointee = 0
+	return 1   // cancel: do not submit a code
+}
+
+/// Phone-selection callback: mark 2FA and cancel, so no SMS is ever triggered.
+private let zagPhoneSelectCancelCallback: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<Int64>?) -> Int32 = { ctx, _, _ in
+	if let ctx { Unmanaged<ZagTwoFactorSentinel>.fromOpaque(ctx).takeUnretainedValue().mark() }
+	return 1   // cancel: do not select a number / trigger an SMS
+}
+#endif
