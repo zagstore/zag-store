@@ -520,12 +520,18 @@ impl RemoteV3AnisetteProvider {
                 generated_at: SystemTime::now(),
             })),
             AnisetteHeaders::GetHeadersError { message } => {
-                if message.contains("-45061") {
+                // Zag Store fork: recognise "device not provisioned" from the
+                // typed allowlist, not a raw substring. `message.contains("-45061")`
+                // false-matched longer numbers such as -450610 and scanned the raw
+                // text a second time; known_adi_code reads whole numeric tokens and
+                // is reused for the fault below.
+                let code = known_adi_code(&message);
+                if code == Some(-45061) {
                     warn!("Server says anisette not provisioned");
                     return Ok(AnisetteDataResponse::IncorrectlyProvisioned);
                 }
                 Err(report!("Failed to get anisette headers ({} bytes withheld)", message.len())
-                    .context(ProvisioningFault { stage: ProvisioningStage::HeaderFetch, code: known_adi_code(&message) })
+                    .context(ProvisioningFault { stage: ProvisioningStage::HeaderFetch, code })
                     .into())
             }
         }
