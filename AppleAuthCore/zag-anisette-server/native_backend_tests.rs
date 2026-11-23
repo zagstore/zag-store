@@ -51,7 +51,7 @@ fn runtime(name: &str) -> PathBuf {
 
 fn config(runtime: PathBuf, state_dir: PathBuf, max_workers: usize) -> NativeConfig {
     NativeConfig {
-        worker: fixture(), runtime, state_dir, max_workers,
+        platform: NativePlatform::Android, worker: fixture(), runtime, state_dir, max_workers,
         headers_deadline: Duration::from_millis(1500), session_deadline: Duration::from_secs(5),
     }
 }
@@ -349,6 +349,7 @@ fn real_coreadi_rejects_unprovisioned_material_offline() {
         return;
     };
     let native = Arc::new(NativeBackend::open(NativeConfig {
+        platform: NativePlatform::Android,
         worker: PathBuf::from(worker), runtime: PathBuf::from(runtime), state_dir: temp("real-state"),
         max_workers: 2, headers_deadline: Duration::from_secs(20), session_deadline: Duration::from_secs(30),
     }).expect("real native readiness check"));
@@ -359,6 +360,98 @@ fn real_coreadi_rejects_unprovisioned_material_offline() {
     assert_eq!(status, "HTTP/1.1 200 OK");
     assert_eq!(body["result"], "GetHeadersError", "{body}");
     eprintln!("real CoreADI get_headers on a foreign state: {}", body["message"]);
+    let mut ws = websocket(address);
+    ws.read().unwrap();
+    exchange(&mut ws, serde_json::json!({"identifier": base64_encode(&id)}));
+    let reply = exchange(&mut ws, serde_json::json!({"spim": base64_encode(&[0x5a; 64])}));
+    assert_eq!(reply["result"], "StartProvisioningError", "{reply}");
+    assert!(wait_until(|| work_entries(&native) == 0 && native.active_workers() == 0));
+}
+
+/// A Windows runtime: a protected directory holding CoreADI64.dll.
+fn windows_runtime(name: &str) -> PathBuf {
+    let root = temp(name);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join(WINDOWS_LIBRARY), b"MZ fixture").unwrap();
+    fs::set_permissions(root.join(WINDOWS_LIBRARY), fs::Permissions::from_mode(0o644)).unwrap();
+    root
+}
+
+#[test]
+fn platforms_are_configured_separately_and_never_mixed() {
+    let windows = |runtime: PathBuf| NativeConfig { platform: NativePlatform::Windows, ..config(runtime, temp("state"), 2) };
+    // Each platform accepts only its own runtime layout.
+    assert!(matches!(NativeBackend::open(windows(runtime("android-layout"))), Err(BackendError::Config(_))));
+    let android = config(windows_runtime("windows-layout"), temp("state"), 2);
+    assert!(matches!(NativeBackend::open(android), Err(BackendError::Config(_))));
+    let native = Arc::new(NativeBackend::open(windows(windows_runtime("windows"))).unwrap());
+    assert_eq!(native.platform(), NativePlatform::Windows);
+    // The Windows worker receives the identifier as lower-case hex.
+    let address = server(Arc::clone(&native));
+    let id: [u8; 16] = *b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\xff";
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    let (_, body) = get_headers(address, &id, format!("provisioned:{hex}").as_bytes());
+    assert_eq!(body["result"], "Headers", "{body}");
+    let (_, body) = get_headers(address, &id, format!("provisioned:{}", android_identifier(&id)).as_bytes());
+    assert_eq!(body["result"], "GetHeadersError");
+    let (_, health) = http(address, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!((health["native_platform"].as_str(), health["adi_platform"].as_str()), (Some("windows"), Some("Windows")));
+}
+
+#[test]
+fn readiness_needs_an_identity_of_the_configured_adi() {
+    let metadata = |client_info: &str, user_agent: &str| crate::client_info_config::parse(
+        serde_json::json!({"client_info": client_info, "user_agent": user_agent}).to_string().as_bytes()).unwrap();
+    // The client_info follows iTunes 12.13.12.3's template; the user agent is
+    // only a syntactic placeholder (the real one is unresolved).
+    let itunes = metadata("<PC> <Windows;10.0(0,0);19045> <com.apple.AuthKitWin/1 (com.apple.iTunes/12.13.12)>", "iTunes/12.13.12");
+    let mac = metadata("<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>", "akd/1.0 CFNetwork/808.1.4");
+    let windows_akd = metadata("<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.akd/1.0)>", "akd/1.0 CFNetwork/808.1.4");
+    assert!(NativePlatform::Windows.accepts(&itunes));
+    assert!(!NativePlatform::Windows.accepts(&mac));
+    // A Windows platform field alone is not iTunes' AuthKitWin identity.
+    assert!(!NativePlatform::Windows.accepts(&windows_akd));
+    assert!(!NativePlatform::Android.accepts(&itunes));
+    assert!(!NativePlatform::Android.accepts(&mac));
+}
+
+/// Real Windows CoreADI64.dll through the real Windows worker and the real
+/// server path, offline: readiness (NOT_PROVISIONED), then states and an
+/// SPIM Apple never issued are rejected, concurrently and with cleanup.
+/// Runs when ZAG_NATIVE_E2E_WINDOWS_WORKER and _RUNTIME are set; it proves
+/// rejection and supervision, not acceptance.
+#[test]
+fn real_windows_coreadi_rejects_unprovisioned_material_offline() {
+    let (Some(worker), Some(runtime)) = (std::env::var_os("ZAG_NATIVE_E2E_WINDOWS_WORKER"), std::env::var_os("ZAG_NATIVE_E2E_WINDOWS_RUNTIME")) else {
+        eprintln!("skipped: ZAG_NATIVE_E2E_WINDOWS_WORKER / ZAG_NATIVE_E2E_WINDOWS_RUNTIME not set");
+        return;
+    };
+    let native = Arc::new(NativeBackend::open(NativeConfig {
+        platform: NativePlatform::Windows,
+        worker: PathBuf::from(worker), runtime: PathBuf::from(runtime), state_dir: temp("real-windows-state"),
+        max_workers: 3, headers_deadline: Duration::from_secs(20), session_deadline: Duration::from_secs(30),
+    }).expect("real Windows readiness check"));
+    let address = server(Arc::clone(&native));
+    let mut id = [0u8; 16];
+    fs::File::open("/dev/urandom").unwrap().read_exact(&mut id).unwrap();
+    // Plain bytes are not a Windows state container.
+    let (status, body) = get_headers(address, &id, b"not an Apple-issued adi.pb");
+    assert_eq!((status.as_str(), body["result"].as_str()), ("HTTP/1.1 200 OK", Some("GetHeadersError")), "{body}");
+    eprintln!("real Windows CoreADI, plain bytes: {}", body["message"]);
+    // A well-formed container whose files Apple never issued.
+    let entry = |name: &str, data: &[u8]| [&(name.len() as u16).to_be_bytes()[..], name.as_bytes(), &(data.len() as u32).to_be_bytes(), data].concat();
+    let forged = [&b"ZWADI\x00\x01\x00"[..], &entry("adi.pb", &[0x5a; 256])].concat();
+    // Eight at once against three worker slots: each is rejected by CoreADI
+    // or refused as busy, never answered with headers.
+    let replies: Vec<_> = (0..8).map(|_| { let forged = forged.clone(); thread::spawn(move || get_headers(address, &id, &forged)) })
+        .collect::<Vec<_>>().into_iter().map(|t| t.join().unwrap()).collect();
+    let rejected: Vec<_> = replies.iter().filter(|(status, body)| status == "HTTP/1.1 200 OK" && body["result"] == "GetHeadersError").collect();
+    let busy = replies.iter().filter(|(status, body)| status == "HTTP/1.1 503 Service Unavailable" && body["error"] == "busy").count();
+    assert_eq!(rejected.len() + busy, replies.len(), "{replies:?}");
+    assert!(!rejected.is_empty());
+    eprintln!("real Windows CoreADI, forged container: {} ({} rejected, {busy} busy)", rejected[0].1["message"], rejected.len());
+    let (_, body) = get_headers(address, &id, &forged);
+    assert_eq!(body["result"], "GetHeadersError", "{body}");
     let mut ws = websocket(address);
     ws.read().unwrap();
     exchange(&mut ws, serde_json::json!({"identifier": base64_encode(&id)}));
