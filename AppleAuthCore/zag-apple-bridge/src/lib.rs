@@ -22,6 +22,12 @@ pub mod slot;
 
 #[cfg(feature = "live")]
 mod live;
+
+/// Supervised, owner-authorized scoped live probe (stages 1-3 only). Present
+/// only in a `live` build; it drives the private live backend's
+/// `probe_provisioning` and prints a privacy-preserving diagnostic.
+#[cfg(feature = "live")]
+pub mod probe;
 #[cfg(feature = "mock")]
 pub mod mock;
 

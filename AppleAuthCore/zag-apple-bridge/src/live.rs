@@ -185,6 +185,79 @@ impl IsideloadBackend {
         Ok(RemoteV3AnisetteProvider::new(&self.anisette_url, Box::new(KeychainStorage::new(self.storage, scope)?), self.device_serial.clone())?
             .set_state_scope(scope))
     }
+
+    /// Shared by `sign_in` and the supervised scoped probe: builds the account
+    /// over this account's anisette device state and performs auth + 2FA,
+    /// returning the authenticated account. Anisette provisioning happens inside
+    /// `login` (its headers are needed for the SRP handshake), so a provisioning
+    /// failure surfaces here as a `Report` the caller can diagnose. No
+    /// developer-portal call is made here.
+    async fn authenticate(&self, anisette_scope: &str, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> Result<AppleAccount, Report> {
+        let provider = self.provider(anisette_scope)?;
+        let mut account = AppleAccount::builder(email).anisette_provider(provider).build().await?;
+        // The 2FA callback must be 'static; it reaches the prompter through a
+        // channel owned by this call.
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel::<(CodePrompt, tokio::sync::oneshot::Sender<CodeAction>)>();
+        let callback = move |params: TwoFactorCallbackParams| {
+            let ask_tx = ask_tx.clone();
+            async move {
+                let sms = params.sms;
+                let selected = params.selected_number_id.or_else(|| params.numbers.first().map(|n| n.id));
+                let masked = params
+                    .numbers
+                    .iter()
+                    .find(|n| Some(n.id) == selected)
+                    .map(|n| n.last_two_digits.chars().filter(char::is_ascii_digit).take(2).collect::<String>());
+                let prompt = CodePrompt {
+                    method: if sms { TwoFactorMethod::Sms } else { TwoFactorMethod::TrustedDevice },
+                    code_length: 6,
+                    masked_destination: if sms { masked } else { None },
+                    can_request_sms: !sms && selected.is_some(),
+                    retry: params.last_error.is_some(),
+                };
+                let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+                if ask_tx.send((prompt, answer_tx)).is_err() {
+                    return Ok(TwoFactorCallbackResponse::Abort);
+                }
+                Ok(match answer_rx.await.unwrap_or(CodeAction::Cancel) {
+                    CodeAction::Submit(code) => TwoFactorCallbackResponse::SubmitCode(code.to_string()),
+                    CodeAction::RequestSms => match selected {
+                        Some(id) => TwoFactorCallbackResponse::SendSms(id),
+                        None => TwoFactorCallbackResponse::Abort,
+                    },
+                    CodeAction::Cancel => TwoFactorCallbackResponse::Abort,
+                })
+            }
+        };
+        let relay = async {
+            while let Some((prompt, answer)) = ask_rx.recv().await {
+                let _ = answer.send(prompter.ask(prompt).await);
+            }
+        };
+        let login = account.login(&password, callback);
+        let result = tokio::select! {
+            result = login => result,
+            _ = relay => Err(rootcause::report!("relay ended")),
+        };
+        drop(password);
+        result?;
+        Ok(account)
+    }
+
+    /// Supervised, owner-authorized scoped probe — **stages 1-3 only**. Runs
+    /// Apple authentication (with 2FA) and anisette/ADI provisioning, then STOPS
+    /// before any developer-portal call: no team discovery, device registration,
+    /// App ID or certificate issuance, so it consumes no Apple-account resource.
+    /// On success returns `Ok(())`; on failure returns only a privacy-preserving
+    /// `ProvisioningDiagnostic` (stage, source, HTTP status, allow-listed code,
+    /// retryability) — never a message, token or identifier. It never retries.
+    /// Driven by `crate::probe`.
+    pub async fn probe_provisioning(&self, anisette_scope: &str, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> Result<(), crate::diagnostics::ProvisioningDiagnostic> {
+        match self.authenticate(anisette_scope, email, password, prompter).await {
+            Ok(_account) => Ok(()), // dropped here — no portal call is ever made
+            Err(report) => Err(crate::diagnostics::diagnose(&report)),
+        }
+    }
 }
 
 /// The opaque token Swift stores: everything needed to reopen a portal
@@ -236,58 +309,10 @@ fn to_team(team: &DeveloperTeam) -> Team {
 #[async_trait]
 impl Backend for IsideloadBackend {
     async fn sign_in(&self, anisette_scope: &str, email: &str, password: Zeroizing<String>, prompter: &Prompter) -> BridgeResult<SignedIn> {
-        let provider = self.provider(anisette_scope).map_err(|_| BridgeError::new(FailureKind::InvalidInput))?;
-        let mut account = AppleAccount::builder(email)
-            .anisette_provider(provider)
-            .build()
+        let mut account = self
+            .authenticate(anisette_scope, email, password, prompter)
             .await
             .map_err(|r| classify(&r))?;
-        // The 2FA callback must be 'static; it reaches the prompter through a
-        // channel owned by this call.
-        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel::<(CodePrompt, tokio::sync::oneshot::Sender<CodeAction>)>();
-        let callback = move |params: TwoFactorCallbackParams| {
-            let ask_tx = ask_tx.clone();
-            async move {
-                let sms = params.sms;
-                let selected = params.selected_number_id.or_else(|| params.numbers.first().map(|n| n.id));
-                let masked = params
-                    .numbers
-                    .iter()
-                    .find(|n| Some(n.id) == selected)
-                    .map(|n| n.last_two_digits.chars().filter(char::is_ascii_digit).take(2).collect::<String>());
-                let prompt = CodePrompt {
-                    method: if sms { TwoFactorMethod::Sms } else { TwoFactorMethod::TrustedDevice },
-                    code_length: 6,
-                    masked_destination: if sms { masked } else { None },
-                    can_request_sms: !sms && selected.is_some(),
-                    retry: params.last_error.is_some(),
-                };
-                let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-                if ask_tx.send((prompt, answer_tx)).is_err() {
-                    return Ok(TwoFactorCallbackResponse::Abort);
-                }
-                Ok(match answer_rx.await.unwrap_or(CodeAction::Cancel) {
-                    CodeAction::Submit(code) => TwoFactorCallbackResponse::SubmitCode(code.to_string()),
-                    CodeAction::RequestSms => match selected {
-                        Some(id) => TwoFactorCallbackResponse::SendSms(id),
-                        None => TwoFactorCallbackResponse::Abort,
-                    },
-                    CodeAction::Cancel => TwoFactorCallbackResponse::Abort,
-                })
-            }
-        };
-        let relay = async {
-            while let Some((prompt, answer)) = ask_rx.recv().await {
-                let _ = answer.send(prompter.ask(prompt).await);
-            }
-        };
-        let login = account.login(&password, callback);
-        let result = tokio::select! {
-            result = login => result,
-            _ = relay => Err(rootcause::report!("relay ended")),
-        };
-        drop(password);
-        result.map_err(|r| classify(&r))?;
 
         let token = account.get_app_token("xcode.auth").await.map_err(|r| classify(&r))?;
         let adsid = account
