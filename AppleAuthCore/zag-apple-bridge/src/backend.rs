@@ -96,6 +96,16 @@ impl Prompter {
         }
         self.answers.lock().await.recv().await.unwrap_or(CodeAction::Cancel)
     }
+
+    /// Builds a prompter together with the two ends that drive it: the stream
+    /// of prompts to display, and the sink for the user's answers. The slot
+    /// feeds these from Swift in the app; the supervised scoped probe feeds
+    /// them from a terminal. Nothing here changes the app's sign-in path.
+    pub fn channel() -> (Prompter, mpsc::UnboundedReceiver<CodePrompt>, mpsc::UnboundedSender<CodeAction>) {
+        let (prompts, prompts_rx) = mpsc::unbounded_channel();
+        let (answers_tx, answers) = mpsc::unbounded_channel();
+        (Prompter { prompts, answers: tokio::sync::Mutex::new(answers) }, prompts_rx, answers_tx)
+    }
 }
 
 /// The minimal session secret Swift keeps in the this-device-only Keychain.
