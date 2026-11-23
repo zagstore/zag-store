@@ -42,8 +42,58 @@ const HEADERS_DEADLINE: Duration = Duration::from_secs(15);
 const SESSION_DEADLINE: Duration = Duration::from_secs(120);
 const CHECK_DEADLINE: Duration = Duration::from_secs(30);
 const LIBRARIES: [&str; 2] = ["libstoreservicescore.so", "libCoreADI.so"];
+/// The Windows CoreADI library, from iTunes for Windows (x64).
+const WINDOWS_LIBRARY: &str = "CoreADI64.dll";
 /// A fixed identifier for the readiness check's empty, discarded state.
 const CHECK_IDENTIFIER: &str = "00010203-0405-06";
+const WINDOWS_CHECK_IDENTIFIER: &str = "000102030405060708090a0b0c0d0e0f";
+
+/// Which CoreADI the worker loads. Each has its own runtime layout, worker
+/// identity and client identity; a configuration never mixes the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePlatform {
+    /// Apple Music for Android: `<runtime>/lib/x86_64/{libstoreservicescore,libCoreADI}.so`.
+    Android,
+    /// iTunes for Windows: `<runtime>/CoreADI64.dll`, run by the Windows worker.
+    Windows,
+}
+
+impl NativePlatform {
+    pub fn name(self) -> &'static str {
+        match self { NativePlatform::Android => "android", NativePlatform::Windows => "windows" }
+    }
+
+    /// The platform field (`<model> <platform;version;build> <...>`) a client
+    /// identity must carry for this ADI: Apple compares the two.
+    pub fn client_platform(self) -> &'static str {
+        match self { NativePlatform::Android => "Android", NativePlatform::Windows => "Windows" }
+    }
+
+    /// Whether the served client metadata describes a client of this ADI.
+    /// Windows: iTunes' AuthKitWin identity, `<PC> <Windows;...> <com.apple.AuthKitWin/N (...)>`.
+    pub fn accepts(self, metadata: &crate::client_info_config::ClientMetadata) -> bool {
+        if metadata.platform() != self.client_platform() { return false; }
+        match self {
+            NativePlatform::Android => true,
+            NativePlatform::Windows => metadata.client_info.starts_with("<PC> <Windows;")
+                && metadata.client_info.contains("> <com.apple.AuthKitWin/"),
+        }
+    }
+
+    /// The identity argument of a worker for a client identifier. Android:
+    /// the CoreADI Android identifier. Windows: the identifier in lower-case
+    /// hex, from which the worker derives its synthetic machine.
+    fn worker_identity(self, identifier: &[u8; 16]) -> String {
+        match self {
+            NativePlatform::Android => android_identifier(identifier),
+            NativePlatform::Windows => identifier.iter().map(|b| format!("{b:02x}")).collect(),
+        }
+    }
+
+    fn check_identity(self) -> &'static str {
+        match self { NativePlatform::Android => CHECK_IDENTIFIER, NativePlatform::Windows => WINDOWS_CHECK_IDENTIFIER }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendError {
@@ -71,6 +121,7 @@ impl BackendError {
 }
 
 pub struct NativeConfig {
+    pub platform: NativePlatform,
     pub worker: PathBuf,
     pub runtime: PathBuf,
     pub state_dir: PathBuf,
@@ -92,6 +143,12 @@ impl NativeConfig {
             var("ZAG_ANISETTE_NATIVE_RUNTIME"),
             var("ZAG_ANISETTE_STATE_DIR"),
         );
+        // Unset keeps the original Android backend; Windows is always explicit.
+        let platform = match std::env::var("ZAG_ANISETTE_NATIVE_PLATFORM").as_deref() {
+            Err(_) | Ok("android") => NativePlatform::Android,
+            Ok("windows") => NativePlatform::Windows,
+            Ok(_) => return Err("ZAG_ANISETTE_NATIVE_PLATFORM must be android or windows"),
+        };
         let max_workers = match std::env::var("ZAG_ANISETTE_MAX_NATIVE_WORKERS") {
             Err(_) => 4,
             Ok(text) => match text.parse::<usize>() {
@@ -102,7 +159,7 @@ impl NativeConfig {
         match (worker, runtime, state_dir) {
             (None, None, None) => Ok(None),
             (Some(worker), Some(runtime), Some(state_dir)) => Ok(Some(Self {
-                worker, runtime, state_dir, max_workers,
+                platform, worker, runtime, state_dir, max_workers,
                 headers_deadline: HEADERS_DEADLINE, session_deadline: SESSION_DEADLINE,
             })),
             _ => Err("ZAG_ANISETTE_NATIVE_WORKER, ZAG_ANISETTE_NATIVE_RUNTIME and ZAG_ANISETTE_STATE_DIR must be set together"),
@@ -129,7 +186,7 @@ impl NativeBackend {
     pub fn open(config: NativeConfig) -> Result<Self, BackendError> {
         verify_worker_executable(&config.worker, &config.worker)
             .map_err(|_| BackendError::Config("native worker is not an approved executable"))?;
-        check_runtime(&config.runtime)?;
+        check_runtime(config.platform, &config.runtime)?;
         check_private_dir(&config.state_dir)?;
         let work = config.state_dir.join("work");
         match fs::symlink_metadata(&work) {
@@ -147,6 +204,7 @@ impl NativeBackend {
     }
 
     pub fn ready(&self) -> bool { self.ready.load(Ordering::Acquire) }
+    pub fn platform(&self) -> NativePlatform { self.config.platform }
     pub fn max_workers(&self) -> usize { self.config.max_workers }
     pub fn active_workers(&self) -> usize { self.active.load(Ordering::Acquire) }
 
@@ -165,7 +223,7 @@ impl NativeBackend {
     /// report NOT_PROVISIONED (-45061) and refuse an OTP.
     fn readiness_check(&self) -> Result<(), BackendError> {
         let dir = WorkDir::create(&self.work).map_err(|_| BackendError::Config("cannot create a work directory"))?;
-        let mut worker = Worker::spawn(&self.config, "--native-offline-check", dir.path(), CHECK_IDENTIFIER, CHECK_DEADLINE)
+        let mut worker = Worker::spawn(&self.config, "--native-offline-check", dir.path(), self.config.platform.check_identity(), CHECK_DEADLINE)
             .map_err(|_| BackendError::Config("native worker could not be started"))?;
         let output = worker.read_to_end(4096);
         let exited = worker.wait_success();
@@ -180,7 +238,8 @@ impl NativeBackend {
         let _permit = self.permit()?;
         let dir = WorkDir::create(&self.work).map_err(|_| BackendError::Worker)?;
         write_private(&dir.path().join("adi.pb"), adi_pb).map_err(|_| BackendError::Worker)?;
-        let mut worker = Worker::spawn(&self.config, "--native-headers", dir.path(), &android_identifier(identifier), self.config.headers_deadline)
+        let mut worker = Worker::spawn(&self.config, "--native-headers", dir.path(),
+            &self.config.platform.worker_identity(identifier), self.config.headers_deadline)
             .map_err(|_| BackendError::Worker)?;
         let frame = worker.receive().map_err(|_| BackendError::Worker)?;
         let reply = wire::decode_headers(&frame).map_err(|_| BackendError::Worker)?;
@@ -269,7 +328,8 @@ impl NativeSessionTransport for NativeTransport<'_> {
         let spim = base64_decode(spim, MAX_STATE_BYTES).ok_or(ProtocolError::InvalidField)?;
         let dir = WorkDir::create(&self.backend.work).map_err(|_| ProtocolError::BackendUnavailable)?;
         let worker = Worker::spawn(&self.backend.config, "--native-v2-session", dir.path(),
-            &android_identifier(&identifier), self.backend.config.session_deadline).map_err(|_| ProtocolError::BackendUnavailable)?;
+            &self.backend.config.platform.worker_identity(&identifier), self.backend.config.session_deadline)
+            .map_err(|_| ProtocolError::BackendUnavailable)?;
         self.dir = Some(dir);
         self.worker = Some(worker);
         match self.exchange(&wire::Request::Start { identifier: DS_ID.into(), spim })? {
@@ -475,19 +535,24 @@ fn check_private_dir(path: &Path) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// The two Apple Music libraries: regular files, not links, writable by
-/// nobody but their owner (root, outside test builds), as is their directory.
-fn check_runtime(runtime: &Path) -> Result<(), BackendError> {
+/// The platform's libraries: regular files, not links, writable by nobody
+/// but their owner (root, outside test builds), as is their directory.
+/// Android: the two Apple Music libraries; Windows: CoreADI64.dll.
+fn check_runtime(platform: NativePlatform, runtime: &Path) -> Result<(), BackendError> {
     let refused = BackendError::Config("native runtime libraries are missing or not protected");
     if !runtime.is_absolute() { return Err(refused); }
-    let dir = runtime.join("lib").join("x86_64");
     let protected = |path: &Path, directory: bool| fs::symlink_metadata(path).is_ok_and(|m|
         (if directory { m.is_dir() } else { m.is_file() })
         && m.mode() & 0o022 == 0
         && (cfg!(test) || m.uid() == 0));
-    if !protected(&dir, true) || !LIBRARIES.iter().all(|name| protected(&dir.join(name), false)) {
-        return Err(refused);
-    }
+    let ok = match platform {
+        NativePlatform::Android => {
+            let dir = runtime.join("lib").join("x86_64");
+            protected(&dir, true) && LIBRARIES.iter().all(|name| protected(&dir.join(name), false))
+        }
+        NativePlatform::Windows => protected(runtime, true) && protected(&runtime.join(WINDOWS_LIBRARY), false),
+    };
+    if !ok { return Err(refused); }
     Ok(())
 }
 

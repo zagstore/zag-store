@@ -18,6 +18,10 @@
 use std::{fs, io::{self, Read}, path::Path};
 
 const MAX_FILE_BYTES: u64 = 2048;
+/// The platform of the Apple Music for Android libraries that the loader
+/// probe and the server's default backend load. The server's Windows backend
+/// checks its own identity instead (`NativePlatform::accepts`).
+pub(crate) const NATIVE_ADI_PLATFORM: &str = "Android";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Provenance { pub(crate) source: String, pub(crate) apple_verified: bool }
@@ -52,6 +56,15 @@ impl ClientMetadata {
     /// The platform field of client_info (`macOS`, `Windows`, ...).
     pub(crate) fn platform(&self) -> &str {
         self.client_info.split("> <").nth(1).and_then(|group| group.split(';').next()).unwrap_or("")
+    }
+
+    /// Whether this identity describes the platform of the native ADI
+    /// libraries (Apple Music for Android). Apple compares the two: Android
+    /// CoreADI with a desktop identity is reported to fail with -29003
+    /// ("possible environment mismatch") at finishMachineProvisioning and
+    /// -80045 at sign-in (see NATIVE_PROVISIONING_RUNBOOK.md).
+    pub(crate) fn matches_native_adi(&self) -> bool {
+        self.platform() == NATIVE_ADI_PLATFORM
     }
 
     /// Checks the structure every known AuthKit client info shares,
@@ -155,6 +168,12 @@ pub(crate) fn read_config(path: &Path) -> io::Result<String> {
     load(path).map(|metadata| metadata.response_json())
 }
 
+/// The configured metadata itself, for checks beyond the served body.
+pub(crate) fn configured_metadata() -> Option<ClientMetadata> {
+    let path = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE")?;
+    load(Path::new(&path)).ok()
+}
+
 pub(crate) fn configured_response() -> Option<String> {
     let path = std::env::var_os("ZAG_ANISETTE_CLIENT_INFO_FILE")?;
     read_config(Path::new(&path)).ok()
@@ -217,6 +236,12 @@ mod tests {
         // The two headers must describe one client.
         assert!(!ok(MAC, "com.apple.AuthKitWin/7.3"));
         assert!(!ok(WIN, "akd/1.0 CFNetwork/808.1.4"));
+        // Only an Android identity matches the Android CoreADI libraries.
+        let metadata = |client_info: &str, user_agent: &str| parse(serde_json::json!(
+            {"client_info": client_info, "user_agent": user_agent}).to_string().as_bytes()).unwrap();
+        assert!(!metadata(MAC, "akd/1.0").matches_native_adi());
+        assert!(!metadata(WIN, "com.apple.AuthKitWin/7.3").matches_native_adi());
+        assert!(metadata("<m> <Android;v;b> <com.apple.AuthKit/1 (com.apple.android.music/1)>", "android.music/1").matches_native_adi());
         for extra in [r#","extra":1"#, r#","provenance":{"source":"x"}"#, r#","provenance":{"source":"","apple_verified":false}"#] {
             let text = good.replace('}', &format!("{extra}}}"));
             assert!(parse(text.as_bytes()).is_err(), "{text}");

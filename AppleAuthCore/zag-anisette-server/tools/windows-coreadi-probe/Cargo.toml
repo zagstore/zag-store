@@ -1,0 +1,15 @@
+[package]
+name = "zag-windows-coreadi-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Offline prototype: load Windows CoreADI64.dll on Linux x86_64 and call its dispatcher"
+
+[dependencies]
+libc = "0.2"
+# For the shared v2 wire module (../../adi_worker_wire_v2.rs).
+serde = "1.0"
+serde_json = "1.0"
+
+[profile.release]
+panic = "abort"

@@ -276,20 +276,36 @@ fn handle_with_offline_mode(stream: TcpStream, offline_mode: bool) -> std::io::R
 
 /// Native-backend answers for routes that passed `route`'s validation.
 fn native_status(native: &NativeBackend) -> Response {
-    let metadata = client_info_config::configured_response().is_some();
+    let configured = client_info_config::configured_metadata();
+    let metadata = configured.is_some();
+    let platform = native.platform();
+    let consistent = configured.as_ref().is_some_and(|m| platform.accepts(m));
     let body = serde_json::json!({
-        "status": "ok", "backend": "native", "ready": native.ready() && metadata,
+        "status": "ok", "backend": "native", "ready": native.ready() && consistent,
+        "native_platform": platform.name(),
         "client_metadata": metadata,
+        "client_platform": configured.as_ref().map(|m| m.platform().to_owned()),
+        "adi_platform": platform.client_platform(),
+        "platform_consistent": consistent,
+        // The operator's statement that Apple accepted this pair; readiness
+        // does not depend on it, the first live attempt establishes it.
+        "client_metadata_apple_verified": configured.as_ref().and_then(|m| m.provenance.as_ref()).is_some_and(|p| p.apple_verified),
         "workers": {"active": native.active_workers(), "max": native.max_workers()},
     }).to_string();
     reply("200 OK", body)
 }
 
+/// Ready only when the configuration is consistent: the native check passed
+/// and the advertised identity is a client of the configured ADI (its
+/// platform, and for Windows iTunes' AuthKitWin identity).
 fn native_ready(native: &NativeBackend) -> Response {
-    match (native.ready(), client_info_config::configured_response().is_some()) {
-        (true, true) => reply("200 OK", r#"{"ready":true}"#),
-        (_, false) => reply("503 Service Unavailable", r#"{"ready":false,"reason":"client_metadata_unavailable"}"#),
+    let configured = client_info_config::configured_metadata();
+    match (native.ready(), configured) {
+        (_, None) => reply("503 Service Unavailable", r#"{"ready":false,"reason":"client_metadata_unavailable"}"#),
         (false, _) => reply("503 Service Unavailable", r#"{"ready":false,"reason":"native_backend_not_ready"}"#),
+        (true, Some(m)) if !native.platform().accepts(&m) =>
+            reply("503 Service Unavailable", r#"{"ready":false,"reason":"client_metadata_platform_mismatch"}"#),
+        (true, Some(_)) => reply("200 OK", r#"{"ready":true}"#),
     }
 }
 

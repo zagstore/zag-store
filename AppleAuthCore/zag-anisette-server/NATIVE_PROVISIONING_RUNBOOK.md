@@ -33,6 +33,74 @@ operator ─▶ supervisor (probe --provision-client-supervised)
   it identically, or the state does not match the device.
 * ds_id is AuthKit's fixed `-2`.
 
+## Platform consistency: the most likely cause of the 401 (22 November 2026)
+
+Apple now compares the platform advertised in `X-Mme-Client-Info` with the
+platform of the ADI library that produced the provisioning data or OTP. Our
+live attempt used the **Android** CoreADI libraries with the upstream
+**macOS** identity (`<MacBookPro13,2> <macOS;13.1;22C65> …`). That is exactly
+the combination the reports below describe as rejected.
+
+Public reports, none of them confirmed by Apple:
+
+| Date | Source | Report |
+| --- | --- | --- |
+| 2026-11-22 | SideStore/SideStore#1745 (comment by akl773) | Android-ADI v3 servers (`ani.sidestore.zip`, `ani.npeg.us`, a self-hosted `dadoum/anisette-v3-server`) fail `finishMachineProvisioning` with `-29003 "possible environment mismatch"`. Mac-ADI servers pass. |
+| 2026-11-11 | Dadoum/anisette-v3-server#62 (open PR) | Swapping OTPs between servers swaps the verdict. Android ADI with any identity gets `-80045` at sign-in. The PR says Apple ID sign-in on `gsa.apple.com` needs a desktop (macOS or Windows) ADI. |
+| 2026-11-12 | Dadoum/anisette-v3-server#61 (comments by dragosol and Dadoum) | Windows `CoreADI64.dll` with the Windows `AuthKitWin/7.3` identity provisions and gets normal sign-in errors. Android ADI gets `-80045` with Mac or Windows identities. A Mac identity on Windows ADI gets `-80044`. |
+| 2026-11-20 | SideStore/SideStore#1745; iloader v2.4.2 | The GSA edge returns 503 on `GsService2` (sign-in) for `macOS;` in the client info; `Mac OS X;` passes. This affects sign-in, not provisioning, but our candidate pair uses `macOS;`. |
+
+**Our own evidence** is HTTP 401 at finish. The Apple status code wasn't
+captured, because that capture came later in PR #44.
+
+**What follows:**
+- Provisioning now refuses a platform mismatch unless
+  `--accept-platform-mismatch` is given for an explicit diagnostic attempt.
+  Preflight lists it as a blocker, and the server's `/readyz` reports
+  `client_metadata_platform_mismatch`.
+- **No configuration available to us is consistent.** Android CoreADI needs a
+  genuine Apple Music for Android identity, and we have no sourced one.
+  PR #62's `<Pixel 8> …` value names a device and is not a captured Apple
+  Music header. Even with such an identity, PR #62 reports that Apple does
+  not serve Apple ID sign-in on `gsa.apple.com` to Android clients.
+- **The supported path is a desktop ADI with its own identity**, for example
+  Windows `CoreADI64.dll` with `AuthKitWin`. That is a new native backend and
+  needs the owner's decision and a licence review.
+
+## One authorized diagnostic attempt (prepared, not run)
+
+**Purpose:** confirm or refute the platform-mismatch explanation with
+Apple's own status code. It cannot produce a usable state.
+
+**Command** (run on approval only):
+```sh
+tools/native-adi-provision.sh --probe BIN --live --runtime ~/zag-adi-setup/runtime \
+  --state-parent ~/zag-adi-setup/adi-experiment-state \
+  --identity ~/zag-adi-setup/adi-test-private/test-identity.json \
+  --client-metadata ~/zag-adi-setup/private-config/client-info.json \
+  --authorize-apple-contact --accept-unverified-metadata --accept-platform-mismatch
+```
+
+**What it exercises:** lookup, start, native Start, then the finish stage.
+There is no Apple ID, password or 2FA. It is one exchange and is never
+retried.
+
+**Expected outcomes:**
+
+| Result | Meaning |
+| --- | --- |
+| `FAIL stage=finish-provisioning reason=Apple HTTP status 401 (Apple status -29003)` | Confirms the mismatch. Stop. |
+| `HTTP 433` / `-29002` | This device ID was already consumed. Use a new identity, and only with approval. |
+| Another status | A new finding. Stop and analyse. |
+| `PASS` | A state was provisioned and is published privately, 0600. Do not use it for sign-in yet. |
+
+**What is captured:** only the stage, the HTTP status and Apple's integer
+`ec`. Material, headers and bodies are never captured. Identity values never
+appear in output.
+
+**Identity reuse:** the earlier attempt stopped at finish, so the identity was
+probably not consumed. A 433 would show otherwise.
+
 ## Finish-provisioning HTTP 401 (22 November 2026)
 
 The first attempt with the pinned root reached `finish-provisioning` and
