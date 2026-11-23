@@ -95,24 +95,48 @@ fn stage_of(stage: ProvisioningStage) -> (DiagnosticStage, Option<bool>) {
     }
 }
 
+/// Whether re-running the same provisioning step could plausibly succeed,
+/// given a typed ADI code and/or the HTTP status observed at that step.
+fn provisioning_retryability(code: Option<i64>, http_status: Option<u16>) -> Retryability {
+    match (code, http_status) {
+        // "Device not provisioned" is recovered by re-provisioning; a typed ADI
+        // code outranks any HTTP status.
+        (Some(-45061), _) => Retryability::Retryable,
+        (Some(_), _) => Retryability::NotRetryable,
+        // No ADI code, but Apple answered our provisioning call. 401/4xx is an
+        // authentication/authorisation rejection — the ecosystem-wide block of
+        // synthetic-ADI provisioning seen since 2026-11-17 — not transient;
+        // 429 and 5xx may clear on retry.
+        (None, Some(429)) => Retryability::Retryable,
+        (None, Some(status)) if (500..=599).contains(&status) => Retryability::Retryable,
+        (None, Some(_)) => Retryability::NotRetryable,
+        // Nothing to go on.
+        (None, None) => Retryability::Unknown,
+    }
+}
+
 /// Derives a privacy-preserving diagnostic from a failure, reading only typed
 /// error contexts — never message text. Returns the first recognised layer in
 /// the report chain; `Unknown` when none matches.
 pub fn diagnose(report: &Report) -> ProvisioningDiagnostic {
+    // An HTTP status can sit deeper than the classifying context — e.g. Apple's
+    // 401 to our own midFinishProvisioning call, under an EndProvisioning fault.
+    // Capture it once across the whole chain so the provisioning view can report
+    // the failing boundary *and* the status together.
+    let http_status = report.iter_reports().find_map(|part| {
+        part.downcast_current_context::<reqwest::Error>()
+            .and_then(|error| error.status().map(|status| status.as_u16()))
+    });
+
     for part in report.iter_reports() {
         if let Some(fault) = part.downcast_current_context::<ProvisioningFault>() {
             let (stage, before) = stage_of(fault.stage);
             return ProvisioningDiagnostic {
                 stage,
                 source: DiagnosticSource::AnisetteProvider,
-                http_status: None,
+                http_status,
                 code: fault.code,
-                retryable: match fault.code {
-                    // "Device not provisioned" is recovered by re-provisioning.
-                    Some(-45061) => Retryability::Retryable,
-                    Some(_) => Retryability::NotRetryable,
-                    None => Retryability::Unknown,
-                },
+                retryable: provisioning_retryability(fault.code, http_status),
                 before_provider_exchange: before,
             };
         }
@@ -241,6 +265,34 @@ mod tests {
         assert_eq!(d.stage, DiagnosticStage::Unknown);
         assert_eq!(d.source, DiagnosticSource::Unknown);
         assert_eq!(d.code, None);
+    }
+
+    #[test]
+    fn a_401_at_finish_provisioning_is_a_nonretryable_rejection() {
+        // The ecosystem-wide block: Apple answers our own finishMachineProvisioning
+        // call with 401. There is no ADI code, but the HTTP status makes the
+        // failure a definite authorisation rejection, not a transient one.
+        assert_eq!(provisioning_retryability(None, Some(401)), Retryability::NotRetryable);
+        assert_eq!(provisioning_retryability(None, Some(403)), Retryability::NotRetryable);
+    }
+
+    #[test]
+    fn a_server_or_rate_limit_status_during_provisioning_is_retryable() {
+        assert_eq!(provisioning_retryability(None, Some(429)), Retryability::Retryable);
+        assert_eq!(provisioning_retryability(None, Some(503)), Retryability::Retryable);
+    }
+
+    #[test]
+    fn a_typed_adi_code_outranks_the_http_status() {
+        // -29003 stays a definite rejection even if the transport reported a 5xx.
+        assert_eq!(provisioning_retryability(Some(-29003), Some(503)), Retryability::NotRetryable);
+        // -45061 stays retryable (re-provision) whatever the status.
+        assert_eq!(provisioning_retryability(Some(-45061), Some(401)), Retryability::Retryable);
+    }
+
+    #[test]
+    fn no_code_and_no_status_is_unknown() {
+        assert_eq!(provisioning_retryability(None, None), Retryability::Unknown);
     }
 
     #[test]

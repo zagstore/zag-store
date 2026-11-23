@@ -720,6 +720,10 @@ impl RemoteV3AnisetteProvider {
                             None,
                         )
                         .await
+                        // Zag Store fork: tag the boundary so a diagnostic can tell a
+                        // failure of our own call to Apple's midStartProvisioning
+                        // (e.g. an HTTP 401) from a server-side StartProvisioningError.
+                        .context(ProvisioningFault { stage: ProvisioningStage::StartProvisioning, code: None })
                         .context("Failed to send start provisioning request")?;
 
                     let spim = response
@@ -752,6 +756,11 @@ impl RemoteV3AnisetteProvider {
                             None,
                         )
                         .await
+                        // Zag Store fork: tag the boundary so a diagnostic can tell a
+                        // failure of our own call to Apple's midFinishProvisioning
+                        // (the ecosystem-wide HTTP 401 since 2026-11-17) from a
+                        // server-side EndProvisioningError.
+                        .context(ProvisioningFault { stage: ProvisioningStage::EndProvisioning, code: None })
                         .context("Failed to send end provisioning request")?;
 
                     ws.send_text(
