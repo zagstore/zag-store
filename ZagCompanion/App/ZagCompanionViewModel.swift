@@ -67,7 +67,7 @@ public final class ZagCompanionViewModel: ObservableObject {
 	public func renew(_ app: ZagManagedApp) {
 		guard let device = selectedDevice ?? devices.first(where: { $0.udid == app.deviceUDID }),
 			  let team = selectedTeam ?? teams.first(where: { $0.identifier == app.teamIdentifier }) else { return }
-		run { try self.service.renew(app, on: device, team: team, allowNewProvisioning: self.allowNewProvisioning, progress: self.report) }
+		run { try self.service.renew(app, on: device, team: team, allowNewProvisioning: self.allowNewProvisioning, progress: self.report).app }
 	}
 	public func launch(_ app: ZagManagedApp) {
 		guard let device = selectedDevice ?? devices.first(where: { $0.udid == app.deviceUDID }) else { return }

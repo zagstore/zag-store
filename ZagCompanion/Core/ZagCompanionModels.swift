@@ -106,29 +106,51 @@ public enum ZagCompanionError: Error, CustomStringConvertible {
 	case unprovisionableExtensions([String])
 	case noUsableProfile(bundleID: String, device: String)
 	case provisioningRefused(String)
+	case provisioningTeamMismatch(requested: String, issued: String)
 	case signingFailed(String)
 	case verificationFailed(String)
 	case installFailed(String)
 	case launchFailed(String)
 	case toolFailed(tool: String, status: Int32, output: String)
 	case unknownManagedApp(String)
+	case invalidBundleIdentifier(String)
+	case unsafeArchive(String)
+	case deviceMismatch(expectedUDIDSuffix: String)
+	case teamMismatch(expected: String, got: String)
+	case renewalNeedsAuthorization(bundleID: String)
 
 	public var description: String {
 		switch self {
 		case .noDeviceConnected: return "No connected iPhone found. Connect and unlock the device, and trust this Mac."
 		case let .deviceHasNoUDID(d): return "Could not read the UDID of \(d)."
 		case .noPersonalTeam: return "No free Apple Account \"Personal Team\" is available in Xcode. Sign in in Xcode > Settings > Accounts."
-		case let .ipaUnreadable(m): return "The IPA could not be read: \(m)"
+		case let .ipaUnreadable(m): return "The IPA could not be read: \(ZagRedaction.sanitize(m))"
 		case .ipaHasNoApp: return "The IPA contains no Payload/*.app bundle."
 		case let .unprovisionableExtensions(ids): return "This app has extensions a free team cannot provision in v0.1: \(ids.joined(separator: ", "))"
-		case let .noUsableProfile(b, d): return "No valid provisioning profile covers \(b) on device \(d), and new provisioning was not authorised."
-		case let .provisioningRefused(m): return "Xcode provisioning failed: \(m)"
-		case let .signingFailed(m): return "Signing with Zag Store's engine failed: \(m)"
-		case let .verificationFailed(m): return "Verification of the signed app failed: \(m)"
-		case let .installFailed(m): return "Installation on the device failed: \(m)"
-		case let .launchFailed(m): return "Launch failed: \(m)"
-		case let .toolFailed(tool, status, output): return "\(tool) exited \(status): \(output.suffix(400))"
+		case let .noUsableProfile(b, d): return "No valid provisioning profile covers \(b) on device \(d) for the selected team, and new provisioning was not authorised."
+		case let .provisioningRefused(m): return "Xcode provisioning failed: \(ZagRedaction.sanitize(m))"
+		case let .provisioningTeamMismatch(req, got): return "Xcode issued a profile for team \(got), not the selected team \(req)."
+		case let .signingFailed(m): return "Signing with Zag Store's engine failed: \(ZagRedaction.sanitize(m))"
+		case let .verificationFailed(m): return "Verification of the signed app failed: \(ZagRedaction.sanitize(m))"
+		case let .installFailed(m): return "Installation on the device failed: \(ZagRedaction.sanitize(m))"
+		case let .launchFailed(m): return "Launch failed: \(ZagRedaction.sanitize(m))"
+		case let .toolFailed(tool, status, output): return "\(tool) exited \(status): \(ZagRedaction.sanitize(output))"
 		case let .unknownManagedApp(id): return "No managed app \(id)."
+		case let .invalidBundleIdentifier(b): return "Unsafe or invalid bundle identifier: \(b)"
+		case let .unsafeArchive(m): return "The IPA contains an unsafe entry and was rejected: \(m)"
+		case let .deviceMismatch(suffix): return "The selected device is not the one this app was installed on (expected UDID …\(suffix))."
+		case let .teamMismatch(expected, got): return "The selected team \(got) does not match this app's team \(expected)."
+		case let .renewalNeedsAuthorization(b): return "\(b) is near expiry; renewing it needs a fresh profile from Xcode. Enable new provisioning to authorise it."
 		}
 	}
+}
+
+/// The result of a renewal, stating whether the expiration was actually
+/// extended — never reported as extended unless the new expiry is genuinely later.
+public struct ZagRenewalOutcome: Sendable {
+	public let app: ZagManagedApp
+	public let previousExpiry: Date
+	public let newExpiry: Date
+	public let extended: Bool
+	public let issuedFreshProfile: Bool
 }

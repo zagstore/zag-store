@@ -21,9 +21,71 @@ import CryptoKit
 		ipaInspection(tmp)
 		pairingCrypto()
 		signerFailsClosed()
+		renewalPlanner()
+		inputSafety()
+		redaction()
+		pairingDisabled()
+		teamScopedResolution(tmp)
 
 		if failures == 0 { print("SUCCESS: companion core tests") }
 		exit(failures == 0 ? 0 : 1)
+	}
+
+	// Renewal decides purely from dates + authorisation, and never claims an
+	// extension it will not deliver.
+	static func renewalPlanner() {
+		let now = Date()
+		let prev = now.addingTimeInterval(86_400)              // expires in 1 day (near)
+		let far = now.addingTimeInterval(6 * 86_400)           // expires in 6 days (not near)
+		let threshold: TimeInterval = 2 * 86_400
+
+		let newer = ZagRenewalPlanner.plan(previousExpiry: prev, candidateExpiry: prev.addingTimeInterval(86_400), now: now, threshold: threshold, allowNewProvisioning: false)
+		check(newer.action == .reuseNewerProfile && newer.willExtend, "a newer on-disk profile extends by reuse")
+
+		let notNear = ZagRenewalPlanner.plan(previousExpiry: far, candidateExpiry: far, now: now, threshold: threshold, allowNewProvisioning: true)
+		check(notNear.action == .reuseWithoutExtension && !notNear.willExtend, "not near expiry: reinstall without claiming extension")
+
+		let fresh = ZagRenewalPlanner.plan(previousExpiry: prev, candidateExpiry: prev, now: now, threshold: threshold, allowNewProvisioning: true)
+		check(fresh.action == .provisionFresh && fresh.willExtend, "near expiry + authorised: provision a fresh profile (extends)")
+
+		let blocked = ZagRenewalPlanner.plan(previousExpiry: prev, candidateExpiry: prev, now: now, threshold: threshold, allowNewProvisioning: false)
+		check(blocked.action == .blockedNeedsAuthorization && !blocked.willExtend, "near expiry + unauthorised: blocked, no false extension")
+	}
+
+	static func inputSafety() {
+		check(ZagCompanionSafety.isSafeBundleIdentifier("com.example.app"), "a normal bundle ID is accepted")
+		check(!ZagCompanionSafety.isSafeBundleIdentifier("-rf"), "a leading-dash bundle ID (option injection) is rejected")
+		check(!ZagCompanionSafety.isSafeBundleIdentifier("com.example/../x"), "a bundle ID with path chars is rejected")
+		check(!ZagCompanionSafety.isSafeBundleIdentifier("no-dot"), "a bundle ID without a dot is rejected")
+		check(ZagCompanionSafety.isSafeArchiveEntry("Payload/App.app/App"), "a normal archive entry is accepted")
+		check(!ZagCompanionSafety.isSafeArchiveEntry("../escape"), "a traversal archive entry is rejected")
+		check(!ZagCompanionSafety.isSafeArchiveEntry("/etc/passwd"), "an absolute archive entry is rejected")
+		check(!ZagCompanionSafety.isSafeArchiveEntry("Payload/../../x"), "a deep traversal entry is rejected")
+	}
+
+	static func redaction() {
+		// Synthetic, non-real values shaped like a UDID / serial / email.
+		let udid = "0000ABCD-1111222233334444", serial = "AAAABBBBCCCCDDDDEEEEFFFF00001111"
+		let clean = ZagRedaction.sanitize("error for user@example.com device \(udid) serial \(serial)")
+		check(!clean.contains("@example.com") && !clean.contains(udid) && !clean.contains("AAAABBBB"),
+			  "redaction strips emails, UDIDs and serials from tool output")
+	}
+
+	static func pairingDisabled() {
+		check(!ZagCompanionPairing.remoteInstallEnabled, "remote install is disabled in v0.1")
+		do { try ZagCompanionPairing.authorizeRemoteInstall(); check(false, "remote install authorisation should throw") }
+		catch { check(true, "remote-install authorisation is refused") }
+	}
+
+	// A profile for a different team (or none) must not be returned: resolving
+	// an unknown bundle ID for a team with no matching profile is rejected when
+	// provisioning is not authorised.
+	static func teamScopedResolution(_ tmp: URL) {
+		let prov = ZagCompanionProvisioning(templateProjectURL: tmp)
+		let device = ZagCompanionDevice(id: "x", name: "iPhone", model: "iPhone", udid: "00000000-0000000000000000", connected: true)
+		let team = ZagCompanionTeam(identifier: "ZZZZZZZZZZ", name: "Nonexistent", isFree: true)
+		do { _ = try prov.resolve(bundleID: "com.zag.nonexistent.\(UUID().uuidString.prefix(6))", device: device, team: team, allowNewProvisioning: false); check(false, "unknown team/bundle should not resolve") }
+		catch { check(true, "no profile is returned for a team/bundle with no match (team isolation)") }
 	}
 
 	static func registry(_ tmp: URL) {

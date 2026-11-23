@@ -26,6 +26,27 @@ public enum ZagCompanionPairing {
 	private static let keychainAccount = "com.zagstore.companion.identity-key"
 	private static let service = "ZagCompanion"
 
+	/// Remote installation initiated from the phone is DISABLED in v0.1. The
+	/// primitives below (identity, code, sealed sessions) are a foundation, not
+	/// a complete authenticated pairing protocol. Before this may be turned on,
+	/// the transport must implement and test: mutual authentication, transcript
+	/// binding (the session key committing to both parties' keys and the code),
+	/// pairing-code expiry, attempt/rate limits, replay protection (nonces),
+	/// and a real encrypted channel. Until then any remote-install request is
+	/// refused.
+	public static let remoteInstallEnabled = false
+
+	public enum PairingError: Error, CustomStringConvertible {
+		case remoteInstallDisabled
+		public var description: String { "Remote installation over pairing is disabled in v0.1 until the full authenticated protocol is implemented." }
+	}
+
+	/// The single gate a transport must pass before acting on a phone-initiated
+	/// install. It always throws in v0.1.
+	public static func authorizeRemoteInstall() throws {
+		guard remoteInstallEnabled else { throw PairingError.remoteInstallDisabled }
+	}
+
 	/// The companion's identity public key, creating the key pair on first use.
 	public static func identity() throws -> ZagPairingIdentity {
 		let key = try loadOrCreateSigningKey()

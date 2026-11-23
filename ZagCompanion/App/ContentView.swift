@@ -149,8 +149,9 @@ struct ContentView: View {
 	}
 
 	private var pairingSection: some View {
-		card("Zag Store pairing (foundation)") {
-			Text("Pair Zag Store on iPhone to request installs. v0.1 establishes the companion identity and pairing code; the encrypted local transport is the next step.")
+		card("Zag Store pairing (foundation — remote install disabled)") {
+			Label("Remote install from the phone is disabled in v0.1 until mutual authentication, transcript binding, code expiry, attempt limits, replay protection and an encrypted transport are implemented and tested.",
+				  systemImage: "lock.fill")
 				.font(.caption).foregroundStyle(.secondary)
 			HStack {
 				Button("Show pairing code") { model.startPairing() }

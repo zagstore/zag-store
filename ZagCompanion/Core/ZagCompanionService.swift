@@ -12,11 +12,16 @@ public struct ZagCompanionConfig: Sendable {
 	public let workDirectory: URL
 	public let outputDirectory: URL
 	public let registryURL: URL
+	/// How close to expiry a managed app must be before renewal tries to obtain
+	/// a genuinely fresh profile. Default: 2 days.
+	public var renewalThreshold: TimeInterval = 2 * 86_400
 
 	/// Default locations under Application Support, with the template bundled
 	/// beside the app (or pointed at the in-repo experiment for the CLI test).
 	public init(templateProjectURL: URL,
-				supportDirectory: URL? = nil) {
+				supportDirectory: URL? = nil,
+				renewalThreshold: TimeInterval = 2 * 86_400) {
+		self.renewalThreshold = renewalThreshold
 		let support = supportDirectory ?? FileManager.default.homeDirectoryForCurrentUser
 			.appendingPathComponent("Library/Application Support/ZagCompanion")
 		try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
@@ -57,7 +62,7 @@ public final class ZagCompanionService {
 
 		progress(ZagCompanionProgress(.resolvingProfile, "Finding a profile for \(info.bundleIdentifier) on \(device.name)…"))
 		let profile: ZagResolvedProfile
-		if let existing = ZagCompanionProvisioning.existingProfile(bundleID: info.bundleIdentifier, deviceUDID: device.udid, now: now) {
+		if let existing = ZagCompanionProvisioning.existingProfile(bundleID: info.bundleIdentifier, deviceUDID: device.udid, team: team.identifier, now: now) {
 			profile = existing
 		} else {
 			progress(ZagCompanionProgress(.provisioning, "Asking Xcode to provision \(info.bundleIdentifier)…"))
@@ -76,37 +81,68 @@ public final class ZagCompanionService {
 		return managed
 	}
 
-	/// Renews a managed app with a currently-valid profile. Reuses an existing
-	/// profile when one still covers the app; provisions only with authorisation.
+	/// Renews a managed app. Validates that the selected device and team match
+	/// the ones the app was installed under, decides (purely) whether a fresh
+	/// profile is needed from its expiry and the configured threshold, obtains
+	/// one through Xcode when authorised, and reports an extension only when the
+	/// new expiry is genuinely later than the old one.
 	@discardableResult
 	public func renew(_ app: ZagManagedApp, on device: ZagCompanionDevice, team: ZagCompanionTeam,
-					  allowNewProvisioning: Bool, now: Date = Date(), progress: Progress = { _ in }) throws -> ZagManagedApp {
+					  allowNewProvisioning: Bool, now: Date = Date(), progress: Progress = { _ in }) throws -> ZagRenewalOutcome {
+		// 1. Device and team must match what this app was installed under.
+		guard device.udid == app.deviceUDID else {
+			throw ZagCompanionError.deviceMismatch(expectedUDIDSuffix: String(app.deviceUDID.suffix(6)))
+		}
+		guard team.identifier == app.teamIdentifier else {
+			throw ZagCompanionError.teamMismatch(expected: app.teamIdentifier, got: team.identifier)
+		}
 		let ipa = URL(fileURLWithPath: app.sourceIPAPath)
 		guard FileManager.default.fileExists(atPath: ipa.path) else {
-			throw ZagCompanionError.ipaUnreadable("source IPA missing: \(app.sourceIPAPath)")
+			throw ZagCompanionError.ipaUnreadable("source IPA missing")
 		}
 		progress(ZagCompanionProgress(.resolvingProfile, "Renewing \(app.displayName)…"))
 		let info = try ZagIPA.info(ipa)
+
+		// 2. Decide from dates + authorisation (pure), then obtain the profile.
+		let candidate = ZagCompanionProvisioning.existingProfile(bundleID: app.bundleIdentifier, deviceUDID: device.udid, team: team.identifier, now: now)
+		let decision = ZagRenewalPlanner.plan(previousExpiry: app.profileExpiresAt, candidateExpiry: candidate?.expiresAt,
+											  now: now, threshold: config.renewalThreshold, allowNewProvisioning: allowNewProvisioning)
 		let profile: ZagResolvedProfile
-		if let existing = ZagCompanionProvisioning.existingProfile(bundleID: app.bundleIdentifier, deviceUDID: device.udid, now: now) {
-			profile = existing
-		} else {
-			progress(ZagCompanionProgress(.provisioning, "Obtaining a fresh profile…"))
-			profile = try provisioning.resolve(bundleID: app.bundleIdentifier, device: device, team: team,
-											   allowNewProvisioning: allowNewProvisioning, now: now)
+		var issuedFresh = false
+		switch decision.action {
+		case .reuseNewerProfile, .reuseWithoutExtension:
+			guard let candidate else { throw ZagCompanionError.noUsableProfile(bundleID: app.bundleIdentifier, device: device.name) }
+			profile = candidate
+		case .provisionFresh:
+			progress(ZagCompanionProgress(.provisioning, "Obtaining a fresh profile from Xcode…"))
+			profile = try provisioning.provisionViaXcode(bundleID: app.bundleIdentifier, device: device, team: team)
+			issuedFresh = true
+		case .blockedNeedsAuthorization:
+			throw ZagCompanionError.renewalNeedsAuthorization(bundleID: app.bundleIdentifier)
 		}
-		// Validate identity, device and bundle ID before re-signing.
-		guard profile.bundleIdentifier == app.bundleIdentifier, profile.deviceUDIDs.contains(device.udid) else {
-			throw ZagCompanionError.verificationFailed("the renewal profile does not match the app and device")
+
+		// 3. Validate the resolved profile against the app before re-signing.
+		guard profile.bundleIdentifier == app.bundleIdentifier,
+			  profile.teamIdentifier == app.teamIdentifier,
+			  profile.deviceUDIDs.contains(device.udid) else {
+			throw ZagCompanionError.verificationFailed("the renewal profile does not match the app, team and device")
 		}
+
 		let signed = try signAndInstall(ipa: ipa, info: info, profile: profile, device: device, now: now, progress: progress)
+
+		// 4. Only claim an extension if the expiry is genuinely later.
+		let previousExpiry = app.profileExpiresAt
+		let newExpiry = signed.profileExpiresAt
+		let extended = newExpiry > previousExpiry
 		var updated = app
 		updated.certificateSerial = signed.certificateSerial
-        updated.profileExpiresAt = signed.profileExpiresAt
+		updated.profileExpiresAt = newExpiry
 		updated.lastRenewedAt = now
 		registry.upsert(updated)
-		progress(ZagCompanionProgress(.done, "Renewed \(app.displayName). Now expires \(Self.format(signed.profileExpiresAt))."))
-		return updated
+		progress(ZagCompanionProgress(.done, extended
+			? "Renewed \(app.displayName). Expiry extended to \(Self.format(newExpiry))."
+			: "Reinstalled \(app.displayName) with the current profile — expiry unchanged (\(Self.format(newExpiry)))."))
+		return ZagRenewalOutcome(app: updated, previousExpiry: previousExpiry, newExpiry: newExpiry, extended: extended, issuedFreshProfile: issuedFresh)
 	}
 
 	// MARK: - Shared pipeline

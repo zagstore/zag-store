@@ -56,15 +56,25 @@ import Foundation
 			check(false, "launch (if this reports an untrusted developer, trust the cert in Settings then re-run): \(error)")
 		}
 
-		// 5. Renew with the valid profile — must NOT issue a new certificate.
+		// 5. Renew with the valid profile and no authorisation to provision.
+		//    The profile is not near expiry, so this reinstalls with the current
+		//    profile WITHOUT issuing a new certificate and WITHOUT claiming an
+		//    extension (honest reporting). Device/team are validated to match.
 		let serialBefore = managed.certificateSerial
 		do {
-			let renewed = try service.renew(managed, on: device, team: team, allowNewProvisioning: false) { p in
+			let outcome = try service.renew(managed, on: device, team: team, allowNewProvisioning: false) { p in
 				print("   [renew:\(p.stage.rawValue)] \(p.message)")
 			}
-			check(renewed.certificateSerial == serialBefore, "renewal reused the same certificate (no new cert issued)")
-			check(renewed.lastRenewedAt != nil, "renewal was recorded")
+			check(outcome.app.certificateSerial == serialBefore, "renewal reused the same certificate (no new cert issued)")
+			check(!outcome.issuedFreshProfile, "no fresh Apple-side profile was issued (allowNewProvisioning: false)")
+			check(!outcome.extended, "renewal honestly reports no extension when reusing the current profile")
+			check(outcome.app.lastRenewedAt != nil, "renewal was recorded")
 		} catch { check(false, "renew: \(error)") }
+
+		// 5b. Renewal must refuse a device that is not this app's device.
+		let wrongDevice = ZagCompanionDevice(id: device.id, name: "Other", model: "iPhone", udid: "00000000-0000000000000000", connected: true)
+		do { _ = try service.renew(managed, on: wrongDevice, team: team, allowNewProvisioning: false); check(false, "renewal should reject a mismatched device") }
+		catch { check(true, "renewal rejects a device that is not the app's recorded device") }
 
 		// 6. Registry round-trip.
 		check(service.registry.all().contains { $0.id == managed.id }, "the managed app is tracked for renewal")

@@ -10,9 +10,25 @@ public enum ZagIPA {
 	public static func unpack(_ ipa: URL, into workDir: URL) throws -> URL {
 		try? FileManager.default.removeItem(at: workDir)
 		try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+
+		// Refuse any archive entry that could escape the extraction directory
+		// (absolute path, `..` traversal, volume/drive prefix) BEFORE extracting.
+		let listing = ZagProcess.run("/usr/bin/unzip", ["-Z1", ipa.path])
+		guard listing.succeeded else { throw ZagCompanionError.ipaUnreadable(listing.combined) }
+		for entry in listing.standardOutput.split(separator: "\n").map(String.init) where !entry.isEmpty {
+			guard ZagCompanionSafety.isSafeArchiveEntry(entry) else { throw ZagCompanionError.unsafeArchive(entry) }
+		}
+
 		let result = ZagProcess.run("/usr/bin/unzip", ["-q", ipa.path, "-d", workDir.path])
 		guard result.succeeded else { throw ZagCompanionError.ipaUnreadable(result.combined) }
-		return try appInPayload(workDir)
+
+		let app = try appInPayload(workDir)
+		// Defence in depth: the resolved app path (symlinks included) must stay
+		// inside the work directory.
+		guard ZagCompanionSafety.isContained(app, within: workDir) else {
+			throw ZagCompanionError.unsafeArchive("extracted app escaped the work directory")
+		}
+		return app
 	}
 
 	/// The .app under `<dir>/Payload`.
@@ -30,6 +46,7 @@ public enum ZagIPA {
 		defer { try? FileManager.default.removeItem(at: tmp) }
 		let app = try unpack(ipa, into: tmp)
 		let (bundleID, name, version) = try readInfoPlist(app)
+		guard ZagCompanionSafety.isSafeBundleIdentifier(bundleID) else { throw ZagCompanionError.invalidBundleIdentifier(bundleID) }
 		let extIDs = extensionBundleIDs(in: app)
 		return ZagCompanionIPAInfo(url: ipa, bundleIdentifier: bundleID, displayName: name,
 								   version: version, extensionBundleIdentifiers: extIDs)

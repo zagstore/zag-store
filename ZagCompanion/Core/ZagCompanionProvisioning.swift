@@ -56,16 +56,18 @@ public struct ZagCompanionProvisioning {
 
 	// MARK: - Resolve
 
-	/// A profile that covers this bundle ID on this device, not expired, whose
-	/// certificate is a Keychain identity we can sign with. Newest expiry wins.
-	public static func existingProfile(bundleID: String, deviceUDID: String, now: Date = Date()) -> ZagResolvedProfile? {
+	/// A profile that covers this bundle ID on this device FOR THE REQUESTED
+	/// TEAM, not expired, whose certificate is a Keychain identity we can sign
+	/// with. A profile from any other team is never returned. Newest expiry wins.
+	public static func existingProfile(bundleID: String, deviceUDID: String, team: String, now: Date = Date()) -> ZagResolvedProfile? {
 		let dir = profilesDirectory
 		let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
 		var best: ZagResolvedProfile?
 		for file in files where file.hasSuffix(".mobileprovision") {
 			let url = dir.appendingPathComponent(file)
 			guard let data = try? Data(contentsOf: url), let profile = try? ZagIssuedProfile(profileData: data) else { continue }
-			guard profile.bundleIdentifier == bundleID,
+			guard profile.teamIdentifier == team,
+				  profile.bundleIdentifier == bundleID,
 				  profile.deviceUDIDs.contains(deviceUDID),
 				  profile.expiresAt > now,
 				  profile.certificateSerials.contains(where: { ZagCompanionKeychain.hasIdentity(serial: $0) }) else { continue }
@@ -78,12 +80,14 @@ public struct ZagCompanionProvisioning {
 		return best
 	}
 
-	/// Resolves a profile, provisioning through Xcode only when none exists and
-	/// `allowNewProvisioning` is set (a new Apple-side action: registers the
-	/// device, issues a profile, and may consume a free-team slot).
+	/// Resolves a profile for the requested team, provisioning through Xcode
+	/// only when none exists and `allowNewProvisioning` is set (a new Apple-side
+	/// action: registers the device, issues a profile, and may consume a
+	/// free-team slot).
 	public func resolve(bundleID: String, device: ZagCompanionDevice, team: ZagCompanionTeam,
 						allowNewProvisioning: Bool, now: Date = Date()) throws -> ZagResolvedProfile {
-		if let existing = Self.existingProfile(bundleID: bundleID, deviceUDID: device.udid, now: now) { return existing }
+		guard ZagCompanionSafety.isSafeBundleIdentifier(bundleID) else { throw ZagCompanionError.invalidBundleIdentifier(bundleID) }
+		if let existing = Self.existingProfile(bundleID: bundleID, deviceUDID: device.udid, team: team.identifier, now: now) { return existing }
 		guard allowNewProvisioning else { throw ZagCompanionError.noUsableProfile(bundleID: bundleID, device: device.name) }
 		return try provisionViaXcode(bundleID: bundleID, device: device, team: team)
 	}
@@ -91,6 +95,10 @@ public struct ZagCompanionProvisioning {
 	/// Asks Xcode to provision `bundleID` for `device` using a disposable copy
 	/// of the template project. Validates the resulting profile before use.
 	public func provisionViaXcode(bundleID: String, device: ZagCompanionDevice, team: ZagCompanionTeam) throws -> ZagResolvedProfile {
+		guard ZagCompanionSafety.isSafeBundleIdentifier(bundleID) else { throw ZagCompanionError.invalidBundleIdentifier(bundleID) }
+		guard ZagCompanionSafety.isSafeIdentifierToken(team.identifier), ZagCompanionSafety.isSafeIdentifierToken(device.udid) else {
+			throw ZagCompanionError.provisioningRefused("unsafe team or device identifier")
+		}
 		let work = FileManager.default.temporaryDirectory.appendingPathComponent("zag-provision-\(UUID().uuidString)")
 		try? FileManager.default.removeItem(at: work)
 		try FileManager.default.copyItem(at: templateProjectURL, to: work)
@@ -126,6 +134,11 @@ public struct ZagCompanionProvisioning {
 		}
 		guard profile.deviceUDIDs.contains(device.udid) else {
 			throw ZagCompanionError.provisioningRefused("the issued profile does not include this device")
+		}
+		// Enforce the selected team — never sign with a profile Xcode issued
+		// under a different team than the one the user chose.
+		guard profile.teamIdentifier == team.identifier else {
+			throw ZagCompanionError.provisioningTeamMismatch(requested: team.identifier, issued: profile.teamIdentifier)
 		}
 		return ZagResolvedProfile(
 			data: data, url: embedded, teamIdentifier: profile.teamIdentifier, bundleIdentifier: profile.bundleIdentifier,
