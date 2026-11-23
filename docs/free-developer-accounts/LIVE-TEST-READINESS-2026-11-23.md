@@ -60,8 +60,9 @@ libraries and services. Both are open; neither is a legal opinion.
   APK. Whether they may be used this way is governed by **Apple's terms**, not an
   open-source licence, and **fetching them contacts Apple**. This is unresolved
   and is separate from (A).
-- Native/Android ADI as an Apple *device identity* is additionally rejected at
-  runtime (ADI -29003) — a technical-compatibility fact, discussed under G3.
+- Native/Android ADI as an Apple *device identity* additionally produced an
+  observed end-provisioning failure (ADI -29003) in our testing; the precise
+  root cause is not established from that code alone. Discussed under G3.
 
 - **Verdict:** a licence-tracked *client* exists (MPL-2.0/MIT, pending review),
   but **no legally usable anisette *implementation* (client + a licensed server
@@ -86,10 +87,12 @@ libraries and services. Both are open; neither is a legal opinion.
   identified.
 - **Native ADI is not the credible first route.** Per PR #49 and
   `ISIDELOAD-EVALUATION.md`, Apple's Android CoreADI libraries are not
-  licensable as hosted multi-user auth, and the -29003 end-provisioning
-  mismatch is exactly an Android-ADI-vs-claimed-platform rejection. **Do not
-  assume Android CoreADI is accepted as an Apple device identity** — the
-  ecosystem-wide 401s since 2026-11-17 reinforce this.
+  licensable as hosted multi-user auth. Separately, our native-ADI testing
+  produced an observed -29003 end-provisioning failure; an Android-ADI vs
+  claimed-platform mismatch is a leading hypothesis but is not proven by that
+  code alone (see the diagnosis note). **Do not assume Android CoreADI is
+  accepted as an Apple device identity** — the ecosystem-wide 401s since
+  2026-11-17 are consistent with, but do not by themselves establish, that.
 - **Recommendation:** the **remote anisette provider (the `remote_v3` client)**
   is the most technically credible and compatible route and the only one with a
   known (if pending) client licence. It is gated on: (1) the study's 25 Nov
@@ -126,7 +129,7 @@ inspection, not a substitute for the independent review):**
       device state shared vs per-account.
 - [ ] `test-zag-apple-bridge.sh`, `test-zag-isideload-fork.sh` and the release
       scan run by the reviewer.
-- [ ] PR #55 (diagnostics) final-merged by its reviewer.
+- [x] PR #55 (diagnostics) final-merged into integration (`45a64442`).
 - [ ] Confirmed: the test build sets only the dedicated compilation conditions
       below and leaves the Release configuration unchanged.
 
@@ -191,8 +194,8 @@ code, no sensitive text). The full stop-on-first-failure run is in
    first-party) anisette server + a decision on Apple's libraries.
 2. **G3** — the 25 Nov study verdict + stage-4 privacy decisions; owner chooses
    the provider URL and device serial.
-3. **G4** — independent security review completed; §10 questions decided; PR #55
-   merged.
+3. **G4** — independent security review completed; §10 questions decided. (PR
+   #55 is already merged into integration at `45a64442`.)
 4. **G1 / G5 / G6** — owner approves the supervised experiment, the test-build
    plan, and confirms the dedicated account is ready.
 5. **Owner's explicit authorization** of the single live run (not granted here).
