@@ -1,0 +1,4 @@
+module ZagAppleAuth {
+    header "shim.h"
+    export *
+}
