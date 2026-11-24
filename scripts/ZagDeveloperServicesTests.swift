@@ -25,7 +25,7 @@ check(Set(readOnly + mutating).count == ZagDeveloperServicesAction.allCases.coun
 // MARK: Endpoint building.
 let ep = try! ZagDeveloperServicesProtocol.endpoint(.listTeams)
 check(ep.scheme == "https" && ep.host == "developerservices2.apple.com", "endpoint is https on the pinned host")
-check(ep.path == "/services/QH65B2/viewDeveloper.action", "endpoint path includes protocol version + action")
+check(ep.path == "/services/QH65B2/listTeams.action", "endpoint path includes protocol version + action")
 check((ep.query ?? "").contains("clientId=XABBG36SBA"), "endpoint carries the clientId query")
 let csrEp = try! ZagDeveloperServicesProtocol.endpoint(.submitCSR)
 check(csrEp.path == "/services/QH65B2/ios/submitDevelopmentCSR.action", "ios-scoped action path")

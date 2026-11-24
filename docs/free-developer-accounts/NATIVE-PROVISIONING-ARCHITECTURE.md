@@ -283,3 +283,36 @@ First a token must be persisted (an authorized dev-session run). Then:
 ```
 xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_TEAMS":"1"}' dev.zagstore.ptteamprobe
 ```
+
+---
+
+## First live team discovery + endpoint correction (2026-11-24 14:45)
+
+First live developer-services request (`ZAG_RUN_MACLEGACY_TEAMS`):
+`{ http_status:200, result_code:0, request_count:1, team_count:0, outcome:no-teams,
+all three profiles 10/consistent }`.
+
+**Milestone**: Apple **accepted the native developer token** against
+developerservices2.apple.com (HTTP 200, resultCode 0) — the standalone
+free-account token authenticates to developer services end to end.
+
+**Defect found + fixed (verified against AltSign/SideStore source):** the
+`listTeams` action was `viewDeveloper.action`, which returns a `developer` dict
+(no `teams` array) — hence resultCode 0 but team_count 0. Corrected to
+**`listTeams.action`** (response key `teams`; per-team keys name/teamId/type/
+memberships — these now verified, not assumed). All other QH65B2 actions and
+response keys matched the source and are unchanged.
+
+**Corrections noted for the certificate phase (not team discovery):** certificate
+LISTING and REVOKE use the newer `/services/v1/` JSON API
+(`/services/v1/certificates`, POST + `X-HTTP-Method-Override: GET`/`DELETE`,
+`application/vnd.api+json`, body `{"urlEncodedQueryParams": …}`, response under
+`data`), not the QH65B2 plist actions. `submitDevelopmentCSR` remains the plist
+action (`ios/submitDevelopmentCSR.action`, response `certRequest`). The two cert
+LIST/REVOKE cases are flagged in code as placeholders to switch at the cert phase.
+
+Re-validated offline after the fix: host tests pass; full arm64 iOS target
+builds/links; app reinstalled; the persisted token survives reinstall
+(`token_in_store:true`); network-refused selfcheck makes 0 requests; all three
+ADI profiles intact. The next live `ZAG_RUN_MACLEGACY_TEAMS` (same persisted
+token, one request) should now return `team_count ≥ 1`.

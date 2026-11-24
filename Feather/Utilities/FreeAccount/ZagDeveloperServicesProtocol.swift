@@ -19,9 +19,13 @@ import Foundation
 /// only reads account state or mutates it. Mutations are gated on explicit
 /// consent by the live portal; read-only operations are not.
 enum ZagDeveloperServicesAction: String, Sendable, Equatable, CaseIterable {
-	// Read-only discovery.
-	case listTeams           = "viewDeveloper.action"
+	// Read-only discovery. Action strings verified against AltSign/SideStore.
+	case listTeams           = "listTeams.action"
 	case listDevices         = "ios/listDevices.action"
+	// NOTE: certificate LISTING and REVOKE now use the /services/v1/ JSON API
+	// (POST with X-HTTP-Method-Override: GET/DELETE, application/vnd.api+json,
+	// response under "data"), NOT this QH65B2 plist action. Kept here only as a
+	// placeholder; the cert phase must switch these two to the v1 transport.
 	case listCertificates    = "ios/listAllDevelopmentCerts.action"
 	case listAppIDs          = "ios/listAppIds.action"
 	case listAppGroups       = "ios/listApplicationGroups.action"
@@ -29,7 +33,7 @@ enum ZagDeveloperServicesAction: String, Sendable, Equatable, CaseIterable {
 	// Account-state mutations.
 	case addDevice           = "ios/addDevice.action"
 	case submitCSR           = "ios/submitDevelopmentCSR.action"
-	case revokeCertificate   = "ios/revokeDevelopmentCert.action"
+	case revokeCertificate   = "ios/revokeDevelopmentCert.action"   // superseded by v1 DELETE
 	case addAppID            = "ios/addAppId.action"
 	case addAppGroup         = "ios/addApplicationGroup.action"
 	case assignAppGroups     = "ios/assignApplicationGroupToAppId.action"
