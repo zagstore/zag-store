@@ -98,6 +98,29 @@ struct ZagOnDeviceAnisetteTests {
 		check(!ZagAppleAuthMachine.clientInfoConsistent(sampleHeaders, platform: .mac), "iphone sample inconsistent with .mac (the -22410 hybrid)")
 		check(!ZagAppleAuthMachine.clientInfoConsistent([:], platform: .mac), "missing client-info -> inconsistent")
 
+		// 7c. Safe HTTP diagnostic capture: header-value sanitizer + trace builder.
+		check(ZagAppleAuthTransport.sanitizeHeaderValue(nil) == nil, "header value missing -> nil")
+		check(ZagAppleAuthTransport.sanitizeHeaderValue("") == nil, "header value empty -> nil")
+		check(ZagAppleAuthTransport.sanitizeHeaderValue("   ") == nil, "header value whitespace-only -> nil")
+		check(ZagAppleAuthTransport.sanitizeHeaderValue("120") == "120", "numeric Retry-After passes through")
+		check(ZagAppleAuthTransport.sanitizeHeaderValue("Wed, 21 Oct 2026 07:28:00 GMT") == "Wed, 21 Oct 2026 07:28:00 GMT", "HTTP-date Retry-After passes through")
+		// Malformed: a CRLF-injecting value must not carry control chars through.
+		let malformed = ZagAppleAuthTransport.sanitizeHeaderValue("30\r\nX-Injected: evil") ?? ""
+		check(!malformed.contains("\r") && !malformed.contains("\n"), "malformed header value is de-controlled (no CRLF)")
+		// Oversized: bounded with an ellipsis.
+		let oversized = ZagAppleAuthTransport.sanitizeHeaderValue(String(repeating: "A", count: 500), limit: 32) ?? ""
+		check(oversized.count <= 33 && oversized.hasSuffix("…"), "oversized header value is length-bounded")
+		check(ZagAppleAuthTransport.allowedResponseHeaders == ["retry-after"], "only Retry-After is allowlisted")
+		// Stage mapping + trace builder.
+		check(ZagAppleAuthMachine.provisionStage(requestCount: 1) == "lookup"
+			  && ZagAppleAuthMachine.provisionStage(requestCount: 2) == "start-provisioning"
+			  && ZagAppleAuthMachine.provisionStage(requestCount: 3) == "finish-provisioning", "provision stage mapping")
+		let rawTrace: [(status: Int, metadata: [String: String])] = [(200, [:]), (200, [:]), (503, ["retry-after": "120"])]
+		let built = ZagAppleAuthMachine.httpTrace(rawTrace, stageFor: ZagAppleAuthMachine.signInStage)
+		check(built.count == 3 && built[0].stage == "lookup" && built[1].stage == "srp-init"
+			  && built[2].stage == "srp-complete" && built[2].status == 503
+			  && built[2].metadata["retry-after"] == "120", "trace builder labels stages and keeps allowlisted metadata")
+
 		// 8. The gated sign-in experiment is inert when the module is unlinked.
 		let signInMachine = ZagAppleAuthMachine()
 		do { _ = try await signInMachine.signInExperiment(email: "test@example.com", password: "x", allowNetwork: false)

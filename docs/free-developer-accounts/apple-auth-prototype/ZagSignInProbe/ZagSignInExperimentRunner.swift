@@ -37,6 +37,8 @@ enum ZagSignInExperimentRunner {
 		report["request_count"] = await m.lastRequestCount
 		report["http_statuses"] = await m.lastHTTPStatuses
 		report["reached_apple"] = await m.lastReachedApple
+		let trace = await m.lastHTTPTrace
+		if !trace.isEmpty { report["http_trace"] = traceDicts(trace) }
 
 		// Offline re-derivation: can the stored Mac profile make fresh headers
 		// with the transport refused (no Apple contact)?
@@ -98,6 +100,7 @@ enum ZagSignInExperimentRunner {
 			if let ec = signIn.ec { report["ec"] = ec }
 			if let http = signIn.httpStatus { report["http_status"] = http }
 			if let message = signIn.appleMessage { report["apple_message"] = message }
+			if !signIn.httpTrace.isEmpty { report["http_trace"] = traceDicts(signIn.httpTrace) }
 		} catch {
 			report["outcome"] = "error"
 		}
@@ -119,6 +122,16 @@ enum ZagSignInExperimentRunner {
 		}
 		report["result"] = "ran"
 		return report
+	}
+
+	/// Renders the sanitized per-request trace as JSON-friendly dicts: stage,
+	/// status, and allowlisted metadata (e.g. `retry-after` -> `retry_after`).
+	static func traceDicts(_ trace: [ZagHTTPTraceEntry]) -> [[String: Any]] {
+		trace.map { entry in
+			var d: [String: Any] = ["stage": entry.stage, "status": entry.status]
+			for (k, v) in entry.metadata { d[k.replacingOccurrences(of: "-", with: "_")] = v }
+			return d
+		}
 	}
 
 	static func describe(_ outcome: ZagAppleAuthSignInOutcome) -> String {

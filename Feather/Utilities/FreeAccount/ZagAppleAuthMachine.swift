@@ -83,11 +83,32 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 	private let lock = NSLock()
 	private var count = 0
 	private(set) var log: [String] = []
+	/// Per-request diagnostics: the HTTP status and an allowlisted, sanitized
+	/// subset of response-header metadata. Raw headers and bodies are never kept.
+	private(set) var httpTrace: [(status: Int, metadata: [String: String])] = []
 	private let maxRequests: Int
 
 	init(allowNetwork: Bool, maxRequests: Int = 3) {
 		self.allowNetwork = allowNetwork
 		self.maxRequests = maxRequests
+	}
+
+	/// The only response headers ever recorded — non-sensitive, for diagnosing a
+	/// 503/429 (transient vs persistent). Lower-cased for case-insensitive match.
+	static let allowedResponseHeaders: Set<String> = ["retry-after"]
+
+	/// Sanitizes an allowlisted header value: strips control characters (so a
+	/// value cannot inject newlines or escapes into the report), collapses
+	/// whitespace, length-bounds it, and returns nil when absent or empty. The
+	/// raw header is never stored.
+	static func sanitizeHeaderValue(_ raw: String?, limit: Int = 64) -> String? {
+		guard let raw else { return nil }
+		let decontrolled = String(String.UnicodeScalarView(raw.unicodeScalars.map {
+			($0.value < 0x20 || $0.value == 0x7F) ? UnicodeScalar(0x20)! : $0
+		}))
+		let collapsed = decontrolled.split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
+		if collapsed.isEmpty { return nil }
+		return collapsed.count > limit ? String(collapsed.prefix(limit)) + "…" : collapsed
 	}
 
 	/// Whether any request actually went to Apple (distinguishes a transport
@@ -128,16 +149,24 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 		if method == "POST" { req.httpBody = body }
 		let sem = DispatchSemaphore(value: 0)
 		var out: (Int, Data, [[String]])?
+		var captured: [String: String] = [:]
 		session.dataTask(with: req) { data, resp, _ in
 			defer { sem.signal() }
 			guard let http = resp as? HTTPURLResponse else { return }
 			var pairs: [[String]] = []
 			for (k, v) in http.allHeaderFields { pairs.append([String(describing: k), String(describing: v)]) }
+			// Record ONLY allowlisted, sanitized response metadata for diagnostics.
+			// The full header set (`pairs`) is handed to apple-auth transiently
+			// for the protocol but is never persisted.
+			for name in ZagAppleAuthTransport.allowedResponseHeaders {
+				if let v = ZagAppleAuthTransport.sanitizeHeaderValue(http.value(forHTTPHeaderField: name)) { captured[name] = v }
+			}
 			out = (http.statusCode, data ?? Data(), pairs)
 		}.resume()
 		sem.wait()
 		lock.lock()
 		log.append("\(method) \(host) -> \(out.map { String($0.0) } ?? "err")")
+		if let out { httpTrace.append((status: out.0, metadata: captured)) }
 		lock.unlock()
 		return out
 	}
@@ -197,6 +226,9 @@ actor ZagAppleAuthMachine {
 	private(set) var lastRequestCount = 0
 	private(set) var lastReachedApple = false
 	private(set) var lastHTTPStatuses: [Int] = []
+	/// Per-request sanitized trace (stage, status, allowlisted metadata) from the
+	/// last provisioning call.
+	private(set) var lastHTTPTrace: [ZagHTTPTraceEntry] = []
 
 	/// Parses the transport's sanitized log ("POST host -> 200") into statuses.
 	static func httpStatuses(_ log: [String]) -> [Int] {
@@ -245,6 +277,7 @@ actor ZagAppleAuthMachine {
 		lastRequestCount = transport.requestCount
 		lastReachedApple = transport.reachedApple
 		lastHTTPStatuses = Self.httpStatuses(transport.log)
+		lastHTTPTrace = Self.httpTrace(transport.httpTrace, stageFor: Self.provisionStage)
 		let (headers, snapshot) = try result.get()
 		try store.save(snapshot, scope: scope)
 		return Self.anisetteSubset(headers)
@@ -357,6 +390,27 @@ actor ZagAppleAuthMachine {
 		}
 	}
 
+	/// The provisioning stage from the request count: 1 lookup, 2 start, 3
+	/// finish. Non-sensitive; parallels `signInStage` for the trace labels.
+	static func provisionStage(requestCount: Int) -> String {
+		switch requestCount {
+		case ..<1: return "pre-request"
+		case 1: return "lookup"
+		case 2: return "start-provisioning"
+		default: return "finish-provisioning"
+		}
+	}
+
+	/// Builds a sanitized per-request trace from the transport's recorded
+	/// (status, allowlisted-metadata) list, labelling each request with its
+	/// stage. Carries no header beyond the allowlist and no body.
+	static func httpTrace(_ raw: [(status: Int, metadata: [String: String])],
+						   stageFor: (Int) -> String) -> [ZagHTTPTraceEntry] {
+		raw.enumerated().map { index, entry in
+			ZagHTTPTraceEntry(stage: stageFor(index + 1), status: entry.status, metadata: entry.metadata)
+		}
+	}
+
 	/// Apple's human-readable `em` message, surfaced by the vendored patch as
 	/// `em=[…]`. Always sanitized (emails/tokens/identifiers redacted via
 	/// `ZagSensitiveRedactor`), control characters stripped and length-bounded.
@@ -442,9 +496,19 @@ actor ZagAppleAuthMachine {
 		return ZagAppleAuthSignInReport(outcome: raw.outcome,
 										stage: Self.signInStage(requestCount: transport.requestCount),
 										requestCount: transport.requestCount,
-										ec: raw.ec, httpStatus: raw.http, appleMessage: raw.message)
+										ec: raw.ec, httpStatus: raw.http, appleMessage: raw.message,
+										httpTrace: Self.httpTrace(transport.httpTrace, stageFor: Self.signInStage))
 	}
 	#endif
+}
+
+/// One request's sanitized HTTP trace: its stage, status, and an allowlisted,
+/// sanitized subset of response-header metadata (e.g. `retry-after`). Never a
+/// raw header or body.
+struct ZagHTTPTraceEntry: Equatable, Sendable {
+	let stage: String
+	let status: Int
+	let metadata: [String: String]
 }
 
 /// The classified result of the gated sign-in experiment. Carries no account
@@ -471,6 +535,8 @@ struct ZagAppleAuthSignInReport: Equatable, Sendable {
 	var httpStatus: Int? = nil
 	/// Apple's `em` message, already sanitized and length-bounded (never raw).
 	var appleMessage: String? = nil
+	/// Per-request sanitized HTTP trace (stage, status, allowlisted metadata).
+	var httpTrace: [ZagHTTPTraceEntry] = []
 }
 
 #if canImport(ZagAppleAuth)
