@@ -196,7 +196,11 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		let pem = ZagDeveloperServicesProtocol.pem(request.data)
 		// submitDevelopmentCSR is a QH65B2 plist action; the DER comes straight
 		// back under "certRequest" (verified: AltSign/SideStore do not re-list).
-		let dict = try await send(.submitCSR, teamID: team, parameters: ["csrContent": pem, "machineName": "Zag Store", "machineId": UUID().uuidString.uppercased()])
+		// machineId is a STABLE per-install identifier (not a fresh value per
+		// request): the established protocol labels the request with the machine's
+		// identity, and a stable id keeps the account from accruing certificates
+		// that look like they came from many machines.
+		let dict = try await send(.submitCSR, teamID: team, parameters: ["csrContent": pem, "machineName": "Zag Store", "machineId": ZagMachineIdentifier.current()])
 		guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
 			  let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der else {
 			throw ZagPortalError.malformedResponse

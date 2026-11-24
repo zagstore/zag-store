@@ -344,5 +344,66 @@ check(CR.resolve(certificates: [foreignA, crCert("v1-h", "HELD")], locallyHeldSe
 check(CR.isAutonomouslyRecoverable(.recoverExisting(serial: "X")) && CR.isAutonomouslyRecoverable(.resolvePendingRequest), "conflict: reuse+pending are autonomous")
 check(!CR.isAutonomouslyRecoverable(.replacementRequired(candidates: [])) && !CR.isAutonomouslyRecoverable(.onlyActiveCertificatePresent), "conflict: replacement needs explicit consent")
 
+// --- Stable machineId (replaces the random-per-call value) ---
+final class MemMachineStore: ZagMachineIdentifierStore, @unchecked Sendable {
+	var value: String?
+	func load() -> String? { value }
+	func save(_ v: String) -> Bool { value = v; return true }
+}
+let mstore = MemMachineStore()
+let m1 = ZagMachineIdentifier.current(store: mstore)
+let m2 = ZagMachineIdentifier.current(store: mstore)
+check(ZagMachineIdentifier.isValid(m1), "machineId: a valid UUID is produced")
+check(m1 == m2, "machineId: stable across calls (not random-per-request)")
+check(mstore.value == m1, "machineId: persisted once in the backing store")
+let preseeded = MemMachineStore(); preseeded.value = "FEEDFACE-0000-4000-8000-000000000001"
+check(ZagMachineIdentifier.current(store: preseeded) == "FEEDFACE-0000-4000-8000-000000000001", "machineId: reuses an existing persisted value")
+let corrupt = MemMachineStore(); corrupt.value = "not-a-uuid"
+check(ZagMachineIdentifier.isValid(ZagMachineIdentifier.current(store: corrupt)), "machineId: replaces a corrupt stored value with a valid one")
+
+// --- Certificate-replacement coordinator (gated two-mutation state machine) ---
+typealias RC2 = ZagCertificateReplacementCoordinator
+let foreign = ZagRevocableCertificate(id: "v1-foreign", serialNumber: "FOR123", sha1: "BBBB", name: "iPhone Developer", machineName: nil, expiresAt: crSoon)
+let activeCert2 = ZagRevocableCertificate(id: "v1-active", serialNumber: "723BE3EC", sha1: "5657782a6eadfff608040d39186e6533557349fc", name: "Apple Development", machineName: nil, expiresAt: crSoon)
+func step(_ s: ZagCertificateReplacementState, _ e: ZagCertificateReplacementEvent) -> ZagCertificateReplacementState { RC2.reduce(s, e, guard: guardz) }
+
+// The protected active certificate is rejected at selection.
+check(step(.idle, .select(activeCert2)) == .abandoned(reason: .protectedActiveCertificate), "replace: active Xcode cert rejected at selection")
+// Happy path requires a confirmation AND a separate authorization.
+let sel = step(.idle, .select(foreign))
+check(sel == .selected(target: ZagReplacementTarget(id: "v1-foreign", serialNumber: "FOR123", sha1: "BBBB")), "replace: exact certificate captured at selection")
+check(!RC2.mayRevoke(sel), "replace: cannot revoke straight after selection")
+let confirmed = step(sel, .confirmRevoke)
+check(RC2.mayRevoke(confirmed), "replace: revoke allowed only after separate confirmation")
+let revoking = step(confirmed, .revokeStarted)
+let revoked = step(revoking, .revokeSucceeded)
+check(!RC2.maySubmitCSR(revoked), "replace: revoke success alone does NOT authorize the CSR")
+let csrAuth = step(revoked, .authorizeCSR)
+check(RC2.maySubmitCSR(csrAuth), "replace: CSR allowed only after a SECOND separate authorization")
+check(step(step(csrAuth, .csrStarted), .csrSucceeded) == .completed(serial: "FOR123"), "replace: full gated path completes")
+
+// A failed OR ambiguous revoke is terminal and cannot advance to the CSR.
+let failed = step(revoking, .revokeFailed)
+check(failed == .revokeHalted(serial: "FOR123", reason: .revokeFailed), "replace: revoke failure halts")
+check(step(failed, .authorizeCSR) == failed && !RC2.maySubmitCSR(step(failed, .authorizeCSR)), "replace: a failed revoke cannot advance to CSR")
+let ambiguous = step(revoking, .revokeAmbiguous)
+check(ambiguous == .revokeHalted(serial: "FOR123", reason: .revokeAmbiguous), "replace: ambiguous revoke halts")
+check(!RC2.maySubmitCSR(step(ambiguous, .authorizeCSR)), "replace: an ambiguous revoke cannot advance to CSR")
+
+// No chained mutations: you cannot jump selection straight to authorizeCSR.
+check(step(sel, .authorizeCSR) == .abandoned(reason: .illegalTransition), "replace: cannot skip revoke to authorize CSR")
+check(step(revoked, .csrStarted) == .abandoned(reason: .illegalTransition), "replace: cannot start CSR without its authorization")
+// Duplicate operations: a terminal state ignores further events.
+check(step(.completed(serial: "FOR123"), .csrStarted) == .completed(serial: "FOR123"), "replace: completed ignores duplicate events")
+check(step(failed, .revokeStarted) == failed, "replace: halted ignores duplicate revoke")
+
+// Interruption recovery: in-flight mutations resolve to NON-advancing states.
+check(RC2.recoverAfterInterruption(revoking) == .revokeHalted(serial: "FOR123", reason: .interruptedDuringRevoke), "replace: interrupted revoke -> halt (needs re-check)")
+check(RC2.recoverAfterInterruption(step(csrAuth, .csrStarted)) == .submissionUnconfirmed(serial: "FOR123"), "replace: interrupted CSR -> submissionUnconfirmed (reconcile, never completed)")
+check(RC2.recoverAfterInterruption(revoked) == revoked, "replace: a settled state recovers unchanged")
+// The journal round-trips through Codable (survives termination).
+let enc = try! JSONEncoder().encode(csrAuth)
+check((try? JSONDecoder().decode(ZagCertificateReplacementState.self, from: enc)) == csrAuth, "replace: journal state survives Codable round-trip")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -1052,3 +1052,79 @@ consent). dev-services suite otherwise unchanged (the lone intermittent
 imported-identity suite green. Full arm64 iOS build/link; subsystem typecheck
 clean. The non-extractable device key architecture is untouched; the imported
 path is preserved and not used as a fallback.
+
+---
+
+## Replacement preparation: legacy-cert audit, stable machineId, replacement coordinator (2026-11-24)
+
+Offline preparation for a possible owner-authorized replacement of a legacy
+development certificate. No Apple requests, revocations, CSRs, new keys, imports
+or installs.
+
+### Legacy certificate audit (read-only, masked)
+All three team certificates are the same account/team (`…(R3DNK3YV9S)` /
+`V54K5JYGS4`), EKU **Code Signing**, issued Sep 2026, valid one year:
+| cert | type | serial | sha1 | expires | key on this device? | usage |
+|---|---|---|---|---|---|---|
+| legacy A | iPhone Developer | …5EBF18 | 8ECC4AB7… | 2027-09-06 | no | **unknown** |
+| legacy B | iPhone Developer | …97B76D | 8E128662… | 2027-09-12 | no | **unknown** |
+| active | Apple Development | …16EED9 | 5657782A… | 2027-09-27 | yes (Mac/Xcode) | **active — protected** |
+
+The two legacy certs are the older free-account ("iPhone Developer") naming, a
+different era from Xcode's "Apple Development"; the coexistence suggests they
+came from a different free-signing tool/flow. **We hold no private key for
+either legacy cert, and have no verifiable evidence that either is unused.**
+Both remain `unknownUsage`; neither is labelled safe to revoke.
+
+**Least-disruptive candidate (heuristic, not an evidence of safety):** legacy A
+(…5EBF18) — soonest to expire (2027-09-06), so replacing it forfeits the least
+remaining validity, and it is not the active Xcode cert. This is only an
+ordering heuristic; usage is unknown, so revocation still needs the owner's
+explicit, informed decision. (`ZagCertificateConflictResolution` already orders
+replacement candidates soonest-expiring first, so legacy A surfaces first.)
+
+### machineId correction
+The native CSR sent `machineId = UUID().uuidString.uppercased()` — a fresh value
+per request. Corrected to a **stable, securely persisted** identifier
+(`ZagMachineIdentifier`): an opaque per-install UUID created once and kept in the
+Keychain (ThisDeviceOnly, not synced, generic-password item
+`app.zagstore.anisette.appleauth.machineid.v1`). `submitDevelopmentCSR` now sends
+`ZagMachineIdentifier.current()`. This matches the established protocol's
+machine-identity semantics and stops the account from accruing certificates that
+look like they came from many machines. It is a label, not a key: the pending
+non-extractable key and CSR are untouched and are NOT regenerated.
+
+### Certificate-replacement coordinator (`ZagCertificateReplacementCoordinator`)
+A pure, Codable, interruption-surviving state machine (no I/O; never revokes or
+requests). Enforced and tested:
+- The user selects the **exact** certificate (id + serial + sha1 captured at selection).
+- The **active Xcode cert is rejected at selection** (`protectedActiveCertificate`).
+- Revocation needs a **separate explicit confirmation** (`confirmRevoke`); `mayRevoke` is true only in `revokeConfirmed`.
+- CSR submission needs a **second, separate authorization** (`authorizeCSR`), reachable only from a *succeeded* revoke; `maySubmitCSR` is true only in `csrAuthorized`.
+- **No chained mutations / no auto-retry:** each step is a distinct event; skipping a gate yields `abandoned(.illegalTransition)`; terminal states ignore further events.
+- A **failed or ambiguous revoke halts** (`revokeHalted`) and can never advance to CSR.
+- **Interruption recovery:** a revoke in flight becomes `revokeHalted(.interruptedDuringRevoke)` (needs an out-of-band re-check); a CSR in flight becomes `submissionUnconfirmed` (hand to `ZagCSRReconciliation`); neither ever becomes `completed`. State round-trips through Codable for a durable journal.
+
+### Tests / build
+Added focused tests (dev-services suite, ALL PASS): machineId stability/persistence/
+corrupt-replacement; wrong/skip transitions → illegal; protected-cert rejection;
+duplicate-operation no-ops; failed & ambiguous revoke cannot advance; interruption
+recovery for both mutations; Codable round-trip. Full arm64 iOS build/link clean;
+subsystem typecheck clean. Non-extractable key architecture untouched; imported
+path not involved.
+
+### Next proposed LIVE operation (requires separate authorization) + risks
+1. **Read-only recheck** of the team's certificate listing to re-confirm, at the
+   moment of action, that the candidate (legacy A, …5EBF18) is still present and
+   is not the active cert. Risk: none (read-only).
+2. **Revoke legacy A** (one `DELETE /services/v1/certificates/<id>`), gated on
+   explicit confirmation. **Risks:** any app or workflow still signed with legacy
+   A's identity would lose that signing identity; because its private key is not
+   on this device and its usage is unknown, we cannot rule out that something
+   elsewhere depends on it. Irreversible (a revoked cert cannot be un-revoked).
+3. **Submit the preserved CSR** for the device-generated key (second, separate
+   authorization). **Risks:** if the free team enforces a per-machine/per-account
+   rule rather than a simple count, a single freed slot may still not admit the
+   new CSR (another 7460); the coordinator halts rather than retrying.
+
+Stop before any account mutation.

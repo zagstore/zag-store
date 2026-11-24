@@ -13,6 +13,8 @@ swiftc -O -o "$OUT/dsvc" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagProfileIdentityAudit.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagCertificateIssuancePolicy.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagCertificateConflictResolution.swift" \
+  "$ROOT/Feather/Utilities/FreeAccount/ZagCertificateReplacementCoordinator.swift" \
+  "$ROOT/Feather/Utilities/FreeAccount/ZagMachineIdentifier.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagPendingCSRStore.swift" \
   "$OUT/shim.swift" "$OUT/main.swift"
 "$OUT/dsvc"
