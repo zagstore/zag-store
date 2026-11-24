@@ -220,5 +220,58 @@ check(Rec.decide(match: .notFound, submit: Rec.verdict(for: .ambiguousRejection)
 // Delayed visibility: the same key's cert appears in a later listing -> recover.
 check(Rec.decide(match: .found(serial: "LATE"), submit: Rec.verdict(for: .ambiguousRejection)) == .recover(serial: "LATE"), "delayed cert visibility -> recover on later listing")
 
+// MARK: Single-use, evidence-bound operator override (item 11).
+let csrFP = ZagReconciliationEvidence.fingerprint(Data([9]))
+func ev(keySlot: String? = "slot1", csr: String? = nil, team: String = "T1", account: String = "ACC",
+		complete: Bool = true, http: Int = 200, matchFound: Bool = false, verdictUnknown: Bool = true,
+		age: TimeInterval = 10) -> ZagReconciliationEvidence {
+	ZagReconciliationEvidence(teamID: team, keySlot: keySlot, csrSHA256: csr ?? csrFP, account: account,
+							  listingComplete: complete, httpStatus: http, certificateCountObserved: 3,
+							  matchingPublicKeyFound: matchFound, originalVerdictUnknown: verdictUnknown,
+							  observedAt: now.addingTimeInterval(-age))
+}
+func journal(team: String? = "T1", unconfirmed: Bool = true, retryable: Bool? = nil, issued: String? = nil,
+			 evidence: ZagReconciliationEvidence?) -> ZagPendingCSRState {
+	var s = ZagPendingCSRState(keySlot: "slot1", request: Data([9]), startedAt: now, attempts: 1,
+							   submissionUnconfirmed: unconfirmed, issuedSerial: issued)
+	s.team = team; s.reviewEvidence = evidence; s.retryableAfterReview = retryable
+	return s
+}
+func ovr(_ s: ZagPendingCSRState, account: String = "ACC") -> String {
+	switch ZagReconciliationOverride.apply(to: s, account: account, now: now) {
+	case .success: return "ok"; case .failure(let r): return r.rawValue
+	}
+}
+// Successful issuance path: valid bound evidence -> retryableAfterReview, CSR+key preserved.
+if case .success(let u) = ZagReconciliationOverride.apply(to: journal(evidence: ev()), account: "ACC", now: now) {
+	check(u.submissionUnconfirmed == false && u.retryableAfterReview == true, "override: clears unconfirmed, sets retryableAfterReview")
+	check(u.nextStep(at: now) == .submitAfterReview, "overridden journal -> submitAfterReview (one submission)")
+	check(u.request == Data([9]) && u.keySlot == "slot1", "override preserves original CSR + key")
+} else { check(false, "override should succeed on valid bound evidence") }
+// Replayed authorization / duplicate prevention: can't override an already-overridden or issued journal.
+check(ovr(journal(retryable: true, evidence: ev())) == "journalNotUnconfirmed", "replay guard: already retryableAfterReview -> rejected")
+check(ovr(journal(unconfirmed: false, issued: "S1", evidence: ev())) == "journalNotUnconfirmed", "already issued -> rejected")
+check(ovr(journal(unconfirmed: false, evidence: ev())) == "journalNotUnconfirmed", "not unconfirmed -> rejected")
+// Stale reconciliation evidence.
+check(ovr(journal(evidence: ev(age: 7200))) == "evidenceStale", "stale evidence (2h) -> rejected")
+check(ovr(journal(evidence: ev(age: -5))) == "evidenceStale", "future-dated evidence -> rejected")
+// Wrong-key / wrong-team / wrong-account / wrong-CSR overrides.
+check(ovr(journal(evidence: ev(keySlot: "other"))) == "keyBindingMismatch", "wrong key binding -> rejected")
+check(ovr(journal(team: "T1", evidence: ev(team: "T2"))) == "teamMismatch", "wrong team -> rejected")
+check(ovr(journal(evidence: ev()), account: "OTHER") == "accountMismatch", "wrong account -> rejected")
+check(ovr(journal(evidence: ev(csr: "deadbeef"))) == "csrMismatch", "wrong CSR fingerprint -> rejected")
+// Incomplete / ambiguous / match-found evidence must not authorize a retry.
+check(ovr(journal(evidence: nil)) == "noEvidence", "no evidence -> rejected")
+check(ovr(journal(evidence: ev(http: 500))) == "evidenceIncomplete", "incomplete listing (HTTP 500) -> rejected")
+check(ovr(journal(evidence: ev(complete: false))) == "evidenceIncomplete", "incomplete listing flag -> rejected")
+check(ovr(journal(evidence: ev(matchFound: true))) == "matchFound", "cert WAS found -> recover, not override")
+check(ovr(journal(evidence: ev(verdictUnknown: false))) == "verdictNotUnknown", "verdict known -> normal path, not override")
+// Ambiguous outcome after a consumed override: flag cleared + evidence gone -> must reconcile again.
+var consumed = journal(evidence: nil); consumed.retryableAfterReview = false; consumed.submissionUnconfirmed = true
+check(consumed.nextStep(at: now) == .resolveUnconfirmed, "post-consume ambiguous -> resolveUnconfirmed (reconcile again)")
+check(ovr(consumed) == "noEvidence", "re-override after ambiguous needs FRESH evidence (no silent replay)")
+// The real attempt-1 journal shape (team known, evidence to be gathered) still needs evidence first.
+check(ovr(journal(evidence: nil)) == "noEvidence", "attempt-1-shaped journal: override blocked until reconcile records evidence")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

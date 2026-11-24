@@ -83,6 +83,10 @@ struct ZagSignInProbeApp: App {
 				// READ-ONLY reconciliation of an unconfirmed CSR: fresh listing ->
 				// recover / retryable / preserve. No CSR, no revoke, no key creation.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runCSRReconcile(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: true) }, file: "zag_maclegacy_csr_reconcile.json")
+			case let env where env["ZAG_RUN_MACLEGACY_CSR_OVERRIDE"] == "1":
+				// OFFLINE single-use operator override: reviewed evidence ->
+				// retryableAfterReview. No network, no CSR, no key, no revoke.
+				LiveRunView(task: { await ZagSignInExperimentRunner.runReconciliationOverride(platform: .macLegacy, scope: zagMacLegacyScope) }, file: "zag_maclegacy_csr_override.json")
 			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION_SELFCHECK"] == "1":
 				// Offline preflight: developer-session path, transport refused.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devsession_selfcheck.json")

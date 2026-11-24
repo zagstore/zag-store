@@ -375,7 +375,8 @@ enum ZagSignInExperimentRunner {
 			// Create a fresh non-extractable key + CSR only when nothing is journalled.
 			if pending == nil {
 				let made = try factory.makePendingKey(commonName: "Zag Store Development", account: experimentCSRAccount, team: teamID)
-				let state = ZagPendingCSRState(keySlot: made.keySlot, request: made.request.data, startedAt: now, attempts: 0, submissionUnconfirmed: false, issuedSerial: nil)
+				var state = ZagPendingCSRState(keySlot: made.keySlot, request: made.request.data, startedAt: now, attempts: 0, submissionUnconfirmed: false, issuedSerial: nil)
+				state.team = teamID   // binds a future operator override to this exact team
 				try store.save(state, scope: scope); pending = state
 			}
 			var state = pending!
@@ -388,8 +389,15 @@ enum ZagSignInExperimentRunner {
 				report["outcome"] = "submission-unconfirmed-unresolved"   // not found in listing; never resubmit here
 			case .exhausted:
 				report["outcome"] = "retry-budget-exhausted"              // key preserved for review
-			case .submit:
+			case .submit, .submitAfterReview:
 				guard allowMutation else { report["outcome"] = "consent-required"; break }
+				// Single-use operator override: CONSUME retryableAfterReview BEFORE
+				// sending, persisted first, so a crash cannot reuse it (no replay).
+				if state.retryableAfterReview == true {
+					state.retryableAfterReview = false
+					report["override_consumed"] = true
+					try store.save(state, scope: scope)
+				}
 				guard budget.take() else { throw ZagPortalError.network }
 				state.attempts += 1; state.submissionUnconfirmed = true; try store.save(state, scope: scope)
 				let (csrBody, csrStatus) = try await qh65b2Body(.submitCSR, teamID: teamID, headers: headers,
@@ -397,18 +405,20 @@ enum ZagSignInExperimentRunner {
 								 "machineName": "Zag Store", "machineId": UUID().uuidString.uppercased()])
 				if let fault = ZagDeveloperServicesProtocol.fault(body: csrBody, httpStatus: csrStatus) {
 					// Record the EXACT sanitized fault and KEEP submissionUnconfirmed
-					// (item 3): a fresh-listing reconciliation settles it later. No
-					// revoke, no resubmit, no key regeneration here.
+					// (item 3). Clear any stale review evidence so a FRESH reconcile is
+					// required before another override (item 10). No revoke (item 9),
+					// no resubmit, no key regeneration here.
 					state.lastResultCode = fault.resultCode
 					state.lastHTTPStatus = fault.httpStatus
 					state.lastMessage = fault.message.isEmpty ? nil : fault.message
 					state.lastClassification = fault.classification.rawValue
+					state.reviewEvidence = nil
 					try? store.save(state, scope: scope)
 					for (k, v) in fault.sanitized { report[k] = v }
 					report["outcome"] = "csr-rejected-" + fault.classification.rawValue
 					if fault.classification == .certificateLimitReached {
 						report["cap_preflight_was_inferred_risk"] = cap.isInferredRisk
-						report["revoke_candidate_count"] = existing.count
+						report["revoke_candidate_count"] = existing.count   // listed only; never auto-revoked
 					}
 				} else if let dict = (try? PropertyListSerialization.propertyList(from: csrBody, format: nil)) as? [String: Any],
 						  let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
@@ -536,6 +546,44 @@ enum ZagSignInExperimentRunner {
 	/// Sends one QH65B2 plist POST (any read-only action). Ephemeral session, no
 	/// cookies/cache/credentials, redirects refused, pinned to the developer-
 	/// services host. Parses with the shared `ZagDeveloperServicesProtocol`.
+	/// OFFLINE single-use operator override. After a human has reviewed the
+	/// recorded reconciliation evidence, this transitions the journal from
+	/// `submissionUnconfirmed` to `retryableAfterReview`. It contacts no one,
+	/// submits no CSR and touches no key. The evidence must be a complete
+	/// read-only listing that found no matching certificate, bound to this exact
+	/// key/CSR/team/account, verdict-unknown, and recent. Never auto-applied, and
+	/// it never clears the journal — it only enables exactly one later resubmit.
+	static func runReconciliationOverride(platform: ZagAppleAuthPlatform, scope: String) async -> [String: Any] {
+		var report: [String: Any] = ["mode": "operator-csr-override", "platform": platform.rawValue, "scope": scope, "request_count": 0]
+		let store = ZagPendingCSRStore()
+		guard let state = store.load(scope: scope) else {
+			report["result"] = "ran"; report["outcome"] = "nothing-pending"
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		report["journal_submission_unconfirmed"] = state.submissionUnconfirmed
+		report["journal_retryable_after_review"] = (state.retryableAfterReview == true)
+		report["has_evidence"] = (state.reviewEvidence != nil)
+		if let e = state.reviewEvidence {
+			report["evidence_listing_complete"] = e.listingComplete
+			report["evidence_match_found"] = e.matchingPublicKeyFound
+			report["evidence_cert_count"] = e.certificateCountObserved
+			report["evidence_verdict_unknown"] = e.originalVerdictUnknown
+			report["evidence_age_seconds"] = Int(Date().timeIntervalSince(e.observedAt))
+		}
+		switch ZagReconciliationOverride.apply(to: state, account: experimentCSRAccount.uuidString, now: Date()) {
+		case .success(let updated):
+			try? store.save(updated, scope: scope)
+			report["result"] = "ran"; report["outcome"] = "override-applied"
+			report["transition"] = "submissionUnconfirmed->retryableAfterReview"
+		case .failure(let rejection):
+			report["result"] = "ran"; report["outcome"] = "override-rejected"
+			report["rejection"] = rejection.rawValue
+		}
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		return report
+	}
+
 	private static func sendQH65B2(_ action: ZagDeveloperServicesAction, teamID: String?, headers: [String: String], parameters: [String: Any] = [:]) async throws -> [String: Any] {
 		let (data, status) = try await qh65b2Body(action, teamID: teamID, headers: headers, parameters: parameters)
 		return try ZagDeveloperServicesProtocol.parse(data, httpStatus: status)
@@ -627,18 +675,28 @@ enum ZagSignInExperimentRunner {
 				}
 			}
 			let decision = ZagCSRReconciliation.decide(match: match, submit: verdict)
-			report["listing_match"] = { if case .found = match { return "found" }; return "not-found" }()
+			let matchFound: Bool = { if case .found = match { return true }; return false }()
+			report["listing_match"] = matchFound ? "found" : "not-found"
 			report["decision"] = "\(decision)"
+			// Evidence from this complete read-only listing, recorded so a one-time
+			// operator override can later be bound to it (never auto-applied).
+			let evidence = ZagReconciliationEvidence(
+				teamID: teamID, keySlot: state.keySlot, csrSHA256: state.csrFingerprint,
+				account: experimentCSRAccount.uuidString, listingComplete: true, httpStatus: 200,
+				certificateCountObserved: rows.count, matchingPublicKeyFound: matchFound,
+				originalVerdictUnknown: (verdict == .none || verdict == .ambiguous), observedAt: Date())
 			var updated = state
 			switch decision {
 			case .recover(let serial):
 				updated.issuedSerial = serial; updated.submissionUnconfirmed = false; try? store.save(updated, scope: scope)
 				report["outcome"] = "recovered-issued-certificate"
 			case .retryable:
-				updated.submissionUnconfirmed = false; try? store.save(updated, scope: scope)   // authoritative rejection + no cert -> retryable
+				updated.submissionUnconfirmed = false; updated.reviewEvidence = evidence; try? store.save(updated, scope: scope)
 				report["outcome"] = "cleared-retryable"
 			case .preserveForReview:
-				report["outcome"] = "preserved-needs-review"                                     // no match + ambiguous
+				updated.reviewEvidence = evidence; try? store.save(updated, scope: scope)   // records evidence for operator override
+				report["outcome"] = "preserved-needs-review"
+				report["override_available"] = true
 			case .preserveUnconfirmed:
 				report["outcome"] = "preserved-unconfirmed"
 			}

@@ -580,3 +580,62 @@ the journal's recorded verdict. Launch (await authorization):
 xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_CSR_RECONCILE":"1"}' dev.zagstore.ptteamprobe
 ```
 No arbitrary wait period is asserted as an Apple requirement; it is not run here.
+
+---
+
+## One-time operator CSR-retry override (2026-11-24) — offline, no Apple contact
+
+A single-use, evidence-bound, human-reviewed transition that lets exactly one
+authorized CSR resubmission proceed after reconciliation showed no certificate
+was issued. Nothing is ever cleared automatically.
+
+### State transitions
+```
+submissionUnconfirmed --(operator override, bound to evidence)--> retryableAfterReview
+retryableAfterReview  --(consumed at submit time, persisted BEFORE send)--> (single submission)
+   submit success   -> issuedSerial set, submissionUnconfirmed=false
+   submit cap/limit  -> record fault, STOP, no revoke (item 9); evidence cleared
+   submit ambiguous  -> submissionUnconfirmed stays true, evidence cleared -> reconcile again (item 10)
+```
+`nextStep`: issued→reuseIssued; retryableAfterReview→submitAfterReview; else
+unconfirmed→resolveUnconfirmed; else submit/exhausted. The override flag is
+consumed (set false, saved) **before** the request leaves the device, so a crash
+or replay cannot reuse it — at most one submission per authorized experiment.
+
+### How the evidence is validated (`ZagReconciliationOverride.apply`)
+The override is refused unless ALL hold, bound to the exact pending item:
+- journal is `submissionUnconfirmed`, not issued, not already overridden (replay guard);
+- evidence present, a complete read-only listing (`listingComplete && httpStatus==200`);
+- `matchingPublicKeyFound == false` (a found cert means *recover*, never retry);
+- `originalVerdictUnknown == true` (a known verdict uses the normal path);
+- `evidence.keySlot == journal.keySlot`, `evidence.account == expected`,
+  `evidence.teamID == journal.team`, `evidence.csrSHA256 == SHA256(journal.request)`;
+- evidence age in `[0, 3600]s` (stale or future-dated is refused).
+Rejections are typed (`noEvidence/evidenceIncomplete/matchFound/verdictNotUnknown/
+keyBindingMismatch/teamMismatch/accountMismatch/csrMismatch/evidenceStale/
+journalNotUnconfirmed`). The original CSR and non-extractable Keychain key are
+never regenerated; the evidence is recorded by the read-only reconcile run.
+
+### Validation
+130/130 host checks (success transition, replay/duplicate prevention, stale &
+future-dated evidence, wrong key/team/account/CSR, incomplete/ambiguous/match-
+found evidence, post-consume reconcile-again). Full arm64 iOS build/link.
+Offline override preflight against the REAL attempt-1 journal returns
+`{journal_submission_unconfirmed:true, has_evidence:false, outcome:override-rejected,
+rejection:noEvidence, request_count:0}`, token + 3 ADI profiles intact.
+
+### Proposed one-time live sequence (await separate authorization — NOT run)
+The attempt-1 journal has no recorded evidence (the 18:34 reconcile predated
+evidence capture), so the override is correctly blocked. To proceed:
+1. **Re-run the read-only reconcile** (records fresh evidence if still not-found):
+   `ZAG_RUN_MACLEGACY_CSR_RECONCILE` — ≤2 read-only requests, no CSR/revoke/key.
+2. **Run the offline override** (no network): `ZAG_RUN_MACLEGACY_CSR_OVERRIDE` —
+   transitions to `retryableAfterReview` iff the evidence validates.
+3. **One consented CSR**: `ZAG_RUN_MACLEGACY_CSR` — shows the consent screen, then
+   submits once (reusing the same key + CSR). May return `certificateLimitReached`
+   (count 3 vs inferred cap 2) → stop, surface revoke candidates (active Xcode
+   cert protected) for a separate decision. No step is run here; no throttle wait
+   is asserted as an Apple requirement.
+```
+xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_CSR_OVERRIDE":"1"}' dev.zagstore.ptteamprobe
+```
