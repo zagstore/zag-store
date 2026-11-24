@@ -636,6 +636,7 @@ enum ZagExperimentFailureMap {
 		case .deviceLimitReached: "portal.deviceLimit"
 		case .appIDLimitReached: "portal.appIDCapacity"
 		case .certificateLimitReached: "portal.certificateLimit"
+		case .existingCertificateOrPendingRequest: "cert.unresolved"   // existing cert / pending request (not throttling, not a numeric cap)
 		case .livePortalDisabled: "experiment.notArmed"
 		}
 	}

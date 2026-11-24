@@ -14,5 +14,10 @@ enum ZagPortalError: Error, Equatable, Sendable {
 	case deviceLimitReached
 	case appIDLimitReached
 	case certificateLimitReached
+	/// Apple refused a CSR because the account already has a current development
+	/// certificate OR an outstanding pending certificate request (resultCode
+	/// 7460). This is an application-level conflict, NOT HTTP throttling and NOT a
+	/// conclusively-established numeric certificate cap — the two are kept distinct.
+	case existingCertificateOrPendingRequest
 	case livePortalDisabled
 }

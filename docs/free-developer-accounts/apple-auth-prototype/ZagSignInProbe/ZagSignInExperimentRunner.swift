@@ -420,6 +420,17 @@ enum ZagSignInExperimentRunner {
 						report["cap_preflight_was_inferred_risk"] = cap.isInferredRisk
 						report["revoke_candidate_count"] = existing.count   // listed only; never auto-revoked
 					}
+					if fault.classification == .existingCertificateOrPendingRequest {
+						// 7460: existing cert OR pending request. Do NOT present revoke
+						// as the only recovery (item 3). Recovery is multi-path and
+						// needs review: an outstanding pending request may still resolve
+						// into a certificate (reconcile later), an existing cert may be
+						// reusable where its key is available, and revocation is only one
+						// option with its own risk.
+						report["is_throttling"] = false
+						report["existing_cert_count"] = existing.count
+						report["recovery"] = "reconcile-or-reuse-or-review-revoke"
+					}
 				} else if let dict = (try? PropertyListSerialization.propertyList(from: csrBody, format: nil)) as? [String: Any],
 						  let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
 						  let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der {
@@ -721,6 +732,7 @@ enum ZagSignInExperimentRunner {
 		case .deviceLimitReached: return "device-limit"
 		case .appIDLimitReached: return "app-id-limit"
 		case .certificateLimitReached: return "certificate-limit"
+		case .existingCertificateOrPendingRequest: return "existing-cert-or-pending-request"
 		case .livePortalDisabled: return "portal-disabled"
 		}
 	}

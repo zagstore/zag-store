@@ -639,3 +639,58 @@ evidence capture), so the override is correctly blocked. To proceed:
 ```
 xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_CSR_OVERRIDE":"1"}' dev.zagstore.ptteamprobe
 ```
+
+---
+
+## resultCode 7460 — classifier correction + certificate investigation (2026-11-24)
+
+Offline-only. No Apple network requests, no revocation, no CSR, no new keys.
+
+### The observed response (verified)
+Our second explicitly-authorized CSR returned, exactly:
+- HTTP status `200`
+- Apple `resultCode` `7460`
+- Apple message: *"You already have a current iOS Development certificate or a pending certificate request."*
+- No certificate issued for our pending device-local key; retry authorization consumed; journal remains `submissionUnconfirmed`; key + CSR + token + 3 ADI profiles preserved.
+
+### Root cause of the classifier bug
+`7460` was mapped (in both `throwIfError` and `fault()`) to a rate-limit — a value inherited without evidence and grouped with `7788`. The actual condition is an **existing development certificate or a pending certificate request**, an application-level conflict, not HTTP throttling. This is also what mislabeled the first attempt as "rate-limited".
+
+### Correction (code)
+- New typed error `ZagPortalError.existingCertificateOrPendingRequest` and classification `ZagDeveloperServicesFault.Classification.existingCertificateOrPendingRequest`.
+- `7460` now maps to it in `throwIfError` and `fault()`, preserving the exact raw code, HTTP status and (redacted, bounded) message.
+- Kept DISTINCT: genuine HTTP 429 throttling (`confirmedRateLimit`), verified certificate-cap codes (`certificateLimitReached`, 3540/7458), existing-cert/pending conflict (`7460`), auth failures (`sessionRejected`), and ambiguous/undocumented codes (`ambiguousRejection`).
+- `7788` is no longer asserted to be a throttle: with no evidence and its only companion (7460) disproven, it now falls to the explicit "unknown" bucket. Not reclassified to any positive meaning.
+- Reconciliation: a confirmed conflict maps to a new `SubmitVerdict.confirmedConflict` → `preserveForReview` (a blind resubmit of the same CSR would simply recur), never auto-cleared to retryable. `submissionUnconfirmed` is not auto-cleared; revocation is not presented as the only recovery.
+- HTTP 200 carrying an Apple application-level error remains an error throughout.
+
+### Certificate inventory (team V54K5JYGS4) — evidence tiers
+| Fact | Tier | Basis |
+|---|---|---|
+| 3 development certificates on the team | **Verified** | live listing 15:36 + two reconciles, stable |
+| All 3 currently non-expired | **Verified** | nearest expiry 286 days out |
+| One is the Mac's active Xcode "Apple Development" cert (SHA-1 suffix `5657782A`, OU `V54K5JYGS4`, expires 2027-09-27, private key in Mac login keychain) | **Verified** | local keychain + cert subject |
+| Mac keychain holds exactly ONE Apple Development private key for this team | **Verified** | `security find-identity` |
+| Our pending device-local key matches none of the 3 | **Verified** | reconcile not-found, twice |
+| 7460 is caused by the team already having a current dev certificate | **Inferred** | a current valid cert (the Xcode one) exists; message wording |
+| A server-side pending certificate request also exists | **Unknown** | our listing enumerates issued certs, not pending requests; 7460 explicitly admits this cause |
+| The two non-Xcode certs' origin/usage/keys | **Unknown** | no local private keys; could be prior tooling (AltStore/Sideloadly/our experiments) |
+| Which single certificate "causes" 7460 | **Unknown** | 7460 is account-level, not cert-specific |
+| Exact numeric development-certificate cap for a free Personal Team | **Unknown** | only known: 3 present, a 4th refused |
+
+**The one-development-certificate Personal Team limit is NOT a verified fact.** Three certificates are present; the evidence shows only that we are at or above some unknown cap and/or that a current cert or pending request blocks a new one.
+
+### Non-destructive alternatives (architectural evaluation only)
+- **Reuse an existing certificate whose key is on another device** — only the Xcode cert has a local (Mac) key. Using it to sign on the iPhone means importing that key onto the device, which breaks the device-local, non-extractable-key invariant. **Conflicts.**
+- **Transfer a signing identity** — requires exporting the private key. **Conflicts** with the non-extractable design.
+- **External signing without exporting the key** — the key-holder (Mac) performs the signature, i.e. a Mac companion / signing service. **Excluded** by the no-Mac goal.
+- **An Apple-supported separate device-local certificate for this team** — that is exactly our CSR; it is refused while a current certificate or pending request exists. No supported path to an additional independent certificate beyond the (unknown) cap without freeing a slot.
+- **Paid Apple Developer Program** — would materially raise certificate allowances and enables the ASC API signing path already scoped (PR #50/#51). **Excluded** here; abandons the free-account goal. Noted, not implemented.
+
+### Risks of revoking an existing certificate
+- Revoking the Xcode cert `5657782A` would break Xcode signing on the Mac. **Protected — never revoke.**
+- Revoking either non-Xcode cert carries **unknown, unquantified risk**: apps signed with a revoked certificate can stop launching, and these certs' usage is not established. They are `unknownUsage`, never assumed unused merely for being legacy-named or absent from the iPhone Keychain.
+- Even after a revoke, a new certificate is only guaranteed to issue if the cause was a cap — which is unproven. If the cause is a pending request, revocation does not help.
+
+### Recommended next action (requires separate authorization — not run here)
+Do NOT revoke anything. The lowest-risk next step is a **read-only probe for outstanding pending certificate requests** — the untested half of the 7460 message. Our current tooling lists issued certificates only; if the developer-services API exposes a pending-requests listing, a pending request from our own attempts may resolve into a certificate (reconcile would recover it) or age out, with no revocation needed. If no such listing exists, document that as a gap. Only if the account is confirmed to be at a genuine, cap-driven limit should an explicit, separately-consented revocation of a specific, usage-established certificate be considered.

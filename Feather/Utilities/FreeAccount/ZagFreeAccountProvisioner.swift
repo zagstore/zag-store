@@ -908,6 +908,10 @@ actor ZagFreeAccountProvisioner {
 			case .deviceLimitReached: return .deviceLimitReached
 			case .appIDLimitReached: return .appIDCapacityExhausted(needed: 1, available: 0, nextSlotFreesAt: nil)
 			case .certificateLimitReached: return .certificateMustBeRevoked(candidates: [])
+			// 7460: existing cert OR pending request — surfaced as "unresolved"
+			// (its message asks the user to check existing certificates before
+			// requesting another), NOT as a forced revoke and NOT as throttling.
+			case .existingCertificateOrPendingRequest: return .certificateRequestUnresolved
 			case .livePortalDisabled: return .unavailable
 			}
 		case ZagTransportError.timedOut: return .timedOut

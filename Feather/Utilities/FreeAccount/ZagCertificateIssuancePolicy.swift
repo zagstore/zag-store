@@ -150,6 +150,12 @@ enum ZagCSRReconciliation {
 		/// The server definitively refused and created nothing (cap, device/App-ID
 		/// limit, session rejected, identifier unavailable, confirmed HTTP-429 throttle).
 		case authoritativeRejection
+		/// The account already has a current development certificate or a pending
+		/// request (resultCode 7460): a confirmed refusal where a blind resubmit of
+		/// the same CSR would simply recur, so recovery needs human review (reuse an
+		/// existing cert, wait for a pending request, or decide on revocation) — it
+		/// is NOT auto-cleared to retryable.
+		case confirmedConflict
 		/// An unknown/ambiguous resultCode: the outcome is genuinely unknown.
 		case ambiguous
 		/// A transport failure or incomplete response.
@@ -175,9 +181,10 @@ enum ZagCSRReconciliation {
 		case .listingUnavailable: return .preserveUnconfirmed
 		case .notFound:
 			switch submit {
-			case .authoritativeRejection: return .retryable
-			case .transportIncomplete:    return .preserveUnconfirmed
-			case .ambiguous, .none:       return .preserveForReview
+			case .authoritativeRejection:      return .retryable
+			case .confirmedConflict:           return .preserveForReview   // blind retry would recur; needs review
+			case .transportIncomplete:         return .preserveUnconfirmed
+			case .ambiguous, .none:            return .preserveForReview
 			}
 		}
 	}
@@ -189,6 +196,8 @@ enum ZagCSRReconciliation {
 		case .sessionRejected, .deviceLimitReached, .appIDLimitReached,
 			 .certificateLimitReached, .identifierUnavailable, .confirmedRateLimit:
 			return .authoritativeRejection
+		case .existingCertificateOrPendingRequest:
+			return .confirmedConflict
 		case .ambiguousRejection, .malformed:
 			return .ambiguous
 		case .network:

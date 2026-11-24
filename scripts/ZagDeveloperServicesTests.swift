@@ -52,7 +52,7 @@ check((ok["teams"] as? [[String: Any]])?.first?["teamId"] as? String == "T1", "s
 let okNoCode = try! ZagDeveloperServicesProtocol.parse(plist(["teams": []]), httpStatus: 200)
 check(okNoCode["teams"] != nil, "absent resultCode treated as success")
 throws_(.sessionRejected, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 1100, "userString": "bad session"]), httpStatus: 200) }, "resultCode 1100 -> sessionRejected")
-throws_(.rateLimited,     { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 7460]), httpStatus: 200) }, "resultCode 7460 -> rateLimited")
+throws_(.existingCertificateOrPendingRequest, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 7460]), httpStatus: 200) }, "parse 7460 -> existingCertificateOrPendingRequest")
 throws_(.deviceLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9120]), httpStatus: 200) }, "resultCode 9120 -> deviceLimitReached")
 throws_(.appIDLimitReached,  { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9412]), httpStatus: 200) }, "resultCode 9412 -> appIDLimitReached")
 throws_(.certificateLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 3540]), httpStatus: 200) }, "resultCode 3540 -> certificateLimitReached")
@@ -186,7 +186,7 @@ func faultPlist(_ code: Int, _ msg: String = "") -> Data {
 	return try! PropertyListSerialization.data(fromPropertyList: d, format: .xml, options: 0)
 }
 check(ZagDeveloperServicesProtocol.fault(body: faultPlist(0), httpStatus: 200) == nil, "resultCode 0 -> no fault (success)")
-check(ZagDeveloperServicesProtocol.fault(body: faultPlist(7460), httpStatus: 200)?.classification == .confirmedRateLimit, "verified throttle code -> confirmed rate-limit")
+check(ZagDeveloperServicesProtocol.fault(body: faultPlist(7460), httpStatus: 200)?.classification == .existingCertificateOrPendingRequest, "7460 -> existingCertificateOrPendingRequest (corrected)")
 check(ZagDeveloperServicesProtocol.fault(body: Data(), httpStatus: 429)?.classification == .confirmedRateLimit, "HTTP 429 -> confirmed rate-limit")
 let amb = ZagDeveloperServicesProtocol.fault(body: faultPlist(4, "user@example.com please retry"), httpStatus: 200)
 check(amb?.classification == .ambiguousRejection, "resultCode 4 is AMBIGUOUS, not a confirmed throttle")
@@ -272,6 +272,39 @@ check(consumed.nextStep(at: now) == .resolveUnconfirmed, "post-consume ambiguous
 check(ovr(consumed) == "noEvidence", "re-override after ambiguous needs FRESH evidence (no silent replay)")
 // The real attempt-1 journal shape (team known, evidence to be gathered) still needs evidence first.
 check(ovr(journal(evidence: nil)) == "noEvidence", "attempt-1-shaped journal: override blocked until reconcile records evidence")
+
+// MARK: resultCode 7460 classifier correction (the exact observed response).
+let msg7460 = "You already have a current iOS Development certificate or a pending certificate request."
+func plist7460(_ code: Int, _ m: String) -> Data {
+	try! PropertyListSerialization.data(fromPropertyList: ["resultCode": code, "userString": m], format: .xml, options: 0)
+}
+let f7460 = ZagDeveloperServicesProtocol.fault(body: plist7460(7460, msg7460), httpStatus: 200)
+check(f7460?.classification == .existingCertificateOrPendingRequest, "7460 -> existingCertificateOrPendingRequest (NOT throttle)")
+check(f7460?.classification != .confirmedRateLimit, "7460 is NOT confirmedRateLimit")
+check(f7460?.classification != .certificateLimitReached, "7460 is NOT collapsed into certificate-cap")
+check(f7460?.resultCode == 7460 && f7460?.httpStatus == 200, "7460 fault preserves raw code + status")
+check(f7460?.message == msg7460, "7460 fault preserves the exact Apple message (no email/token to redact)")
+check(f7460?.sanitized["apple_message"] as? String == msg7460, "sanitized dict carries the real message")
+// HTTP 200 + app-level error remains an error.
+check(ZagDeveloperServicesProtocol.fault(body: plist7460(7460, msg7460), httpStatus: 200) != nil, "HTTP 200 + 7460 is still a fault (not success)")
+// 7788 is no longer asserted to be a throttle (conservative: unknown).
+check(ZagDeveloperServicesProtocol.fault(body: plist7460(7788, "x"), httpStatus: 200)?.classification == .ambiguousRejection, "7788 -> ambiguousRejection (no evidence it is a throttle)")
+// Genuine throttle and cert-cap stay distinct from 7460.
+check(ZagDeveloperServicesProtocol.fault(body: Data(), httpStatus: 429)?.classification == .confirmedRateLimit, "HTTP 429 -> confirmedRateLimit (genuine throttle, distinct)")
+check(ZagDeveloperServicesProtocol.fault(body: plist7460(3540, "limit"), httpStatus: 200)?.classification == .certificateLimitReached, "3540 -> certificateLimitReached (distinct cap)")
+check(ZagDeveloperServicesProtocol.fault(body: plist7460(1100, "session"), httpStatus: 200)?.classification == .sessionRejected, "1100 -> sessionRejected (distinct auth)")
+// throwIfError path: 7460 -> dedicated typed error, not rateLimited.
+throws_(.existingCertificateOrPendingRequest, { try ZagDeveloperServicesProtocol.throwIfError(["resultCode": 7460, "userString": msg7460]) }, "throwIfError 7460 -> existingCertificateOrPendingRequest")
+throws_(.malformedResponse, { try ZagDeveloperServicesProtocol.throwIfError(["resultCode": 7788]) }, "throwIfError 7788 -> unknown (malformedResponse), not rateLimited")
+throws_(.certificateLimitReached, { try ZagDeveloperServicesProtocol.throwIfError(["resultCode": 3540]) }, "throwIfError 3540 -> certificateLimitReached (unchanged)")
+// Reconciliation: a confirmed conflict is preserved for review, never auto-retried.
+check(Rec.verdict(for: .existingCertificateOrPendingRequest) == .confirmedConflict, "7460 classification -> confirmedConflict verdict")
+check(Rec.decide(match: .notFound, submit: .confirmedConflict) == .preserveForReview, "conflict + not-found -> preserveForReview (NOT retryable)")
+check(Rec.decide(match: .found(serial: "S9"), submit: .confirmedConflict) == .recover(serial: "S9"), "conflict but cert found -> recover")
+// The four outcomes are distinct verdicts: conflict / cap / throttle / unknown.
+check(Rec.verdict(for: .existingCertificateOrPendingRequest) != Rec.verdict(for: .ambiguousRejection), "conflict distinct from unknown")
+check(Rec.verdict(for: .certificateLimitReached) == .authoritativeRejection && Rec.verdict(for: .existingCertificateOrPendingRequest) == .confirmedConflict, "cap vs conflict are different verdicts")
+check(Rec.decide(match: .notFound, submit: .confirmedConflict) != Rec.decide(match: .notFound, submit: .authoritativeRejection), "conflict (preserve) differs from authoritative cap (retryable)")
 
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

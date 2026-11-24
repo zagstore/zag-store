@@ -132,10 +132,14 @@ enum ZagDeveloperServicesProtocol {
 		let message = (dict["userString"] as? String) ?? (dict["resultString"] as? String) ?? ""
 		switch code {
 		case 1100, 1:                 throw ZagPortalError.sessionRejected        // invalid/expired session
-		case 7460, 7788:              throw ZagPortalError.rateLimited            // verified throttle codes
+		case 7460:                    throw ZagPortalError.existingCertificateOrPendingRequest  // OBSERVED: "You already have a current iOS Development certificate or a pending certificate request." (NOT a throttle)
 		case 9120, 9401:              throw ZagPortalError.deviceLimitReached     // device limit
 		case 9412, 35:                throw ZagPortalError.appIDLimitReached      // App ID limit (free: per-week)
 		case 3540, 7458:              throw ZagPortalError.certificateLimitReached// cert limit
+		// 7788 was previously grouped with 7460 as a "throttle"; that grouping was
+		// never evidenced and 7460 is now known NOT to be a throttle, so 7788 falls
+		// through to the unknown path below rather than asserting a meaning we
+		// cannot support. Genuine throttling is HTTP 429 (handled in parse()).
 		default:
 			// An identifier owned by another team surfaces a distinctive message.
 			if message.lowercased().contains("not available") || message.lowercased().contains("already in use") {
@@ -169,10 +173,14 @@ enum ZagDeveloperServicesProtocol {
 		let classification: ZagDeveloperServicesFault.Classification
 		switch code {
 		case 1100, 1:     classification = .sessionRejected
-		case 7460, 7788:  classification = .confirmedRateLimit
+		case 7460:        classification = .existingCertificateOrPendingRequest   // OBSERVED (HTTP 200 + 7460): existing cert / pending request, NOT a throttle
 		case 9120, 9401:  classification = .deviceLimitReached
 		case 9412, 35:    classification = .appIDLimitReached
 		case 3540, 7458:  classification = .certificateLimitReached
+		// 7788 is intentionally NOT mapped here: its old "confirmedRateLimit" label
+		// was inherited without evidence, and the only code grouped with it (7460)
+		// proved to be a certificate conflict. It now falls to ambiguousRejection
+		// (the explicit "unknown" bucket). Genuine throttling is HTTP 429 above.
 		default:
 			classification = (raw.lowercased().contains("not available") || raw.lowercased().contains("already in use"))
 				? .identifierUnavailable : .ambiguousRejection
@@ -245,6 +253,11 @@ struct ZagDeveloperServicesFault: Equatable, Sendable {
 		case deviceLimitReached
 		case appIDLimitReached
 		case certificateLimitReached
+		/// resultCode 7460: the account already has a current development certificate
+		/// or an outstanding pending certificate request. A definite application-level
+		/// refusal (nothing was created), kept DISTINCT from a numeric certificate cap
+		/// and from HTTP throttling.
+		case existingCertificateOrPendingRequest
 		case identifierUnavailable
 		/// A non-zero resultCode we do not map with confidence — outcome unknown.
 		case ambiguousRejection
