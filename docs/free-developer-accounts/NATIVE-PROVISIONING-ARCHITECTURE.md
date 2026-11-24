@@ -694,3 +694,73 @@ Our second explicitly-authorized CSR returned, exactly:
 
 ### Recommended next action (requires separate authorization — not run here)
 Do NOT revoke anything. The lowest-risk next step is a **read-only probe for outstanding pending certificate requests** — the untested half of the 7460 message. Our current tooling lists issued certificates only; if the developer-services API exposes a pending-requests listing, a pending request from our own attempts may resolve into a certificate (reconcile would recover it) or age out, with no revocation needed. If no such listing exists, document that as a gap. Only if the account is confirmed to be at a genuine, cap-driven limit should an explicit, separately-consented revocation of a specific, usage-established certificate be considered.
+
+---
+
+## Imported-identity bootstrap (one-time Mac→iPhone) — offline prototype (2026-11-24)
+
+A SEPARATE, opt-in signing path (`ZagImportedSigningIdentity`) that lets a user
+import a password-protected PKCS#12 development identity once, then sign on the
+iPhone. The device-generated, non-extractable key path is unchanged and
+preferred. No real identity was exported/transferred; fixtures are synthetic.
+
+### Feasibility verdict: FEASIBLE
+| Question | Verdict | Basis |
+|---|---|---|
+| Active Xcode key exportable? | Yes (mechanism) | Mac login-keychain Apple Development keys export as PKCS#12 via the standard flow; not exported here |
+| Cert type compatible with dev profiles? | Yes | Apple Development cert, OU `V54K5JYGS4` — the type dev profiles embed |
+| Key algorithm supported by the Zsign callback? | Yes | RSA-2048; the callback is `SecKeyCreateSignature(.rsaSignatureDigestPKCS1v15Raw)` — host test produces a 256-byte signature |
+| Security.framework import/use? | Yes | `SecPKCS12Import → SecIdentity → cert+key`, signs with `SecKeyCreateSignature` (proven on host; iOS API identical) |
+| ThisDeviceOnly protection? | Yes | stored `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, non-synchronized |
+| Reuse the cert without a new CSR? | Yes | signing uses the imported cert+key directly |
+
+### The imported path (`ZagImportedSigningIdentity`)
+- `importIdentity(pkcs12:password:)` — `SecPKCS12Import`; wrong password / corrupt → `wrongPasswordOrCorrupt`; passphrase used only transiently, never stored or logged.
+- `validate(_:now:expectedTeam:)` — key↔cert correspondence (challenge sign/verify, the same proof the device path uses), development-suitability (CN prefix), validity window, and optional team (OU) — typed failures (`keyCertMismatch`, `certExpired`, `notDevelopmentCertificate`, `teamMismatch`).
+- `zsignSigner(_:)` — returns the **same** `ZagKeychainSigningKeys.signer` closure the device-key path hands to Zsign, so the signing pipeline is unchanged.
+- `store/load/delete` — Keychain identity items, ThisDeviceOnly, under a dedicated label prefix, never conflated with the non-extractable device keys.
+- Certificate parsing uses the iOS-safe DER inspector `ZagCertificateInspection` (extended with the subject OU); `SecCertificateCopyValues`/`kSecOIDX509V1*` are macOS-only and are not used.
+
+### Security distinction (preserved in model + UI)
+`ZagImportedIdentityInfo.isNonExtractable` is ALWAYS `false`. An imported key is
+extractable key material — a weaker posture than a device-generated
+non-extractable key. This path is a bootstrap/prototype, not a permanent
+replacement, and the two are never represented as equivalent.
+
+### Provisioning reuse (Phase 3)
+A development profile is reusable with the imported identity only if it embeds a
+certificate whose serial matches the imported identity AND its device UDID,
+bundle identifier, entitlements and expiry validate — team match alone is
+insufficient. `ZagProfileIdentityAudit` already validates team/device/bundle/
+expiry; serial-membership against the imported identity is the remaining wiring,
+to be exercised against a real profile under separate authorization.
+
+### Pending-certificate-request endpoint (Phase 4)
+Bounded offline search of our codec (`ZagDeveloperServicesAction`) and the
+AltSign/SideStore action vocabulary finds **no** mechanism to list *pending*
+certificate requests: the known actions are listTeams / listDevices /
+listAllDevelopmentCerts / listAppIds / listApplicationGroups /
+listProvisioningProfiles / addDevice / submitDevelopmentCSR / revokeDevelopmentCert,
+and the v1 JSON lists *issued* certificates only. The `submissionUnconfirmed` /
+`unresolvedRequest` references in the code are our OWN local journal, not an
+Apple query. No pending-request endpoint is implemented or invoked.
+
+### Can the imported identity sign an IPA entirely on-device?
+The signing primitive — yes: the Zsign callback over the imported key is the
+same one the device path uses and runs on iOS (proven: 256-byte RSA-2048
+signature, verified against the certificate's public key). A COMPLETE IPA also
+needs a provisioning profile embedding this cert + the target device UDID +
+matching entitlements; that reuse is identified but not yet exercised live.
+
+### Remaining steps to transfer the real identity securely (each needs authorization)
+1. On the Mac, export the Apple Development identity once as a strong-password PKCS#12.
+2. User-initiated in-app import (file picker / share sheet) — never via logs or temp files.
+3. In-app: prompt for the export password, `SecPKCS12Import`, validate (correspondence + team `V54K5JYGS4` + development + validity), store ThisDeviceOnly, zero the password and plaintext promptly.
+4. Validate/reuse a development profile embedding this cert's serial + device UDID + bundle + entitlements + expiry.
+5. Sign the IPA on-device via the existing Zsign callback; install.
+
+### Free Personal Team limitations (carried forward)
+7-day provisioning profiles (weekly re-sign), limited devices/App IDs, and the
+existing-certificate/pending-request conflict (resultCode 7460) when issuing new
+certificates — which this bootstrap sidesteps by reusing an existing identity
+rather than requesting another.
