@@ -207,9 +207,39 @@ private let zagAppleAuthTransportCallback: @convention(c) (UnsafeMutableRawPoint
 enum ZagAppleAuthPlatform: String, Sendable, Equatable {
 	case iphone
 	case mac
+	/// Mac ADI algorithm/identity exactly like `.mac`, but presenting the legacy
+	/// `Mac OS X;` client-info that Apple's GSA edge currently accepts (the
+	/// `macOS;` token has returned HTTP 503 since 2026-11-20 — see
+	/// APPLE-AUTH-SIGNIN-503-ASSESSMENT.md). The client-info and User-Agent are
+	/// supplied through apple-auth's supported `headers_json` override, applied
+	/// consistently to provisioning, anisette and auth; no preset is modified.
+	case macLegacy = "mac-legacy"
 
 	/// The OS token the anisette client-info must carry for this platform.
-	var clientInfoOS: String { self == .mac ? "macOS" : "iPhone OS" }
+	var clientInfoOS: String {
+		switch self {
+		case .mac: return "macOS"
+		case .macLegacy: return "Mac OS X"
+		case .iphone: return "iPhone OS"
+		}
+	}
+
+	/// Whether this platform runs apple-auth's Mac ADI algorithm (`.mac` and
+	/// `.macLegacy` share the identical algorithm and identity derivation).
+	var usesMacAlgorithm: Bool { self == .mac || self == .macLegacy }
+
+	/// Allowlisted client-info / User-Agent overrides passed via apple-auth's
+	/// `headers_json` (merged last, so they win in every header path). nil keeps
+	/// apple-auth's computed defaults. Provenance of the `.macLegacy` values:
+	/// the independently-confirmed working configuration from SideStore #1745 /
+	/// LiveContainer #1744 (#1752). Difference from our `.mac` preset: the OS
+	/// token `macOS;` → `Mac OS X;`, a current-format model/version, and the
+	/// legacy akd User-Agent; the ADI algorithm and identity are unchanged.
+	var headerOverrides: [String: String]? {
+		guard self == .macLegacy else { return nil }
+		return ["X-MMe-Client-Info": "<MacBookPro13,3> <Mac OS X;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+				"User-Agent": "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0"]
+	}
 }
 
 /// The on-device machine. A single actor serialises access to the underlying
@@ -229,6 +259,12 @@ actor ZagAppleAuthMachine {
 	/// Per-request sanitized trace (stage, status, allowlisted metadata) from the
 	/// last provisioning call.
 	private(set) var lastHTTPTrace: [ZagHTTPTraceEntry] = []
+
+	/// Runs `body` with a C string for `s`, or a null pointer when `s` is nil.
+	static func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+		if let s { return s.withCString { body($0) } }
+		return body(nil)
+	}
 
 	/// Parses the transport's sanitized log ("POST host -> 200") into statuses.
 	static func httpStatuses(_ log: [String]) -> [Int] {
@@ -296,22 +332,29 @@ actor ZagAppleAuthMachine {
 		let ctx = Unmanaged.passUnretained(transport).toOpaque()
 		var options = aauth_client_options(transport: zagAppleAuthTransportCallback, observer: nil, clock: nil, context: ctx)
 		var client: OpaquePointer?
-		// Serial absent for both platforms (no fabricated hardware identifier).
+		// Serial absent for every platform (no fabricated hardware identifier).
 		// Device fields nil -> apple-auth's default software identity for the
-		// platform (iPhone preset, or Mac preset for the consistent Mac pairing).
+		// platform. `.macLegacy` adds a client-info/User-Agent override through
+		// apple-auth's supported headers_json (merged last in every header path);
+		// it modifies no preset and shares `.mac`'s algorithm and identity.
+		let overridesJSON = platform.headerOverrides.flatMap {
+			(try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+		}
 		let created: aauth_status = "".withCString { serial in
 			var iphone = aauth_iphone_device(model: nil, ios_version: nil, ios_build: nil)
-			let devicePlatform = platform == .mac ? AAUTH_DEVICE_MAC : AAUTH_DEVICE_IPHONE
+			let devicePlatform = platform.usesMacAlgorithm ? AAUTH_DEVICE_MAC : AAUTH_DEVICE_IPHONE
 			return withUnsafePointer(to: &options) { opt in
 				withUnsafePointer(to: &iphone) { ip in
-					func make(statePtr: UnsafePointer<UInt8>?, stateSize: Int) -> aauth_status {
-						var cfg = aauth_client_config(directory: nil, options: opt, platform: devicePlatform,
-							mac_device: nil, iphone_device: platform == .mac ? nil : ip, serial_number: serial,
-							headers: nil, headers_json: nil, state: statePtr, state_size: stateSize)
-						return aauth_client_create(&cfg, &client)
+					Self.withOptionalCString(overridesJSON) { hj in
+						func make(statePtr: UnsafePointer<UInt8>?, stateSize: Int) -> aauth_status {
+							var cfg = aauth_client_config(directory: nil, options: opt, platform: devicePlatform,
+								mac_device: nil, iphone_device: platform.usesMacAlgorithm ? nil : ip, serial_number: serial,
+								headers: nil, headers_json: hj, state: statePtr, state_size: stateSize)
+							return aauth_client_create(&cfg, &client)
+						}
+						if let persisted { return persisted.withUnsafeBytes { make(statePtr: $0.bindMemory(to: UInt8.self).baseAddress, stateSize: persisted.count) } }
+						return make(statePtr: nil, stateSize: 0)
 					}
-					if let persisted { return persisted.withUnsafeBytes { make(statePtr: $0.bindMemory(to: UInt8.self).baseAddress, stateSize: persisted.count) } }
-					return make(statePtr: nil, stateSize: 0)
 				}
 			}
 		}

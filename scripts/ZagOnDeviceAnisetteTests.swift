@@ -98,6 +98,24 @@ struct ZagOnDeviceAnisetteTests {
 		check(!ZagAppleAuthMachine.clientInfoConsistent(sampleHeaders, platform: .mac), "iphone sample inconsistent with .mac (the -22410 hybrid)")
 		check(!ZagAppleAuthMachine.clientInfoConsistent([:], platform: .mac), "missing client-info -> inconsistent")
 
+		// 7d. Legacy Mac identity (E3): client-info OS token, consistency matrix,
+		//     header overrides and User-Agent, and shared Mac algorithm.
+		check(ZagAppleAuthPlatform.macLegacy.clientInfoOS == "Mac OS X", "macLegacy OS token is 'Mac OS X'")
+		check(ZagAppleAuthPlatform.macLegacy.rawValue == "mac-legacy", "macLegacy scope label")
+		check(ZagAppleAuthPlatform.macLegacy.usesMacAlgorithm && ZagAppleAuthPlatform.mac.usesMacAlgorithm
+			  && !ZagAppleAuthPlatform.iphone.usesMacAlgorithm, "macLegacy shares the Mac algorithm")
+		let legacyHeaders = ["X-MMe-Client-Info": "<MacBookPro13,3> <Mac OS X;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"]
+		check(ZagAppleAuthMachine.clientInfoConsistent(legacyHeaders, platform: .macLegacy), "legacy headers consistent with .macLegacy")
+		check(!ZagAppleAuthMachine.clientInfoConsistent(legacyHeaders, platform: .mac), "legacy headers inconsistent with .mac (not 'macOS;')")
+		check(!ZagAppleAuthMachine.clientInfoConsistent(legacyHeaders, platform: .iphone), "legacy headers inconsistent with .iphone")
+		check(!ZagAppleAuthMachine.clientInfoConsistent(macHeaders, platform: .macLegacy), "mac 'macOS;' headers inconsistent with .macLegacy (the 503 token)")
+		// Header overrides: only macLegacy supplies them; values match the
+		// independently-confirmed working config; iPhone/Mac supply none.
+		check(ZagAppleAuthPlatform.mac.headerOverrides == nil && ZagAppleAuthPlatform.iphone.headerOverrides == nil, "mac/iphone supply no overrides")
+		let ov = ZagAppleAuthPlatform.macLegacy.headerOverrides ?? [:]
+		check(ov["X-MMe-Client-Info"]?.contains("Mac OS X;") == true && ov["X-MMe-Client-Info"]?.contains("macOS;") == false, "macLegacy override carries the legacy client-info")
+		check(ov["User-Agent"] == "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0", "macLegacy override carries the legacy User-Agent")
+
 		// 7c. Safe HTTP diagnostic capture: header-value sanitizer + trace builder.
 		check(ZagAppleAuthTransport.sanitizeHeaderValue(nil) == nil, "header value missing -> nil")
 		check(ZagAppleAuthTransport.sanitizeHeaderValue("") == nil, "header value empty -> nil")

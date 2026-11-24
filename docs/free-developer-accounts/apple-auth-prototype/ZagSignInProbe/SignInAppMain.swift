@@ -15,6 +15,7 @@ import SwiftUI
 // Experiment scopes. The Mac identity (E2) uses its own Keychain scope so the
 // provisioned iPhone-labelled baseline (`device`) is never touched.
 private let zagMacScope = "mac-experiment"
+private let zagMacLegacyScope = "mac-legacy-experiment"
 
 @main
 struct ZagSignInProbeApp: App {
@@ -30,6 +31,12 @@ struct ZagSignInProbeApp: App {
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: false, platform: .mac, scope: zagMacScope) }, file: "zag_mac_selfcheck.json")
 			case let env where env["ZAG_RUN_MAC_SIGNIN"] == "1":
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .mac, scope: zagMacScope) }, file: "zag_mac_signin.json")
+			case let env where env["ZAG_RUN_MACLEGACY_PROVISION"] == "1":
+				LiveRunView(task: { await ZagSignInExperimentRunner.provision(platform: .macLegacy, scope: zagMacLegacyScope) }, file: "zag_maclegacy_provision.json")
+			case let env where env["ZAG_RUN_MACLEGACY_SELFCHECK"] == "1":
+				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: false, platform: .macLegacy, scope: zagMacLegacyScope) }, file: "zag_maclegacy_selfcheck.json")
+			case let env where env["ZAG_RUN_MACLEGACY_SIGNIN"] == "1":
+				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .macLegacy, scope: zagMacLegacyScope) }, file: "zag_maclegacy_signin.json")
 			default:
 				CredentialEntryView()
 			}

@@ -50,15 +50,29 @@ enum ZagSignInExperimentRunner {
 			} catch { report["offline_headers"] = "unavailable" }
 		}
 
-		// Condition 8: the original iPhone-labelled profile is unchanged — it
-		// still derives its headers offline from the untouched `device` scope.
-		let baseline = ZagAppleAuthMachine(scope: "device", platform: .iphone)
-		do {
-			let h = try await baseline.anisetteHeaders(allowProvisioning: false)
-			report["iphone_baseline_header_count"] = h.count
-			report["iphone_baseline_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(h, platform: .iphone)
-		} catch { report["iphone_baseline"] = "error" }
+		// The pre-existing profiles (device, mac-experiment) are unchanged — each
+		// still derives its headers offline from its untouched scope.
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
 		return report
+	}
+
+	/// Offline confirmation that the pre-existing profiles remain intact: each
+	/// named scope (except the one under test) still derives consistent headers.
+	static func preservationChecks(excluding scope: String) async -> [String: Any] {
+		let preserved: [(scope: String, platform: ZagAppleAuthPlatform, key: String)] = [
+			("device", .iphone, "iphone_baseline"),
+			("mac-experiment", .mac, "mac_experiment")
+		]
+		var out: [String: Any] = [:]
+		for p in preserved where p.scope != scope {
+			let m = ZagAppleAuthMachine(scope: p.scope, platform: p.platform)
+			do {
+				let h = try await m.anisetteHeaders(allowProvisioning: false)
+				out["\(p.key)_header_count"] = h.count
+				out["\(p.key)_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(h, platform: p.platform)
+			} catch { out[p.key] = "unavailable" }
+		}
+		return out
 	}
 
 	static func run(live: Bool, platform: ZagAppleAuthPlatform = .iphone, scope: String = "device") async -> [String: Any] {
@@ -112,14 +126,7 @@ enum ZagSignInExperimentRunner {
 			let cur = try await m.anisetteHeaders(allowProvisioning: false)
 			report["profile_intact_header_count"] = cur.count
 		} catch { report["profile_intact"] = "unavailable" }
-		if scope != "device" {
-			let baseline = ZagAppleAuthMachine(scope: "device", platform: .iphone)
-			do {
-				let h = try await baseline.anisetteHeaders(allowProvisioning: false)
-				report["iphone_baseline_header_count"] = h.count
-				report["iphone_baseline_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(h, platform: .iphone)
-			} catch { report["iphone_baseline"] = "error" }
-		}
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
 		report["result"] = "ran"
 		return report
 	}
