@@ -98,3 +98,44 @@ No sign-in (Step B) and no authentication are performed at Step A. Step B needs
 its own separate authorization. Objective unchanged: fully standalone on-device
 auth — no Android libraries, no Mac companion, no remote anisette server; only
 the client-info token is corrected to what Apple's edge currently accepts.
+
+---
+
+## E3 Step B result (2026-11-24) — 503 resolved; SRP authenticated; 2FA gate
+
+One supervised live sign-in on the legacy identity (harness commit 9f38e21c):
+
+```json
+{ "outcome": "rejected(4)", "stage": "srp-complete", "request_count": 3,
+  "http_trace": [{"lookup":200},{"srp-init":200},{"srp-complete":200}],
+  "client_info_consistent": true, "ec": absent, "em": absent, "retry_after": absent,
+  "iphone_baseline": "10/consistent", "mac_experiment": "10/consistent",
+  "profile_intact_header_count": 10 }
+```
+
+**Interpretation (HIGH confidence, source-grounded).**
+- **503 resolved:** `srp-complete` returned HTTP 200 (the `macOS;` identity got
+  503 here). The legacy `Mac OS X;` client-info was the whole cause.
+- **SRP authenticated end-to-end, standalone:** reaching a 4th request requires
+  (`authentication.cpp:229-245`) `proof.verify(M2)` to pass (mutual SRP proof →
+  correct credentials), the session `spd` to decrypt, and
+  `grandslam_account_state` to run. A non-2FA login returns at request 3 with
+  `AAUTH_OK`; the only path to a 4th request is **account_state ≠ authenticated
+  → 2FA**. So our on-device clean-room Mac anisette is accepted for interactive
+  GrandSlam sign-in with no remote anisette server.
+- **`rejected(4)` is a label artifact:** `4 == AAUTH_NETWORK_ERROR`
+  (`c_api.h:34`), not an Apple `ec`. The account requires 2FA; apple-auth's 2FA
+  initiation (the 4th request — SMS/trusted-device *config* fetch) was refused by
+  the hard 3-request ceiling, surfacing as a network error. **No SMS/push sent,
+  no code submitted** (refused at config fetch, before any delivery). Our
+  fallback classifier maps "non-OK status + Apple reached" to `rejected(code)`,
+  hence `rejected(4)`.
+
+**Proposed follow-ups (each needs separate authorization):**
+1. *Offline, diagnostic-only:* refine the classifier so a post-`srp-complete`
+   `AAUTH_NETWORK_ERROR` after three 200s is reported as
+   `two-factor-required (ceiling reached)` rather than `rejected(4)`, for an
+   unambiguous record. No protocol change.
+2. *Decision (not code):* whether to allow one 2FA-completion attempt — which
+   necessarily exceeds 3 requests, submits a code and triggers delivery — or to
+   stop here, having proven standalone authentication works up to the 2FA gate.
