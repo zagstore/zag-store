@@ -316,3 +316,86 @@ builds/links; app reinstalled; the persisted token survives reinstall
 (`token_in_store:true`); network-refused selfcheck makes 0 requests; all three
 ADI profiles intact. The next live `ZAG_RUN_MACLEGACY_TEAMS` (same persisted
 token, one request) should now return `team_count ≥ 1`.
+
+---
+
+## Provisioning offline implementation (2026-11-24) — full models, v1 JSON, consent
+
+Completed offline, no Apple contact; verified against AltSign/SideStore source.
+
+**Models/adapters (all mapped to existing models, reusing them):**
+- Devices: `ios/listDevices.action` → `devices[]` (deviceNumber/name); register
+  `ios/addDevice.action` → `device`.
+- App IDs: `ios/listAppIds.action` → `appIds[]` (appIdId/identifier/expirationDate
+  native Date); create `ios/addAppId.action` → `appId`.
+- Certificates: LIST + REVOKE via the **`/services/v1/` JSON API** (new
+  `ZagDeveloperServicesV1`: POST + `X-HTTP-Method-Override: GET/DELETE`,
+  `application/vnd.api+json`, body `{"urlEncodedQueryParams":…}`, results under
+  `data`); CSR submit stays the plist `ios/submitDevelopmentCSR.action` → the DER
+  comes straight back under `certRequest` (`certContent` raw or
+  `certificateContent` base64 — both handled; no re-list). Shared
+  `ZagDeveloperServicesProtocol.parseCertificate` (serial leading-zeros stripped).
+- Profiles: `ios/downloadTeamProvisioningProfile.action` → `provisioningProfile`
+  (`provisioningProfileId` + `encodedProfile`) → existing `ZagIssuedProfile`.
+
+**QH65B2 plist vs /services/v1/ JSON** are handled by separate codecs
+(`ZagDeveloperServicesProtocol` / `ZagDeveloperServicesV1`), each with its own
+request/response shape and error mapping.
+
+**Consent experience (`ZagMutationConsent.swift`):** `ZagMutationConsentCoordinator`
+(ZagAccountMutationConsent, default-deny, up-front whole-plan authorization, thread-
+safe) + `ZagAccountMutationConsentView` (SwiftUI) showing each action's title and
+consequence (device/App ID/cert/profile — e.g. 7-day expiry, weekly App ID cap)
+before any authorization. Read-only actions are never gated.
+
+**Reuse (no duplication):** `ZagNativeDeveloperPortal` (the live
+`ZagDeveloperPortalService`) plugs into the existing `ZagFreeAccountProvisioner`,
+which already implements discover → reuse → create-if-needed, cert/key
+consistency (`ZagKeychainSigningKeyFactory.check` sign/verify) and profile
+consistency (`ZagProvisioningProfileCheck`). Non-extractable Keychain keys and
+`Zsign.signComponents(…, signer:)` are unchanged. `ZagNativeDeveloperPortal.live(
+machine:consent:)` wires the local `developer_headers` bridge + consent.
+
+**Safety preserved:** default-deny construction, host pinned to
+developerservices2.apple.com, redirects refused, hard request budget, no retries,
+sanitized diagnostics; token/session/3 ADI profiles untouched.
+
+**Validation (offline):** 24 dev-services host tests pass (classification,
+endpoint, plist envelope, error mapping, cert parser, v1 codec, consent,
+budget, PEM); full arm64 iOS target builds/links; new files type-check against
+the real FreeAccount subsystem; device-discovery network-refused preflight =
+`{developer_token_persisted:true, preflight-no-network, request_count:0}`, all
+three ADI profiles 10/consistent.
+
+### Item 2 — is the device already registered?
+Determined by a NEW read-only device-discovery gate `ZAG_RUN_MACLEGACY_DEVICES`
+(+ `_SELFCHECK`) BEFORE any `addDevice` is designed: `teams → listDevices`
+(≤2 read-only requests), reporting `device_count` and, when `ZAG_EXPECT_UDID` is
+set, a `expected_udid_registered` bool (the UDID itself is never logged). The
+device already runs our Xcode-provisioned app for this team, so it is plausibly
+already registered — discovery confirms it before spending a device-quota
+mutation.
+
+**Open item for the addDevice step:** obtaining this device's own iOS UDID on
+device (no Mac) is not possible via public API; it must come from the host
+(`devicectl`/`xctrace list devices`, passed via `ZAG_EXPECT_UDID`) or an existing
+registration. Discovery sidesteps this: if the device is already registered and a
+valid cert/profile exist, no mutation is needed.
+
+### Proposed smallest safe first live DISCOVERY experiment (await authorization)
+- **Operation**: `ZAG_RUN_MACLEGACY_DEVICES` — `listTeams` then `listDevices`.
+- **Endpoints/method**: POST `…/services/QH65B2/listTeams.action` then POST
+  `…/services/QH65B2/ios/listDevices.action` (teamId from the first).
+- **Request count**: ≤ 2, read-only, no retry, budget-capped.
+- **Expected**: HTTP 200, `result_code 0`, `device_count ≥ 0`; with
+  `ZAG_EXPECT_UDID`, `expected_udid_registered` true/false.
+- **Account impact**: NONE (read-only).
+- **Sanitized diagnostics**: outcome, http_status, result_code, device_count,
+  expected_udid_registered, request_count — never a UDID/team id/token/body.
+- **One-time launch command**:
+  ```
+  xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_DEVICES":"1"}' dev.zagstore.ptteamprobe
+  ```
+  (optionally add `"ZAG_EXPECT_UDID":"<device udid from devicectl>"` to check this
+  device specifically). This also exercises the first `listDevices` + v1-less read
+  path and, with a known UDID, tells us whether `addDevice` is even needed.

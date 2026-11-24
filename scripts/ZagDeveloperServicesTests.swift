@@ -84,5 +84,39 @@ let pem = ZagDeveloperServicesProtocol.pem(Data([0x30, 0x82, 0x01, 0x02]))
 check(pem.hasPrefix("-----BEGIN CERTIFICATE REQUEST-----\n") && pem.hasSuffix("-----END CERTIFICATE REQUEST-----\n"), "PEM wraps DER with request armor")
 check(pem.contains("MIIBAg"), "PEM carries base64 of the DER")
 
+// MARK: Certificate parser (certContent raw, certificateContent base64, attributes nesting).
+let derBytes = Data([0x30, 0x82, 0x02, 0x01])
+let certRaw = ZagDeveloperServicesProtocol.parseCertificate(["certContent": derBytes, "serialNumber": "0A1B", "name": "iOS Dev", "machineName": "Zag"])
+check(certRaw?.der == derBytes && certRaw?.serialNumber == "A1B" && certRaw?.machineName == "Zag", "cert from certContent (raw DER), serial leading-zero stripped")
+let certB64 = ZagDeveloperServicesProtocol.parseCertificate(["attributes": ["certificateContent": derBytes.base64EncodedString(), "serialNum": "00FF"]])
+check(certB64?.der == derBytes && certB64?.serialNumber == "FF", "cert from attributes.certificateContent (base64) + serialNum fallback")
+check(ZagDeveloperServicesProtocol.parseCertificate(["name": "x"]) == nil, "cert row with no content and no serial -> nil")
+
+// MARK: /services/v1/ JSON codec.
+let v1ep = try! ZagDeveloperServicesV1.endpoint("certificates")
+check(v1ep.absoluteString == "https://developerservices2.apple.com/services/v1/certificates", "v1 endpoint path")
+let v1body = try! ZagDeveloperServicesV1.listCertificatesBody(teamID: "ABCDE12345")
+let v1json = try! JSONSerialization.jsonObject(with: v1body) as! [String: Any]
+check((v1json["urlEncodedQueryParams"] as? String)?.contains("teamId=ABCDE12345") == true, "v1 cert body carries url-encoded teamId")
+check((v1json["urlEncodedQueryParams"] as? String)?.contains("certificateType") == true, "v1 cert body carries certificateType filter")
+let v1hdrs = ZagDeveloperServicesV1.headers(methodOverride: "GET")
+check(v1hdrs["X-HTTP-Method-Override"] == "GET" && v1hdrs["Content-Type"] == "application/vnd.api+json", "v1 headers set method override + json:api content type")
+func v1(_ d: [String: Any]) -> Data { try! JSONSerialization.data(withJSONObject: d) }
+let v1ok = try! ZagDeveloperServicesV1.parseList(v1(["data": [["id": "C1", "attributes": ["serialNumber": "AB"]]]]), httpStatus: 200)
+check(v1ok.count == 1 && (v1ok.first?["id"] as? String) == "C1", "v1 parseList returns the data array")
+throws_(.sessionRejected, { _ = try ZagDeveloperServicesV1.parseList(Data(), httpStatus: 401) }, "v1 HTTP 401 -> sessionRejected")
+throws_(.certificateLimitReached, { _ = try ZagDeveloperServicesV1.parseList(v1(["errors": [["detail": "Maximum number of certificates reached"]]]), httpStatus: 200) }, "v1 errors 'limit' -> certificateLimitReached")
+
+// MARK: Account-mutation consent coordinator (default-deny, up-front authorize, cancel).
+let consent = ZagMutationConsentCoordinator()
+check(consent.mayPerform(.addDevice) == false, "consent default-deny before authorization")
+consent.authorize([.addDevice, .listTeams])
+check(consent.mayPerform(.addDevice) == true, "authorized mutation is permitted")
+check(consent.mayPerform(.listTeams) == false, "read-only action is never stored as a mutation consent")
+check(consent.mayPerform(.submitCSR) == false, "unauthorized mutation stays denied")
+consent.cancel()
+check(consent.mayPerform(.addDevice) == false, "cancel revokes all consent")
+check(ZagDenyingMutationConsent().mayPerform(.addDevice) == false, "denying consent denies everything")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

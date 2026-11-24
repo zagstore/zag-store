@@ -26,25 +26,9 @@ struct ZagDeveloperTeam: Codable, Equatable, Sendable {
 	let type: String?
 }
 
-enum ZagNativePortalError: Error, Equatable, Sendable {
-	/// A mutating operation was attempted without explicit per-operation consent.
-	case consentRequired(ZagDeveloperServicesAction)
-	/// The native portal was used without being explicitly enabled.
-	case notEnabled
-	/// The request ceiling for one provisioning sequence was reached.
-	case requestCeilingReached
-}
-
-/// Decides, per mutating operation, whether the user has consented. The safe
-/// default denies everything, so nothing mutates the account without a real
-/// gate supplied at the live step.
-protocol ZagAccountMutationConsent: Sendable {
-	func mayPerform(_ action: ZagDeveloperServicesAction) -> Bool
-}
-
-struct ZagDenyingMutationConsent: ZagAccountMutationConsent {
-	func mayPerform(_ action: ZagDeveloperServicesAction) -> Bool { false }
-}
+// ZagNativePortalError, ZagAccountMutationConsent and ZagDenyingMutationConsent
+// live in ZagDeveloperServicesProtocol.swift (pure), so the consent coordinator
+// and host tests compile without the app model graph.
 
 /// The live native portal. Disabled by default: the designated initializer is
 /// internal and the convenience factory returns the disabled stub unless an
@@ -151,7 +135,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 			guard let identifier = (row["appIdId"] as? String) ?? (row["appIdentifierId"] as? String),
 				  let bundle = (row["identifier"] as? String) else { return nil }
 			return ZagRegisteredAppID(identifier: identifier, bundleIdentifier: bundle,
-									  expiresAt: Self.date(row["expirationDate"]))
+									  expiresAt: ZagDeveloperServicesProtocol.date(row["expirationDate"]))
 		}
 	}
 
@@ -162,9 +146,13 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		}
 	}
 
+	/// Development certificates via the `/services/v1/` JSON API (POST +
+	/// X-HTTP-Method-Override: GET), not the QH65B2 plist action. Read-only.
 	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] {
-		let dict = try await send(.listCertificates, teamID: team)
-		return ((dict["certificates"] as? [[String: Any]]) ?? []).compactMap(Self.certificate(from:))
+		let response = try await sendV1(path: "certificates", methodOverride: "GET",
+										body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
+		let rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
+		return rows.compactMap { ZagDeveloperServicesProtocol.parseCertificate($0).map(Self.certificate) }
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
@@ -188,7 +176,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		guard let identifier = row["appIdId"] as? String else { throw ZagPortalError.malformedResponse }
 		return ZagRegisteredAppID(identifier: identifier,
 								  bundleIdentifier: (row["identifier"] as? String) ?? bundleIdentifier,
-								  expiresAt: Self.date(row["expirationDate"]))
+								  expiresAt: ZagDeveloperServicesProtocol.date(row["expirationDate"]))
 	}
 
 	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup {
@@ -206,35 +194,34 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		// The CSR is PEM; the private key stays in the Keychain (only the public
 		// request is sent). No key material is ever in this request.
 		let pem = ZagDeveloperServicesProtocol.pem(request.data)
+		// submitDevelopmentCSR is a QH65B2 plist action; the DER comes straight
+		// back under "certRequest" (verified: AltSign/SideStore do not re-list).
 		let dict = try await send(.submitCSR, teamID: team, parameters: ["csrContent": pem, "machineName": "Zag Store", "machineId": UUID().uuidString.uppercased()])
 		guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
-			  let certificate = Self.certificate(from: row), let der = certificate.data else {
+			  let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der else {
 			throw ZagPortalError.malformedResponse
 		}
-		return ZagIssuedCertificate(certificate: certificate, data: der)
+		return ZagIssuedCertificate(certificate: Self.certificate(parsed), data: der)
 	}
 
 	// MARK: - Helpers
 
-	private static func certificate(from row: [String: Any]) -> ZagDevelopmentCertificate? {
-		guard let serial = (row["serialNumber"] as? String) ?? (row["serialNum"] as? String) else { return nil }
-		let der = (row["certContent"] as? Data) ?? (row["certificateContent"] as? Data)
-		return ZagDevelopmentCertificate(
-			serialNumber: serial,
-			name: (row["name"] as? String) ?? "iOS Development",
-			machineName: row["machineName"] as? String,
-			expiresAt: date(row["expirationDate"]) ?? Date.distantPast,
-			data: der)
+	/// One request to the `/services/v1/` JSON API over the pinned transport.
+	private func sendV1(path: String, methodOverride: String, body: Data) async throws -> ZagHTTPResponse {
+		guard budget.take() else { throw ZagNativePortalError.requestCeilingReached }
+		var requestHeaders = try await headers()
+		guard !requestHeaders.isEmpty, requestHeaders.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) else {
+			throw ZagPortalError.sessionRejected
+		}
+		for (k, v) in ZagDeveloperServicesV1.headers(methodOverride: methodOverride) { requestHeaders[k] = v }
+		let request = ZagHTTPRequest(url: try ZagDeveloperServicesV1.endpoint(path), method: "POST", headers: requestHeaders, body: body)
+		do { return try await transport.send(request) }
+		catch is ZagTransportError { throw ZagPortalError.network }
 	}
 
-	private static func date(_ value: Any?) -> Date? {
-		if let date = value as? Date { return date }
-		guard let string = value as? String else { return nil }
-		return iso8601.date(from: string) ?? iso8601NoFraction.date(from: string)
+	/// Maps a parsed certificate (transport-independent) to the app model.
+	private static func certificate(_ p: ZagParsedCertificate) -> ZagDevelopmentCertificate {
+		ZagDevelopmentCertificate(serialNumber: p.serialNumber, name: p.name, machineName: p.machineName,
+								  expiresAt: p.expiresAt ?? Date.distantPast, data: p.der)
 	}
-
-	private static let iso8601: ISO8601DateFormatter = {
-		let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
-	}()
-	private static let iso8601NoFraction = ISO8601DateFormatter()
 }

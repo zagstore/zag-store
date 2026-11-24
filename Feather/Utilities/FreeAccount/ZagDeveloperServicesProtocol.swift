@@ -54,6 +54,26 @@ enum ZagDeveloperServicesAction: String, Sendable, Equatable, CaseIterable {
 	}
 }
 
+enum ZagNativePortalError: Error, Equatable, Sendable {
+	/// A mutating operation was attempted without explicit per-operation consent.
+	case consentRequired(ZagDeveloperServicesAction)
+	/// The native portal was used without being explicitly enabled.
+	case notEnabled
+	/// The request ceiling for one provisioning sequence was reached.
+	case requestCeilingReached
+}
+
+/// Decides, per mutating operation, whether the user has consented. The safe
+/// default denies everything, so nothing mutates the account without a real
+/// gate supplied at the live step.
+protocol ZagAccountMutationConsent: Sendable {
+	func mayPerform(_ action: ZagDeveloperServicesAction) -> Bool
+}
+
+struct ZagDenyingMutationConsent: ZagAccountMutationConsent {
+	func mayPerform(_ action: ZagDeveloperServicesAction) -> Bool { false }
+}
+
 /// Pure codec for the developer-services plist protocol. No I/O, no token.
 enum ZagDeveloperServicesProtocol {
 	static let host = "developerservices2.apple.com"
@@ -132,6 +152,92 @@ enum ZagDeveloperServicesProtocol {
 	static func pem(_ der: Data) -> String {
 		let b64 = der.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed])
 		return "-----BEGIN CERTIFICATE REQUEST-----\n\(b64)\n-----END CERTIFICATE REQUEST-----\n"
+	}
+
+	/// Parses a certificate row from either the QH65B2 `certRequest` dict or a
+	/// `/services/v1/certificates` `data[]` item. Field names verified against
+	/// AltSign/SideStore: DER bytes come from `certContent` (raw) or
+	/// `certificateContent` (base64 string); serial from `serialNumber`/`serialNum`;
+	/// an `attributes` sub-dict is used when present (v1 JSON). Pure.
+	static func parseCertificate(_ row: [String: Any]) -> ZagParsedCertificate? {
+		let attrs = (row["attributes"] as? [String: Any]) ?? row
+		var der: Data? = attrs["certContent"] as? Data
+		if der == nil, let b64 = attrs["certificateContent"] as? String { der = Data(base64Encoded: b64) }
+		let serial = (attrs["serialNumber"] as? String) ?? (attrs["serialNum"] as? String)
+		guard serial != nil || der != nil else { return nil }
+		return ZagParsedCertificate(
+			serialNumber: (serial ?? "").drop(while: { $0 == "0" }).isEmpty && !(serial ?? "").isEmpty ? (serial ?? "") : String((serial ?? "").drop(while: { $0 == "0" })),
+			name: (attrs["name"] as? String) ?? "iOS Development",
+			machineName: attrs["machineName"] as? String,
+			expiresAt: date(attrs["expirationDate"]),
+			der: der)
+	}
+
+	/// ISO8601 (with or without fractional seconds) or a native Date.
+	static func date(_ value: Any?) -> Date? {
+		if let date = value as? Date { return date }
+		guard let string = value as? String else { return nil }
+		return iso8601.date(from: string) ?? iso8601NoFraction.date(from: string)
+	}
+	static let iso8601: ISO8601DateFormatter = {
+		let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+	}()
+	static let iso8601NoFraction = ISO8601DateFormatter()
+}
+
+/// A certificate parsed from a developer-services response, independent of the
+/// app model graph (so the parser is host-testable). Serial has leading zeros
+/// stripped, as AltSign does, for serial-based matching.
+struct ZagParsedCertificate: Equatable, Sendable {
+	let serialNumber: String
+	let name: String
+	let machineName: String?
+	let expiresAt: Date?
+	let der: Data?
+}
+
+/// The newer `/services/v1/` JSON API, used (per AltSign/SideStore) for
+/// certificate LISTING and REVOKE. Pure codec: no I/O, no token. The logical
+/// GET/DELETE is sent as POST with `X-HTTP-Method-Override`, bodies and
+/// responses are JSON:API (`application/vnd.api+json`), results under `data`.
+enum ZagDeveloperServicesV1 {
+	static let host = ZagDeveloperServicesProtocol.host  // developerservices2.apple.com
+	static let base = "https://developerservices2.apple.com/services/v1/"
+	static let contentType = "application/vnd.api+json"
+
+	static func endpoint(_ path: String) throws -> URL {
+		guard let url = URL(string: base + path) else { throw ZagPortalError.malformedResponse }
+		return url
+	}
+
+	/// Body for listing development certificates: a JSON object carrying the
+	/// url-encoded query (teamId + certificate-type filter), as AltSign sends it.
+	static func listCertificatesBody(teamID: String, certificateTypes: String = "IOS_DEVELOPMENT,DEVELOPMENT") throws -> Data {
+		let raw = "teamId=\(teamID)&filter[certificateType]=\(certificateTypes)"
+		let encoded = raw.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "=&-_"))) ?? raw
+		return try JSONSerialization.data(withJSONObject: ["urlEncodedQueryParams": encoded], options: [])
+	}
+
+	/// Parses a JSON:API response and returns the `data` array, mapping any
+	/// `errors` / HTTP status to a typed `ZagPortalError`. Pure.
+	static func parseList(_ body: Data, httpStatus: Int) throws -> [[String: Any]] {
+		guard (200..<300).contains(httpStatus) else {
+			throw httpStatus == 401 || httpStatus == 403 ? ZagPortalError.sessionRejected
+				: httpStatus == 429 ? ZagPortalError.rateLimited : ZagPortalError.network
+		}
+		guard let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { throw ZagPortalError.malformedResponse }
+		if let errors = obj["errors"] as? [[String: Any]], let first = errors.first {
+			let detail = ((first["detail"] as? String) ?? (first["title"] as? String) ?? "").lowercased()
+			if detail.contains("limit") || detail.contains("maximum") { throw ZagPortalError.certificateLimitReached }
+			throw ZagPortalError.malformedResponse
+		}
+		return (obj["data"] as? [[String: Any]]) ?? []
+	}
+
+	/// The headers the v1 API needs beyond the developer-headers bag:
+	/// the method override and the JSON:API content types.
+	static func headers(methodOverride: String) -> [String: String] {
+		["X-HTTP-Method-Override": methodOverride, "Content-Type": contentType, "Accept": contentType]
 	}
 }
 

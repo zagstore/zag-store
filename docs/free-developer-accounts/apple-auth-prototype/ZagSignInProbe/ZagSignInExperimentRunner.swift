@@ -238,7 +238,7 @@ enum ZagSignInExperimentRunner {
 		let budget = ZagRequestBudget(limit: 1)   // one aggregate request maximum, no retry
 		do {
 			guard budget.take() else { throw ZagPortalError.network }
-			let dict = try await sendTeamDiscovery(headers: headers)
+			let dict = try await sendQH65B2(.listTeams, teamID: nil, headers: headers)
 			let teams = (dict["teams"] as? [[String: Any]]) ?? []
 			report["result"] = "ran"
 			report["http_status"] = 200
@@ -259,11 +259,64 @@ enum ZagSignInExperimentRunner {
 		return report
 	}
 
-	/// Sends exactly one team-discovery POST. Ephemeral session, no cookies/
-	/// cache/credentials, redirects refused, pinned to the developer-services
-	/// host. Parses with the shared `ZagDeveloperServicesProtocol`.
-	private static func sendTeamDiscovery(headers: [String: String]) async throws -> [String: Any] {
-		let url = try ZagDeveloperServicesProtocol.endpoint(.listTeams)
+	/// Read-only DEVICE discovery (item 2): teams -> listDevices, at most TWO
+	/// read-only requests, to determine whether this device is ALREADY registered
+	/// before any addDevice mutation is ever designed. Reports device_count and,
+	/// when ZAG_EXPECT_UDID is set, whether that UDID is present (a bool only) —
+	/// never a team id, UDID, token or body. No mutation. Zero requests with no
+	/// token or in self-check.
+	static func runDeviceDiscovery(platform: ZagAppleAuthPlatform, scope: String, allowNetwork: Bool) async -> [String: Any] {
+		var report: [String: Any] = ["mode": allowNetwork ? "live-devices" : "selfcheck-devices", "platform": platform.rawValue, "scope": scope]
+		let m = ZagAppleAuthMachine(scope: scope, platform: platform)
+		let headers = await m.developerHeaders()
+		report["developer_token_persisted"] = (headers != nil)
+		guard let headers else {
+			report["result"] = "ran"; report["outcome"] = "no-developer-token-persisted"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		guard allowNetwork else {
+			report["result"] = "ran"; report["outcome"] = "preflight-no-network"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		let budget = ZagRequestBudget(limit: 2)   // teams + listDevices, read-only, no retry
+		do {
+			guard budget.take() else { throw ZagPortalError.network }
+			let teamsDict = try await sendQH65B2(.listTeams, teamID: nil, headers: headers)
+			guard let teamID = ((teamsDict["teams"] as? [[String: Any]])?.first)?["teamId"] as? String else {
+				report["result"] = "ran"; report["outcome"] = "no-teams"; report["request_count"] = budget.used
+				for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+				return report
+			}
+			guard budget.take() else { throw ZagPortalError.network }
+			let devDict = try await sendQH65B2(.listDevices, teamID: teamID, headers: headers)
+			let devices = (devDict["devices"] as? [[String: Any]]) ?? []
+			report["result"] = "ran"
+			report["http_status"] = 200
+			report["result_code"] = (devDict["resultCode"] as? NSNumber)?.intValue ?? 0
+			report["device_count"] = devices.count
+			// Whether THIS device is already registered (bool only; UDID not logged).
+			if let expect = ProcessInfo.processInfo.environment["ZAG_EXPECT_UDID"]?.lowercased(), !expect.isEmpty {
+				let present = devices.contains { ($0["deviceNumber"] as? String)?.lowercased() == expect }
+				report["expected_udid_registered"] = present
+			}
+			report["outcome"] = "devices-discovered"
+		} catch let e as ZagPortalError {
+			report["result"] = "ran"; report["outcome"] = describePortalError(e)
+		} catch {
+			report["result"] = "ran"; report["outcome"] = "error"
+		}
+		report["request_count"] = budget.used
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		return report
+	}
+
+	/// Sends one QH65B2 plist POST (any read-only action). Ephemeral session, no
+	/// cookies/cache/credentials, redirects refused, pinned to the developer-
+	/// services host. Parses with the shared `ZagDeveloperServicesProtocol`.
+	private static func sendQH65B2(_ action: ZagDeveloperServicesAction, teamID: String?, headers: [String: String]) async throws -> [String: Any] {
+		let url = try ZagDeveloperServicesProtocol.endpoint(action)
 		guard url.host == ZagDeveloperServicesProtocol.host else { throw ZagPortalError.network }
 		var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
 		req.httpMethod = "POST"
@@ -271,7 +324,7 @@ enum ZagSignInExperimentRunner {
 		for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
 		req.setValue("text/x-xml-plist", forHTTPHeaderField: "Content-Type")
 		req.setValue("text/x-xml-plist", forHTTPHeaderField: "Accept")
-		req.httpBody = try ZagDeveloperServicesProtocol.requestBody(teamID: nil)
+		req.httpBody = try ZagDeveloperServicesProtocol.requestBody(teamID: teamID)
 		let config = URLSessionConfiguration.ephemeral
 		config.httpCookieStorage = nil; config.httpShouldSetCookies = false
 		config.urlCache = nil; config.urlCredentialStorage = nil; config.waitsForConnectivity = false

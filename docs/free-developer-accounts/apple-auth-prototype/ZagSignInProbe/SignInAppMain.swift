@@ -53,6 +53,13 @@ struct ZagSignInProbeApp: App {
 				// Exactly ONE read-only team-discovery request using the persisted
 				// developer token. No login, no token request, no account mutation.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runTeamDiscovery(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: true) }, file: "zag_maclegacy_teams.json")
+			case let env where env["ZAG_RUN_MACLEGACY_DEVICES_SELFCHECK"] == "1":
+				// Offline preflight: device discovery with no network (and/or no token).
+				LiveRunView(task: { await ZagSignInExperimentRunner.runDeviceDiscovery(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devices_selfcheck.json")
+			case let env where env["ZAG_RUN_MACLEGACY_DEVICES"] == "1":
+				// Read-only device discovery: teams -> listDevices (<=2 requests). No
+				// mutation. Determines whether this device is already registered.
+				LiveRunView(task: { await ZagSignInExperimentRunner.runDeviceDiscovery(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: true) }, file: "zag_maclegacy_devices.json")
 			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION_SELFCHECK"] == "1":
 				// Offline preflight: developer-session path, transport refused.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devsession_selfcheck.json")
