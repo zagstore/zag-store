@@ -128,3 +128,31 @@ Expected on success: `outcome "developer-session (verified: token + GS header)"`
 `request_count 1`, `token_present true`, `has_gs_token_header true`, profiles
 intact. If the stored session's trust window has lapsed, `failed`/`expired` —
 then a fresh authenticated login would be the prerequisite (separate request).
+
+---
+
+## Live attempt 1 (2026-11-24) — Apple returned ec -22411
+
+```json
+{ "mode":"live-devsession", "request_count":1, "http_trace":[{"apptokens":200}],
+  "ec":-22411, "outcome":"failed", "token_present":false, "has_gs_token_header":false,
+  "mac_legacy":"10/consistent","mac_experiment":"10/consistent","iphone":"10/consistent" }
+```
+
+The one apptokens request reached Apple (HTTP 200) but the GrandSlam envelope
+carried `ec -22411`, so apple-auth's `status()` rejected it before any token
+decrypt — no token issued. Not an HTTP failure, not our bound: an Apple-side
+rejection of the exchange for this stored session. All three ADI profiles intact.
+
+`-22411` is not documented in apple-auth or found in a web search; the
+authoritative signal is the GrandSlam `em` message, which this run did not
+capture. **Fix (offline, applied):** the developer-session report now captures
+the sanitized `em`, so a re-run states Apple's reason exactly.
+
+Leading hypothesis: the stored session was ~2.5 h old (from the trusted
+3-request re-login), and the apptokens exchange needs a fresher
+authentication/`GsIdmsToken` — the exchange structurally succeeded (sk/c present,
+request sent) but Apple declined the aged session. Next-experiment options (each
+needs authorization): (A) one re-run to read the exact `em`; (B) a combined
+fresh-login → immediate developer-session (reuse the just-authenticated
+in-memory session instead of the stored one).

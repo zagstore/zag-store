@@ -663,9 +663,10 @@ actor ZagAppleAuthMachine {
 			defer { aauth_client_buffer_free(&out) }
 			guard rc == AAUTH_OK, let data = out.data, out.size > 0 else {
 				let error = String(cString: aauth_client_last_error())
-				let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error)
+				let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error), message = grandSlamMessage(error)
 				let outcome: ZagDeveloperSessionOutcome = transport.reachedApple ? .failed : .transportFailed
 				return .success(ZagDeveloperSessionReport(outcome: outcome, requestCount: transport.requestCount, ec: ec, httpStatus: http,
+														  appleMessage: message,
 														  httpTrace: Self.httpTrace(transport.httpTrace, stageFor: { _ in "apptokens" })))
 			}
 			// Parse {account_id, token, expires_at_ms}. These never leave this scope.
@@ -862,6 +863,8 @@ struct ZagDeveloperSessionReport: Equatable, Sendable {
 	var hasGSTokenHeader: Bool = false
 	var ec: Int? = nil
 	var httpStatus: Int? = nil
+	/// Apple's `em` message, already sanitized and length-bounded (never raw).
+	var appleMessage: String? = nil
 	var httpTrace: [ZagHTTPTraceEntry] = []
 }
 

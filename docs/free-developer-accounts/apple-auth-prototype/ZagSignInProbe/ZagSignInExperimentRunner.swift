@@ -193,6 +193,7 @@ enum ZagSignInExperimentRunner {
 			if let d = ds.expiresInDays { report["expires_in_days"] = d }
 			if let ec = ds.ec { report["ec"] = ec }
 			if let http = ds.httpStatus { report["http_status"] = http }
+			if let message = ds.appleMessage { report["apple_message"] = message }
 			if !ds.httpTrace.isEmpty { report["http_trace"] = traceDicts(ds.httpTrace) }
 		} catch { report["outcome"] = "error" }
 		do { let cur = try await m.anisetteHeaders(allowProvisioning: false); report["profile_intact_header_count"] = cur.count }
