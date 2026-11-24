@@ -184,6 +184,21 @@ struct ZagOnDeviceAnisetteTests {
 		try? sessions.delete(scope: "unit-test")
 		check(sessions.hasSession(scope: "unit-test") == false, "session gone after delete")
 
+		// Developer-session: verified success is token + unexpired + GS header,
+		// never HTTP 200 alone; any shortfall is failed/expired.
+		check(ZagAppleAuthMachine.developerSessionOutcome(ok: true, tokenPresent: true, expiryValid: true, headerHasToken: true) == .ok, "dev-session ok = token+unexpired+GS header")
+		check(ZagAppleAuthMachine.developerSessionOutcome(ok: true, tokenPresent: false, expiryValid: true, headerHasToken: true) == .failed, "dev-session no token -> failed")
+		check(ZagAppleAuthMachine.developerSessionOutcome(ok: true, tokenPresent: true, expiryValid: false, headerHasToken: true) == .expired, "dev-session expired -> expired")
+		check(ZagAppleAuthMachine.developerSessionOutcome(ok: true, tokenPresent: true, expiryValid: true, headerHasToken: false) == .failed, "dev-session no GS header -> failed")
+		check(ZagAppleAuthMachine.developerSessionOutcome(ok: false, tokenPresent: true, expiryValid: true, headerHasToken: true) == .failed, "dev-session not-ok -> failed")
+		// Session store round-trips opaque bytes (used only to reconstruct the session).
+		let devStore = ZagAppleAuthSessionStore()
+		try? devStore.delete(scope: "unit-test-ds")
+		check(devStore.load(scope: "unit-test-ds") == nil, "no session bytes before save")
+		try? devStore.save(Data([0x62, 0x70, 0x6c, 0x69, 0x73, 0x74]), scope: "unit-test-ds")
+		check(devStore.load(scope: "unit-test-ds") == Data([0x62, 0x70, 0x6c, 0x69, 0x73, 0x74]), "session bytes round-trip")
+		try? devStore.delete(scope: "unit-test-ds")
+
 		#if canImport(SwiftUI)
 		let coord = ZagTwoFactorCoordinator()
 		check(coord.didCancel == false, "coordinator not cancelled initially")

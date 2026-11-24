@@ -176,6 +176,43 @@ enum ZagSignInExperimentRunner {
 	}
 	#endif
 
+	/// The developer-session experiment: reuse the retained authenticated session
+	/// (no GrandSlam login) to exchange one Xcode developer-services token.
+	/// `allowNetwork` false is the offline preflight (transport refused). Reports
+	/// only sanitized facts; preserves the session and all three ADI profiles.
+	static func runDeveloperSession(platform: ZagAppleAuthPlatform, scope: String, allowNetwork: Bool) async -> [String: Any] {
+		var report: [String: Any] = ["mode": allowNetwork ? "live-devsession" : "selfcheck-devsession", "platform": platform.rawValue, "scope": scope]
+		let m = machine(platform: platform, scope: scope)
+		do {
+			let ds = try await m.developerSession(allowNetwork: allowNetwork)
+			report["outcome"] = describeDeveloper(ds.outcome)
+			report["request_count"] = ds.requestCount
+			report["token_present"] = ds.tokenPresent
+			report["has_gs_token_header"] = ds.hasGSTokenHeader
+			if let hc = ds.headerCount { report["developer_header_count"] = hc }
+			if let d = ds.expiresInDays { report["expires_in_days"] = d }
+			if let ec = ds.ec { report["ec"] = ec }
+			if let http = ds.httpStatus { report["http_status"] = http }
+			if !ds.httpTrace.isEmpty { report["http_trace"] = traceDicts(ds.httpTrace) }
+		} catch { report["outcome"] = "error" }
+		do { let cur = try await m.anisetteHeaders(allowProvisioning: false); report["profile_intact_header_count"] = cur.count }
+		catch { report["profile_intact"] = "unavailable" }
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		report["result"] = "ran"
+		return report
+	}
+
+	static func describeDeveloper(_ outcome: ZagDeveloperSessionOutcome) -> String {
+		switch outcome {
+		case .ok: return "developer-session (verified: token + GS header)"
+		case .expired: return "expired"
+		case .failed: return "failed"
+		case .transportFailed: return "transport-failed"
+		case .noSession: return "no-session"
+		case .notProvisioned: return "not-provisioned"
+		}
+	}
+
 	/// Renders the sanitized per-request trace as JSON-friendly dicts: stage,
 	/// status, and allowlisted metadata (e.g. `retry-after` -> `retry_after`).
 	static func traceDicts(_ trace: [ZagHTTPTraceEntry]) -> [[String: Any]] {

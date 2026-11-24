@@ -109,6 +109,17 @@ struct ZagAppleAuthSessionStore {
 		return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
 	}
 
+	/// Load the opaque session bytes for `scope`, or nil. Used only to
+	/// reconstruct the session for a developer-session exchange; never logged.
+	func load(scope: String) -> Data? {
+		var q = query(scope)
+		q[kSecReturnData as String] = true
+		q[kSecMatchLimit as String] = kSecMatchLimitOne
+		var item: CFTypeRef?
+		guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return nil }
+		return data
+	}
+
 	/// Store opaque session bytes (overwrites). The bytes are never logged.
 	func save(_ data: Data, scope: String) throws {
 		var add = query(scope)

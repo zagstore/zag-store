@@ -39,6 +39,13 @@ struct ZagSignInProbeApp: App {
 				// Hard ceiling of 3 GrandSlam requests (lookup/init/complete): no
 				// 4th (2FA-delivery) request can fire.
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .macLegacy, scope: zagMacLegacyScope, maxRequests: 3) }, file: "zag_maclegacy_signin.json")
+			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION_SELFCHECK"] == "1":
+				// Offline preflight: developer-session path, transport refused.
+				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devsession_selfcheck.json")
+			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION"] == "1":
+				// One developer-session exchange reusing the retained session.
+				// No login, cert, device, App ID, profile or signing.
+				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: true) }, file: "zag_maclegacy_devsession.json")
 			case let env where env["ZAG_RUN_MACLEGACY_2FA_SELFCHECK"] == "1":
 				// Offline preflight: the 2FA harness with the transport refused.
 				// No Apple contact; no consent/code gate is reached.
