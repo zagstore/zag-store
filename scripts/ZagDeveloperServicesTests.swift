@@ -70,6 +70,15 @@ check(!budget.take(), "budget refuses past its limit")
 check(budget.used == 2, "budget counts used requests")
 check(!ZagRequestBudget(limit: 0).take(), "a zero budget admits nothing")
 
+// MARK: Team-discovery gate cannot reach a mutation (audit item 9).
+// The team-discovery path uses only listTeams; assert it is read-only, and that
+// every mutating action is distinct from it, so the gate cannot touch one.
+check(ZagDeveloperServicesAction.listTeams.isMutating == false, "team discovery (listTeams) is read-only")
+check(ZagDeveloperServicesAction.allCases.filter { $0.isMutating }.allSatisfy { $0 != .listTeams }, "no mutating action equals listTeams")
+check(ZagPersistedDeveloperToken(accountID: "a", token: "t", expiresAtMs: 0).isUsable(at: Date()), "token with no expiry is usable")
+check(!ZagPersistedDeveloperToken(accountID: "a", token: "t", expiresAtMs: 1).isUsable(at: Date()), "expired token is not usable")
+check(!ZagPersistedDeveloperToken(accountID: "", token: "", expiresAtMs: 0).isUsable(at: Date()), "empty token is not usable")
+
 // MARK: PEM wrapping of the CSR (public request only).
 let pem = ZagDeveloperServicesProtocol.pem(Data([0x30, 0x82, 0x01, 0x02]))
 check(pem.hasPrefix("-----BEGIN CERTIFICATE REQUEST-----\n") && pem.hasSuffix("-----END CERTIFICATE REQUEST-----\n"), "PEM wraps DER with request armor")

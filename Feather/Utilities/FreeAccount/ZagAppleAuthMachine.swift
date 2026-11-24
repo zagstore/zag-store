@@ -628,9 +628,10 @@ actor ZagAppleAuthMachine {
 		guard let sessionBytes = ZagAppleAuthSessionStore().load(scope: scope) else { return ZagDeveloperSessionReport(outcome: .noSession) }
 		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: 1)  // one apptokens request, no retry
 		let platform = self.platform
+		let scope = self.scope
 		return await withCheckedContinuation { continuation in
 			DispatchQueue.global(qos: .userInitiated).async {
-				continuation.resume(returning: Self.driveDeveloperSession(persisted: persisted, sessionBytes: sessionBytes, transport: transport, platform: platform))
+				continuation.resume(returning: Self.driveDeveloperSession(persisted: persisted, sessionBytes: sessionBytes, transport: transport, platform: platform, scope: scope))
 			}
 		}
 		#else
@@ -654,7 +655,7 @@ actor ZagAppleAuthMachine {
 	/// Reconstructs the stored account session and exchanges it for a developer
 	/// token. The token/account id are used only transiently to derive and verify
 	/// the developer headers; neither is logged or returned.
-	private static func driveDeveloperSession(persisted: Data, sessionBytes: Data, transport: ZagAppleAuthTransport, platform: ZagAppleAuthPlatform) -> ZagDeveloperSessionReport {
+	private static func driveDeveloperSession(persisted: Data, sessionBytes: Data, transport: ZagAppleAuthTransport, platform: ZagAppleAuthPlatform, scope: String) -> ZagDeveloperSessionReport {
 		let result: Result<ZagDeveloperSessionReport, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport, platform: platform) { client in
 			var account: OpaquePointer?
 			let fr = sessionBytes.withUnsafeBytes { raw -> aauth_status in
@@ -662,7 +663,7 @@ actor ZagAppleAuthMachine {
 			}
 			guard fr == AAUTH_OK, let account else { return .success(ZagDeveloperSessionReport(outcome: .failed)) }
 			defer { aauth_account_session_free(account) }
-			return .success(Self.exchangeDeveloper(client: client, account: account, transport: transport, stageFor: { _ in "apptokens" }))
+			return .success(Self.exchangeDeveloper(client: client, account: account, transport: transport, stageFor: { _ in "apptokens" }, persistScope: scope))
 		}
 		if case .success(let r) = result { return r }
 		return ZagDeveloperSessionReport(outcome: .transportFailed, requestCount: transport.requestCount)
@@ -673,7 +674,7 @@ actor ZagAppleAuthMachine {
 	/// the stored-session and the fresh-login paths. The token/account id are used
 	/// only transiently; never logged or returned.
 	static func exchangeDeveloper(client: OpaquePointer, account: OpaquePointer, transport: ZagAppleAuthTransport,
-								  stageFor: @escaping (Int) -> String) -> ZagDeveloperSessionReport {
+								  stageFor: @escaping (Int) -> String, persistScope: String? = nil) -> ZagDeveloperSessionReport {
 		var out = aauth_client_buffer()
 		let rc = aauth_client_developer_session(client, account, &out)
 		defer { aauth_client_buffer_free(&out) }
@@ -705,10 +706,46 @@ actor ZagAppleAuthMachine {
 			}
 			aauth_client_buffer_free(&hdr)
 		}
+		// Persist a verified token (opaque, this-device-only) so it can be reused
+		// for developer-services requests without another login. Only on a fully
+		// verified token (present + GS header); the bytes are never logged.
+		if let persistScope, tokenPresent, hasGSToken {
+			try? ZagDeveloperTokenStore().save(
+				ZagPersistedDeveloperToken(accountID: accountId, token: token, expiresAtMs: expiry), scope: persistScope)
+		}
 		return ZagDeveloperSessionReport(outcome: Self.developerSessionOutcome(ok: true, tokenPresent: tokenPresent, expiryValid: expiryValid, headerHasToken: hasGSToken),
 										 requestCount: transport.requestCount, tokenPresent: tokenPresent,
 										 expiresInDays: expiresInDays, headerCount: headerCount, hasGSTokenHeader: hasGSToken,
 										 httpTrace: Self.httpTrace(transport.httpTrace, stageFor: stageFor))
+	}
+
+	/// Local (no HTTP) developer headers from the PERSISTED developer token and
+	/// this scope's ADI, for the native developer-services portal's header
+	/// provider. Returns nil when no usable token is persisted or the machine is
+	/// not provisioned. Reads only (never writes/alters any ADI profile). The
+	/// token and the returned headers are never logged.
+	func developerHeaders(now: Date = Date()) -> [String: String]? {
+		guard let persisted = try? store.load(scope: scope),
+			  let token = ZagDeveloperTokenStore().load(scope: scope), token.isUsable(at: now) else { return nil }
+		let platform = self.platform
+		// A refused transport: developer_headers is local, so no request is made;
+		// this guarantees the bridge can never reach the network.
+		let transport = ZagAppleAuthTransport(allowNetwork: false, maxRequests: 0)
+		let result: Result<[String: String], ZagAppleAuthError> = Self.withClient(persisted: persisted, transport: transport, platform: platform) { client in
+			var out = aauth_client_buffer()
+			let rc = token.accountID.withCString { a in token.token.withCString { t in
+				aauth_client_developer_headers(client, a, t, token.expiresAtMs, &out)
+			} }
+			defer { aauth_client_buffer_free(&out) }
+			guard rc == AAUTH_OK, let d = out.data, out.size > 0,
+				  let obj = (try? JSONSerialization.jsonObject(with: Data(bytes: d, count: out.size))) as? [String: String] else {
+				return .success([:])
+			}
+			return .success(obj)
+		}
+		if case .success(let headers) = result, !headers.isEmpty,
+		   headers.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) { return headers }
+		return nil
 	}
 	#endif
 
@@ -794,7 +831,7 @@ actor ZagAppleAuthMachine {
 				// Developer-session from the FRESH in-memory session (not the stored,
 				// possibly-aged one), immediately after authentication.
 				if includeDeveloperSession {
-					dev = Self.exchangeDeveloper(client: client, account: session, transport: transport, stageFor: Self.signInStage)
+					dev = Self.exchangeDeveloper(client: client, account: session, transport: transport, stageFor: Self.signInStage, persistScope: scope)
 				}
 			}
 			if let session { aauth_account_session_free(session) }

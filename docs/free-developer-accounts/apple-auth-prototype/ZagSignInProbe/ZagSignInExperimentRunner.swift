@@ -208,6 +208,91 @@ enum ZagSignInExperimentRunner {
 		return report
 	}
 
+	/// Read-only team discovery (Phase 4). Uses the PERSISTED developer token via
+	/// the machine's local `developer_headers` bridge (no login, no token
+	/// request); then exactly ONE request to developerservices2.apple.com — HTTPS,
+	/// no redirect, no retry. Reports only sanitized counts; never a team id,
+	/// token, header, cookie or response body. Mirrors the production
+	/// `ZagNativeDeveloperPortal.teams()` using the same pure codec. When no token
+	/// is persisted, or in self-check, it makes zero requests.
+	static func runTeamDiscovery(platform: ZagAppleAuthPlatform, scope: String, allowNetwork: Bool) async -> [String: Any] {
+		var report: [String: Any] = ["mode": allowNetwork ? "live-teams" : "selfcheck-teams", "platform": platform.rawValue, "scope": scope]
+		let m = ZagAppleAuthMachine(scope: scope, platform: platform)
+		let headers = await m.developerHeaders()
+		report["developer_token_persisted"] = (headers != nil)
+		guard let headers else {
+			report["result"] = "ran"; report["outcome"] = "no-developer-token-persisted"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		guard allowNetwork else {
+			report["result"] = "ran"; report["outcome"] = "preflight-no-network"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		let budget = ZagRequestBudget(limit: 1)   // one aggregate request maximum, no retry
+		do {
+			guard budget.take() else { throw ZagPortalError.network }
+			let dict = try await sendTeamDiscovery(headers: headers)
+			let teams = (dict["teams"] as? [[String: Any]]) ?? []
+			report["result"] = "ran"
+			report["http_status"] = 200
+			report["result_code"] = (dict["resultCode"] as? NSNumber)?.intValue ?? 0
+			report["team_count"] = teams.count
+			if let first = teams.first {
+				report["membership_type"] = ((first["memberships"] as? [[String: Any]])?.first?["name"] as? String)
+					?? (first["type"] as? String) ?? "unknown"
+			}
+			report["outcome"] = teams.isEmpty ? "no-teams" : "teams-discovered"
+		} catch let e as ZagPortalError {
+			report["result"] = "ran"; report["outcome"] = describePortalError(e)
+		} catch {
+			report["result"] = "ran"; report["outcome"] = "error"
+		}
+		report["request_count"] = budget.used
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		return report
+	}
+
+	/// Sends exactly one team-discovery POST. Ephemeral session, no cookies/
+	/// cache/credentials, redirects refused, pinned to the developer-services
+	/// host. Parses with the shared `ZagDeveloperServicesProtocol`.
+	private static func sendTeamDiscovery(headers: [String: String]) async throws -> [String: Any] {
+		let url = try ZagDeveloperServicesProtocol.endpoint(.listTeams)
+		guard url.host == ZagDeveloperServicesProtocol.host else { throw ZagPortalError.network }
+		var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+		req.httpMethod = "POST"
+		req.httpShouldHandleCookies = false
+		for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+		req.setValue("text/x-xml-plist", forHTTPHeaderField: "Content-Type")
+		req.setValue("text/x-xml-plist", forHTTPHeaderField: "Accept")
+		req.httpBody = try ZagDeveloperServicesProtocol.requestBody(teamID: nil)
+		let config = URLSessionConfiguration.ephemeral
+		config.httpCookieStorage = nil; config.httpShouldSetCookies = false
+		config.urlCache = nil; config.urlCredentialStorage = nil; config.waitsForConnectivity = false
+		let delegate = ZagNoRedirect()
+		let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+		defer { session.finishTasksAndInvalidate() }
+		let (data, response) = try await session.data(for: req)
+		guard let http = response as? HTTPURLResponse else { throw ZagPortalError.network }
+		guard data.count <= (1 << 20) else { throw ZagPortalError.malformedResponse }
+		return try ZagDeveloperServicesProtocol.parse(data, httpStatus: http.statusCode)
+	}
+
+	static func describePortalError(_ e: ZagPortalError) -> String {
+		switch e {
+		case .sessionRejected: return "session-rejected"
+		case .network: return "network"
+		case .rateLimited: return "rate-limited"
+		case .malformedResponse: return "malformed-response"
+		case .identifierUnavailable: return "identifier-unavailable"
+		case .deviceLimitReached: return "device-limit"
+		case .appIDLimitReached: return "app-id-limit"
+		case .certificateLimitReached: return "certificate-limit"
+		case .livePortalDisabled: return "portal-disabled"
+		}
+	}
+
 	static func describeDeveloper(_ outcome: ZagDeveloperSessionOutcome) -> String {
 		switch outcome {
 		case .ok: return "developer-session (verified: token + GS header)"
@@ -259,5 +344,15 @@ enum ZagSignInExperimentRunner {
 		FileHandle.standardOutput.write(Data("\n".utf8))
 		let out = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(name)
 		try? data.write(to: out)
+	}
+}
+
+/// Refuses every HTTP redirect: the one team-discovery request may not be
+/// redirected off the pinned developer-services host.
+final class ZagNoRedirect: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+	func urlSession(_ session: URLSession, task: URLSessionTask,
+					willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+					completionHandler: @escaping (URLRequest?) -> Void) {
+		completionHandler(nil)
 	}
 }

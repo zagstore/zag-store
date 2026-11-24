@@ -46,6 +46,13 @@ struct ZagSignInProbeApp: App {
 				// Fresh interactive login, then an IMMEDIATE developer-session from the
 				// just-authenticated in-memory session. No cert/device/App ID/profile/signing.
 				TwoFactorRunView(platform: .macLegacy, scope: zagMacLegacyScope, file: "zag_maclegacy_login_devsession.json", allowNetwork: true, includeDeveloperSession: true)
+			case let env where env["ZAG_RUN_MACLEGACY_TEAMS_SELFCHECK"] == "1":
+				// Offline preflight: team discovery with no network (and/or no token).
+				LiveRunView(task: { await ZagSignInExperimentRunner.runTeamDiscovery(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_teams_selfcheck.json")
+			case let env where env["ZAG_RUN_MACLEGACY_TEAMS"] == "1":
+				// Exactly ONE read-only team-discovery request using the persisted
+				// developer token. No login, no token request, no account mutation.
+				LiveRunView(task: { await ZagSignInExperimentRunner.runTeamDiscovery(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: true) }, file: "zag_maclegacy_teams.json")
 			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION_SELFCHECK"] == "1":
 				// Offline preflight: developer-session path, transport refused.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devsession_selfcheck.json")

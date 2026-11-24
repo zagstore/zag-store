@@ -221,3 +221,65 @@ This confirms the token is accepted by developer services and returns the team
 id needed for every subsequent (mutating, consent-gated) operation. Only after a
 clean team-discovery result would we propose the next step (read-only
 list-devices / list-certificates), still before any mutation.
+
+---
+
+## Live-wiring step (2026-11-24, offline) — bridge + team-discovery gate
+
+Implemented offline, no Apple contact:
+- **Developer token persistence** (`ZagDeveloperTokenStore`): `{account_id,
+  token, expires_at_ms}` stored opaque in the this-device-only Keychain (mac-
+  legacy scope). `exchangeDeveloper` now persists a **verified** token (present +
+  GS header) on success, so a future authorized dev-session run populates it.
+  The token bytes are never logged or returned.
+- **`developer_headers` bridge** (`ZagAppleAuthMachine.developerHeaders()`):
+  LOCAL (no HTTP; a refused transport guarantees it). Loads the persisted token
+  + this scope's ADI and returns the header bag, or nil when no usable token is
+  persisted. Reads only — alters no ADI profile.
+- **Production wiring**: `ZagNativeDeveloperPortal.live(machine:consent:)` feeds
+  the bridge into the portal's `HeadersProvider`.
+- **Gate `ZAG_RUN_MACLEGACY_TEAMS`** (+ `_SELFCHECK`), disabled by default:
+  exactly one read-only team-discovery request via the persisted token, through
+  an ephemeral session pinned to developerservices2.apple.com, redirects
+  refused, no retry, budget 1. In the probe it mirrors
+  `ZagNativeDeveloperPortal.teams()` using the shared pure codec (the probe
+  stubs the production transport). It calls **only** listTeams; the default-deny
+  consent means no mutating action is reachable (regression-tested).
+
+### Is a usable developer token currently persisted? **No.**
+The 13:56 developer token was transient (parsed, verified, reported sanitized,
+discarded). Only the authenticated account **session** is persisted. The safe
+acquisition path (no silent login): a future **authorized** developer-session
+run — the stored-session `ZAG_RUN_MACLEGACY_DEVSESSION` (1 request) or the
+combined `ZAG_RUN_MACLEGACY_LOGIN_DEVSESSION` — now persists the verified token;
+team discovery then uses it in one request. Until then the gate makes **zero**
+requests and reports `no-developer-token-persisted`.
+
+### Offline preflight result (network-refused, on device)
+`{ mode:selfcheck-teams, developer_token_persisted:false,
+outcome:"no-developer-token-persisted", request_count:0, result:ran,
+iphone_baseline 10/consistent, mac_experiment 10/consistent }`. No Apple
+contact; session and all three ADI profiles intact.
+
+### Verification against source (item 7)
+The `apptokens` exchange and `developer_headers` were verified against apple-
+auth source. The QH65B2 endpoint paths, `clientId`/`protocolVersion` and
+`resultCode` values are reverse-engineered from the Xcode/AltStore/SideStore
+flow and are **treated as assumptions** (so marked in code and tests); the plist
+envelope shape and the parser are validated by 39 host tests. Live responses
+will confirm the exact field names.
+
+### Exact request + success criteria (team discovery)
+- `POST https://developerservices2.apple.com/services/QH65B2/viewDeveloper.action?clientId=XABBG36SBA`,
+  `Content-Type`/`Accept: text/x-xml-plist`, body = envelope (clientId,
+  protocolVersion QH65B2, requestId UUID, userLocale), auth = `developer_headers`.
+- Max requests: **1**. Success: HTTP 200, `resultCode 0`, `teams[]` ≥ 1.
+- Reported sanitized: outcome, http_status, result_code, team_count,
+  membership_type, request_count. Never a team id, token, header or body.
+- Account-state change: **none** (read-only).
+
+### One-time launch command (await authorization; do NOT run yet)
+First a token must be persisted (an authorized dev-session run). Then:
+```
+xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_TEAMS":"1"}' dev.zagstore.ptteamprobe
+```

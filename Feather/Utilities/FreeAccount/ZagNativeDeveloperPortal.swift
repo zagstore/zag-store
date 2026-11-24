@@ -81,6 +81,20 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		ZagURLSessionTransport(policy: ZagTransportPolicy(allowedHosts: [ZagDeveloperServicesProtocol.host]))
 	}
 
+	#if canImport(ZagAppleAuth)
+	/// Production construction: headers come from the machine's LOCAL
+	/// `developer_headers` bridge (persisted token + this scope's ADI, no
+	/// network), over the pinned transport. Mutations stay default-denied unless
+	/// a real consent gate is supplied at the live step.
+	static func live(machine: ZagAppleAuthMachine,
+					 consent: ZagAccountMutationConsent = ZagDenyingMutationConsent(),
+					 maxRequests: Int = 16) -> ZagNativeDeveloperPortal {
+		ZagNativeDeveloperPortal(transport: transport(),
+								 headers: { await machine.developerHeaders() ?? [:] },
+								 consent: consent, maxRequests: maxRequests)
+	}
+	#endif
+
 	// MARK: - Core request
 
 	private func send(_ action: ZagDeveloperServicesAction, teamID: String?, parameters: [String: Any] = [:]) async throws -> [String: Any] {
