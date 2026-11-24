@@ -983,3 +983,72 @@ dev-services 150/150.
 - **End-to-end signing is NOT yet proven** — no complete IPA has been signed; that happens when you run the harness on the device. This pass delivered the harness, not a signed artifact.
 - Steps 2–5 require your on-device action (export, build, transfer, run); I cannot drive the device from the CLI.
 - The device-membership preflight check is self-consistent on-device (the provisioning UDID is not readable via a public iOS API; the profile lists one device and the OS installed the app under it).
+
+---
+
+## Native standalone provisioning — 7460 root cause + certificate-conflict recovery (2026-11-24)
+
+Returns the primary objective to fully standalone on-device provisioning (no
+Mac, no .p12, no imported identity). The imported-identity code is preserved,
+not extended. All offline; no Apple requests, no CSR, no revocation.
+
+### Phase 1 — 7460 root cause (verified vs hypothesis)
+**What produced it (verified, from the code + the live account's public data):**
+- Endpoint `POST https://developerservices2.apple.com/services/QH65B2/ios/submitDevelopmentCSR.action?clientId=XABBG36SBA`. Certificate type = development, implicit in the action (no explicit `certificateType` parameter). Body params: `csrContent` (PEM of our PKCS#10 — CN + RSA-2048 public key, SHA-256 self-signed), `machineName="Zag Store"`, `machineId` = a fresh random UUID per call. CSR built by `ZagCertificateSigningRequest.make`.
+- Response: **HTTP 200, resultCode 7460** — a well-formed request that reached issuance and was refused at the application level (not transport, not malformed, not HTTP 429).
+- The team already holds **three valid development certificates**, all for the same account/team (`…(R3DNK3YV9S)` / `V54K5JYGS4`): two legacy **"iPhone Developer"** (expire 2027-09-06 and 2027-09-12) and one modern **"Apple Development"** (2027-09-27, the active Xcode cert). Same issuance category (iOS development signing), different naming eras.
+- **None of the three matches our device-generated non-extractable key.**
+- Apple exposes **no read-only API for PENDING certificate requests**: `listAllDevelopmentCerts` and `/services/v1/certificates` list ISSUED certificates only. The pending arm of 7460 is therefore not directly observable — only inferable from our own journal, or ruled out when a later-listed certificate matches our key.
+
+**Conclusion:** 7460 here is the **"existing certificate"** arm — the free Personal Team already has current development certificates and Apple will not issue another for our new key. This is an account/team-wide state, not a payload defect; the random `machineId` does not avoid it.
+
+**Hypotheses (explicitly NOT asserted as fact):**
+- A specific numeric certificate cap. Three valid certs are present and a new CSR is refused; whether the limit is 2, 3 or a per-machine "one current" rule is **unproven**. No cap is assumed anywhere in the code.
+- Whether the random `machineId` (AltStore/SideStore persist a stable one) contributes. Established tools persist a machine id; ours is per-call. Not shown to be causal.
+- Which arm (existing vs pending) in the general case — Apple conflates them; we disambiguate from the readable issued-cert listing.
+
+**Is our CSR request protocol-correct?** Structurally yes — it matches the AltSign/SideStore `submitDevelopmentCSR` shape. Two deviations are noted as follow-ups, neither proven to cause 7460: the per-call random `machineId`, and reliance on the action's implicit certificate type.
+
+**How established tools handle it without a Mac/export:** AltStore / SideStore / Xcode free provisioning generate the key on-device and, when the free team is at its development-certificate allotment, **revoke an existing free-team development certificate to make room**, then submit the new CSR. They never import a desktop identity. The revoke-to-replace behaviour is community-documented for free-team signing (not Apple-documented).
+
+### Phase 2/3 — the legitimate native recovery path
+The recovery architecture already present is reused, not duplicated:
+`ZagExistingAccountPreflight` (read-only reuse/needs-new/blocked inventory),
+`ZagCertificateRecoveryModel` + the provisioner's recovery service (Check Again /
+Abandon for an unconfirmed request), `ZagActiveCertificateGuard` (protects the
+active Xcode cert) and `ZagCertificateRevocation` (consent-gated, explicit `id`,
+never auto). The missing authoritative piece — now added — is:
+
+**`ZagCertificateConflictResolution`** (pure, no I/O, no revoke): given the 7460
+conflict plus the readable issued-certificate listing, the serials this device
+holds a matching key for, and the active-cert guard, it decides:
+- `recoverExisting(serial)` — a listed valid cert matches a key we hold → reuse; nothing requested or revoked.
+- `resolvePendingRequest` — no existing valid dev cert listed → the pending arm → Check Again / Abandon (never a blind resubmit).
+- `replacementRequired(candidates)` — existing valid certs, none reusable → the user must EXPLICITLY choose one to replace; candidates **exclude the active Xcode certificate**; nothing is revoked until the user decides.
+- `onlyActiveCertificatePresent` — the sole valid cert is the protected active one → a separate authorization is required.
+- `listingUnavailable` — unreadable listing decides nothing (never treated as empty).
+
+For the current test account this resolves to **`onlyActiveCertificatePresent`
+or `replacementRequired`** depending on how many of the three the listing marks
+revocable — and because the active cert is protected and no other cert is held,
+**no automatic path exists; replacement needs the owner's explicit, informed
+consent**, which is exactly the intended behaviour.
+
+### Phase 4 — remaining native pipeline gaps
+From a device-generated development certificate to an installed IPA, reusing the
+completed components (`ZagCMSVerifier`, entitlement validation, preflight, Zsign
+`signComponents`):
+1. **Certificate (the blocker):** resolved in design by the above; obtaining a device-key certificate still requires either a genuine free slot or an owner-consented replacement. **No signable device-key certificate exists yet** for this account.
+2. Device registration / App ID: native portal has `addDevice` / `addAppID` (consent-gated); not exercised live.
+3. Profile: `downloadTeamProvisioningProfile` (creates/renews — a mutation) → `ZagCMSVerifier` verifies it. Ready.
+4. Sign / verify IPA on-device: `ZagSigningPreflight` + `Zsign.signComponents` + independent verify — implemented (the imported-identity harness exercises the same path).
+5. Install / launch: RPPairing installer — out of scope (no install authorized).
+
+### Phase 5 — offline milestone delivered
+`ZagCertificateConflictResolution` + 11 focused tests (both 7460 arms, reuse
+priority, active-cert exclusion, replacement candidate ordering, autonomous-vs-
+consent). dev-services suite otherwise unchanged (the lone intermittent
+"coarse days" check is a day-boundary flake, passes on rerun). CMS 11/11,
+imported-identity suite green. Full arm64 iOS build/link; subsystem typecheck
+clean. The non-extractable device key architecture is untouched; the imported
+path is preserved and not used as a fallback.

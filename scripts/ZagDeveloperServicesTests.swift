@@ -306,5 +306,43 @@ check(Rec.verdict(for: .existingCertificateOrPendingRequest) != Rec.verdict(for:
 check(Rec.verdict(for: .certificateLimitReached) == .authoritativeRejection && Rec.verdict(for: .existingCertificateOrPendingRequest) == .confirmedConflict, "cap vs conflict are different verdicts")
 check(Rec.decide(match: .notFound, submit: .confirmedConflict) != Rec.decide(match: .notFound, submit: .authoritativeRejection), "conflict (preserve) differs from authoritative cap (retryable)")
 
+// --- Native 7460 conflict resolution (distinguishing the two arms + safe replace) ---
+typealias CR = ZagCertificateConflictResolution
+let crSoon = Date().addingTimeInterval(300 * 86_400)
+let crPast = Date().addingTimeInterval(-86_400)
+func crCert(_ id: String, _ serial: String, sha1: String? = nil, expires: Date? = crSoon) -> ZagRevocableCertificate {
+	ZagRevocableCertificate(id: id, serialNumber: serial, sha1: sha1, name: "Development", machineName: nil, expiresAt: expires)
+}
+// Listing unavailable -> decides nothing.
+check(CR.resolve(certificates: nil, locallyHeldSerials: [], activeGuard: guardz, now: Date()) == .listingUnavailable,
+	  "conflict: nil listing -> listingUnavailable (never empty)")
+// No existing valid dev cert -> the pending-request arm (Check Again / Abandon).
+check(CR.resolve(certificates: [], locallyHeldSerials: [], activeGuard: guardz, now: Date()) == .resolvePendingRequest,
+	  "conflict: empty listing -> resolvePendingRequest")
+check(CR.resolve(certificates: [crCert("v1-x", "EXPIRED", expires: crPast)], locallyHeldSerials: [], activeGuard: guardz, now: Date()) == .resolvePendingRequest,
+	  "conflict: only expired certs -> resolvePendingRequest")
+// A listed valid cert we hold the key for -> reuse, no request/revoke.
+check(CR.resolve(certificates: [crCert("v1-a", "HELD")], locallyHeldSerials: ["HELD"], activeGuard: guardz, now: Date()) == .recoverExisting(serial: "HELD"),
+	  "conflict: locally-held valid cert -> recoverExisting")
+// Existing valid foreign certs, none held -> replacement candidates (soonest first).
+let foreignA = crCert("v1-a", "FA", expires: Date().addingTimeInterval(100 * 86_400))
+let foreignB = crCert("v1-b", "FB", expires: Date().addingTimeInterval(50 * 86_400))
+if case .replacementRequired(let cands) = CR.resolve(certificates: [foreignA, foreignB], locallyHeldSerials: [], activeGuard: guardz, now: Date()) {
+	check(cands.map(\.serialNumber) == ["FB", "FA"], "conflict: replacement candidates sorted soonest-expiring first")
+} else { check(false, "conflict: foreign valid certs -> replacementRequired") }
+// The active Xcode cert is NEVER a replacement candidate.
+let activeValid = ZagRevocableCertificate(id: "v1-active", serialNumber: "723BE3EC", sha1: "5657782a6eadfff608040d39186e6533557349fc", name: "Apple Development", machineName: nil, expiresAt: crSoon)
+check(CR.resolve(certificates: [activeValid], locallyHeldSerials: [], activeGuard: guardz, now: Date()) == .onlyActiveCertificatePresent,
+	  "conflict: only the active Xcode cert -> onlyActiveCertificatePresent (protected)")
+if case .replacementRequired(let cands) = CR.resolve(certificates: [activeValid, foreignA], locallyHeldSerials: [], activeGuard: guardz, now: Date()) {
+	check(cands.map(\.serialNumber) == ["FA"], "conflict: active cert excluded, foreign offered")
+} else { check(false, "conflict: active + foreign -> replacementRequired without the active one") }
+// Reuse takes priority even when foreign certs are present.
+check(CR.resolve(certificates: [foreignA, crCert("v1-h", "HELD")], locallyHeldSerials: ["HELD"], activeGuard: guardz, now: Date()) == .recoverExisting(serial: "HELD"),
+	  "conflict: reuse wins over replacement when a held cert is valid")
+// Only reuse / pending are autonomously recoverable.
+check(CR.isAutonomouslyRecoverable(.recoverExisting(serial: "X")) && CR.isAutonomouslyRecoverable(.resolvePendingRequest), "conflict: reuse+pending are autonomous")
+check(!CR.isAutonomouslyRecoverable(.replacementRequired(candidates: [])) && !CR.isAutonomouslyRecoverable(.onlyActiveCertificatePresent), "conflict: replacement needs explicit consent")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)
