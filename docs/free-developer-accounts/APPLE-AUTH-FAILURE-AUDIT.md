@@ -186,3 +186,34 @@ one run, because the combined flow is the single experiment that isolates F1
 (fresh-session apptokens) and re-tests F2 together, at minimum request cost.
 **No live request is justified while the web sign-in is failing or shows a
 security hold.**
+
+---
+
+## RESOLUTION (2026-11-24 13:56) — fresh-session developer-session SUCCEEDED
+
+`ZAG_RUN_MACLEGACY_LOGIN_DEVSESSION` (combined fresh-login → developer-session):
+
+```json
+{ "outcome":"authenticated", "two_factor_completed":true, "session_stored":true,
+  "accepted_by_class":{"authentication":4},
+  "http_trace":[lookup 200, srp-init 200, srp-complete 200, apptokens 200],
+  "developer_outcome":"developer-session (verified: token + GS header)",
+  "developer_token_present":true, "developer_has_gs_token_header":true,
+  "developer_expires_in_days":364, "all three profiles":"10/consistent" }
+```
+
+Decision-tree outcome = **success branch**:
+- **F1 (-22411) was session staleness.** A developer-session exchanged from the
+  FRESH in-memory session (the apptokens POST, the 4th authentication-class
+  request) is accepted and returns a verified token valid ~364 days. The
+  option-B fix is confirmed live.
+- **F2 (-22406 at 13:35) was transient.** The same credential authenticated
+  cleanly here via a trusted 3-request login (no 2FA prompt), so the account and
+  password are healthy — consistent with a momentary throttle at 13:35, not a
+  code fault and not a changed password.
+
+Milestone: on a stock iPhone with a free Apple account — no Mac, companion,
+external anisette server, or Android ADI — we now have standalone GrandSlam
+authentication (with 2FA when required) AND a verified Xcode developer-services
+token. Next stage (cert / device / App ID / profile / signing) is NOT started;
+it awaits separate authorization and will be designed offline first.
