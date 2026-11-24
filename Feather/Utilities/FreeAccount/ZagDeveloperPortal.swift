@@ -86,19 +86,8 @@ extension ZagIssuedProfile {
 	}
 }
 
-enum ZagPortalError: Error, Equatable, Sendable {
-	/// Apple no longer accepts the session; the user must sign in again.
-	case sessionRejected
-	case network
-	case rateLimited
-	case malformedResponse
-	/// Another team owns this identifier.
-	case identifierUnavailable(String)
-	case deviceLimitReached
-	case appIDLimitReached
-	case certificateLimitReached
-	case livePortalDisabled
-}
+// ZagPortalError now lives in ZagPortalError.swift (so the pure developer-
+// services codec can be compiled and host-tested without the model graph).
 
 /// The portal operations, for one signed-in team.
 protocol ZagDeveloperPortalService: Sendable {
