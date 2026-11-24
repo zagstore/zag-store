@@ -20,7 +20,9 @@ enum ZagSignInExperimentRunner {
 	}
 
 	/// Provision a fresh identity (an authorised live step). Reports only
-	/// counts and the offline consistency check — no anisette values.
+	/// sanitized stats — request count, per-request HTTP statuses, outcome,
+	/// consistency, offline re-derivation and the untouched iPhone baseline —
+	/// never an anisette value, credential or session.
 	static func provision(platform: ZagAppleAuthPlatform, scope: String) async -> [String: Any] {
 		var report: [String: Any] = ["mode": "provision", "platform": platform.rawValue, "scope": scope]
 		let m = machine(platform: platform, scope: scope)
@@ -32,6 +34,28 @@ enum ZagSignInExperimentRunner {
 		} catch {
 			report["result"] = "provision-failed"
 		}
+		report["request_count"] = await m.lastRequestCount
+		report["http_statuses"] = await m.lastHTTPStatuses
+		report["reached_apple"] = await m.lastReachedApple
+
+		// Offline re-derivation: can the stored Mac profile make fresh headers
+		// with the transport refused (no Apple contact)?
+		if (report["result"] as? String) == "provisioned" {
+			do {
+				let off = try await m.anisetteHeaders(allowProvisioning: false)
+				report["offline_header_count"] = off.count
+				report["offline_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(off, platform: platform)
+			} catch { report["offline_headers"] = "unavailable" }
+		}
+
+		// Condition 8: the original iPhone-labelled profile is unchanged — it
+		// still derives its headers offline from the untouched `device` scope.
+		let baseline = ZagAppleAuthMachine(scope: "device", platform: .iphone)
+		do {
+			let h = try await baseline.anisetteHeaders(allowProvisioning: false)
+			report["iphone_baseline_header_count"] = h.count
+			report["iphone_baseline_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(h, platform: .iphone)
+		} catch { report["iphone_baseline"] = "error" }
 		return report
 	}
 

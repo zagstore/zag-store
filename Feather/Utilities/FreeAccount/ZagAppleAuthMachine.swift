@@ -191,6 +191,21 @@ actor ZagAppleAuthMachine {
 	private let store: ZagAppleAuthMachineStore
 	private let now: @Sendable () -> Date
 
+	/// Sanitized stats from the most recent `anisetteHeaders` call — request
+	/// count, whether Apple was reached, and per-request HTTP status codes
+	/// (method/host/status only; never content). For the provisioning report.
+	private(set) var lastRequestCount = 0
+	private(set) var lastReachedApple = false
+	private(set) var lastHTTPStatuses: [Int] = []
+
+	/// Parses the transport's sanitized log ("POST host -> 200") into statuses.
+	static func httpStatuses(_ log: [String]) -> [Int] {
+		log.compactMap { line in
+			guard let r = line.range(of: "-> [0-9]{3}$", options: .regularExpression) else { return nil }
+			return Int(line[r].dropFirst(3))
+		}
+	}
+
 	init(scope: String = "device", platform: ZagAppleAuthPlatform = .iphone,
 		 store: ZagAppleAuthMachineStore = ZagAppleAuthMachineStore(), now: @escaping @Sendable () -> Date = { Date() }) {
 		self.scope = scope
@@ -227,6 +242,9 @@ actor ZagAppleAuthMachine {
 				continuation.resume(returning: Self.drive(persisted: persisted, transport: transport, platform: platform))
 			}
 		}
+		lastRequestCount = transport.requestCount
+		lastReachedApple = transport.reachedApple
+		lastHTTPStatuses = Self.httpStatuses(transport.log)
 		let (headers, snapshot) = try result.get()
 		try store.save(snapshot, scope: scope)
 		return Self.anisetteSubset(headers)
