@@ -39,6 +39,13 @@ struct ZagSignInProbeApp: App {
 				// Hard ceiling of 3 GrandSlam requests (lookup/init/complete): no
 				// 4th (2FA-delivery) request can fire.
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .macLegacy, scope: zagMacLegacyScope, maxRequests: 3) }, file: "zag_maclegacy_signin.json")
+			case let env where env["ZAG_RUN_MACLEGACY_LOGIN_DEVSESSION_SELFCHECK"] == "1":
+				// Offline preflight: fresh-login + developer-session, transport refused.
+				TwoFactorRunView(platform: .macLegacy, scope: zagMacLegacyScope, file: "zag_maclegacy_login_devsession_selfcheck.json", allowNetwork: false, includeDeveloperSession: true)
+			case let env where env["ZAG_RUN_MACLEGACY_LOGIN_DEVSESSION"] == "1":
+				// Fresh interactive login, then an IMMEDIATE developer-session from the
+				// just-authenticated in-memory session. No cert/device/App ID/profile/signing.
+				TwoFactorRunView(platform: .macLegacy, scope: zagMacLegacyScope, file: "zag_maclegacy_login_devsession.json", allowNetwork: true, includeDeveloperSession: true)
 			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION_SELFCHECK"] == "1":
 				// Offline preflight: developer-session path, transport refused.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devsession_selfcheck.json")
@@ -87,6 +94,7 @@ struct TwoFactorRunView: View {
 	let scope: String
 	let file: String
 	var allowNetwork: Bool = true
+	var includeDeveloperSession: Bool = false
 	@StateObject private var coordinator = ZagTwoFactorCoordinator()
 	@State private var status = "Starting one supervised 2FA attempt…"
 	@State private var code = ""
@@ -131,7 +139,7 @@ struct TwoFactorRunView: View {
 		}
 		.padding()
 		.task {
-			let report = await ZagSignInExperimentRunner.runTwoFactor(platform: platform, scope: scope, coordinator: coordinator, allowNetwork: allowNetwork)
+			let report = await ZagSignInExperimentRunner.runTwoFactor(platform: platform, scope: scope, coordinator: coordinator, allowNetwork: allowNetwork, includeDeveloperSession: includeDeveloperSession)
 			ZagSignInExperimentRunner.emit(report, name: file)
 			status = "Done: \(report["outcome"] ?? report["result"] ?? "—")"
 		}

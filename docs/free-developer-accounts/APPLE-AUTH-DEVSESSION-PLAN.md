@@ -156,3 +156,41 @@ request sent) but Apple declined the aged session. Next-experiment options (each
 needs authorization): (A) one re-run to read the exact `em`; (B) a combined
 fresh-login → immediate developer-session (reuse the just-authenticated
 in-memory session instead of the stored one).
+
+---
+
+## ec -22411 em + fresh-session fix (2026-11-24)
+
+Re-run with `em` capture: `ec -22411` = **"This action cannot be completed at
+this time"** — a generic GrandSlam condition, identical on two attempts 5 min
+apart (consistent, not transient). The request is well-formed (reached Apple,
+HTTP 200); Apple declines the exchange for the aged, reused stored session (the
+single-use `c` challenge / `GsIdmsToken` has a short validity).
+
+**Fix (option B, implemented offline): fresh-login → immediate developer-session.**
+`signInWith2FA(..., includeDeveloperSession: true)` exchanges the token from the
+just-authenticated in-memory session (fresh `c`/`GsIdmsToken`) rather than the
+stored one — the AltStore/SideStore pattern. The apptokens POST is an
+authentication-class request, so the auth ceiling is raised by one (6) for this
+flow; everything else (consent/code/cancel gates, 2FA machinery, sanitized
+reporting) is unchanged. `exchangeDeveloper` is shared by the stored-session and
+fresh-login paths. Gates: `ZAG_RUN_MACLEGACY_LOGIN_DEVSESSION` (+ `_SELFCHECK`).
+
+Validated offline: host tests pass, arm64 iOS links, on-device preflight
+(network refused) `transport-failed`/`request_count 0`, all three ADI profiles
+intact.
+
+### Proposed experiment (awaiting authorization)
+One supervised run: fresh interactive login (trusted → ~3 requests, no 2FA; or
+the full 2FA flow if trust lapsed), then one immediate apptokens exchange from
+the fresh session. No cert/device/App ID/profile/signing. Launch (with `!`):
+
+```
+xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_LOGIN_DEVSESSION":"1"}' dev.zagstore.ptteamprobe
+```
+
+Expected on success: `outcome authenticated`, `developer_outcome
+"developer-session (verified: token + GS header)"`, `developer_token_present
+true`, `developer_has_gs_token_header true`, profiles intact. If `-22411`
+persists even from a fresh session, that points to an account-level condition
+(e.g. developer terms) rather than staleness — investigated next.

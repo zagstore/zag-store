@@ -137,8 +137,9 @@ enum ZagSignInExperimentRunner {
 	/// the coordinator's consent/phone/code gates and securely retains the session
 	/// on success. Reports only sanitized outcomes — never a code, token or
 	/// session. Preserves all three ADI profiles (read-only).
-	static func runTwoFactor(platform: ZagAppleAuthPlatform, scope: String, coordinator: ZagTwoFactorCoordinator, allowNetwork: Bool = true) async -> [String: Any] {
-		var report: [String: Any] = ["mode": allowNetwork ? "live-2fa" : "selfcheck-2fa", "platform": platform.rawValue, "scope": scope]
+	static func runTwoFactor(platform: ZagAppleAuthPlatform, scope: String, coordinator: ZagTwoFactorCoordinator, allowNetwork: Bool = true, includeDeveloperSession: Bool = false) async -> [String: Any] {
+		let label = includeDeveloperSession ? "login-devsession" : "2fa"
+		var report: [String: Any] = ["mode": (allowNetwork ? "live-" : "selfcheck-") + label, "platform": platform.rawValue, "scope": scope]
 		let m = machine(platform: platform, scope: scope)
 
 		let provider = ZagOnDeviceAnisetteProvider(machine: m, allowProvisioning: false)
@@ -154,8 +155,12 @@ enum ZagSignInExperimentRunner {
 		report["credential"] = "present"
 
 		do {
-			let signIn = try await m.signInWith2FA(email: credential.email, password: credential.password, coordinator: coordinator, allowNetwork: allowNetwork)
+			let signIn = try await m.signInWith2FA(email: credential.email, password: credential.password, coordinator: coordinator, allowNetwork: allowNetwork, includeDeveloperSession: includeDeveloperSession)
 			report["outcome"] = describe(signIn.outcome)
+			if let dOut = signIn.developerOutcome { report["developer_outcome"] = describeDeveloper(dOut) }
+			if let t = signIn.developerTokenPresent { report["developer_token_present"] = t }
+			if let g = signIn.developerHasGSTokenHeader { report["developer_has_gs_token_header"] = g }
+			if let d = signIn.developerExpiresInDays { report["developer_expires_in_days"] = d }
 			if let stage = signIn.stage { report["stage"] = stage }
 			report["request_count"] = signIn.requestCount
 			if let ec = signIn.ec { report["ec"] = ec }

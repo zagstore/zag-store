@@ -585,10 +585,13 @@ actor ZagAppleAuthMachine {
 	/// retained only when the login positively returns AAUTH_OK with valid
 	/// session material. Requires an authorised live run.
 	#if canImport(SwiftUI)
-	func signInWith2FA(email: String, password: String, coordinator: ZagTwoFactorCoordinator, allowNetwork: Bool = true) async throws -> ZagAppleAuthSignInReport {
+	func signInWith2FA(email: String, password: String, coordinator: ZagTwoFactorCoordinator, allowNetwork: Bool = true, includeDeveloperSession: Bool = false) async throws -> ZagAppleAuthSignInReport {
 		#if canImport(ZagAppleAuth)
 		guard let persisted = try store.load(scope: scope) else { return ZagAppleAuthSignInReport(outcome: .notProvisioned) }
-		let policy = ZagTwoFactorPolicy()   // authentication 5, verification-initiation 2, code-submission 1
+		var policy = ZagTwoFactorPolicy()   // authentication 5, verification-initiation 2, code-submission 1
+		// One extra authentication-class request (the apptokens POST GsService2)
+		// when the developer session is exchanged from the fresh session.
+		if includeDeveloperSession { policy.authenticationCeiling += 1 }
 		let overall = policy.authenticationCeiling + policy.verificationInitiationCeiling + policy.codeSubmissionCeiling
 		// allowNetwork false = offline preflight: the transport refuses every
 		// request, so no Apple contact and no consent/code gate is ever reached.
@@ -602,7 +605,8 @@ actor ZagAppleAuthMachine {
 			DispatchQueue.global(qos: .userInitiated).async {
 				continuation.resume(returning: Self.driveSignInWith2FA(persisted: persisted, transport: transport,
 																	   email: email, password: password,
-																	   platform: platform, scope: scope, coordinator: coordinator))
+																	   platform: platform, scope: scope, coordinator: coordinator,
+																	   includeDeveloperSession: includeDeveloperSession))
 			}
 		}
 		#else
@@ -658,54 +662,58 @@ actor ZagAppleAuthMachine {
 			}
 			guard fr == AAUTH_OK, let account else { return .success(ZagDeveloperSessionReport(outcome: .failed)) }
 			defer { aauth_account_session_free(account) }
-			var out = aauth_client_buffer()
-			let rc = aauth_client_developer_session(client, account, &out)
-			defer { aauth_client_buffer_free(&out) }
-			guard rc == AAUTH_OK, let data = out.data, out.size > 0 else {
-				let error = String(cString: aauth_client_last_error())
-				let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error), message = grandSlamMessage(error)
-				let outcome: ZagDeveloperSessionOutcome = transport.reachedApple ? .failed : .transportFailed
-				return .success(ZagDeveloperSessionReport(outcome: outcome, requestCount: transport.requestCount, ec: ec, httpStatus: http,
-														  appleMessage: message,
-														  httpTrace: Self.httpTrace(transport.httpTrace, stageFor: { _ in "apptokens" })))
-			}
-			// Parse {account_id, token, expires_at_ms}. These never leave this scope.
-			let json = (try? JSONSerialization.jsonObject(with: Data(bytes: data, count: out.size))) as? [String: Any]
-			let accountId = json?["account_id"] as? String ?? ""
-			let token = json?["token"] as? String ?? ""
-			let expiry = (json?["expires_at_ms"] as? NSNumber)?.int64Value ?? 0
-			let tokenPresent = !token.isEmpty && !accountId.isEmpty
-			let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-			let expiryValid = expiry == 0 || expiry > nowMs
-			let expiresInDays = expiry > nowMs ? Int((expiry - nowMs) / 86_400_000) : nil
-			// Verify developer_headers derives and carries X-Apple-GS-Token (never its value).
-			var headerCount: Int? = nil
-			var hasGSToken = false
-			if tokenPresent {
-				var hdr = aauth_client_buffer()
-				let hr = accountId.withCString { a in token.withCString { t in
-					aauth_client_developer_headers(client, a, t, expiry, &hdr)
-				} }
-				if hr == AAUTH_OK, let hd = hdr.data, hdr.size > 0,
-				   let obj = (try? JSONSerialization.jsonObject(with: Data(bytes: hd, count: hdr.size))) as? [String: Any] {
-					headerCount = obj.count
-					hasGSToken = obj.keys.contains { $0.lowercased() == "x-apple-gs-token" }
-				}
-				aauth_client_buffer_free(&hdr)
-			}
-			let outcome = Self.developerSessionOutcome(ok: true, tokenPresent: tokenPresent, expiryValid: expiryValid, headerHasToken: hasGSToken)
-			return .success(ZagDeveloperSessionReport(outcome: outcome, requestCount: transport.requestCount,
-													  tokenPresent: tokenPresent, expiresInDays: expiresInDays,
-													  headerCount: headerCount, hasGSTokenHeader: hasGSToken,
-													  httpTrace: Self.httpTrace(transport.httpTrace, stageFor: { _ in "apptokens" })))
+			return .success(Self.exchangeDeveloper(client: client, account: account, transport: transport, stageFor: { _ in "apptokens" }))
 		}
 		if case .success(let r) = result { return r }
 		return ZagDeveloperSessionReport(outcome: .transportFailed, requestCount: transport.requestCount)
 	}
+
+	/// Exchanges an authenticated account session (live or reconstructed) for a
+	/// developer token on `client`, and verifies the derived headers. Shared by
+	/// the stored-session and the fresh-login paths. The token/account id are used
+	/// only transiently; never logged or returned.
+	static func exchangeDeveloper(client: OpaquePointer, account: OpaquePointer, transport: ZagAppleAuthTransport,
+								  stageFor: @escaping (Int) -> String) -> ZagDeveloperSessionReport {
+		var out = aauth_client_buffer()
+		let rc = aauth_client_developer_session(client, account, &out)
+		defer { aauth_client_buffer_free(&out) }
+		guard rc == AAUTH_OK, let data = out.data, out.size > 0 else {
+			let error = String(cString: aauth_client_last_error())
+			return ZagDeveloperSessionReport(outcome: transport.reachedApple ? .failed : .transportFailed,
+											 requestCount: transport.requestCount, ec: grandSlamCode(error),
+											 httpStatus: grandSlamHTTPStatus(error), appleMessage: grandSlamMessage(error),
+											 httpTrace: Self.httpTrace(transport.httpTrace, stageFor: stageFor))
+		}
+		let json = (try? JSONSerialization.jsonObject(with: Data(bytes: data, count: out.size))) as? [String: Any]
+		let accountId = json?["account_id"] as? String ?? ""
+		let token = json?["token"] as? String ?? ""
+		let expiry = (json?["expires_at_ms"] as? NSNumber)?.int64Value ?? 0
+		let tokenPresent = !token.isEmpty && !accountId.isEmpty
+		let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+		let expiryValid = expiry == 0 || expiry > nowMs
+		let expiresInDays = expiry > nowMs ? Int((expiry - nowMs) / 86_400_000) : nil
+		// Verify developer_headers derives and carries X-Apple-GS-Token (never its value).
+		var headerCount: Int? = nil
+		var hasGSToken = false
+		if tokenPresent {
+			var hdr = aauth_client_buffer()
+			let hr = accountId.withCString { a in token.withCString { t in aauth_client_developer_headers(client, a, t, expiry, &hdr) } }
+			if hr == AAUTH_OK, let hd = hdr.data, hdr.size > 0,
+			   let obj = (try? JSONSerialization.jsonObject(with: Data(bytes: hd, count: hdr.size))) as? [String: Any] {
+				headerCount = obj.count
+				hasGSToken = obj.keys.contains { $0.lowercased() == "x-apple-gs-token" }
+			}
+			aauth_client_buffer_free(&hdr)
+		}
+		return ZagDeveloperSessionReport(outcome: Self.developerSessionOutcome(ok: true, tokenPresent: tokenPresent, expiryValid: expiryValid, headerHasToken: hasGSToken),
+										 requestCount: transport.requestCount, tokenPresent: tokenPresent,
+										 expiresInDays: expiresInDays, headerCount: headerCount, hasGSTokenHeader: hasGSToken,
+										 httpTrace: Self.httpTrace(transport.httpTrace, stageFor: stageFor))
+	}
 	#endif
 
 	#if canImport(ZagAppleAuth)
-	private struct RawSignIn { var outcome: ZagAppleAuthSignInOutcome; var ec: Int?; var http: Int?; var message: String?; var sessionStored = false }
+	private struct RawSignIn { var outcome: ZagAppleAuthSignInOutcome; var ec: Int?; var http: Int?; var message: String?; var sessionStored = false; var dev: ZagDeveloperSessionReport? = nil }
 
 	private static func driveSignIn(persisted: Data, transport: ZagAppleAuthTransport,
 									email: String, password: String, sentinel: ZagTwoFactorSentinel,
@@ -754,7 +762,8 @@ actor ZagAppleAuthMachine {
 	/// success. The code and session material never appear in the return value.
 	private static func driveSignInWith2FA(persisted: Data, transport: ZagAppleAuthTransport,
 										   email: String, password: String, platform: ZagAppleAuthPlatform,
-										   scope: String, coordinator: ZagTwoFactorCoordinator) -> ZagAppleAuthSignInReport {
+										   scope: String, coordinator: ZagTwoFactorCoordinator,
+										   includeDeveloperSession: Bool = false) -> ZagAppleAuthSignInReport {
 		coordinator.begin()
 		let result: Result<RawSignIn, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport, platform: platform) { client in
 			let p = aauth_client_provision(client)
@@ -772,6 +781,7 @@ actor ZagAppleAuthMachine {
 				withUnsafePointer(to: &verification) { v in aauth_client_login(client, e, pw, v, &session) }
 			} }
 			var sessionStored = false
+			var dev: ZagDeveloperSessionReport? = nil
 			// Persist ONLY on a positive AAUTH_OK with valid (non-empty) session
 			// material. The bytes are opaque and never logged.
 			if rc == AAUTH_OK, let session {
@@ -781,9 +791,14 @@ actor ZagAppleAuthMachine {
 					if (try? ZagAppleAuthSessionStore().save(bytes, scope: scope)) != nil { sessionStored = true }
 				}
 				aauth_client_buffer_free(&buf)
+				// Developer-session from the FRESH in-memory session (not the stored,
+				// possibly-aged one), immediately after authentication.
+				if includeDeveloperSession {
+					dev = Self.exchangeDeveloper(client: client, account: session, transport: transport, stageFor: Self.signInStage)
+				}
 			}
 			if let session { aauth_account_session_free(session) }
-			if rc == AAUTH_OK { return .success(RawSignIn(outcome: .authenticated, sessionStored: sessionStored)) }
+			if rc == AAUTH_OK { return .success(RawSignIn(outcome: .authenticated, sessionStored: sessionStored, dev: dev)) }
 			let error = String(cString: aauth_client_last_error())
 			let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error), message = grandSlamMessage(error)
 			let isNetworkError = rc.rawValue == AAUTH_NETWORK_ERROR.rawValue
@@ -804,7 +819,11 @@ actor ZagAppleAuthMachine {
 										twoFactorCompleted: raw.outcome == .authenticated,
 										sessionStored: raw.sessionStored,
 										acceptedByClass: transport.acceptedByClass,
-										refusals: transport.refusalList)
+										refusals: transport.refusalList,
+										developerOutcome: raw.dev?.outcome,
+										developerTokenPresent: raw.dev?.tokenPresent,
+										developerHasGSTokenHeader: raw.dev?.hasGSTokenHeader,
+										developerExpiresInDays: raw.dev?.expiresInDays)
 	}
 	#endif
 	#endif
@@ -895,6 +914,12 @@ struct ZagAppleAuthSignInReport: Equatable, Sendable {
 	/// Why any request was refused (class + reason), locating where a bounded
 	/// sequence stopped. No request content.
 	var refusals: [[String: String]]? = nil
+	/// When a developer-session was exchanged from the fresh in-memory session in
+	/// the same run, its sanitized outcome (never the token).
+	var developerOutcome: ZagDeveloperSessionOutcome? = nil
+	var developerTokenPresent: Bool? = nil
+	var developerHasGSTokenHeader: Bool? = nil
+	var developerExpiresInDays: Int? = nil
 }
 
 #if canImport(ZagAppleAuth)
