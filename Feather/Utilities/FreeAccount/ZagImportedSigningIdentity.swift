@@ -163,4 +163,23 @@ enum ZagImportedSigningIdentity {
 	static func delete(label: String) {
 		SecItemDelete([kSecClass: kSecClassIdentity, kSecAttrLabel: labelPrefix + label] as CFDictionary)
 	}
+
+	// MARK: Explicit resolution for the signing pipeline (no silent fallback)
+
+	/// Resolves a stored imported identity to the Zsign signer + its certificate
+	/// DER, after re-validating it. Returns a typed failure if the identity is
+	/// missing or no longer valid — it NEVER falls back to a device-generated
+	/// key; the caller chose `ZagSigningSource.imported` explicitly.
+	static func resolve(label: String, now: Date = Date(), expectedTeam: String? = nil)
+		-> Result<(signer: (Data) -> Data?, certificateDER: Data, info: ZagImportedIdentityInfo), ZagImportedIdentityError> {
+		guard let identity = load(label: label) else { return .failure(.noIdentity) }
+		switch validate(identity, now: now, expectedTeam: expectedTeam) {
+		case .failure(let e): return .failure(e)
+		case .success(let info):
+			guard let signer = zsignSigner(identity) else { return .failure(.signFailed) }
+			var certRef: SecCertificate?
+			guard SecIdentityCopyCertificate(identity, &certRef) == errSecSuccess, let cert = certRef else { return .failure(.noIdentity) }
+			return .success((signer, SecCertificateCopyData(cert) as Data, info))
+		}
+	}
 }

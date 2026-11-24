@@ -90,5 +90,61 @@ if let signer = ZagImportedSigningIdentity.zsignSigner(id) {
 	check(sig?.count == 256, "zsign signature is RSA-2048 sized (256 bytes)")
 } else { check(false, "obtain zsign signer from imported identity") }
 
+// MARK: Phase 2/3 — profile parsing + authoritative identity/profile/device/bundle match.
+var idCert: SecCertificate?; SecIdentityCopyCertificate(id, &idCert)
+let idDER = SecCertificateCopyData(idCert!) as Data
+let udid = "00009999-000ABCDEF1234567"   // synthetic provisioning UDID (NOT a CoreDevice id)
+let bundle = "com.zagstore.test"
+
+guard let profile = ZagMobileProvision.parse(data("profile.plist")) else {
+	print("FAIL: parse synthetic profile fixture"); print("FAILURES: \(failures + 1)"); exit(1)
+}
+check(profile.teamIdentifier == team, "profile parse: TeamIdentifier")
+check(profile.developerCertificates.count == 1, "profile parse: DeveloperCertificates present")
+check(profile.provisionedDevices.contains(udid), "profile parse: ProvisionedDevices")
+check(profile.entitlementKeys.contains("application-identifier"), "profile parse: entitlement keys")
+
+func ev(idDER d: Data = idDER, team t: String? = team, dev: Bool = true, dev2 p: ZagProfileContents = profile,
+		device: String = udid, bundleID: String = bundle, ent: [String] = ["application-identifier", "get-task-allow"],
+		now n: Date = now) -> ZagProfileMatchResult {
+	ZagImportedIdentityProfileMatch.evaluate(identityCertificateDER: d, identityTeam: t, identityIsDevelopment: dev,
+		profile: p, deviceProvisioningUDID: device, targetBundleID: bundleID, requestedEntitlements: ent, now: n)
+}
+check(ev() == .compatible, "match: fully compatible identity/profile/device/bundle/entitlements")
+check(ev(dev: false) == .notDevelopmentCertificate, "match: non-development certificate fails closed")
+// A different identity's certificate is not in the profile.
+if case .success(let other) = ZagImportedSigningIdentity.importIdentity(pkcs12: data("id2.p12"), password: "pw2") {
+	var oc: SecCertificate?; SecIdentityCopyCertificate(other, &oc)
+	check(ev(idDER: SecCertificateCopyData(oc!) as Data) == .certificateNotInProfile, "match: certificate not in profile (DER/SHA-256 compare)")
+}
+check(ev(team: "WRONGTEAM0") == .teamMismatch, "match: team mismatch")
+check(ev(device: "00000000-000000000000000") == .deviceNotProvisioned, "match: device not provisioned")
+let afterProfile = Date(timeIntervalSince1970: 5_000_000_000)   // ~2128, past the fixture's 2099 expiry
+check(ev(now: afterProfile) == .profileExpired, "match: expired profile")
+check(ev(bundleID: "com.zagstore.other") == .bundleMismatch, "match: wrong bundle id")
+check(ev(ent: ["application-identifier", "com.apple.developer.icloud-services"]) == .disallowedEntitlements(["com.apple.developer.icloud-services"]),
+	  "match: disallowed entitlement fails closed")
+
+// Wildcard bundle semantics (unit).
+check(ZagImportedIdentityProfileMatch.bundleMatches(target: "com.a.b", applicationIdentifier: "TEAMID.*", team: "TEAMID"), "wildcard: bare * matches")
+check(ZagImportedIdentityProfileMatch.bundleMatches(target: "com.foo.bar", applicationIdentifier: "TEAMID.com.foo.*", team: "TEAMID"), "wildcard: prefix .* matches child")
+check(!ZagImportedIdentityProfileMatch.bundleMatches(target: "com.other", applicationIdentifier: "TEAMID.com.foo.*", team: "TEAMID"), "wildcard: prefix .* rejects non-child")
+check(!ZagImportedIdentityProfileMatch.bundleMatches(target: "com.foo.bar", applicationIdentifier: "OTHER.com.foo.bar", team: "TEAMID"), "wildcard: wrong team prefix rejected")
+
+// Explicit signing-source selection (no silent fallback).
+check(ZagSigningSource.deviceGenerated(keySlot: "s1").usesNonExtractableKey, "source: device-generated uses non-extractable key")
+check(ZagSigningSource.imported(label: "x").isImported && !ZagSigningSource.imported(label: "x").usesNonExtractableKey, "source: imported is distinct, not non-extractable")
+check(ZagSigningSource.imported(label: "a") != ZagSigningSource.imported(label: "b"), "source: labels distinguish imported identities")
+
+// End-to-end: a signature by the imported key verifies under the EXACT certificate
+// the profile authorizes (the signing step the on-device Zsign callback performs).
+let cdPayload = Data("synthetic CodeDirectory for an IPA".utf8)
+if let sig = ZagImportedSigningIdentity.sign(cdPayload, identity: id),
+   let profileCert = SecCertificateCreateWithData(nil, profile.developerCertificates[0] as CFData),
+   let profileCertKey = SecCertificateCopyKey(profileCert) {
+	check(SecKeyVerifySignature(profileCertKey, .rsaSignatureMessagePKCS1v15SHA256, cdPayload as CFData, sig as CFData, nil),
+		  "end-to-end: imported-key signature verifies under the profile's embedded certificate")
+} else { check(false, "end-to-end: sign + load profile certificate") }
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -21,6 +21,27 @@ gen id2    "/UID=TESTUID002/CN=Apple Development: other@example.com (TESTAPP0002
 # A non-development certificate.
 gen server "/CN=Some Server/OU=V54K5JYGS4/O=Test/C=US" pw3
 
+# Synthetic provisioning profile (bare plist; the parser scans for it in a CMS
+# blob too) embedding id's certificate DER. Synthetic UDID, never a real one.
+openssl x509 -in "$FIX/id.cert.pem" -outform DER -out "$FIX/id.cert.der" >/dev/null 2>&1
+python3 -I - "$FIX/id.cert.der" "$FIX/profile.plist" <<'PY'
+import plistlib, sys, datetime
+der = open(sys.argv[1], "rb").read()
+profile = {
+    "TeamIdentifier": ["V54K5JYGS4"],
+    "DeveloperCertificates": [der],
+    "ProvisionedDevices": ["00009999-000ABCDEF1234567"],
+    "ExpirationDate": datetime.datetime(2099, 1, 1),
+    "Entitlements": {
+        "application-identifier": "V54K5JYGS4.com.zagstore.test",
+        "com.apple.developer.team-identifier": "V54K5JYGS4",
+        "get-task-allow": True,
+        "keychain-access-groups": ["V54K5JYGS4.*"],
+    },
+}
+open(sys.argv[2], "wb").write(plistlib.dumps(profile, fmt=plistlib.FMT_XML))
+PY
+
 # Shim: an exact copy of ZagKeychainSigningKeys.signer (raw PKCS#1 v1.5 DigestInfo)
 # plus the minimal error stub the signing-key file expects.
 cat > "$WORK/shim.swift" <<'SWIFT'
@@ -40,6 +61,8 @@ swiftc -O \
 	"$ROOT/Feather/Utilities/FreeAccount/ZagSigningModels.swift" \
 	"$ROOT/Feather/Utilities/FreeAccount/ZagSigningKey.swift" \
 	"$ROOT/Feather/Utilities/FreeAccount/ZagImportedSigningIdentity.swift" \
+	"$ROOT/Feather/Utilities/FreeAccount/ZagMobileProvision.swift" \
+	"$ROOT/Feather/Utilities/FreeAccount/ZagImportedIdentityProfileMatch.swift" \
 	"$WORK/main.swift" \
 	-o "$WORK/tests" 2>&1 | grep -vi 'warning:' || true
 

@@ -764,3 +764,48 @@ matching entitlements; that reuse is identified but not yet exercised live.
 existing-certificate/pending-request conflict (resultCode 7460) when issuing new
 certificates — which this bootstrap sidesteps by reusing an existing identity
 rather than requesting another.
+
+---
+
+## Imported-identity signing pipeline — complete offline vertical slice (2026-11-24)
+
+Builds on the imported-identity bootstrap: profile↔identity↔device↔bundle
+validation, explicit identity selection, the import UX, and an end-to-end
+offline signing proof. Device-generated non-extractable path unchanged.
+
+### Components
+- `ZagMobileProvision` — iOS-safe `.mobileprovision` parsing (scans the CMS blob for the embedded cleartext plist; no macOS-only CMSDecoder), yielding team, `DeveloperCertificates` (DER), `ProvisionedDevices`, expiry, `application-identifier`, entitlement keys.
+- `ZagImportedIdentityProfileMatch.evaluate(...)` — authoritative, fail-closed compatibility: certificate present in `DeveloperCertificates` (compared by **DER SHA-256**, not serial), team match, device **provisioning UDID** in `ProvisionedDevices` (never a CoreDevice id), not expired, bundle id under `application-identifier` (with `*` / trailing `.*` wildcard semantics), requested entitlements ⊆ profile entitlements, development-signing suitability.
+- `ZagSigningSource` — explicit `.deviceGenerated(keySlot:)` vs `.imported(label:)`; **no silent fallback**. `ZagImportedSigningIdentity.resolve(label:…)` re-validates and returns the Zsign signer + cert DER, or a typed failure — it never substitutes the device key.
+- `ZagImportedSigningIdentity.zsignSigner` — the SAME `ZagKeychainSigningKeys.signer` closure the device path hands Zsign (raw PKCS#1 v1.5 DigestInfo).
+- `ZagImportedIdentityImportView` / `…Model` — file picker (`.p12`/`.pfx`), secure passphrase, preview (cert/team/serial/expiry), explicit confirm, ThisDeviceOnly store, failure + removal states, and a plain statement that an imported key is extractable — not a device-generated non-extractable key. Passphrase + `.p12` bytes are in memory only and cleared after use; no plaintext file, no password logging.
+
+### End-to-end offline validation (40/40 host checks)
+Import (correct/wrong/corrupt), correspondence (match + mismatch), development/team/expiry validation, non-development rejection, sign/verify round-trip + tamper rejection, Zsign callback 256-byte RSA-2048 signature; profile parse; the full match matrix (compatible + certificateNotInProfile + teamMismatch + deviceNotProvisioned + profileExpired + bundleMismatch + disallowedEntitlements + notDevelopmentCertificate); wildcard semantics; explicit source selection; and the crux — **a signature by the imported key verifies under the EXACT certificate the profile embeds**. Full arm64 iOS build/link; dev-services suite 150/150; device-generated path untouched.
+
+### Is the existing Xcode-generated provisioning profile reusable?
+**Conditional — must verify its actual bytes, not assume.** It embeds the right
+certificate (the Xcode `5657782A` cert) and team `V54K5JYGS4`, so two of the
+checks would pass. Reuse additionally requires that the profile's
+`ProvisionedDevices` lists THIS iPhone's provisioning UDID and that it has not
+expired. Free Personal Team profiles expire in **7 days**, so an Xcode profile
+is very likely already expired, and it may not list this specific device. The
+validation to decide is implemented (`ZagImportedIdentityProfileMatch`); it needs
+the real profile fed in. We did not inspect a real profile in this pass.
+
+### First real iPhone signing + installation — exact minimal sequence
+1. **Mac (offline):** Keychain Access → export the "Apple Development: …" identity as a strong-password `.p12`.
+2. **iPhone (offline):** Zag Store → import screen → choose the `.p12` → passphrase → preview → confirm → stored ThisDeviceOnly.
+3. **Compatible profile:**
+   - *Offline* if a compatible, unexpired profile that lists this iPhone's provisioning UDID is already on hand (e.g. copied from the Mac's `~/Library/MobileDevice/Provisioning Profiles` or a built app's `embedded.mobileprovision`) — validated by `ZagImportedIdentityProfileMatch`.
+   - *Requires Apple Developer Services* to obtain or **renew** a profile (7-day expiry), register this device's UDID, or mint a new App ID (QH65B2 `listProvisioningProfiles`/download). The imported **certificate** needs no Apple contact.
+4. **Sign (offline):** select `ZagSigningSource.imported(label:)`, resolve → signer + cert, confirm profile match, run the existing Zsign path with the imported signer + `embedded.mobileprovision`; verify offline.
+5. **Install + launch (offline transport):** install via the developer disk; iOS validates the signature + profile at install and launch. No Apple network for the install itself, but the profile's validity traces to Apple-issued data.
+
+**Offline:** Mac export, iPhone import, signing, verification, install/launch, and reuse of an already-obtained compatible profile.
+**Requires Apple Developer Services:** obtaining or renewing a provisioning profile, registering a new device, or a new App ID.
+
+### Remaining blockers
+1. A compatible, **unexpired** development profile that lists this iPhone's provisioning UDID — the Xcode profile is likely expired (7-day) and may need an Apple renewal.
+2. The real export → import → install steps are gated behind explicit authorization (not performed).
+3. The Mach-O/CMS assembly runs through Zsign on-device; the signing primitive it uses is proven here, but a full on-device IPA was not produced in this offline pass.
