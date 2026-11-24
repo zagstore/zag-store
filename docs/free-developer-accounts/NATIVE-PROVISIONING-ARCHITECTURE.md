@@ -399,3 +399,83 @@ valid cert/profile exist, no mutation is needed.
   (optionally add `"ZAG_EXPECT_UDID":"<device udid from devicectl>"` to check this
   device specifically). This also exercises the first `listDevices` + v1-less read
   path and, with a known UDID, tells us whether `addDevice` is even needed.
+
+---
+
+## Device-identity + reuse audit (2026-11-24) — offline, no Apple contact
+
+Verdicts only below; raw UDIDs/serials are never committed or logged.
+
+### 1–2. Device identity confirmed (authoritative UDID, not the CoreDevice id)
+`xcrun devicectl list devices --json` exposes two different identifiers for the
+test iPhone: the **CoreDevice identifier** (a `8A6B…` UUID, used by `devicectl
+--device`) and `hardwareProperties.udid` — the **authoritative iOS provisioning
+UDID** (modern ECID form `00008130-…`). These are NOT equivalent; only the latter
+is what the developer portal registers. The locally built Xcode-provisioned test
+app's `embedded.mobileprovision` (decoded with `security cms -D`) lists exactly
+one `ProvisionedDevices` entry, and it **equals this iPhone's authoritative
+provisioning UDID** → the device registered in the team (device_count 1, live
+discovery) IS this iPhone.
+
+### 3. Team match (secure, no identifier exposed)
+`ZagProfileIdentityAudit` (pure) compares the profile's `TeamIdentifier` against
+the team returned by live `listTeams`, and checks whether this device's UDID is
+in the profile — returning **only booleans and coarse counts**, never the UDID,
+team id, serial, bundle or date. Result for our profile: team matches, device in
+profile, bundle matches, 1 device, 3 certs, 7-day profile.
+
+### 4. Certificate listing audited against `/services/v1/` JSON
+`ZagNativeDeveloperPortal.certificates()` uses the v1 JSON:API (POST +
+`X-HTTP-Method-Override: GET`, `application/vnd.api+json`, `data[]`). A new
+read-only live gate `ZAG_RUN_MACLEGACY_CERTS` (+ `_SELFCHECK`) exercises it:
+`teams → certificates` (≤2 requests), reporting `certificate_count` and the
+nearest expiry in coarse days — no serials. Disabled by default.
+
+### 5. Reusable existing resources (before any mutation)
+The profile and live discovery show these already exist for the free Personal
+Team `V54K5JYGS4` and are reusable by the discover→reuse path:
+- **Team** — the free Personal Team (membership "Xcode Free Provisioning").
+- **Device registration** — this iPhone (confirmed above); `addDevice` NOT needed.
+- **App ID** — `dev.zagstore.ptteamprobe` (the profile's application-identifier).
+
+NOT reusable for native standalone signing:
+- **Signing certificate / private key.** The profile embeds 3 developer certs,
+  but their private keys live in the **Mac login keychain** (Xcode's) — NOT on
+  the device. Our native flow signs with a device-Keychain **non-extractable**
+  key, so a NEW certificate must be issued for that key via `submitDevelopmentCSR`.
+- **The Xcode profile** references those Mac certs, so a native run creates its
+  own profile tying the new (device-key) cert + existing App ID + existing device.
+
+### 6. Certificate-issuance flow (reuses existing key factory + CSR; already wired)
+No new signing code needed — the existing pieces compose:
+`ZagKeychainSigningKeyFactory.makePendingKey` creates a non-extractable RSA key in
+the device Keychain and a `ZagCertificateRequest` (CSR) from it (key never
+exported); `ZagNativeDeveloperPortal.submitCertificateRequest` sends the PEM CSR
+(public request only) and returns the issued cert. **Public-key match is verified
+by a real sign/verify round-trip** in `ZagKeychainSigningKeyFactory.check`: it
+signs a fresh 32-byte challenge with the Keychain private key
+(`SecKeyCreateSignature`) and verifies it with the certificate's public key
+(`SecCertificateCopyKey` → `SecKeyVerifySignature`). `ZagFreeAccountProvisioner`
+already calls this after CSR submission and discards any cert that no longer
+matches its key.
+
+### 7. Lifecycles are independent (do not infer one from another)
+Three independent validity windows, confirmed from the live/offline artifacts:
+- **Developer token** ~364 days (apptokens).
+- **Signing certificate** ~1 year (our cert's notAfter is `2027-09-27`).
+- **Provisioning profile** 7 days (`TimeToLive 7`; expires `2026-11-30`).
+A valid developer token does NOT imply a valid cert or an unexpired profile, and
+an unexpired cert does NOT imply an unexpired profile. Free Personal Team
+restrictions still apply (small device/App-ID/certificate caps, 7-day profiles);
+the `ZAG_RUN_MACLEGACY_CERTS` count check exists precisely to see whether a new
+CSR would exceed the certificate cap before submitting one.
+
+### Smallest safe next live read-only experiment (await authorization)
+`ZAG_RUN_MACLEGACY_CERTS` — `listTeams → certificates` (v1 JSON), ≤2 read-only
+requests, no account impact. Confirms the current certificate count vs the free-
+team cap (and nearest expiry) BEFORE any CSR is ever designed. Launch:
+```
+xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_CERTS":"1"}' dev.zagstore.ptteamprobe
+```
+Reports: outcome, http_status, certificate_count, nearest_cert_expires_in_days,
+request_count — no serials/ids. No mutation.

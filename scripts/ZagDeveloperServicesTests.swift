@@ -118,5 +118,29 @@ consent.cancel()
 check(consent.mayPerform(.addDevice) == false, "cancel revokes all consent")
 check(ZagDenyingMutationConsent().mayPerform(.addDevice) == false, "denying consent denies everything")
 
+// MARK: Profile-identity audit (reuse decision; sanitized bool/count output only).
+let soon = Date().addingTimeInterval(6 * 86_400)     // ~7-day free-account profile
+let aud = ZagProfileIdentityAudit.audit(
+	profileTeam: "V54K5JYGS4", profileDevices: ["00009999-000ABCDEF1234567"],
+	profileCertificateSerials: ["A", "B", "C"], profileBundle: "dev.zagstore.ptteamprobe",
+	profileExpiresAt: soon, discoveredTeam: "v54k5jygs4",
+	expectedDeviceUDID: "00009999-000abcdef1234567", targetBundle: "dev.zagstore.ptteamprobe")
+check(aud.teamMatchesDiscovered, "team matches discovered (case-insensitive)")
+check(aud.deviceInProfile, "this device's UDID found in profile (case-insensitive)")
+check(aud.bundleMatchesTarget, "profile bundle matches target")
+check(aud.certificateCount == 3 && aud.deviceCount == 1, "counts are exposed, not identifiers")
+check(!aud.profileExpired && aud.profileExpiresInDays == 6, "profile expiry reported in coarse days")
+let miss = ZagProfileIdentityAudit.audit(
+	profileTeam: "V54K5JYGS4", profileDevices: ["00009999-000ABCDEF1234567"],
+	profileCertificateSerials: [], profileBundle: "dev.zagstore.ptteamprobe",
+	profileExpiresAt: Date().addingTimeInterval(-3 * 86_400), discoveredTeam: "OTHERTEAMX",
+	expectedDeviceUDID: "DEADBEEF", targetBundle: nil)
+check(!miss.teamMatchesDiscovered, "different team -> no match")
+check(!miss.deviceInProfile, "absent UDID -> not in profile")
+check(miss.bundleMatchesTarget, "nil target bundle -> treated as matching")
+check(miss.profileExpired && miss.profileExpiresInDays == -3, "past expiry -> expired, negative days")
+let sani = aud.sanitized
+check(sani["team_matches_discovered"] as? Bool == true && sani.count == 7, "sanitized dict carries only verdicts/counts")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -312,6 +312,84 @@ enum ZagSignInExperimentRunner {
 		return report
 	}
 
+	/// Read-only CERTIFICATE discovery (item 4): teams -> certificates via the
+	/// `/services/v1/` JSON API (POST + X-HTTP-Method-Override: GET). At most TWO
+	/// read-only requests. Reports cert_count and the nearest expiry in coarse
+	/// days — never a serial, team id, token or body. No mutation. Confirms the
+	/// current certificate count against the free-team limit before any CSR is
+	/// ever submitted. Zero requests with no token or in self-check.
+	static func runCertificateDiscovery(platform: ZagAppleAuthPlatform, scope: String, allowNetwork: Bool) async -> [String: Any] {
+		var report: [String: Any] = ["mode": allowNetwork ? "live-certs" : "selfcheck-certs", "platform": platform.rawValue, "scope": scope]
+		let m = ZagAppleAuthMachine(scope: scope, platform: platform)
+		let headers = await m.developerHeaders()
+		report["developer_token_persisted"] = (headers != nil)
+		guard let headers else {
+			report["result"] = "ran"; report["outcome"] = "no-developer-token-persisted"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		guard allowNetwork else {
+			report["result"] = "ran"; report["outcome"] = "preflight-no-network"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		let budget = ZagRequestBudget(limit: 2)   // teams + certificates, read-only, no retry
+		do {
+			guard budget.take() else { throw ZagPortalError.network }
+			let teamsDict = try await sendQH65B2(.listTeams, teamID: nil, headers: headers)
+			guard let teamID = ((teamsDict["teams"] as? [[String: Any]])?.first)?["teamId"] as? String else {
+				report["result"] = "ran"; report["outcome"] = "no-teams"; report["request_count"] = budget.used
+				for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+				return report
+			}
+			guard budget.take() else { throw ZagPortalError.network }
+			let (body, status) = try await sendV1(path: "certificates", methodOverride: "GET",
+												  body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: teamID), headers: headers)
+			let rows = try ZagDeveloperServicesV1.parseList(body, httpStatus: status)
+			let certs = rows.compactMap { ZagDeveloperServicesProtocol.parseCertificate($0) }
+			report["result"] = "ran"
+			report["http_status"] = status
+			report["certificate_count"] = certs.count
+			// Nearest expiry in coarse days (no serials, no exact dates).
+			let now = Date()
+			if let soonest = certs.compactMap({ $0.expiresAt }).min() {
+				report["nearest_cert_expires_in_days"] = Int((soonest.timeIntervalSince(now) / 86_400).rounded(.towardZero))
+			}
+			report["outcome"] = "certificates-discovered"
+		} catch let e as ZagPortalError {
+			report["result"] = "ran"; report["outcome"] = describePortalError(e)
+		} catch {
+			report["result"] = "ran"; report["outcome"] = "error"
+		}
+		report["request_count"] = budget.used
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		return report
+	}
+
+	/// Sends one `/services/v1/` JSON POST (read-only via X-HTTP-Method-Override).
+	/// Ephemeral session, no cookies/cache/credentials, redirects refused, pinned
+	/// to the developer-services host. Returns the body and HTTP status for the
+	/// shared `ZagDeveloperServicesV1` parser.
+	private static func sendV1(path: String, methodOverride: String, body: Data, headers: [String: String]) async throws -> (Data, Int) {
+		let url = try ZagDeveloperServicesV1.endpoint(path)
+		guard url.host == ZagDeveloperServicesV1.host else { throw ZagPortalError.network }
+		var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+		req.httpMethod = "POST"
+		req.httpShouldHandleCookies = false
+		for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+		for (k, v) in ZagDeveloperServicesV1.headers(methodOverride: methodOverride) { req.setValue(v, forHTTPHeaderField: k) }
+		req.httpBody = body
+		let config = URLSessionConfiguration.ephemeral
+		config.httpCookieStorage = nil; config.httpShouldSetCookies = false
+		config.urlCache = nil; config.urlCredentialStorage = nil; config.waitsForConnectivity = false
+		let delegate = ZagNoRedirect()
+		let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+		defer { session.finishTasksAndInvalidate() }
+		let (data, response) = try await session.data(for: req)
+		guard let http = response as? HTTPURLResponse else { throw ZagPortalError.network }
+		return (data, http.statusCode)
+	}
+
 	/// Sends one QH65B2 plist POST (any read-only action). Ephemeral session, no
 	/// cookies/cache/credentials, redirects refused, pinned to the developer-
 	/// services host. Parses with the shared `ZagDeveloperServicesProtocol`.

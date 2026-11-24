@@ -10,5 +10,6 @@ swiftc -O -o "$OUT/dsvc" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagDeveloperServicesProtocol.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagDeveloperTokenStore.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagMutationConsent.swift" \
+  "$ROOT/Feather/Utilities/FreeAccount/ZagProfileIdentityAudit.swift" \
   "$OUT/shim.swift" "$OUT/main.swift"
 "$OUT/dsvc"

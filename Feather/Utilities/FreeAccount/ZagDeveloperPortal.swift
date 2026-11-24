@@ -86,6 +86,24 @@ extension ZagIssuedProfile {
 	}
 }
 
+extension ZagProfileIdentityAudit {
+	/// Audits a parsed profile against the discovered team and this device.
+	/// Pulls primitives from `ZagIssuedProfile`; the audit itself is pure.
+	init(profile: ZagIssuedProfile, discoveredTeam: String, expectedDeviceUDID: String?,
+		 targetBundle: String?, now: Date = Date()) {
+		self = ZagProfileIdentityAudit.audit(
+			profileTeam: profile.teamIdentifier,
+			profileDevices: profile.deviceUDIDs,
+			profileCertificateSerials: profile.certificateSerials,
+			profileBundle: profile.bundleIdentifier,
+			profileExpiresAt: profile.expiresAt,
+			discoveredTeam: discoveredTeam,
+			expectedDeviceUDID: expectedDeviceUDID,
+			targetBundle: targetBundle,
+			now: now)
+	}
+}
+
 // ZagPortalError now lives in ZagPortalError.swift (so the pure developer-
 // services codec can be compiled and host-tested without the model graph).
 
