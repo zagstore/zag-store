@@ -42,6 +42,21 @@ profile = {
 open(sys.argv[2], "wb").write(plistlib.dumps(profile, fmt=plistlib.FMT_XML))
 PY
 
+# CMS-sign that profile with a synthetic chain so the on-device verifier
+# (ZagCMSVerifier) has a real signature to authenticate in the preflight test.
+osr() { openssl req "$@" >/dev/null 2>&1; }
+osx() { openssl x509 "$@" >/dev/null 2>&1; }
+osr -x509 -newkey rsa:2048 -keyout "$FIX/proot.key" -out "$FIX/proot.crt" -days 3650 -nodes -subj "/CN=Synthetic Profile Root" -sha256 -addext "basicConstraints=critical,CA:TRUE"
+osr -newkey rsa:2048 -keyout "$FIX/psign.key" -out "$FIX/psign.csr" -nodes -subj "/CN=Synthetic Profile Signer" -sha256
+osx -req -in "$FIX/psign.csr" -CA "$FIX/proot.crt" -CAkey "$FIX/proot.key" -CAcreateserial -days 3650 -sha256 -out "$FIX/psign.crt"
+openssl cms -sign -binary -nodetach -in "$FIX/profile.plist" -signer "$FIX/psign.crt" -inkey "$FIX/psign.key" -certfile "$FIX/proot.crt" -md sha256 -outform DER -out "$FIX/profile_signed.der" >/dev/null 2>&1
+# An untrusted-root variant (identical contents, different signer).
+osr -x509 -newkey rsa:2048 -keyout "$FIX/uroot.key" -out "$FIX/uroot.crt" -days 3650 -nodes -subj "/CN=Untrusted Root" -sha256 -addext "basicConstraints=critical,CA:TRUE"
+osr -newkey rsa:2048 -keyout "$FIX/usign.key" -out "$FIX/usign.csr" -nodes -subj "/CN=Untrusted Signer" -sha256
+osx -req -in "$FIX/usign.csr" -CA "$FIX/uroot.crt" -CAkey "$FIX/uroot.key" -CAcreateserial -days 3650 -sha256 -out "$FIX/usign.crt"
+openssl cms -sign -binary -nodetach -in "$FIX/profile.plist" -signer "$FIX/usign.crt" -inkey "$FIX/usign.key" -certfile "$FIX/uroot.crt" -md sha256 -outform DER -out "$FIX/profile_untrusted.der" >/dev/null 2>&1
+printf '%s' "$(openssl x509 -in "$FIX/proot.crt" -outform DER | shasum -a 256 | awk '{print $1}')" > "$FIX/synthetic_root_sha256.txt"
+
 # Shim: an exact copy of ZagKeychainSigningKeys.signer (raw PKCS#1 v1.5 DigestInfo)
 # plus the minimal error stub the signing-key file expects.
 cat > "$WORK/shim.swift" <<'SWIFT'
@@ -63,6 +78,8 @@ swiftc -O \
 	"$ROOT/Feather/Utilities/FreeAccount/ZagImportedSigningIdentity.swift" \
 	"$ROOT/Feather/Utilities/FreeAccount/ZagMobileProvision.swift" \
 	"$ROOT/Feather/Utilities/FreeAccount/ZagImportedIdentityProfileMatch.swift" \
+	"$ROOT/Feather/Utilities/FreeAccount/ZagCMSVerifier.swift" \
+	"$ROOT/Feather/Utilities/FreeAccount/ZagSigningPreflight.swift" \
 	"$WORK/main.swift" \
 	-o "$WORK/tests" 2>&1 | grep -vi 'warning:' || true
 

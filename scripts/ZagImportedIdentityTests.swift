@@ -177,5 +177,27 @@ if let sig = ZagImportedSigningIdentity.sign(cdPayload, identity: id),
 		  "end-to-end: imported-key signature verifies under the profile's embedded certificate")
 } else { check(false, "end-to-end: sign + load profile certificate") }
 
+// End-to-end PREFLIGHT: cryptographic CMS verification composed with the full
+// compatibility match. CMS trust is derived ONLY from ZagCMSVerifier — there is
+// no caller boolean/Mac flag shortcut.
+let synRoot = ((try? String(contentsOf: URL(fileURLWithPath: "\(dir)/synthetic_root_sha256.txt"), encoding: .utf8)) ?? "")
+	.trimmingCharacters(in: .whitespacesAndNewlines)
+let reqEnt: [String: ZagEntitlementValue] = ["application-identifier": .string("V54K5JYGS4.com.zagstore.test"), "get-task-allow": .bool(true)]
+func preflight(_ file: String, device: String = udid, roots: Set<String>) -> ZagSigningPreflightResult {
+	ZagSigningPreflight.prepare(profileData: data(file), identityCertificateDER: idDER, identityTeam: team,
+		identityIsDevelopment: true, deviceProvisioningUDID: device, targetBundleID: bundle,
+		requestedEntitlements: reqEnt, trustedRootSHA256: roots, now: Date())
+}
+if case .ready = preflight("profile_signed.der", roots: [synRoot]) {
+	check(true, "preflight: cryptographically verified CMS + compatible identity -> ready")
+} else { check(false, "preflight: verified CMS should be ready") }
+check(preflight("profile_untrusted.der", roots: [synRoot]) == .profileNotTrusted,
+	  "preflight: untrusted CMS chain -> profileNotTrusted (identical contents, no shortcut)")
+check(preflight("profile_signed.der", roots: ["ff" + String(synRoot.dropFirst(2))]) == .profileNotTrusted,
+	  "preflight: wrong pinned anchor -> profileNotTrusted")
+if case .incompatible(.deviceNotProvisioned) = preflight("profile_signed.der", device: "00000000-000000000000000", roots: [synRoot]) {
+	check(true, "preflight: verified CMS but wrong device -> incompatible, not ready")
+} else { check(false, "preflight: wrong device should be incompatible") }
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -868,3 +868,77 @@ clean; device-generated path untouched.
 
 **Requires Apple Developer Services:** only a profile **renewal after 2026-11-30**
 (or a new device/App ID). Everything else is offline + user authorization.
+
+---
+
+## On-device CMS verification — the final trust gate (2026-11-24)
+
+Closes the gap flagged in the readiness pass: the iPhone now cryptographically
+verifies a provisioning profile itself, with no Mac-supplied trust boolean,
+sidecar or digest shortcut.
+
+### `ZagCMSVerifier` (new)
+A small, auditable CMS (PKCS#7 SignedData, RFC 5652) verifier. It reuses the
+repo's existing `ZagDER` ASN.1 walker for STRUCTURE only; all cryptography is
+the Security framework — nothing re-implements ASN.1 crypto from scratch:
+- **Signature:** locates the signer by `issuerAndSerialNumber`, and
+  `SecKeyVerifySignature` checks the RSA signature. With CMS signed attributes
+  present (as Apple profiles have), the `messageDigest` attribute must equal the
+  digest of the eContent (binding the authentic payload to the signature) and
+  the signature is checked over the DER of the signed attributes re-encoded with
+  the SET tag. SHA-256 and SHA-1 digests supported.
+- **Chain:** `SecTrust` with `SecPolicyCreateBasicX509`, `anchorCertificatesOnly`,
+  and the verify date set — so certificate validity windows are enforced.
+- **Trust anchor:** the classic **Apple Root CA**, pinned by SHA-256
+  `b0b1730e…1001f024` (public, well-known). The anchor certificate is taken from
+  the CMS's own certificate set but is trusted ONLY when its fingerprint equals
+  the pinned value; a substituted root fails the fingerprint check, and SHA-256
+  preimage resistance prevents forging one.
+- **Fail closed:** malformed CMS, not-SignedData, no signer cert, digest
+  mismatch, bad signature, no pinned anchor, or an untrusted/expired chain each
+  return a typed failure and NO payload. The only success output is the
+  authenticated eContent bytes.
+
+### Integration
+- `ZagMobileProvision.parseAppleVerified` parses ONLY the content
+  `ZagCMSVerifier` authenticates; `cmsVerificationAvailable` is now `true`.
+- `ZagSigningPreflight.prepare(...)` is the single real-signing entry point. It
+  derives the `cmsVerified` flag passed to the compatibility check solely from a
+  successful `ZagCMSVerifier.verify` — there is deliberately no parameter by
+  which a caller can assert `cmsVerified = true`.
+
+### Cryptographic test results
+`scripts/test-zag-cms-verifier.sh` — **11/11** against a synthetic
+root→intermediate→signer chain and the REAL Apple profile:
+valid+trusted → authenticated payload; tampered payload → digest mismatch;
+corrupted signature → bad signature; untrusted root (pinned to the synthetic
+root) → no trusted anchor; malformed bytes → rejected; wrong pinned fingerprint
+→ rejected; verify-date past validity → untrusted chain; **the real
+`75c25062…` profile verifies against the pinned Apple Root CA and fails closed
+when one byte is flipped.** Preflight composition (in the imported-identity
+suite): verified+compatible → ready; untrusted CMS (identical contents) →
+profileNotTrusted; wrong anchor → profileNotTrusted; verified but wrong device →
+incompatible (not ready). Imported-identity suite 59 checks; dev-services
+150/150. Full arm64 iOS build/link; subsystem typecheck clean.
+
+### Shortest real-device test sequence + where trust/authorization sit
+1. **Export (Mac) — offline, USER AUTHORIZATION.** Keychain Access → export the Apple Development identity as a strong-password `.p12`.
+2. **Transfer to iPhone — offline, USER AUTHORIZATION.** Move the password-protected `.p12` (e.g. AirDrop/Files). The profile bytes can travel unprotected; their trust comes from CMS verification, not the transfer.
+3. **Import — offline.** Import UX: preview → confirm → ThisDeviceOnly.
+4. **Independent on-device profile verification — offline, NOW IMPLEMENTED.** `ZagCMSVerifier` validates the profile's signature + chain to the pinned Apple Root CA on the device; no Mac boolean involved.
+5. **Sign the IPA — offline.** `ZagSigningSource.imported` → preflight `.ready` → Zsign with the imported signer + this `embedded.mobileprovision`.
+6. **Install + launch — offline transport, USER AUTHORIZATION.**
+
+**No Apple network is required** for the first real test (the profile is valid
+through 2026-11-30 and the certificate already exists); only a profile renewal
+after that date would.
+
+### Remaining integration gaps (NOT yet done — end-to-end signing is NOT proven)
+- **No complete IPA has actually been signed yet.** The Zsign Mach-O/CMS
+  assembly runs on-device and has not been executed end-to-end against a real
+  app bundle in this offline pass. The signing primitive and the preflight are
+  proven; the full IPA output is not.
+- Real key export, transfer, import and installation are gated on explicit
+  authorization and have not been performed.
+- The verifier handles the `issuerAndSerialNumber` signer form Apple profiles
+  use; the `subjectKeyIdentifier` (v3) form is rejected (fail closed).
