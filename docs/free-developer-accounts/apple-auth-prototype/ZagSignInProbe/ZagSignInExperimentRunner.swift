@@ -101,6 +101,22 @@ enum ZagSignInExperimentRunner {
 		} catch {
 			report["outcome"] = "error"
 		}
+
+		// Condition 8: both profiles remain intact after the attempt — the
+		// sign-in reads the profile read-only (no re-provision, no save), so
+		// each scope still derives its headers offline, unchanged.
+		do {
+			let cur = try await m.anisetteHeaders(allowProvisioning: false)
+			report["profile_intact_header_count"] = cur.count
+		} catch { report["profile_intact"] = "unavailable" }
+		if scope != "device" {
+			let baseline = ZagAppleAuthMachine(scope: "device", platform: .iphone)
+			do {
+				let h = try await baseline.anisetteHeaders(allowProvisioning: false)
+				report["iphone_baseline_header_count"] = h.count
+				report["iphone_baseline_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(h, platform: .iphone)
+			} catch { report["iphone_baseline"] = "error" }
+		}
 		report["result"] = "ran"
 		return report
 	}

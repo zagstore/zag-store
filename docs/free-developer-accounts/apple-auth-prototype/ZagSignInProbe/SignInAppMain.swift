@@ -25,6 +25,9 @@ struct ZagSignInProbeApp: App {
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true) }, file: "zag_signin_result.json")
 			case let env where env["ZAG_RUN_MAC_PROVISION"] == "1":
 				LiveRunView(task: { await ZagSignInExperimentRunner.provision(platform: .mac, scope: zagMacScope) }, file: "zag_mac_provision.json")
+			case let env where env["ZAG_RUN_MAC_SELFCHECK"] == "1":
+				// Offline preflight: transport refused, zero Apple contact.
+				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: false, platform: .mac, scope: zagMacScope) }, file: "zag_mac_selfcheck.json")
 			case let env where env["ZAG_RUN_MAC_SIGNIN"] == "1":
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .mac, scope: zagMacScope) }, file: "zag_mac_signin.json")
 			default:
