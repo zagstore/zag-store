@@ -39,6 +39,15 @@ struct ZagSignInProbeApp: App {
 				// Hard ceiling of 3 GrandSlam requests (lookup/init/complete): no
 				// 4th (2FA-delivery) request can fire.
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .macLegacy, scope: zagMacLegacyScope, maxRequests: 3) }, file: "zag_maclegacy_signin.json")
+			case let env where env["ZAG_RUN_MACLEGACY_2FA_SELFCHECK"] == "1":
+				// Offline preflight: the 2FA harness with the transport refused.
+				// No Apple contact; no consent/code gate is reached.
+				TwoFactorRunView(platform: .macLegacy, scope: zagMacLegacyScope, file: "zag_maclegacy_2fa_selfcheck.json", allowNetwork: false)
+			case let env where env["ZAG_RUN_MACLEGACY_2FA"] == "1":
+				// Supervised, interactive 2FA completion. Disabled by default; one
+				// bounded sequence (ceilings 5/2/1). Consent is required before any
+				// delivery; a code is submitted only by a separate explicit action.
+				TwoFactorRunView(platform: .macLegacy, scope: zagMacLegacyScope, file: "zag_maclegacy_2fa.json")
 			default:
 				CredentialEntryView()
 			}
@@ -58,6 +67,67 @@ struct LiveRunView: View {
 				ZagSignInExperimentRunner.emit(report, name: file)
 				status = "Done: \(report["outcome"] ?? report["result"] ?? "—")"
 			}
+	}
+}
+
+/// The interactive 2FA screen. The sign-in runs in `.task`; the coordinator
+/// publishes each decision point and this view resolves it. Consent is a
+/// deliberate button press before any delivery; the code is entered in a
+/// SecureField and submitted by a separate explicit action; Cancel is available
+/// at every stage. The code is never shown back, logged or written to the file.
+struct TwoFactorRunView: View {
+	let platform: ZagAppleAuthPlatform
+	let scope: String
+	let file: String
+	var allowNetwork: Bool = true
+	@StateObject private var coordinator = ZagTwoFactorCoordinator()
+	@State private var status = "Starting one supervised 2FA attempt…"
+	@State private var code = ""
+
+	var body: some View {
+		VStack(spacing: 16) {
+			Text(status).font(.footnote).multilineTextAlignment(.center)
+			switch coordinator.stage {
+			case .authenticating:
+				ProgressView("Authenticating…")
+			case .awaitingConsent:
+				Text("Apple will send a verification code to your trusted device or phone number. No code is sent until you consent.")
+					.font(.footnote).multilineTextAlignment(.center)
+				HStack {
+					Button("Cancel", role: .cancel) { coordinator.cancel() }
+					Button("Consent & send code") { coordinator.resolveConsent(true) }
+						.buttonStyle(.borderedProminent)
+				}
+			case .selectingPhone(let choices):
+				Text("Choose a number to receive the SMS code:").font(.footnote)
+				ForEach(choices) { c in
+					Button(c.display) { coordinator.resolvePhone(c.id) }
+				}
+				Button("Cancel", role: .cancel) { coordinator.cancel() }
+			case .awaitingCode:
+				Text("Enter the 6-digit verification code.").font(.footnote)
+				SecureField("Code", text: $code)
+					.textContentType(.oneTimeCode)
+					.keyboardType(.numberPad)
+					.multilineTextAlignment(.center)
+				HStack {
+					Button("Cancel", role: .cancel) { coordinator.cancel() }
+					Button("Submit code") { coordinator.submitCode(code); code = "" }
+						.buttonStyle(.borderedProminent)
+						.disabled(code.count != 6)
+				}
+			case .submitting:
+				ProgressView("Completing…")
+			case .idle, .finished, .cancelled:
+				EmptyView()
+			}
+		}
+		.padding()
+		.task {
+			let report = await ZagSignInExperimentRunner.runTwoFactor(platform: platform, scope: scope, coordinator: coordinator, allowNetwork: allowNetwork)
+			ZagSignInExperimentRunner.emit(report, name: file)
+			status = "Done: \(report["outcome"] ?? report["result"] ?? "—")"
+		}
 	}
 }
 

@@ -87,11 +87,35 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 	/// subset of response-header metadata. Raw headers and bodies are never kept.
 	private(set) var httpTrace: [(status: Int, metadata: [String: String])] = []
 	private let maxRequests: Int
+	/// HTTP methods the transport will issue. The SRP-only sign-in keeps the
+	/// strict GET/POST set; the 2FA flow additionally needs PUT (SMS delivery).
+	private let allowedMethods: Set<String>
+	/// When set, requests are bounded by separate per-class ceilings instead of a
+	/// single cap, and every verification-initiation request is gated on consent.
+	private let twoFactorPolicy: ZagTwoFactorPolicy?
+	/// Blocking consent gate: asked before the first verification-initiation
+	/// request, returns whether the user consented to delivery. nil denies.
+	private let consentGate: (() -> Bool)?
+	private var classCounts: [ZagAppleAuthRequestClass: Int] = [:]
 
-	init(allowNetwork: Bool, maxRequests: Int = 3) {
+	init(allowNetwork: Bool, maxRequests: Int = 3,
+		 allowedMethods: Set<String> = ["GET", "POST"],
+		 twoFactorPolicy: ZagTwoFactorPolicy? = nil,
+		 consentGate: (() -> Bool)? = nil) {
 		self.allowNetwork = allowNetwork
 		self.maxRequests = maxRequests
+		self.allowedMethods = allowedMethods
+		self.twoFactorPolicy = twoFactorPolicy
+		self.consentGate = consentGate
 	}
+
+	/// Per-class accepted-request counts, for the sanitized report. No URL,
+	/// header or body is retained — only how many of each class were allowed.
+	var acceptedByClass: [String: Int] { lock.withLock {
+		var out: [String: Int] = [:]
+		for (k, v) in classCounts { out[k.rawValue] = v }
+		return out
+	} }
 
 	/// The only response headers ever recorded — non-sensitive, for diagnosing a
 	/// 503/429 (transient vs persistent). Lower-cased for case-insensitive match.
@@ -145,15 +169,35 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 	func perform(url: String, method: String, headers: [String: String], body: Data) -> (Int, Data, [[String]])? {
 		guard allowNetwork else { lock.lock(); log.append("BLOCKED (offline)"); lock.unlock(); return nil }
 		guard let u = URL(string: url), u.scheme == "https", let host = u.host, host.hasSuffix(".apple.com") else { return nil }
-		guard method == "GET" || method == "POST" else { return nil }
-		lock.lock()
-		guard count < maxRequests else { ceilingRefusals += 1; log.append("REFUSED (ceiling)"); lock.unlock(); return nil }
-		count += 1
-		lock.unlock()
+		guard allowedMethods.contains(method) else { return nil }
+		if let policy = twoFactorPolicy {
+			let hasCodeHeader = headers.contains { $0.key.lowercased() == "security-code" }
+			let cls = ZagAppleAuthRequestClass.classify(url: url, method: method, hasSecurityCodeHeader: hasCodeHeader)
+			// Consent gate (outside the lock, as it blocks on the UI): every
+			// verification-initiation request requires explicit consent. The first
+			// non-GsService2 request of the login is always one of these, so no
+			// delivery/verification request can fire without consent.
+			if cls == .verificationInitiation, !(consentGate?() ?? false) {
+				lock.lock(); ceilingRefusals += 1; log.append("REFUSED (no consent)"); lock.unlock(); return nil
+			}
+			lock.lock()
+			let already = classCounts[cls] ?? 0
+			guard already < policy.ceiling(for: cls), count < maxRequests else {
+				ceilingRefusals += 1; log.append("REFUSED (\(cls.rawValue) ceiling)"); lock.unlock(); return nil
+			}
+			classCounts[cls] = already + 1
+			count += 1
+			lock.unlock()
+		} else {
+			lock.lock()
+			guard count < maxRequests else { ceilingRefusals += 1; log.append("REFUSED (ceiling)"); lock.unlock(); return nil }
+			count += 1
+			lock.unlock()
+		}
 		var req = URLRequest(url: u)
 		req.httpMethod = method
 		for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-		if method == "POST" { req.httpBody = body }
+		if method != "GET" { req.httpBody = body }
 		let sem = DispatchSemaphore(value: 0)
 		var out: (Int, Data, [[String]])?
 		var captured: [String: String] = [:]
@@ -526,8 +570,44 @@ actor ZagAppleAuthMachine {
 		#endif
 	}
 
+	/// The supervised, interactive 2FA sign-in. Completes the GrandSlam exchange
+	/// past the 2FA gate using apple-auth's real callbacks, driven by the
+	/// `coordinator` (explicit consent before any delivery, phone selection when
+	/// offered, a SecureField code on a separate action, cancel throughout).
+	/// Bounds: one sequence, no retries, separate per-class ceilings (5 / 2 / 1).
+	/// Verification method is AUTOMATIC — it follows the account's actual 2FA
+	/// configuration rather than forcing SMS or trusted-device. A session is
+	/// retained only when the login positively returns AAUTH_OK with valid
+	/// session material. Requires an authorised live run.
+	#if canImport(SwiftUI)
+	func signInWith2FA(email: String, password: String, coordinator: ZagTwoFactorCoordinator, allowNetwork: Bool = true) async throws -> ZagAppleAuthSignInReport {
+		#if canImport(ZagAppleAuth)
+		guard let persisted = try store.load(scope: scope) else { return ZagAppleAuthSignInReport(outcome: .notProvisioned) }
+		let policy = ZagTwoFactorPolicy()   // authentication 5, verification-initiation 2, code-submission 1
+		let overall = policy.authenticationCeiling + policy.verificationInitiationCeiling + policy.codeSubmissionCeiling
+		// allowNetwork false = offline preflight: the transport refuses every
+		// request, so no Apple contact and no consent/code gate is ever reached.
+		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: overall,
+											  allowedMethods: ["GET", "POST", "PUT"],
+											  twoFactorPolicy: policy,
+											  consentGate: { coordinator.requestConsent() })
+		let platform = self.platform
+		let scope = self.scope
+		return await withCheckedContinuation { continuation in
+			DispatchQueue.global(qos: .userInitiated).async {
+				continuation.resume(returning: Self.driveSignInWith2FA(persisted: persisted, transport: transport,
+																	   email: email, password: password,
+																	   platform: platform, scope: scope, coordinator: coordinator))
+			}
+		}
+		#else
+		throw ZagAppleAuthError.unavailable
+		#endif
+	}
+	#endif
+
 	#if canImport(ZagAppleAuth)
-	private struct RawSignIn { var outcome: ZagAppleAuthSignInOutcome; var ec: Int?; var http: Int?; var message: String? }
+	private struct RawSignIn { var outcome: ZagAppleAuthSignInOutcome; var ec: Int?; var http: Int?; var message: String?; var sessionStored = false }
 
 	private static func driveSignIn(persisted: Data, transport: ZagAppleAuthTransport,
 									email: String, password: String, sentinel: ZagTwoFactorSentinel,
@@ -570,6 +650,64 @@ actor ZagAppleAuthMachine {
 										ec: raw.ec, httpStatus: raw.http, appleMessage: raw.message,
 										httpTrace: Self.httpTrace(transport.httpTrace, stageFor: Self.signInStage))
 	}
+
+	#if canImport(SwiftUI)
+	/// Drives one interactive 2FA login and securely retains the session on
+	/// success. The code and session material never appear in the return value.
+	private static func driveSignInWith2FA(persisted: Data, transport: ZagAppleAuthTransport,
+										   email: String, password: String, platform: ZagAppleAuthPlatform,
+										   scope: String, coordinator: ZagTwoFactorCoordinator) -> ZagAppleAuthSignInReport {
+		coordinator.begin()
+		let result: Result<RawSignIn, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport, platform: platform) { client in
+			let p = aauth_client_provision(client)
+			guard p == AAUTH_OK else {
+				return .success(RawSignIn(outcome: transport.reachedApple ? .rejected(code: Int(p.rawValue)) : .transportFailed))
+			}
+			let ctx = Unmanaged.passUnretained(coordinator).toOpaque()
+			// AUTOMATIC: follow the account's real 2FA configuration; do not force a
+			// method. phone_number_id 0 discovers the trusted numbers to present.
+			var verification = aauth_verification_options(
+				method: AAUTH_VERIFY_AUTOMATIC, phone_number_id: 0,
+				code: zagTwoFactorCodeCallback, select_phone: zagPhoneSelectCallback, context: ctx)
+			var session: OpaquePointer?
+			let rc: aauth_status = email.withCString { e in password.withCString { pw in
+				withUnsafePointer(to: &verification) { v in aauth_client_login(client, e, pw, v, &session) }
+			} }
+			var sessionStored = false
+			// Persist ONLY on a positive AAUTH_OK with valid (non-empty) session
+			// material. The bytes are opaque and never logged.
+			if rc == AAUTH_OK, let session {
+				var buf = aauth_client_buffer()
+				if aauth_account_session_plist(session, &buf) == AAUTH_OK, let d = buf.data, buf.size > 0 {
+					let bytes = Data(bytes: d, count: buf.size)
+					if (try? ZagAppleAuthSessionStore().save(bytes, scope: scope)) != nil { sessionStored = true }
+				}
+				aauth_client_buffer_free(&buf)
+			}
+			if let session { aauth_account_session_free(session) }
+			if rc == AAUTH_OK { return .success(RawSignIn(outcome: .authenticated, sessionStored: sessionStored)) }
+			let error = String(cString: aauth_client_last_error())
+			let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error), message = grandSlamMessage(error)
+			let isNetworkError = rc.rawValue == AAUTH_NETWORK_ERROR.rawValue
+			let all200 = !transport.httpTrace.isEmpty && transport.httpTrace.allSatisfy { $0.status == 200 }
+			let outcome: ZagAppleAuthSignInOutcome = ec.map { .rejected(code: $0) }
+				?? http.map { .httpError(status: $0) }
+				?? (isNetworkError ? Self.networkErrorOutcome(hitCeiling: transport.hitCeiling, all200: all200)
+					: (transport.reachedApple ? .rejected(code: Int(rc.rawValue)) : .transportFailed))
+			return .success(RawSignIn(outcome: outcome, ec: ec, http: http, message: message))
+		}
+		coordinator.finish()
+		let raw: RawSignIn = { if case .success(let r) = result { return r }; return RawSignIn(outcome: .transportFailed) }()
+		return ZagAppleAuthSignInReport(outcome: raw.outcome,
+										stage: Self.signInStage(requestCount: transport.requestCount),
+										requestCount: transport.requestCount,
+										ec: raw.ec, httpStatus: raw.http, appleMessage: raw.message,
+										httpTrace: Self.httpTrace(transport.httpTrace, stageFor: Self.signInStage),
+										twoFactorCompleted: raw.outcome == .authenticated,
+										sessionStored: raw.sessionStored,
+										acceptedByClass: transport.acceptedByClass)
+	}
+	#endif
 	#endif
 }
 
@@ -615,6 +753,15 @@ struct ZagAppleAuthSignInReport: Equatable, Sendable {
 	var appleMessage: String? = nil
 	/// Per-request sanitized HTTP trace (stage, status, allowlisted metadata).
 	var httpTrace: [ZagHTTPTraceEntry] = []
+	/// Whether the 2FA exchange completed and the login returned AAUTH_OK. nil for
+	/// the SRP-only experiment that never submits a code.
+	var twoFactorCompleted: Bool? = nil
+	/// Whether valid session material was securely retained on-device. nil when
+	/// retention was not attempted. Never carries the session itself.
+	var sessionStored: Bool? = nil
+	/// Per-class accepted request counts (authentication / verification-initiation
+	/// / code-submission), for bound reporting. No request content.
+	var acceptedByClass: [String: Int]? = nil
 }
 
 #if canImport(ZagAppleAuth)
@@ -640,4 +787,32 @@ private let zagPhoneSelectCancelCallback: @convention(c) (UnsafeMutableRawPointe
 	if let ctx { Unmanaged<ZagTwoFactorSentinel>.fromOpaque(ctx).takeUnretainedValue().mark() }
 	return 1   // cancel: do not select a number / trigger an SMS
 }
+
+#if canImport(SwiftUI)
+/// Interactive 2FA code callback: blocks for the code the user enters in the
+/// SecureField (via the coordinator), writes it into apple-auth's buffer and
+/// returns success, or returns cancel. The code is never logged or copied
+/// anywhere else; apple-auth wipes its own buffer after use.
+private let zagTwoFactorCodeCallback: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutablePointer<CChar>?, Int, UnsafeMutablePointer<Int>?) -> Int32 = { ctx, output, capacity, written in
+	guard let ctx, let output else { written?.pointee = 0; return 1 }
+	let coordinator = Unmanaged<ZagTwoFactorCoordinator>.fromOpaque(ctx).takeUnretainedValue()
+	guard let code = coordinator.provideCode() else { written?.pointee = 0; return 1 }
+	let count = code.utf8.count
+	guard count > 0, count <= capacity else { written?.pointee = 0; return 1 }
+	code.withCString { src in _ = memcpy(output, src, count) }   // digits only, no NUL needed
+	written?.pointee = count
+	coordinator.markSubmitting()
+	return 0
+}
+
+/// Interactive phone-selection callback: presents the account's trusted numbers
+/// through the coordinator and returns the chosen id, or cancel.
+private let zagPhoneSelectCallback: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<Int64>?) -> Int32 = { ctx, phonesJSON, selected in
+	guard let ctx, let phonesJSON, let selected else { return 1 }
+	let coordinator = Unmanaged<ZagTwoFactorCoordinator>.fromOpaque(ctx).takeUnretainedValue()
+	guard let id = coordinator.selectPhone(String(cString: phonesJSON)) else { return 1 }
+	selected.pointee = id
+	return 0
+}
+#endif
 #endif

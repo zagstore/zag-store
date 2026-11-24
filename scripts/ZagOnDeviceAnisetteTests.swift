@@ -150,13 +150,17 @@ struct ZagOnDeviceAnisetteTests {
 
 		// 7f. Phase 2 — request classification, per-class ceilings, consent gate,
 		//     controller cancellation, session-store round-trip.
-		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/GsService2") == .authentication, "GsService2 -> authentication")
-		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/lookup") == .authentication, "lookup -> authentication")
-		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/verify/phone", method: "PUT") == .verificationInitiation, "verify/phone -> verification-initiation")
-		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/trustedDeviceSecondaryAuth") == .verificationInitiation, "trusted-device push -> verification-initiation")
-		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/verify/phone/securitycode") == .codeSubmission, "securitycode -> code-submission")
-		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/validateCode") == .codeSubmission, "validateCode -> code-submission")
-		check(ZagAppleAuthRequestClass.classify(url: "https://example.com/other") == .other, "unrelated -> other")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/GsService2/lookup", method: "GET") == .authentication, "GsService2/lookup -> authentication")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/GsService2") == .authentication, "GsService2 SRP -> authentication")
+		// Opaque URL-bag bases still classify as verification (consent-gated):
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/opaque-secondary", method: "GET") == .verificationInitiation, "post-auth config GET -> verification-initiation")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/x/verify/phone", method: "PUT") == .verificationInitiation, "SMS delivery PUT -> verification-initiation")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/opaque-trusteddevice", method: "GET") == .verificationInitiation, "trusted-device push -> verification-initiation")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/x/verify/phone/securitycode") == .codeSubmission, "SMS securitycode -> code-submission")
+		// Trusted-device submit is identified by the security-code request header:
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/opaque-validate", method: "GET", hasSecurityCodeHeader: true) == .codeSubmission, "validateCode w/ security-code header -> code-submission")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/opaque-validate", method: "GET") == .verificationInitiation, "validate URL w/o header -> verification-initiation")
+		check(ZagAppleAuthRequestClass.classify(url: "not-a-url") == .other, "non-https -> other")
 		let pol = ZagTwoFactorPolicy()
 		check(pol.consentToDeliver == false, "consent defaults to NOT granted")
 		check(pol.authenticationCeiling == 5 && pol.verificationInitiationCeiling == 2 && pol.codeSubmissionCeiling == 1, "default per-class ceilings")
@@ -175,6 +179,17 @@ struct ZagOnDeviceAnisetteTests {
 		check(sessions.hasSession(scope: "unit-test") == true, "session present after save")
 		try? sessions.delete(scope: "unit-test")
 		check(sessions.hasSession(scope: "unit-test") == false, "session gone after delete")
+
+		#if canImport(SwiftUI)
+		let coord = ZagTwoFactorCoordinator()
+		check(coord.didCancel == false, "coordinator not cancelled initially")
+		coord.cancel()
+		check(coord.didCancel == true, "coordinator cancelled after cancel()")
+		check(coord.requestConsent() == false, "consent denied once cancelled")
+		check(coord.provideCode() == nil, "no code provided once cancelled")
+		let choices = ZagTwoFactorCoordinator.parseChoices("[{\"id\":42,\"display_number\":\"(•••) •••-1234\"}]")
+		check(choices.count == 1 && choices.first?.id == 42, "phone choices parsed from JSON")
+		#endif
 
 		// 8. The gated sign-in experiment is inert when the module is unlinked.
 		let signInMachine = ZagAppleAuthMachine()

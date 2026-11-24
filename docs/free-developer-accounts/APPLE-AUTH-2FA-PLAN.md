@@ -115,3 +115,67 @@ controller; and a Keychain session-store round-trip. Compiles and links
 
 Objective unchanged: fully standalone on-device authentication — no Android
 libraries, no Mac companion, no remote anisette server.
+
+---
+
+## E3 2FA harness — WIRED & PREFLIGHTED (offline), 2026-11-24
+
+The supervised harness is implemented and validated offline; no live 2FA has
+run. `ZAG_RUN_MACLEGACY_2FA` is disabled by default.
+
+### Interactive sequence (what the supervised run does)
+1. **Authenticate** — 3 GrandSlam requests (lookup, SRP init, SRP complete) on
+   the `mac-legacy-experiment` identity, exactly as E3 Step B. No code can be
+   delivered here.
+2. **Consent gate** — if the account requires 2FA, the first post-completion
+   request is refused until the user taps **Consent & send code**. Denying or
+   **Cancel** aborts with no delivery.
+3. **Choose number (SMS only)** — if Apple uses SMS, the trusted numbers are
+   presented and the user selects one (no number is auto-selected). Trusted-
+   device 2FA pushes to devices with no selection.
+4. **Enter code** — Apple delivers the code; the user types it in a SecureField
+   and taps **Submit code** (a separate explicit action). The code is never
+   shown back, logged, persisted or written to the report.
+5. **Complete** — apple-auth submits the code and re-authenticates; on a
+   positive `AAUTH_OK` with valid session material, the opaque session is stored
+   in the this-device-only Keychain. **Cancel** is available at every stage.
+
+### Every possible Apple-contacting action (and nothing else)
+- `GET /grandslam/GsService2/lookup` — URL-bag lookup (authentication).
+- `POST /grandslam/GsService2` ×2 — SRP init + complete (authentication).
+- **[consent-gated]** `GET <secondaryAuth>` — SMS config, OR
+  `GET <trustedDeviceSecondaryAuth>` — trusted-device push (verification-init).
+- **[consent-gated]** `PUT <secondaryAuth>/verify/phone` — SMS delivery
+  (verification-init).
+- `POST <secondaryAuth>/verify/phone/securitycode` — SMS code submit, OR
+  `GET <validateCode>` (security-code header) — trusted-device submit
+  (code-submission).
+- `POST /grandslam/GsService2` ×2 — re-auth after 2FA (authentication).
+Transport is HTTPS-only, `*.apple.com` only, GET/POST/PUT only, no redirects, no
+retries. Offline (`allowNetwork` false) refuses all of them.
+
+### Request limits (one bounded sequence, no retries)
+- authentication ≤ 5, verification-initiation ≤ 2, code-submission ≤ 1;
+  overall ≤ 8. A verification-initiation request also requires consent.
+
+### Success evidence (never inferred from HTTP 200)
+`aauth_client_login` returns `AAUTH_OK` and non-empty `aauth_account_session_plist`
+material; the report records `two_factor_completed: true`, `session_stored:
+true`, and per-class counts — never a code, token or session.
+
+### Offline validation (done)
+- Host tests: all pass (classifier, per-class ceilings, consent gate,
+  coordinator cancellation, session-store round-trip).
+- iOS `arm64` compile + link: clean.
+- On-device preflight, network refused (`ZAG_RUN_MACLEGACY_2FA_SELFCHECK`):
+  `outcome transport-failed`, `request_count 0`, `stage pre-request` (zero Apple
+  contact); mac-legacy 10 consistent headers, credential present; all three ADI
+  profiles intact (mac-legacy / mac-experiment / iphone each 10 consistent).
+
+### One-time launch command (awaiting separate authorization)
+The signed app is already installed and preflighted. When authorized, run with
+the `!` prefix in Claude Code:
+
+```
+xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_2FA":"1"}' dev.zagstore.ptteamprobe
+```

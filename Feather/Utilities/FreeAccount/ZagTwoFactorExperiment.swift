@@ -18,14 +18,19 @@ enum ZagAppleAuthRequestClass: String, Sendable, Equatable {
 	case codeSubmission          // verify/phone/securitycode, validateCode
 	case other
 
-	/// Classifies by URL (case-insensitive) and method. Order matters:
-	/// code-submission endpoints are matched before the broader verification
-	/// endpoints they are nested under.
-	static func classify(url: String, method: String = "POST") -> ZagAppleAuthRequestClass {
+	/// Classifies a request robustly, without depending on the opaque URL-bag
+	/// values for the verification endpoints. The only URL fact relied upon is the
+	/// hardcoded `/grandslam/GsService2` path (the URL-bag lookup and every SRP
+	/// request, including the post-2FA re-auth). apple-auth issues no other
+	/// request during login except the 2FA steps, so every non-GsService2 request
+	/// is a verification step and is consent-gated. Code submission is identified
+	/// by the SMS `securitycode` path or the trusted-device `security-code`
+	/// request header — the two ways apple-auth carries the entered code.
+	static func classify(url: String, method: String = "POST", hasSecurityCodeHeader: Bool = false) -> ZagAppleAuthRequestClass {
 		let u = url.lowercased()
-		if u.contains("securitycode") || u.contains("validatecode") { return .codeSubmission }
-		if u.contains("/verify/phone") || u.contains("secondaryauth") { return .verificationInitiation }
-		if u.contains("lookup") || u.contains("gsservice2") { return .authentication }
+		if u.contains("/grandslam/gsservice2") { return .authentication }
+		if u.contains("securitycode") || hasSecurityCodeHeader { return .codeSubmission }
+		if u.hasPrefix("https://") { return .verificationInitiation }
 		return .other
 	}
 }
@@ -119,3 +124,125 @@ struct ZagAppleAuthSessionStore {
 		guard s == errSecSuccess || s == errSecItemNotFound else { throw ZagAppleAuthError.keychain(s) }
 	}
 }
+
+#if canImport(SwiftUI)
+import SwiftUI
+
+/// Drives the interactive, human-in-the-loop 2FA flow. The sign-in runs on a
+/// background thread; this object blocks that thread at each decision point and
+/// publishes the current stage to the SwiftUI view, which resolves it on the
+/// main thread. Every blocking gate short-circuits to a cancelled result, so a
+/// denial or a cancel can never let the flow proceed. A verification code lives
+/// only in `codeResult` between submit and hand-off and is never logged,
+/// persisted, echoed or placed in any report.
+final class ZagTwoFactorCoordinator: ObservableObject, @unchecked Sendable {
+	struct PhoneChoice: Identifiable, Equatable { let id: Int64; let display: String }
+
+	enum Stage: Equatable {
+		case idle
+		case authenticating               // SRP in progress (no code can be delivered)
+		case awaitingConsent              // asking BEFORE any verification delivery
+		case selectingPhone([PhoneChoice])// SMS: user picks a trusted number
+		case awaitingCode                 // delivery done; user enters the code
+		case submitting                   // code handed off; completing
+		case finished
+		case cancelled
+	}
+
+	@Published private(set) var stage: Stage = .idle
+
+	private let lock = NSLock()
+	private var cancelledFlag = false
+	private var consentDecided = false
+	private var consentGranted = false
+	private var phoneResult: Int64?
+	private var codeResult: String?
+	private let consentSem = DispatchSemaphore(value: 0)
+	private let phoneSem = DispatchSemaphore(value: 0)
+	private let codeSem = DispatchSemaphore(value: 0)
+
+	var didCancel: Bool { lock.withLock { cancelledFlag } }
+
+	// ---- called on the background (login) thread; each blocks until resolved ----
+
+	/// Explicit consent before ANY verification-initiation request. Asked once;
+	/// the decision is cached for the delivery request that follows the config
+	/// fetch. Returns false immediately if already cancelled.
+	func requestConsent() -> Bool {
+		lock.lock()
+		if cancelledFlag { lock.unlock(); return false }
+		if consentDecided { let g = consentGranted; lock.unlock(); return g }
+		lock.unlock()
+		setStage(.awaitingConsent)
+		consentSem.wait()
+		return lock.withLock { consentGranted && !cancelledFlag }
+	}
+
+	/// Present the account's trusted numbers (item 8) and block for the choice.
+	func selectPhone(_ phonesJSON: String) -> Int64? {
+		if didCancel { return nil }
+		let choices = Self.parseChoices(phonesJSON)
+		setStage(.selectingPhone(choices))
+		phoneSem.wait()
+		return lock.withLock { cancelledFlag ? nil : phoneResult }
+	}
+
+	/// Block for the code the user enters in the SecureField (item 3). Cleared
+	/// from the coordinator as soon as it is read.
+	func provideCode() -> String? {
+		if didCancel { return nil }
+		setStage(.awaitingCode)
+		codeSem.wait()
+		return lock.withLock {
+			defer { codeResult = nil }
+			return cancelledFlag ? nil : codeResult
+		}
+	}
+
+	// ---- called on the main thread by the view ----
+
+	func begin() { setStage(.authenticating) }
+	func markSubmitting() { setStage(.submitting) }
+	func finish() { setStage(.finished) }
+
+	func resolveConsent(_ granted: Bool) {
+		lock.withLock { consentDecided = true; consentGranted = granted }
+		consentSem.signal()
+	}
+	func resolvePhone(_ id: Int64?) {
+		lock.withLock { phoneResult = id }
+		phoneSem.signal()
+	}
+	/// Submit the entered code (a separate, explicit user action). Never logged.
+	func submitCode(_ code: String) {
+		lock.withLock { codeResult = code }
+		codeSem.signal()
+	}
+
+	/// Cancel from any stage: all pending and future gates resolve to cancelled,
+	/// so no verification can be initiated or submitted.
+	func cancel() {
+		lock.withLock {
+			cancelledFlag = true
+			consentDecided = true; consentGranted = false
+			phoneResult = nil; codeResult = nil
+		}
+		consentSem.signal(); phoneSem.signal(); codeSem.signal()
+		setStage(.cancelled)
+	}
+
+	private func setStage(_ s: Stage) { DispatchQueue.main.async { self.stage = s } }
+
+	/// Parses apple-auth's phone-choice JSON (`[{id, display_number}]`) into
+	/// view choices. Tolerant of the field spellings the C API documents.
+	static func parseChoices(_ json: String) -> [PhoneChoice] {
+		guard let data = json.data(using: .utf8),
+			  let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+		return arr.compactMap { item in
+			guard let id = (item["id"] as? NSNumber)?.int64Value else { return nil }
+			let display = (item["display_number"] as? String) ?? (item["numberWithDialCode"] as? String) ?? "•••"
+			return PhoneChoice(id: id, display: display)
+		}
+	}
+}
+#endif

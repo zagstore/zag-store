@@ -131,6 +131,50 @@ enum ZagSignInExperimentRunner {
 		return report
 	}
 
+	#if canImport(SwiftUI)
+	/// The supervised, interactive 2FA run: fresh offline anisette, then one
+	/// bounded interactive GrandSlam sign-in that completes the 2FA exchange under
+	/// the coordinator's consent/phone/code gates and securely retains the session
+	/// on success. Reports only sanitized outcomes — never a code, token or
+	/// session. Preserves all three ADI profiles (read-only).
+	static func runTwoFactor(platform: ZagAppleAuthPlatform, scope: String, coordinator: ZagTwoFactorCoordinator, allowNetwork: Bool = true) async -> [String: Any] {
+		var report: [String: Any] = ["mode": allowNetwork ? "live-2fa" : "selfcheck-2fa", "platform": platform.rawValue, "scope": scope]
+		let m = machine(platform: platform, scope: scope)
+
+		let provider = ZagOnDeviceAnisetteProvider(machine: m, allowProvisioning: false)
+		do {
+			let anisette = try await provider.anisetteData()
+			report["anisette_header_count"] = anisette.headers.count
+			report["client_info_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(anisette.headers, platform: platform)
+		} catch { report["anisette"] = anisetteLabel(error) }
+
+		guard let credential = ZagSignInCredentialStore().load() else {
+			report["credential"] = "absent"; report["result"] = "no-credential"; return report
+		}
+		report["credential"] = "present"
+
+		do {
+			let signIn = try await m.signInWith2FA(email: credential.email, password: credential.password, coordinator: coordinator, allowNetwork: allowNetwork)
+			report["outcome"] = describe(signIn.outcome)
+			if let stage = signIn.stage { report["stage"] = stage }
+			report["request_count"] = signIn.requestCount
+			if let ec = signIn.ec { report["ec"] = ec }
+			if let http = signIn.httpStatus { report["http_status"] = http }
+			if let message = signIn.appleMessage { report["apple_message"] = message }
+			if !signIn.httpTrace.isEmpty { report["http_trace"] = traceDicts(signIn.httpTrace) }
+			if let tf = signIn.twoFactorCompleted { report["two_factor_completed"] = tf }
+			if let ss = signIn.sessionStored { report["session_stored"] = ss }
+			if let byClass = signIn.acceptedByClass { report["accepted_by_class"] = byClass }
+		} catch { report["outcome"] = "error" }
+
+		do { let cur = try await m.anisetteHeaders(allowProvisioning: false); report["profile_intact_header_count"] = cur.count }
+		catch { report["profile_intact"] = "unavailable" }
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		report["result"] = "ran"
+		return report
+	}
+	#endif
+
 	/// Renders the sanitized per-request trace as JSON-friendly dicts: stage,
 	/// status, and allowlisted metadata (e.g. `retry-after` -> `retry_after`).
 	static func traceDicts(_ trace: [ZagHTTPTraceEntry]) -> [[String: Any]] {
