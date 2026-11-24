@@ -218,6 +218,11 @@ enum ZagSignInExperimentRunner {
 	static func runTeamDiscovery(platform: ZagAppleAuthPlatform, scope: String, allowNetwork: Bool) async -> [String: Any] {
 		var report: [String: Any] = ["mode": allowNetwork ? "live-teams" : "selfcheck-teams", "platform": platform.rawValue, "scope": scope]
 		let m = ZagAppleAuthMachine(scope: scope, platform: platform)
+		// Offline diagnostic: is a token actually in the store, and is it usable?
+		// (Isolates a save failure from a bridge failure. No Apple contact.)
+		let stored = ZagDeveloperTokenStore().load(scope: scope)
+		report["token_in_store"] = (stored != nil)
+		report["token_usable"] = (stored?.isUsable(at: Date()) ?? false)
 		let headers = await m.developerHeaders()
 		report["developer_token_persisted"] = (headers != nil)
 		guard let headers else {
