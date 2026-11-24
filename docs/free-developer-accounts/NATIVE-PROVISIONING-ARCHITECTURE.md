@@ -809,3 +809,62 @@ the real profile fed in. We did not inspect a real profile in this pass.
 1. A compatible, **unexpired** development profile that lists this iPhone's provisioning UDID — the Xcode profile is likely expired (7-day) and may need an Apple renewal.
 2. The real export → import → install steps are gated behind explicit authorization (not performed).
 3. The Mach-O/CMS assembly runs through Zsign on-device; the signing primitive it uses is proven here, but a full on-device IPA was not produced in this offline pass.
+
+---
+
+## Real-profile readiness + CMS/entitlement hardening (2026-11-24)
+
+Offline inspection of the actual Xcode profile, plus two security corrections.
+No Apple contact, no export, no install.
+
+### The real profile (`75c25062…`, decoded + CMS-verified on the Mac)
+`iOS Team Provisioning Profile: dev.zagstore.ptteamprobe`. `security cms -D`
+verified its signature. Facts (identifiers masked):
+| Field | Value |
+|---|---|
+| Created / Expires | 2026-11-23 / **2026-11-30** (7-day TTL) |
+| Usable now? | **YES — ~5 days left** (as of 2026-11-24) |
+| TeamIdentifier | `V54K…` (our team) |
+| application-identifier | `V54K….dev.zagstore.ptteamprobe` (exact, matches target) |
+| DeveloperCertificates | 3; one SHA-256 **matches** the Mac login-keychain Apple Development cert (the importable identity) |
+| ProvisionedDevices | 1, and it **is** our iPhone's authoritative provisioning UDID |
+| Entitlements | `application-identifier` (str), `com.apple.developer.team-identifier` (str), `get-task-allow` (bool true), `keychain-access-groups` ([`V54K5JYGS4.*`]) |
+
+**Verdict: usable right now, until 2026-11-30.** Every compatibility dimension
+passes against the importable identity: certificate present (DER match), team,
+device, bundle, entitlements, validity. After 2026-11-30 it expires (7-day
+free-team limit) and a renewal — which requires Apple Developer Services — would
+be needed. Nothing needs renewing or changing before then.
+
+### Security fix 1 — CMS trust (fail closed)
+`ZagMobileProvision` previously located the plist inside the `.mobileprovision`
+bytes without verifying the CMS signature — untrusted bytes could carry a forged
+plist. Corrected:
+- `extractUnverifiedPlist` / `parseUnverified` are explicitly UNVERIFIED (preview/display only).
+- `parseVerified(_:verifier:)` returns contents only from a verifier-authenticated signed payload, and fails closed otherwise.
+- `cmsVerificationAvailable` is currently **false** — iOS has no public high-level CMS-verify API (CMSDecoder is macOS-only); a vendored iOS CMS verifier is the identified missing piece.
+- `ZagImportedIdentityProfileMatch.evaluate(..., cmsVerified:)` gates on verification FIRST and returns `.profileNotCMSVerified` when false, so real on-device signing refuses an unverified profile. (A profile verified on the Mac at export time, or a future vendored verifier, satisfies the gate.)
+
+### Security fix 2 — entitlement values, not just keys
+`ZagEntitlementAudit` now compares requested entitlements against the profile's
+grant by VALUE and structure, failing closed:
+- booleans must match exactly (cannot request `get-task-allow=true` the profile denies);
+- strings match with wildcard rules (`*`, trailing `*` prefix) — covers `application-identifier` and `keychain-access-groups`;
+- arrays require every requested element to be covered by a granted element;
+- unsupported/complex values, type mismatches, or ungranted keys are rejected.
+
+### Tests / build
+Imported-identity + profile + entitlement suite: **56/56** (incl. CMS-unverified
+fail-closed, boolean/string/array/wildcard entitlement rules, type-mismatch
+rejection). dev-services 150/150. Full arm64 iOS build/link; subsystem typecheck
+clean; device-generated path untouched.
+
+### Shortest real-device sequence (unchanged flow; trust gates added)
+1. **Mac (offline):** export the Apple Development identity as a strong-password `.p12`, AND capture the CMS-verified profile (the Mac verifies it) — *user authorization*.
+2. **iPhone (offline):** import the `.p12` (preview → confirm → ThisDeviceOnly) — *user authorization*.
+3. **Profile trust:** supply the profile as CMS-verified (verified on the Mac at export, or via a future on-device verifier). Until the iOS verifier exists, the profile must be marked verified by the trusted Mac-side step; otherwise signing fails closed.
+4. **Sign (offline):** `ZagSigningSource.imported` → resolve → match (now valid, ≤2026-11-30) → Zsign with the imported signer + this `embedded.mobileprovision`; verify.
+5. **Install + launch (offline transport):** iOS validates signature + profile.
+
+**Requires Apple Developer Services:** only a profile **renewal after 2026-11-30**
+(or a new device/App ID). Everything else is offline + user authorization.

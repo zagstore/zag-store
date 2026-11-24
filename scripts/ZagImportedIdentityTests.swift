@@ -96,21 +96,29 @@ let idDER = SecCertificateCopyData(idCert!) as Data
 let udid = "00009999-000ABCDEF1234567"   // synthetic provisioning UDID (NOT a CoreDevice id)
 let bundle = "com.zagstore.test"
 
-guard let profile = ZagMobileProvision.parse(data("profile.plist")) else {
+guard let profile = ZagMobileProvision.parseUnverified(data("profile.plist")) else {
 	print("FAIL: parse synthetic profile fixture"); print("FAILURES: \(failures + 1)"); exit(1)
 }
 check(profile.teamIdentifier == team, "profile parse: TeamIdentifier")
 check(profile.developerCertificates.count == 1, "profile parse: DeveloperCertificates present")
 check(profile.provisionedDevices.contains(udid), "profile parse: ProvisionedDevices")
-check(profile.entitlementKeys.contains("application-identifier"), "profile parse: entitlement keys")
+check(profile.entitlements["application-identifier"] != nil, "profile parse: entitlement values")
+check(profile.entitlements["get-task-allow"] == .bool(true), "profile parse: boolean entitlement value")
+check(profile.entitlements["keychain-access-groups"] == .array([.string("V54K5JYGS4.*")]), "profile parse: array entitlement value")
 
-func ev(idDER d: Data = idDER, team t: String? = team, dev: Bool = true, dev2 p: ZagProfileContents = profile,
-		device: String = udid, bundleID: String = bundle, ent: [String] = ["application-identifier", "get-task-allow"],
-		now n: Date = now) -> ZagProfileMatchResult {
+let reqOK: [String: ZagEntitlementValue] = [
+	"application-identifier": .string("V54K5JYGS4.com.zagstore.test"),
+	"get-task-allow": .bool(true),
+	"keychain-access-groups": .array([.string("V54K5JYGS4.myapp")]),   // covered by granted V54K5JYGS4.*
+]
+func ev(idDER d: Data = idDER, team t: String? = team, dev: Bool = true, p: ZagProfileContents = profile,
+		device: String = udid, bundleID: String = bundle, ent: [String: ZagEntitlementValue] = reqOK,
+		cms: Bool = true, now n: Date = now) -> ZagProfileMatchResult {
 	ZagImportedIdentityProfileMatch.evaluate(identityCertificateDER: d, identityTeam: t, identityIsDevelopment: dev,
-		profile: p, deviceProvisioningUDID: device, targetBundleID: bundleID, requestedEntitlements: ent, now: n)
+		profile: p, deviceProvisioningUDID: device, targetBundleID: bundleID, requestedEntitlements: ent, cmsVerified: cms, now: n)
 }
-check(ev() == .compatible, "match: fully compatible identity/profile/device/bundle/entitlements")
+check(ev() == .compatible, "match: fully compatible (cert/team/device/bundle/entitlement VALUES)")
+check(ev(cms: false) == .profileNotCMSVerified, "match: unverified CMS fails closed for real signing")
 check(ev(dev: false) == .notDevelopmentCertificate, "match: non-development certificate fails closed")
 // A different identity's certificate is not in the profile.
 if case .success(let other) = ZagImportedSigningIdentity.importIdentity(pkcs12: data("id2.p12"), password: "pw2") {
@@ -122,8 +130,31 @@ check(ev(device: "00000000-000000000000000") == .deviceNotProvisioned, "match: d
 let afterProfile = Date(timeIntervalSince1970: 5_000_000_000)   // ~2128, past the fixture's 2099 expiry
 check(ev(now: afterProfile) == .profileExpired, "match: expired profile")
 check(ev(bundleID: "com.zagstore.other") == .bundleMismatch, "match: wrong bundle id")
-check(ev(ent: ["application-identifier", "com.apple.developer.icloud-services"]) == .disallowedEntitlements(["com.apple.developer.icloud-services"]),
-	  "match: disallowed entitlement fails closed")
+// Entitlement VALUE/structure checks (not just keys).
+check(ev(ent: ["com.apple.developer.icloud-services": .bool(true)]) == .disallowedEntitlements(["com.apple.developer.icloud-services"]),
+	  "entitlement: key the profile does not grant -> rejected")
+check(ev(ent: ["get-task-allow": .bool(false)]) == .disallowedEntitlements(["get-task-allow"]),
+	  "entitlement: boolean value mismatch -> rejected")
+check(ev(ent: ["keychain-access-groups": .array([.string("OTHERTEAM.foo")])]) == .disallowedEntitlements(["keychain-access-groups"]),
+	  "entitlement: keychain group outside the granted wildcard -> rejected")
+check(ev(ent: ["keychain-access-groups": .array([.string("V54K5JYGS4.anything")])]) == .compatible,
+	  "entitlement: keychain group under the granted wildcard -> allowed")
+check(ev(ent: ["application-identifier": .string("V54K5JYGS4.wrong.bundle")]) == .disallowedEntitlements(["application-identifier"]),
+	  "entitlement: application-identifier value mismatch -> rejected")
+check(ev(ent: ["get-task-allow": .string("true")]) == .disallowedEntitlements(["get-task-allow"]),
+	  "entitlement: type mismatch (string vs bool) -> rejected")
+
+// ZagEntitlementAudit unit rules.
+check(ZagEntitlementAudit.stringGrants(granted: "V54K5JYGS4.*", requested: "V54K5JYGS4.app"), "stringGrants: trailing * prefix wildcard")
+check(!ZagEntitlementAudit.stringGrants(granted: "V54K5JYGS4.*", requested: "OTHER.app"), "stringGrants: wrong prefix rejected")
+check(ZagEntitlementAudit.stringGrants(granted: "*", requested: "anything"), "stringGrants: bare * grants anything")
+check(ZagEntitlementAudit.stringGrants(granted: "exact", requested: "exact"), "stringGrants: exact match")
+check(!ZagEntitlementAudit.stringGrants(granted: "exact", requested: "exacto"), "stringGrants: non-match rejected")
+check(ZagEntitlementAudit.grants(.array([.string("A.*")]), .array([.string("A.x"), .string("A.y")]), key: "k"),
+	  "grants: array all elements covered by a granted wildcard")
+check(!ZagEntitlementAudit.grants(.array([.string("A.*")]), .array([.string("A.x"), .string("B.y")]), key: "k"),
+	  "grants: array with an uncovered element rejected")
+check(!ZagEntitlementAudit.grants(.other, .bool(true), key: "k"), "grants: unsupported/other value fails closed")
 
 // Wildcard bundle semantics (unit).
 check(ZagImportedIdentityProfileMatch.bundleMatches(target: "com.a.b", applicationIdentifier: "TEAMID.*", team: "TEAMID"), "wildcard: bare * matches")
