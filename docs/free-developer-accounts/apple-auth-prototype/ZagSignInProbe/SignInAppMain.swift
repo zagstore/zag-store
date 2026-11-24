@@ -68,6 +68,14 @@ struct ZagSignInProbeApp: App {
 				// certificates (<=2 requests). No mutation. Confirms the current
 				// certificate count against the free-team limit before any CSR.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runCertificateDiscovery(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: true) }, file: "zag_maclegacy_certs.json")
+			case let env where env["ZAG_RUN_MACLEGACY_CSR_SELFCHECK"] == "1":
+				// Offline preflight: certificate issuance with no network and no mutation.
+				LiveRunView(task: { await ZagSignInExperimentRunner.runCertificateIssuance(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false, allowMutation: false) }, file: "zag_maclegacy_csr_selfcheck.json")
+			case let env where env["ZAG_RUN_MACLEGACY_CSR"] == "1":
+				// Supervised FIRST MUTATION: issue one development certificate for a
+				// new non-extractable Keychain key. The CSR is sent only after the
+				// explicit consent screen is authorised.
+				CertificateIssuanceRunView(platform: .macLegacy, scope: zagMacLegacyScope, file: "zag_maclegacy_csr.json")
 			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION_SELFCHECK"] == "1":
 				// Offline preflight: developer-session path, transport refused.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devsession_selfcheck.json")
@@ -165,6 +173,54 @@ struct TwoFactorRunView: View {
 			ZagSignInExperimentRunner.emit(report, name: file)
 			status = "Done: \(report["outcome"] ?? report["result"] ?? "—")"
 		}
+	}
+}
+
+/// The supervised certificate-issuance screen. It shows the explicit consent
+/// screen FIRST (what will be created, in which team, and the consequences).
+/// Only when the user authorises is `.submitCSR` consented and the one bounded
+/// issuance sequence run; Cancel contacts Apple for nothing.
+struct CertificateIssuanceRunView: View {
+	let platform: ZagAppleAuthPlatform
+	let scope: String
+	let file: String
+	@State private var consent = ZagMutationConsentCoordinator()
+	@State private var stage = Stage.consent
+	@State private var status = ""
+
+	enum Stage: Equatable { case consent, running, done }
+
+	var body: some View {
+		VStack(spacing: 16) {
+			switch stage {
+			case .consent:
+				ZagAccountMutationConsentView(
+					plan: [.submitCSR],
+					onAuthorize: {
+						consent.authorize([.submitCSR])
+						stage = .running
+						Task { await run(allowMutation: consent.mayPerform(.submitCSR)) }
+					},
+					onCancel: {
+						stage = .done
+						ZagSignInExperimentRunner.emit(["mode": "live-csr", "outcome": "cancelled", "request_count": 0], name: file)
+						status = "Cancelled. Nothing was sent to Apple."
+					})
+			case .running:
+				ProgressView("Issuing one development certificate…")
+			case .done:
+				Text(status).font(.footnote).multilineTextAlignment(.center)
+			}
+		}
+		.padding()
+	}
+
+	private func run(allowMutation: Bool) async {
+		let report = await ZagSignInExperimentRunner.runCertificateIssuance(
+			platform: platform, scope: scope, allowNetwork: true, allowMutation: allowMutation)
+		ZagSignInExperimentRunner.emit(report, name: file)
+		status = "Done: \(report["outcome"] ?? "—")"
+		stage = .done
 	}
 }
 

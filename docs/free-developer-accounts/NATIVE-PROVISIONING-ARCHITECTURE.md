@@ -479,3 +479,40 @@ xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F
 ```
 Reports: outcome, http_status, certificate_count, nearest_cert_expires_in_days,
 request_count — no serials/ids. No mutation.
+
+---
+
+## Certificate-issuance path (2026-11-24) — offline, prepared not run
+
+The native CSR path, ready for a single separately-authorized live submission.
+
+### Exact certificate-issuance request + expected response
+- **Request** — one POST to `https://developerservices2.apple.com/services/QH65B2/ios/submitDevelopmentCSR.action`, headers `Content-Type`/`Accept: text/x-xml-plist` + the local `developer_headers` bag (X-Apple-GS-Token, identity, Xcode headers, anisette). XML-plist body:
+  `clientId=XABBG36SBA`, `protocolVersion=QH65B2`, `requestId=<UUID>`, `userLocale=[en_US]`, `teamId=<team>`, `csrContent=<PEM CERTIFICATE REQUEST>`, `machineName="Zag Store"`, `machineId=<UUID>`. The PEM is the **public** CSR only; the RSA-2048 private key stays non-extractable in the Keychain.
+- **Expected response** — `resultCode 0` with a `certRequest` dict carrying the DER in `certContent` (raw) or `certificateContent` (base64); parsed by the shared `parseCertificate` (no re-list needed). Certificate-cap exhaustion returns `resultCode 3540/7458` → `ZagPortalError.certificateLimitReached`.
+
+### Consent behaviour + state transitions
+`.submitCSR` is a mutation gated by `ZagMutationConsentCoordinator` (default-deny). The supervised screen (`ZagAccountMutationConsentView`, plan `[.submitCSR]`) shows the consequence — *"Creates a new development certificate in your Apple Developer Personal Team, for this device's private key. Free accounts allow only a small number; an old one may need to be revoked."* — before anything is sent.
+- **Consent → Authorize** → `coordinator.authorize([.submitCSR])` → `mayPerform(.submitCSR)==true` → run the bounded sequence.
+- **Consent → Cancel** → nothing is sent to Apple (`request_count 0`, outcome `cancelled`).
+- Without authorization the runner reaches discovery only and reports `consent-required` (no CSR).
+
+### Certificate-cap handling (inferred vs authoritative)
+`ZagCertificateCapPreflight.evaluate(count)` yields `withinInferredCap` or `inferredCapacityRisk` — explicitly **non-authoritative** (`authoritative:false`); it warns but never blocks. The only authoritative capacity verdict is Apple's `certificateLimitReached` at submit time. On that error the runner **stops immediately**, preserves the pending key, performs **no revocation**, and reports `revoke_candidate_count`. Revocation (`ZagCertificateRevocation`, v1 `DELETE /services/v1/certificates/<id>`) is a **separate, separately-consented** action that identifies the certificate unambiguously by its v1 `id`; `ZagActiveCertificateGuard` refuses the active Xcode certificate (matched by SHA-1 / serial) unless an explicit override is set, and classifies the two legacy certs as **unknown-usage, never "unused"**. A capacity error can never trigger a revoke (building the request needs an explicit `id`).
+
+### Keychain persistence + recovery behaviour
+`ZagPendingCSRStore` journals one `ZagPendingCSRState` per scope (this-device-only Keychain) beside the signing key:
+- First run creates the non-extractable key + CSR and stores `{keySlot, request, startedAt, attempts:0}`.
+- A retry **reuses the stored request bytes and key** (no new key → no orphans; no new request → no duplicates).
+- Before each send `submissionUnconfirmed=true` is written; a crash between send and response leaves it set, and the next run **resolves it against the team's certificate listing** (public-key match) rather than resubmitting — recovering a lost-response certificate or clearing the flag.
+- `nextStep(at:)`: `reuseIssued` / `resolveUnconfirmed` / `submit` / `exhausted` (retry budget 3, lifetime 24h; on exhaustion the key is kept for review).
+- On issuance the certificate is accepted as usable only after: **public-key match** (sign/verify round-trip, `ZagKeychainSigningKeyFactory.check`), **not expired**, and **team association** (DER carries `OU=<teamID>`).
+
+### Test results
+24-case issuance/policy suite + the full developer-services suite pass (**84/84** host checks): cap preflight, active-cert guard (protect/override, legacy=unknown), revocation codec (id + DER SHA-1, v1 DELETE, synthetic 2xx/403/errors), pending-CSR journal (submit/resolve/reuse/exhausted). Full arm64 iOS target builds and links with the signing stack. New files type-check against the real FreeAccount subsystem. CSR network-refused preflight = `{mode:selfcheck-csr, mutation_authorized:false, outcome:preflight-no-network, request_count:0}`, developer token persisted, all three ADI profiles 10/consistent. Also fixed a latent duplicate `ZagDeveloperTeam` (renamed the native one to `ZagNativeDeveloperTeam`).
+
+### One-time launch command for a single live CSR submission (await authorization)
+```
+xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_CSR":"1"}' dev.zagstore.ptteamprobe
+```
+This shows the consent screen first; only on Authorize is one CSR submitted (bounded: teams + certificates + one submit, no retry). **Not executed.**

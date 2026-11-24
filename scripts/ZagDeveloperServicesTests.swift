@@ -142,5 +142,43 @@ check(miss.profileExpired && miss.profileExpiresInDays == -3, "past expiry -> ex
 let sani = aud.sanitized
 check(sani["team_matches_discovered"] as? Bool == true && sani.count == 7, "sanitized dict carries only verdicts/counts")
 
+// MARK: Certificate-cap preflight (inferred, NOT authoritative).
+let within = ZagCertificateCapPreflight.evaluate(certificateCount: 1, inferredCap: 2)
+check(within == .withinInferredCap(count: 1, inferredCap: 2) && !within.isInferredRisk, "count below inferred cap -> within")
+let risk = ZagCertificateCapPreflight.evaluate(certificateCount: 3, inferredCap: 2)
+check(risk.isInferredRisk, "count at/over inferred cap -> inferred risk")
+check(risk.sanitized["authoritative"] as? Bool == false, "cap preflight is explicitly non-authoritative")
+
+// MARK: Active-certificate guard (protects the Xcode cert; legacy = unknown, not unused).
+let guardz = ZagActiveCertificateGuard(activeSHA1: "5657782A6EADFFF608040D39186E6533557349FC", activeSerial: "723BE3EC")
+let active = ZagRevocableCertificate(id: "v1-active", serialNumber: "723BE3EC", sha1: "5657782a6eadfff608040d39186e6533557349fc", name: "Apple Development", machineName: nil, expiresAt: nil)
+let legacy = ZagRevocableCertificate(id: "v1-legacy", serialNumber: "1950B2FA", sha1: "AAAA", name: "iPhone Developer", machineName: nil, expiresAt: nil)
+check(guardz.classify(active) == .activeProtected, "active Xcode cert is classified protected (by SHA-1, case-insensitive)")
+check(guardz.classify(legacy) == .unknownUsage, "legacy cert is unknown usage, never assumed unused")
+check(!guardz.mayRevoke(active, explicitOverride: false), "active cert refused without explicit override")
+check(guardz.mayRevoke(active, explicitOverride: true), "active cert revocable only with explicit override")
+check(guardz.mayRevoke(legacy, explicitOverride: false), "non-active cert revocable once consented")
+
+// MARK: Revocation codec (unambiguous id; synthetic responses only).
+let revRows: [[String: Any]] = [["id": "CERTID1", "attributes": ["serialNumber": "AB", "certificateContent": Data([1,2,3]).base64EncodedString(), "name": "Apple Development"]]]
+let cands = ZagCertificateRevocation.candidates(from: revRows)
+check(cands.count == 1 && cands.first?.id == "CERTID1" && cands.first?.sha1 != nil, "revoke candidate carries v1 id + DER sha1")
+check(ZagCertificateRevocation.endpointPath(id: "CERTID1") == "certificates/CERTID1" && ZagCertificateRevocation.methodOverride == "DELETE", "revoke uses v1 DELETE on the id")
+check((try? ZagCertificateRevocation.parse(Data(), httpStatus: 200)) == true, "empty 2xx -> revoked")
+check((try? ZagCertificateRevocation.parse(Data("{\"data\":null}".utf8), httpStatus: 200)) == true, "2xx json without errors -> revoked")
+throws_(.sessionRejected, { _ = try ZagCertificateRevocation.parse(Data(), httpStatus: 403) }, "revoke HTTP 403 -> sessionRejected")
+throws_(.malformedResponse, { _ = try ZagCertificateRevocation.parse(Data("{\"errors\":[{\"detail\":\"no\"}]}".utf8), httpStatus: 200) }, "revoke errors -> malformedResponse")
+
+// MARK: Pending-CSR journal (idempotency: no duplicate request, no orphaned key).
+let now = Date()
+let fresh = ZagPendingCSRState(keySlot: "slot1", request: Data([9]), startedAt: now, attempts: 1, submissionUnconfirmed: false, issuedSerial: nil)
+check(fresh.nextStep(at: now) == .submit, "fresh pending with attempts left -> submit (reuses stored request/key)")
+var unconfirmed = fresh; unconfirmed.submissionUnconfirmed = true
+check(unconfirmed.nextStep(at: now) == .resolveUnconfirmed, "unconfirmed submission -> resolve via listing, never resubmit")
+var issued = fresh; issued.issuedSerial = "SER123"
+check(issued.nextStep(at: now) == .reuseIssued(serial: "SER123"), "already issued -> reuse, no new request")
+let spent = ZagPendingCSRState(keySlot: "slot1", request: Data([9]), startedAt: now.addingTimeInterval(-90_000), attempts: 3, submissionUnconfirmed: false, issuedSerial: nil)
+check(spent.nextStep(at: now) == .exhausted, "retry budget/lifetime exhausted -> stop, keep key for review")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

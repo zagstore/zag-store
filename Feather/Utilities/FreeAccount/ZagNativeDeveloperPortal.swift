@@ -18,7 +18,7 @@ import Foundation
 
 /// A developer team as returned by read-only discovery (`viewDeveloper` /
 /// listTeams). Not part of `ZagDeveloperPortalService`: discovery precedes it.
-struct ZagDeveloperTeam: Codable, Equatable, Sendable {
+struct ZagNativeDeveloperTeam: Codable, Equatable, Sendable {
 	let teamID: String
 	let name: String
 	/// e.g. "active"; Apple also reports membership type for free accounts.
@@ -107,13 +107,13 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	// MARK: - Read-only discovery
 
 	/// Team discovery — the smallest safe first live experiment. Read-only.
-	func teams() async throws -> [ZagDeveloperTeam] {
+	func teams() async throws -> [ZagNativeDeveloperTeam] {
 		let dict = try await send(.listTeams, teamID: nil)
 		let rows = (dict["teams"] as? [[String: Any]]) ?? []
 		return rows.compactMap { row in
 			guard let id = row["teamId"] as? String else { return nil }
 			let memberships = (row["memberships"] as? [[String: Any]])?.first
-			return ZagDeveloperTeam(
+			return ZagNativeDeveloperTeam(
 				teamID: id,
 				name: (row["name"] as? String) ?? id,
 				status: (row["status"] as? String) ?? "unknown",
@@ -202,6 +202,21 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 			throw ZagPortalError.malformedResponse
 		}
 		return ZagIssuedCertificate(certificate: Self.certificate(parsed), data: der)
+	}
+
+	/// Revokes ONE certificate via `/services/v1/` DELETE. Consent-gated on
+	/// `.revokeCertificate` and guarded by `ZagActiveCertificateGuard`: the active
+	/// Xcode certificate is refused unless `override` is explicitly set. This is
+	/// never reachable from a capacity error — it requires an explicit `id`.
+	func revokeCertificate(_ certificate: ZagRevocableCertificate, guard activeGuard: ZagActiveCertificateGuard,
+						   override: Bool, team: String) async throws {
+		guard consent.mayPerform(.revokeCertificate) else { throw ZagNativePortalError.consentRequired(.revokeCertificate) }
+		guard activeGuard.mayRevoke(certificate, explicitOverride: override) else {
+			throw ZagNativePortalError.consentRequired(.revokeCertificate)   // active cert without override
+		}
+		let response = try await sendV1(path: ZagCertificateRevocation.endpointPath(id: certificate.id),
+										methodOverride: ZagCertificateRevocation.methodOverride, body: Data())
+		_ = try ZagCertificateRevocation.parse(response.body, httpStatus: response.statusCode)
 	}
 
 	// MARK: - Helpers

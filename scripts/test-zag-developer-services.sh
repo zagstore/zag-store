@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Offline host tests for the native developer-services codec. No Apple contact.
+# Offline host tests for the native developer-services codec + issuance policy. No Apple contact.
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$(mktemp -d)"
@@ -11,5 +11,7 @@ swiftc -O -o "$OUT/dsvc" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagDeveloperTokenStore.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagMutationConsent.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagProfileIdentityAudit.swift" \
+  "$ROOT/Feather/Utilities/FreeAccount/ZagCertificateIssuancePolicy.swift" \
+  "$ROOT/Feather/Utilities/FreeAccount/ZagPendingCSRStore.swift" \
   "$OUT/shim.swift" "$OUT/main.swift"
 "$OUT/dsvc"

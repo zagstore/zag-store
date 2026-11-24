@@ -19,7 +19,7 @@ enum ZagMutationConsequence {
 					"Registers the app's bundle identifier with your team. Free accounts allow only a few App IDs per week.")
 		case .submitCSR:
 			return ("Issue a signing certificate",
-					"Creates a development certificate for this device's private key. Free accounts allow a small number; an old one may need to be revoked.")
+					"Creates a new development certificate in your Apple Developer Personal Team, for this device's private key. Free accounts allow only a small number; an old one may need to be revoked.")
 		case .downloadProfile:
 			return ("Create a provisioning profile",
 					"Generates a 7-day provisioning profile for this app on this device.")

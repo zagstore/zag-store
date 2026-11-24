@@ -312,6 +312,138 @@ enum ZagSignInExperimentRunner {
 		return report
 	}
 
+	/// A stable account identity for the experiment's signing key, so retries
+	/// address the same Keychain key (no orphaned keys).
+	static let experimentCSRAccount = UUID(uuidString: "0E5A0000-0000-4000-8000-000000000001")!
+
+	/// NATIVE CERTIFICATE ISSUANCE (prepared; not run live until authorized).
+	/// teams -> certificates (cap preflight) -> submitDevelopmentCSR for a NEW,
+	/// non-extractable Keychain key. The CSR is sent only when `allowMutation`
+	/// (the consent coordinator authorised `.submitCSR`). Idempotent via
+	/// `ZagPendingCSRStore`: a stored request/key is reused, an unconfirmed
+	/// submission is resolved against the listing (never blindly resubmitted),
+	/// and `certificateLimitReached` stops immediately, preserving the key, with
+	/// no revocation. Sanitized report only — no serials, keys, team ids or UDIDs.
+	static func runCertificateIssuance(platform: ZagAppleAuthPlatform, scope: String, allowNetwork: Bool, allowMutation: Bool) async -> [String: Any] {
+		var report: [String: Any] = ["mode": allowNetwork ? "live-csr" : "selfcheck-csr", "platform": platform.rawValue, "scope": scope, "mutation_authorized": allowMutation]
+		let m = ZagAppleAuthMachine(scope: scope, platform: platform)
+		let headers = await m.developerHeaders()
+		report["developer_token_persisted"] = (headers != nil)
+		guard let headers else {
+			report["result"] = "ran"; report["outcome"] = "no-developer-token-persisted"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		guard allowNetwork else {
+			report["result"] = "ran"; report["outcome"] = "preflight-no-network"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		let keys = ZagKeychainSigningKeys(namespace: "ZagStore.experiment.csr")
+		let factory = ZagKeychainSigningKeyFactory(keys: keys)
+		let store = ZagPendingCSRStore()
+		let budget = ZagRequestBudget(limit: 3)   // teams + certificates + CSR, no retry
+		let now = Date()
+		report["result"] = "ran"
+		do {
+			guard budget.take() else { throw ZagPortalError.network }
+			let teamsDict = try await sendQH65B2(.listTeams, teamID: nil, headers: headers)
+			guard let teamID = ((teamsDict["teams"] as? [[String: Any]])?.first)?["teamId"] as? String else {
+				report["outcome"] = "no-teams"; report["request_count"] = budget.used
+				for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+				return report
+			}
+			guard budget.take() else { throw ZagPortalError.network }
+			let (certBody, certStatus) = try await sendV1(path: "certificates", methodOverride: "GET",
+														  body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: teamID), headers: headers)
+			let existing = try ZagDeveloperServicesV1.parseList(certBody, httpStatus: certStatus)
+				.compactMap { ZagDeveloperServicesProtocol.parseCertificate($0) }
+			let cap = ZagCertificateCapPreflight.evaluate(certificateCount: existing.count)
+			for (k, v) in cap.sanitized { report[k] = v }
+
+			// Resolve or recover any journalled attempt against the live listing.
+			var pending = store.load(scope: scope)
+			if let p = pending, p.issuedSerial == nil, factory.hasKey(account: experimentCSRAccount, team: teamID, keySlot: p.keySlot) {
+				for parsed in existing {
+					if let der = parsed.der,
+					   case .matches(let serial, _) = factory.check(certificate: der, privateKey: Data(), account: experimentCSRAccount, team: teamID, keySlot: p.keySlot) {
+						var done = p; done.issuedSerial = serial; done.submissionUnconfirmed = false
+						try? store.save(done, scope: scope); pending = done; break
+					}
+				}
+			}
+			// Create a fresh non-extractable key + CSR only when nothing is journalled.
+			if pending == nil {
+				let made = try factory.makePendingKey(commonName: "Zag Store Development", account: experimentCSRAccount, team: teamID)
+				let state = ZagPendingCSRState(keySlot: made.keySlot, request: made.request.data, startedAt: now, attempts: 0, submissionUnconfirmed: false, issuedSerial: nil)
+				try store.save(state, scope: scope); pending = state
+			}
+			var state = pending!
+			report["pending_key_present"] = factory.hasKey(account: experimentCSRAccount, team: teamID, keySlot: state.keySlot)
+
+			switch state.nextStep(at: now) {
+			case .reuseIssued:
+				report["outcome"] = "certificate-already-issued"; report["public_key_match"] = true
+			case .resolveUnconfirmed:
+				report["outcome"] = "submission-unconfirmed-unresolved"   // not found in listing; never resubmit here
+			case .exhausted:
+				report["outcome"] = "retry-budget-exhausted"              // key preserved for review
+			case .submit:
+				guard allowMutation else { report["outcome"] = "consent-required"; break }
+				guard budget.take() else { throw ZagPortalError.network }
+				state.attempts += 1; state.submissionUnconfirmed = true; try store.save(state, scope: scope)
+				do {
+					let dict = try await sendQH65B2(.submitCSR, teamID: teamID, headers: headers,
+													parameters: ["csrContent": ZagDeveloperServicesProtocol.pem(state.request),
+																 "machineName": "Zag Store", "machineId": UUID().uuidString.uppercased()])
+					guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
+						  let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der else {
+						throw ZagPortalError.malformedResponse
+					}
+					let teamAssoc = derContainsASCII(der, teamID)
+					if case .matches(let serial, let expiresAt) = factory.check(certificate: der, privateKey: Data(), account: experimentCSRAccount, team: teamID, keySlot: state.keySlot) {
+						let notExpired = expiresAt > now
+						let valid = notExpired && teamAssoc
+						state.issuedSerial = serial; state.submissionUnconfirmed = false; try store.save(state, scope: scope)
+						report["public_key_match"] = true
+						report["not_expired"] = notExpired
+						report["team_association"] = teamAssoc
+						report["cert_valid"] = valid
+						report["cert_expires_in_days"] = Int((expiresAt.timeIntervalSince(now) / 86_400).rounded(.towardZero))
+						report["outcome"] = valid ? "certificate-issued" : "certificate-issued-validation-failed"
+					} else {
+						state.submissionUnconfirmed = false; try store.save(state, scope: scope)
+						report["public_key_match"] = false; report["outcome"] = "certificate-key-mismatch"
+					}
+				} catch ZagPortalError.certificateLimitReached {
+					state.submissionUnconfirmed = false; try? store.save(state, scope: scope)  // preserve key, no revoke
+					report["outcome"] = "certificate-limit-reached"
+					report["cap_preflight_was_inferred_risk"] = cap.isInferredRisk
+					report["revoke_candidate_count"] = existing.count
+				}
+			}
+			report["http_status"] = 200
+		} catch let e as ZagPortalError {
+			report["outcome"] = describePortalError(e)
+		} catch {
+			report["outcome"] = "error"
+		}
+		report["request_count"] = budget.used
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		return report
+	}
+
+	/// Whether the certificate DER contains the team identifier as ASCII (the
+	/// free-team "Apple Development" subject carries OU=<teamID>). A cheap,
+	/// on-device team-association check that needs no X.509 subject parser.
+	private static func derContainsASCII(_ der: Data, _ ascii: String) -> Bool {
+		let needle = Array(ascii.utf8)
+		guard !needle.isEmpty, der.count >= needle.count else { return false }
+		let hay = Array(der)
+		for i in 0...(hay.count - needle.count) where Array(hay[i..<i+needle.count]) == needle { return true }
+		return false
+	}
+
 	/// Read-only CERTIFICATE discovery (item 4): teams -> certificates via the
 	/// `/services/v1/` JSON API (POST + X-HTTP-Method-Override: GET). At most TWO
 	/// read-only requests. Reports cert_count and the nearest expiry in coarse
@@ -393,7 +525,7 @@ enum ZagSignInExperimentRunner {
 	/// Sends one QH65B2 plist POST (any read-only action). Ephemeral session, no
 	/// cookies/cache/credentials, redirects refused, pinned to the developer-
 	/// services host. Parses with the shared `ZagDeveloperServicesProtocol`.
-	private static func sendQH65B2(_ action: ZagDeveloperServicesAction, teamID: String?, headers: [String: String]) async throws -> [String: Any] {
+	private static func sendQH65B2(_ action: ZagDeveloperServicesAction, teamID: String?, headers: [String: String], parameters: [String: Any] = [:]) async throws -> [String: Any] {
 		let url = try ZagDeveloperServicesProtocol.endpoint(action)
 		guard url.host == ZagDeveloperServicesProtocol.host else { throw ZagPortalError.network }
 		var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
@@ -402,7 +534,7 @@ enum ZagSignInExperimentRunner {
 		for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
 		req.setValue("text/x-xml-plist", forHTTPHeaderField: "Content-Type")
 		req.setValue("text/x-xml-plist", forHTTPHeaderField: "Accept")
-		req.httpBody = try ZagDeveloperServicesProtocol.requestBody(teamID: teamID)
+		req.httpBody = try ZagDeveloperServicesProtocol.requestBody(teamID: teamID, parameters: parameters)
 		let config = URLSessionConfiguration.ephemeral
 		config.httpCookieStorage = nil; config.httpShouldSetCookies = false
 		config.urlCache = nil; config.urlCredentialStorage = nil; config.waitsForConnectivity = false
