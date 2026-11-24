@@ -194,3 +194,27 @@ Expected on success: `outcome authenticated`, `developer_outcome
 true`, `developer_has_gs_token_header true`, profiles intact. If `-22411`
 persists even from a fresh session, that points to an account-level condition
 (e.g. developer terms) rather than staleness — investigated next.
+
+---
+
+## Fresh-login attempt (2026-11-24 13:35) — login rejected ec -22406 (likely rate-limit)
+
+```json
+{ "mode":"live-login-devsession", "request_count":3, "http_trace":[200,200,200],
+  "ec":-22406, "apple_message":"Enter the correct password for this Apple Account.",
+  "outcome":"rejected(-22406)", "stage":"srp-complete", "session_stored":false,
+  "developer_*":absent, "all three profiles":"10/consistent" }
+```
+
+The combined flow ran correctly up to SRP-complete, where Apple rejected the
+password (`-22406`). The SAME credential authenticated ~45 min earlier (live
+attempt 2) and drove the 2FA, so this is almost certainly **Apple rate-limiting
+/ soft-locking the account** after ~6 rapid auth/dev attempts in <1 h (the
+earlier `-22411` was likely the first sign). Not a code fault: the fresh-session
+dev-session path is validated offline and unchanged.
+
+**Action: stop live attempts and let the account cool down.** Re-attempting now
+worsens a lock. When ready: confirm the password still signs in at
+appleid.apple.com (clear any security prompt / unlock there), wait for the
+throttle to clear (hours), then one `ZAG_RUN_MACLEGACY_LOGIN_DEVSESSION` run
+verifies the fix. All profiles intact; production and PR #63/#64 unchanged.
