@@ -118,3 +118,71 @@ now**. So the highest-value next step is **not** another blind sign-in:
   preset once — rather than guessing against a moving Apple-side target.
 
 Both Keychain profiles remain intact. PR #63 / #64 draft; production unchanged.
+
+---
+
+## Fix tracking (update 2026-11-24) — credible, independently confirmed
+
+Status of the tracked reports:
+
+- [LiveContainer #1744](https://github.com/LiveContainer/LiveContainer/issues/1744)
+  — **CLOSED/resolved**.
+- [SideStore #1745](https://github.com/SideStore/SideStore/issues/1745) — open,
+  but with multiple independent end-to-end confirmations; references
+  [#1752](https://github.com/SideStore/SideStore/issues/1752).
+
+**Root cause (confirmed):** since 2026-11-20 the GSA edge rejects the literal
+`macOS;` token in `X-MMe-Client-Info` with HTTP 503. **Fix (confirmed):** use the
+legacy `Mac OS X;` token instead. Independent reporters (bpawnzZ, Owlock,
+RFFFF0 via #1752) converge on the working client-info:
+
+```
+X-MMe-Client-Info: <MacBookPro13,3> <Mac OS X;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>
+User-Agent:        akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0
+```
+
+This is a reproducible compatibility fix, not a speculative workaround. Two
+caveats, both material to us:
+
+1. **Their delivery path uses a *remote* anisette server** (jkcoxson) with
+   "On-Device Anisette OFF" + Fetch → Save as Overrides. That is how they obtain
+   the corrected header; it is not itself the fix. The 503-specific fix is the
+   `macOS;` → `Mac OS X;` token. Our standalone design sets the token directly
+   on-device, so we can test the token fix *without* a remote server.
+2. **After the 503 clears, changing the token on an existing profile yields
+   -22410** (identity/header mismatch) unless the identity is **re-provisioned
+   with the new client-info**. So the token must be present from provisioning.
+
+In apple-auth the `macOS;` token is hard-coded in `client.cpp` `device_headers`
+(`"<" + model + "> <macOS;" + version + ...`), so emitting `Mac OS X;` needs
+either a narrow vendored patch (a `mac-legacy` client-info variant) or a
+client-info override — not a runtime config knob.
+
+## Proposed controlled experiment (awaiting authorization)
+
+**E3 — legacy `Mac OS X;` client-info identity.** Smallest change that applies
+the confirmed fix to our standalone on-device path:
+
+1. **Offline prep (no Apple):** add a narrow apple-auth patch / override so a new
+   platform variant emits the legacy client-info + User-Agent above (behind a
+   new `mac-legacy` selection), rebuild the xcframework; provision+sign-in use a
+   **new** Keychain scope `mac-legacy-experiment`. The `device` and
+   `mac-experiment` profiles stay untouched. Offline consistency assertion:
+   client-info contains `Mac OS X;` (not `macOS;`). Host tests + iOS link.
+2. **Live step A (separate authorization):** provision the legacy identity —
+   bounded lookup → start → finish, **ceiling 3 requests**, no retry.
+3. **Live step B (separate authorization):** one bounded GrandSlam sign-in —
+   **ceiling 3 GrandSlam requests** (lookup/init/complete; transport hard cap 6
+   unchanged), **no auto-retry**, 2FA detected-and-cancelled. The new
+   `http_trace` records each request's status + any `Retry-After`.
+
+**What it proves:** clears init *and* complete (200/`ec`/2FA) ⇒ the `macOS;`
+token was the whole 503 and our on-device anisette is accepted end-to-end
+standalone. Still 503 at complete ⇒ the token alone is insufficient on-device
+(the ecosystem's genuine remote anisette is also doing work) — a distinct,
+important negative. -22410 ⇒ a residual identity-consistency issue with the
+legacy preset.
+
+This stays fully within the standalone objective — no Android libraries, no Mac
+companion, no external anisette server — it only corrects the client-info token
+to the value Apple's edge currently accepts.
