@@ -392,14 +392,27 @@ enum ZagSignInExperimentRunner {
 				guard allowMutation else { report["outcome"] = "consent-required"; break }
 				guard budget.take() else { throw ZagPortalError.network }
 				state.attempts += 1; state.submissionUnconfirmed = true; try store.save(state, scope: scope)
-				do {
-					let dict = try await sendQH65B2(.submitCSR, teamID: teamID, headers: headers,
-													parameters: ["csrContent": ZagDeveloperServicesProtocol.pem(state.request),
-																 "machineName": "Zag Store", "machineId": UUID().uuidString.uppercased()])
-					guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
-						  let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der else {
-						throw ZagPortalError.malformedResponse
+				let (csrBody, csrStatus) = try await qh65b2Body(.submitCSR, teamID: teamID, headers: headers,
+					parameters: ["csrContent": ZagDeveloperServicesProtocol.pem(state.request),
+								 "machineName": "Zag Store", "machineId": UUID().uuidString.uppercased()])
+				if let fault = ZagDeveloperServicesProtocol.fault(body: csrBody, httpStatus: csrStatus) {
+					// Record the EXACT sanitized fault and KEEP submissionUnconfirmed
+					// (item 3): a fresh-listing reconciliation settles it later. No
+					// revoke, no resubmit, no key regeneration here.
+					state.lastResultCode = fault.resultCode
+					state.lastHTTPStatus = fault.httpStatus
+					state.lastMessage = fault.message.isEmpty ? nil : fault.message
+					state.lastClassification = fault.classification.rawValue
+					try? store.save(state, scope: scope)
+					for (k, v) in fault.sanitized { report[k] = v }
+					report["outcome"] = "csr-rejected-" + fault.classification.rawValue
+					if fault.classification == .certificateLimitReached {
+						report["cap_preflight_was_inferred_risk"] = cap.isInferredRisk
+						report["revoke_candidate_count"] = existing.count
 					}
+				} else if let dict = (try? PropertyListSerialization.propertyList(from: csrBody, format: nil)) as? [String: Any],
+						  let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
+						  let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der {
 					let teamAssoc = derContainsASCII(der, teamID)
 					if case .matches(let serial, let expiresAt) = factory.check(certificate: der, privateKey: Data(), account: experimentCSRAccount, team: teamID, keySlot: state.keySlot) {
 						let notExpired = expiresAt > now
@@ -412,17 +425,15 @@ enum ZagSignInExperimentRunner {
 						report["cert_expires_in_days"] = Int((expiresAt.timeIntervalSince(now) / 86_400).rounded(.towardZero))
 						report["outcome"] = valid ? "certificate-issued" : "certificate-issued-validation-failed"
 					} else {
-						state.submissionUnconfirmed = false; try store.save(state, scope: scope)
+						// A cert came back but does not match our key: never silently
+						// adopt it; keep unconfirmed for explicit review.
 						report["public_key_match"] = false; report["outcome"] = "certificate-key-mismatch"
 					}
-				} catch ZagPortalError.certificateLimitReached {
-					state.submissionUnconfirmed = false; try? store.save(state, scope: scope)  // preserve key, no revoke
-					report["outcome"] = "certificate-limit-reached"
-					report["cap_preflight_was_inferred_risk"] = cap.isInferredRisk
-					report["revoke_candidate_count"] = existing.count
+				} else {
+					// 2xx + resultCode 0 but no parsable certRequest: ambiguous; keep unconfirmed.
+					report["outcome"] = "csr-response-unparsed"
 				}
 			}
-			report["http_status"] = 200
 		} catch let e as ZagPortalError {
 			report["outcome"] = describePortalError(e)
 		} catch {
@@ -526,6 +537,15 @@ enum ZagSignInExperimentRunner {
 	/// cookies/cache/credentials, redirects refused, pinned to the developer-
 	/// services host. Parses with the shared `ZagDeveloperServicesProtocol`.
 	private static func sendQH65B2(_ action: ZagDeveloperServicesAction, teamID: String?, headers: [String: String], parameters: [String: Any] = [:]) async throws -> [String: Any] {
+		let (data, status) = try await qh65b2Body(action, teamID: teamID, headers: headers, parameters: parameters)
+		return try ZagDeveloperServicesProtocol.parse(data, httpStatus: status)
+	}
+
+	/// The QH65B2 plist transport: one POST, returning the raw body + HTTP status
+	/// WITHOUT classifying the resultCode, so the caller can capture the exact
+	/// (sanitized) fault. Ephemeral session, no cookies/cache/credentials,
+	/// redirects refused, pinned to the developer-services host.
+	private static func qh65b2Body(_ action: ZagDeveloperServicesAction, teamID: String?, headers: [String: String], parameters: [String: Any] = [:]) async throws -> (Data, Int) {
 		let url = try ZagDeveloperServicesProtocol.endpoint(action)
 		guard url.host == ZagDeveloperServicesProtocol.host else { throw ZagPortalError.network }
 		var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
@@ -544,7 +564,93 @@ enum ZagSignInExperimentRunner {
 		let (data, response) = try await session.data(for: req)
 		guard let http = response as? HTTPURLResponse else { throw ZagPortalError.network }
 		guard data.count <= (1 << 20) else { throw ZagPortalError.malformedResponse }
-		return try ZagDeveloperServicesProtocol.parse(data, httpStatus: http.statusCode)
+		return (data, http.statusCode)
+	}
+
+	/// READ-ONLY reconciliation of an unconfirmed CSR (no CSR, no revoke, no key
+	/// creation). Fetches a FRESH certificate listing, looks for the pending
+	/// key's certificate, and applies `ZagCSRReconciliation` using the recorded
+	/// submit verdict. A "not found" listing never by itself clears the flag.
+	static func runCSRReconcile(platform: ZagAppleAuthPlatform, scope: String, allowNetwork: Bool) async -> [String: Any] {
+		var report: [String: Any] = ["mode": allowNetwork ? "live-csr-reconcile" : "selfcheck-csr-reconcile", "platform": platform.rawValue, "scope": scope]
+		let m = ZagAppleAuthMachine(scope: scope, platform: platform)
+		let store = ZagPendingCSRStore()
+		guard let state = store.load(scope: scope) else {
+			report["result"] = "ran"; report["outcome"] = "nothing-pending"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		report["journal_submission_unconfirmed"] = state.submissionUnconfirmed
+		if let c = state.lastClassification { report["journal_last_classification"] = c }
+		if let rc = state.lastResultCode { report["journal_last_result_code"] = rc }
+		let verdict = ZagCSRReconciliation.verdict(for: state.lastClassification.flatMap { ZagDeveloperServicesFault.Classification(rawValue: $0) })
+		report["submit_verdict"] = "\(verdict)"
+		let headers = await m.developerHeaders()
+		report["developer_token_persisted"] = (headers != nil)
+		guard state.submissionUnconfirmed else {
+			report["result"] = "ran"; report["outcome"] = "not-unconfirmed"; report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		guard let headers, allowNetwork else {
+			// Cannot fetch a listing: the listing is unavailable -> preserve.
+			let decision = ZagCSRReconciliation.decide(match: .listingUnavailable, submit: verdict)
+			report["result"] = "ran"; report["decision"] = "\(decision)"
+			report["outcome"] = headers == nil ? "no-developer-token-persisted" : "preflight-no-network"
+			report["request_count"] = 0
+			for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+			return report
+		}
+		let keys = ZagKeychainSigningKeys(namespace: "ZagStore.experiment.csr")
+		let factory = ZagKeychainSigningKeyFactory(keys: keys)
+		let budget = ZagRequestBudget(limit: 2)
+		report["result"] = "ran"
+		do {
+			guard budget.take() else { throw ZagPortalError.network }
+			let teamsDict = try await sendQH65B2(.listTeams, teamID: nil, headers: headers)
+			guard let teamID = ((teamsDict["teams"] as? [[String: Any]])?.first)?["teamId"] as? String else {
+				report["outcome"] = "no-teams"; report["request_count"] = budget.used
+				for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+				return report
+			}
+			guard budget.take() else { throw ZagPortalError.network }
+			let (certBody, certStatus) = try await sendV1(path: "certificates", methodOverride: "GET",
+														  body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: teamID), headers: headers)
+			let rows = try ZagDeveloperServicesV1.parseList(certBody, httpStatus: certStatus)
+			var match = ZagCSRReconciliation.ListingMatch.notFound
+			if factory.hasKey(account: experimentCSRAccount, team: teamID, keySlot: state.keySlot) {
+				for row in rows {
+					if let der = ZagDeveloperServicesProtocol.parseCertificate(row)?.der,
+					   case .matches(let serial, _) = factory.check(certificate: der, privateKey: Data(), account: experimentCSRAccount, team: teamID, keySlot: state.keySlot) {
+						match = .found(serial: serial); break
+					}
+				}
+			}
+			let decision = ZagCSRReconciliation.decide(match: match, submit: verdict)
+			report["listing_match"] = { if case .found = match { return "found" }; return "not-found" }()
+			report["decision"] = "\(decision)"
+			var updated = state
+			switch decision {
+			case .recover(let serial):
+				updated.issuedSerial = serial; updated.submissionUnconfirmed = false; try? store.save(updated, scope: scope)
+				report["outcome"] = "recovered-issued-certificate"
+			case .retryable:
+				updated.submissionUnconfirmed = false; try? store.save(updated, scope: scope)   // authoritative rejection + no cert -> retryable
+				report["outcome"] = "cleared-retryable"
+			case .preserveForReview:
+				report["outcome"] = "preserved-needs-review"                                     // no match + ambiguous
+			case .preserveUnconfirmed:
+				report["outcome"] = "preserved-unconfirmed"
+			}
+			report["http_status"] = 200
+		} catch let e as ZagPortalError {
+			report["outcome"] = describePortalError(e)
+		} catch {
+			report["outcome"] = "error"
+		}
+		report["request_count"] = budget.used
+		for (k, v) in await preservationChecks(excluding: scope) { report[k] = v }
+		return report
 	}
 
 	static func describePortalError(_ e: ZagPortalError) -> String {

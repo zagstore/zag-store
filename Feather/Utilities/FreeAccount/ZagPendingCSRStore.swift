@@ -22,6 +22,13 @@ struct ZagPendingCSRState: Codable, Equatable, Sendable {
 	var attempts: Int
 	var submissionUnconfirmed: Bool
 	var issuedSerial: String?
+	// The last submission's recorded fault (for reconciliation). All optional so
+	// an older journal decodes unchanged; the raw resultCode is a small integer,
+	// the message is already redacted and bounded.
+	var lastResultCode: Int?
+	var lastHTTPStatus: Int?
+	var lastMessage: String?
+	var lastClassification: String?
 
 	func allowsRetry(at now: Date) -> Bool {
 		attempts < Self.maximumAttempts && now >= startedAt && now.timeIntervalSince(startedAt) < Self.lifetime

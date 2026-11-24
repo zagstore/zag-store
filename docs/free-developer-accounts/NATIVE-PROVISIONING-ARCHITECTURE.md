@@ -516,3 +516,67 @@ The native CSR path, ready for a single separately-authorized live submission.
 xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_CSR":"1"}' dev.zagstore.ptteamprobe
 ```
 This shows the consent screen first; only on Authorize is one CSR submitted (bounded: teams + certificates + one submit, no retry). **Not executed.**
+
+---
+
+## CSR diagnostics + reconciliation (2026-11-24) — offline, no Apple contact
+
+Corrections after the attempt-1 CSR returned a client-classified `rate-limited`
+whose raw Apple result code was never captured.
+
+### 1. Exact fault capture
+`ZagDeveloperServicesProtocol.fault(body:httpStatus:)` records a
+`ZagDeveloperServicesFault{classification, resultCode, httpStatus, message}`
+WITHOUT throwing, so the raw Apple `resultCode`, HTTP status and a redacted,
+length-bounded message (`sanitizeMessage`: strips email/token-like text + control
+chars, caps at 160) are preserved. No credentials, identifiers, headers, CSR
+contents or sensitive bodies are ever recorded. The CSR path now records these
+into the journal (`lastResultCode/lastHTTPStatus/lastMessage/lastClassification`).
+
+### 2. Classifier audit — confirmed throttle vs ambiguous
+The old map treated `resultCode 4` as a rate-limit; that was wrong and almost
+certainly mislabeled attempt 1. Corrected: **only** HTTP 429 and the verified
+throttle codes (7460/7788) are `confirmedRateLimit`; every other unknown non-zero
+code is `ambiguousRejection` — never silently called a throttle. `throwIfError`
+no longer maps `4` to rateLimited.
+
+### 3–4. Reconciliation state machine (`ZagCSRReconciliation`)
+A "no matching certificate" listing does **not** by itself clear
+`submissionUnconfirmed`. `decide(match:submit:)`:
+- **matching certificate found** → `recover` (verify key + team + validity, then adopt);
+- **no match + authoritative rejection** (cap / device / App-ID / session / identifier / confirmed 429) → `retryable` (clear the flag, allow one resubmit of the same key+CSR);
+- **no match + ambiguous (or no recorded verdict)** → `preserveForReview`;
+- **no match + transport-incomplete**, or **listing unavailable** → `preserveUnconfirmed`.
+The read-only `runCSRReconcile` gate (`ZAG_RUN_MACLEGACY_CSR_RECONCILE` + `_SELFCHECK`)
+fetches a fresh listing and applies this — no CSR, no revoke, no key creation.
+
+### 5. Key/CSR reuse
+The pending non-extractable Keychain key and the original CSR bytes are reused on
+any retry (`ZagPendingCSRState`), never regenerated or resubmitted automatically.
+
+### 6–8. Tests + build + preflight
+110/110 host checks (duplicate prevention, delayed certificate visibility,
+ambiguous responses, rate-limit classification, certificate-cap errors, crash
+recovery). Full arm64 iOS target builds/links; new files type-check against the
+real subsystem. Network-refused reconcile preflight reads the real attempt-1
+journal: `{journal_submission_unconfirmed:true, submit_verdict:none, decision:preserveUnconfirmed, request_count:0}`, developer token + all three ADI profiles intact.
+
+### Current journal state + what would resolve it
+The attempt-1 journal is `submissionUnconfirmed = true` with **no recorded submit
+verdict** (attempt 1 predated fault capture, so its result code is unknown —
+consistent with not treating the throttle as confirmed). The pending
+non-extractable key and CSR are preserved. Safe resolution evidence:
+- **Recover** iff a fresh `/services/v1/certificates` listing contains a
+  certificate whose public key matches the pending key (verify key + team + validity).
+- Otherwise, because the submit verdict is unknown (not an authoritative
+  rejection), the journal is **preserved for explicit review** — it is NOT
+  cleared or retried on an empty listing.
+
+### Smallest separately-authorized read-only reconciliation experiment
+`ZAG_RUN_MACLEGACY_CSR_RECONCILE` — `listTeams` + `certificates` (≤2 read-only
+requests, no CSR/revoke/key-creation). Reports `listing_match`, `decision` and
+the journal's recorded verdict. Launch (await authorization):
+```
+xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_CSR_RECONCILE":"1"}' dev.zagstore.ptteamprobe
+```
+No arbitrary wait period is asserted as an Apple requirement; it is not run here.

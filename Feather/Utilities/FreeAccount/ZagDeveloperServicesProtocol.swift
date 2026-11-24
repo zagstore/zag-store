@@ -132,12 +132,10 @@ enum ZagDeveloperServicesProtocol {
 		let message = (dict["userString"] as? String) ?? (dict["resultString"] as? String) ?? ""
 		switch code {
 		case 1100, 1:                 throw ZagPortalError.sessionRejected        // invalid/expired session
-		case 7460, 7788, 4:           throw ZagPortalError.rateLimited            // throttled / too many
+		case 7460, 7788:              throw ZagPortalError.rateLimited            // verified throttle codes
 		case 9120, 9401:              throw ZagPortalError.deviceLimitReached     // device limit
 		case 9412, 35:                throw ZagPortalError.appIDLimitReached      // App ID limit (free: per-week)
 		case 3540, 7458:              throw ZagPortalError.certificateLimitReached// cert limit
-		case 9401 where message.lowercased().contains("device"):
-			throw ZagPortalError.deviceLimitReached
 		default:
 			// An identifier owned by another team surfaces a distinctive message.
 			if message.lowercased().contains("not available") || message.lowercased().contains("already in use") {
@@ -145,6 +143,54 @@ enum ZagDeveloperServicesProtocol {
 			}
 			throw ZagPortalError.malformedResponse
 		}
+	}
+
+	/// Captures a developer-services error WITHOUT throwing, so the raw Apple
+	/// resultCode, HTTP status and a safely-redacted, bounded message can be
+	/// recorded. Returns nil on success (HTTP 2xx + resultCode 0). The raw
+	/// resultCode is a small integer (not sensitive); the message is redacted.
+	/// Classification is CONSERVATIVE: only HTTP 429 and the verified throttle
+	/// codes are a confirmed rate-limit — every other unknown non-zero code is
+	/// `ambiguousRejection`, never silently called a throttle.
+	static func fault(body: Data, httpStatus: Int) -> ZagDeveloperServicesFault? {
+		guard (200..<300).contains(httpStatus) else {
+			let classification: ZagDeveloperServicesFault.Classification =
+				httpStatus == 401 || httpStatus == 403 ? .sessionRejected
+				: httpStatus == 429 ? .confirmedRateLimit : .network
+			return ZagDeveloperServicesFault(classification: classification, resultCode: nil, httpStatus: httpStatus, message: "")
+		}
+		guard let dict = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any] else {
+			return ZagDeveloperServicesFault(classification: .malformed, resultCode: nil, httpStatus: httpStatus, message: "")
+		}
+		let code = (dict["resultCode"] as? NSNumber)?.intValue ?? (dict["resultCode"] as? Int) ?? 0
+		if code == 0 { return nil }
+		let raw = (dict["userString"] as? String) ?? (dict["resultString"] as? String) ?? ""
+		let message = sanitizeMessage(raw)
+		let classification: ZagDeveloperServicesFault.Classification
+		switch code {
+		case 1100, 1:     classification = .sessionRejected
+		case 7460, 7788:  classification = .confirmedRateLimit
+		case 9120, 9401:  classification = .deviceLimitReached
+		case 9412, 35:    classification = .appIDLimitReached
+		case 3540, 7458:  classification = .certificateLimitReached
+		default:
+			classification = (raw.lowercased().contains("not available") || raw.lowercased().contains("already in use"))
+				? .identifierUnavailable : .ambiguousRejection
+		}
+		return ZagDeveloperServicesFault(classification: classification, resultCode: code, httpStatus: httpStatus, message: message)
+	}
+
+	/// Redacts and bounds an Apple error string for diagnostics: removes anything
+	/// email/token-like, strips control characters, collapses whitespace and caps
+	/// the length. Never returns credentials, identifiers or long opaque tokens.
+	static func sanitizeMessage(_ text: String, limit: Int = 160) -> String {
+		var s = text
+		for pattern in ["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[A-Za-z0-9+/_-]{24,}={0,2}"] {
+			s = s.replacingOccurrences(of: pattern, with: "[redacted]", options: .regularExpression)
+		}
+		s = String(s.unicodeScalars.filter { !$0.properties.isDefaultIgnorableCodePoint && ($0.value >= 32) })
+		s = s.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }).joined(separator: " ")
+		return s.count > limit ? String(s.prefix(limit)) + "…" : s
 	}
 
 	/// Wraps DER CSR bytes as a PEM CERTIFICATE REQUEST, as the portal expects.
@@ -188,6 +234,40 @@ enum ZagDeveloperServicesProtocol {
 /// A certificate parsed from a developer-services response, independent of the
 /// app model graph (so the parser is host-testable). Serial has leading zeros
 /// stripped, as AltSign does, for serial-based matching.
+/// A developer-services error captured without throwing, so the raw resultCode,
+/// HTTP status and a redacted message can be recorded and reconciled later.
+struct ZagDeveloperServicesFault: Equatable, Sendable {
+	/// Conservative classification: a confirmed server rate-limit is distinguished
+	/// from an unknown/ambiguous rejection, which is never silently called a throttle.
+	enum Classification: String, Equatable, Sendable {
+		case sessionRejected
+		case confirmedRateLimit
+		case deviceLimitReached
+		case appIDLimitReached
+		case certificateLimitReached
+		case identifierUnavailable
+		/// A non-zero resultCode we do not map with confidence — outcome unknown.
+		case ambiguousRejection
+		/// The body was not a usable plist.
+		case malformed
+		/// A non-2xx, non-auth, non-throttle HTTP status (transport/service level).
+		case network
+	}
+	let classification: Classification
+	/// The raw Apple resultCode (a small integer; not sensitive). Nil for HTTP-level faults.
+	let resultCode: Int?
+	let httpStatus: Int
+	/// A redacted, length-bounded message. Never a credential/identifier/token.
+	let message: String
+
+	var sanitized: [String: Any] {
+		var out: [String: Any] = ["classification": classification.rawValue, "http_status": httpStatus]
+		if let resultCode { out["result_code"] = resultCode }
+		if !message.isEmpty { out["apple_message"] = message }
+		return out
+	}
+}
+
 struct ZagParsedCertificate: Equatable, Sendable {
 	let serialNumber: String
 	let name: String

@@ -129,3 +129,71 @@ enum ZagCertificateRevocation {
 		return true
 	}
 }
+
+// MARK: - Reconciling an unconfirmed CSR submission
+
+/// Decides what to do with a journal whose last submission is unconfirmed, from
+/// a FRESH certificate listing and the recorded submit verdict. The rule that
+/// matters: a "no matching certificate" listing does NOT by itself clear the
+/// unconfirmed flag — only an authoritative rejection makes the journal
+/// retryable; anything ambiguous is preserved for explicit review.
+enum ZagCSRReconciliation {
+	/// Looking for the pending key's certificate in a fresh listing.
+	enum ListingMatch: Equatable, Sendable {
+		case found(serial: String)
+		case notFound
+		case listingUnavailable
+	}
+
+	/// What the recorded submit response established.
+	enum SubmitVerdict: Equatable, Sendable {
+		/// The server definitively refused and created nothing (cap, device/App-ID
+		/// limit, session rejected, identifier unavailable, confirmed HTTP-429 throttle).
+		case authoritativeRejection
+		/// An unknown/ambiguous resultCode: the outcome is genuinely unknown.
+		case ambiguous
+		/// A transport failure or incomplete response.
+		case transportIncomplete
+		/// No submit verdict is recorded (e.g. an older journal).
+		case none
+	}
+
+	enum Decision: Equatable, Sendable {
+		/// A matching certificate was found: verify key/team/validity, then recover.
+		case recover(serial: String)
+		/// Safe to allow ONE resubmit of the same key+CSR (clears unconfirmed).
+		case retryable
+		/// Keep unconfirmed; a human must review before anything else.
+		case preserveForReview
+		/// Keep unconfirmed; the listing or transport was inconclusive.
+		case preserveUnconfirmed
+	}
+
+	static func decide(match: ListingMatch, submit: SubmitVerdict) -> Decision {
+		switch match {
+		case .found(let serial): return .recover(serial: serial)
+		case .listingUnavailable: return .preserveUnconfirmed
+		case .notFound:
+			switch submit {
+			case .authoritativeRejection: return .retryable
+			case .transportIncomplete:    return .preserveUnconfirmed
+			case .ambiguous, .none:       return .preserveForReview
+			}
+		}
+	}
+
+	/// Maps a recorded fault classification to a submit verdict.
+	static func verdict(for classification: ZagDeveloperServicesFault.Classification?) -> SubmitVerdict {
+		guard let classification else { return .none }
+		switch classification {
+		case .sessionRejected, .deviceLimitReached, .appIDLimitReached,
+			 .certificateLimitReached, .identifierUnavailable, .confirmedRateLimit:
+			return .authoritativeRejection
+		case .ambiguousRejection, .malformed:
+			return .ambiguous
+		case .network:
+			return .transportIncomplete
+		}
+	}
+}
+

@@ -180,5 +180,45 @@ check(issued.nextStep(at: now) == .reuseIssued(serial: "SER123"), "already issue
 let spent = ZagPendingCSRState(keySlot: "slot1", request: Data([9]), startedAt: now.addingTimeInterval(-90_000), attempts: 3, submissionUnconfirmed: false, issuedSerial: nil)
 check(spent.nextStep(at: now) == .exhausted, "retry budget/lifetime exhausted -> stop, keep key for review")
 
+// MARK: Fault capture + conservative classifier (item 1/2).
+func faultPlist(_ code: Int, _ msg: String = "") -> Data {
+	var d: [String: Any] = ["resultCode": code]; if !msg.isEmpty { d["userString"] = msg }
+	return try! PropertyListSerialization.data(fromPropertyList: d, format: .xml, options: 0)
+}
+check(ZagDeveloperServicesProtocol.fault(body: faultPlist(0), httpStatus: 200) == nil, "resultCode 0 -> no fault (success)")
+check(ZagDeveloperServicesProtocol.fault(body: faultPlist(7460), httpStatus: 200)?.classification == .confirmedRateLimit, "verified throttle code -> confirmed rate-limit")
+check(ZagDeveloperServicesProtocol.fault(body: Data(), httpStatus: 429)?.classification == .confirmedRateLimit, "HTTP 429 -> confirmed rate-limit")
+let amb = ZagDeveloperServicesProtocol.fault(body: faultPlist(4, "user@example.com please retry"), httpStatus: 200)
+check(amb?.classification == .ambiguousRejection, "resultCode 4 is AMBIGUOUS, not a confirmed throttle")
+check(amb?.resultCode == 4 && amb?.httpStatus == 200, "fault preserves the raw resultCode + http status")
+check(amb?.message.contains("@example.com") == false && amb?.message.contains("[redacted]") == true, "fault message is redacted (no email)")
+check(ZagDeveloperServicesProtocol.fault(body: faultPlist(3540), httpStatus: 200)?.classification == .certificateLimitReached, "3540 -> certificate limit")
+check(ZagDeveloperServicesProtocol.fault(body: faultPlist(9999, "Identifier is not available"), httpStatus: 200)?.classification == .identifierUnavailable, "identifier message -> identifierUnavailable")
+check(ZagDeveloperServicesProtocol.fault(body: Data("x".utf8), httpStatus: 200)?.classification == .malformed, "non-plist 2xx -> malformed")
+check(ZagDeveloperServicesProtocol.fault(body: Data(), httpStatus: 500)?.classification == .network, "HTTP 500 -> network")
+check(ZagDeveloperServicesProtocol.sanitizeMessage(String(repeating: "a", count: 300)).count <= 161, "message is length-bounded")
+// Classifier audit: resultCode 4 must no longer throw rateLimited.
+throws_(.malformedResponse, { try ZagDeveloperServicesProtocol.throwIfError(["resultCode": 4]) }, "throwIfError no longer maps 4 -> rateLimited")
+
+// MARK: Reconciliation state machine (item 3/4) — not-found alone never clears.
+typealias Rec = ZagCSRReconciliation
+check(Rec.decide(match: .found(serial: "S1"), submit: .ambiguous) == .recover(serial: "S1"), "matching cert -> recover (verify+recover)")
+check(Rec.decide(match: .notFound, submit: .authoritativeRejection) == .retryable, "no match + authoritative rejection -> retryable")
+check(Rec.decide(match: .notFound, submit: .ambiguous) == .preserveForReview, "no match + ambiguous -> preserve for review (NOT cleared)")
+check(Rec.decide(match: .notFound, submit: .none) == .preserveForReview, "no match + no recorded verdict -> preserve for review")
+check(Rec.decide(match: .notFound, submit: .transportIncomplete) == .preserveUnconfirmed, "no match + transport incomplete -> preserve")
+check(Rec.decide(match: .listingUnavailable, submit: .authoritativeRejection) == .preserveUnconfirmed, "listing unavailable -> preserve, even with authoritative verdict")
+check(Rec.verdict(for: .certificateLimitReached) == .authoritativeRejection, "cap -> authoritative rejection")
+check(Rec.verdict(for: .confirmedRateLimit) == .authoritativeRejection, "confirmed rate-limit -> authoritative (not processed)")
+check(Rec.verdict(for: .ambiguousRejection) == .ambiguous, "ambiguous code -> ambiguous verdict")
+check(Rec.verdict(for: .network) == .transportIncomplete, "network fault -> transport incomplete")
+check(Rec.verdict(for: nil) == .none, "no recorded classification -> none")
+// Delayed-visibility + crash recovery: an attempt-1 journal (ambiguous, unconfirmed) is preserved, not resubmitted.
+let attempt1 = ZagPendingCSRState(keySlot: "slot1", request: Data([9]), startedAt: Date(), attempts: 1, submissionUnconfirmed: true, issuedSerial: nil, lastResultCode: 4, lastHTTPStatus: 200, lastMessage: "could not be completed", lastClassification: "ambiguousRejection")
+check(attempt1.nextStep(at: Date()) == .resolveUnconfirmed, "attempt-1 (unconfirmed) -> resolve, never auto-submit")
+check(Rec.decide(match: .notFound, submit: Rec.verdict(for: .ambiguousRejection)) == .preserveForReview, "attempt-1 not-found stays for review (no silent clear)")
+// Delayed visibility: the same key's cert appears in a later listing -> recover.
+check(Rec.decide(match: .found(serial: "LATE"), submit: Rec.verdict(for: .ambiguousRejection)) == .recover(serial: "LATE"), "delayed cert visibility -> recover on later listing")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

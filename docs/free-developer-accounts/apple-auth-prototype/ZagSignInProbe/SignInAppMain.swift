@@ -76,6 +76,13 @@ struct ZagSignInProbeApp: App {
 				// new non-extractable Keychain key. The CSR is sent only after the
 				// explicit consent screen is authorised.
 				CertificateIssuanceRunView(platform: .macLegacy, scope: zagMacLegacyScope, file: "zag_maclegacy_csr.json")
+			case let env where env["ZAG_RUN_MACLEGACY_CSR_RECONCILE_SELFCHECK"] == "1":
+				// Offline preflight: reconciliation with no network (listing unavailable -> preserve).
+				LiveRunView(task: { await ZagSignInExperimentRunner.runCSRReconcile(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_csr_reconcile_selfcheck.json")
+			case let env where env["ZAG_RUN_MACLEGACY_CSR_RECONCILE"] == "1":
+				// READ-ONLY reconciliation of an unconfirmed CSR: fresh listing ->
+				// recover / retryable / preserve. No CSR, no revoke, no key creation.
+				LiveRunView(task: { await ZagSignInExperimentRunner.runCSRReconcile(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: true) }, file: "zag_maclegacy_csr_reconcile.json")
 			case let env where env["ZAG_RUN_MACLEGACY_DEVSESSION_SELFCHECK"] == "1":
 				// Offline preflight: developer-session path, transport refused.
 				LiveRunView(task: { await ZagSignInExperimentRunner.runDeveloperSession(platform: .macLegacy, scope: zagMacLegacyScope, allowNetwork: false) }, file: "zag_maclegacy_devsession_selfcheck.json")
