@@ -12,15 +12,41 @@ import Foundation
 // token or anisette value.
 
 enum ZagSignInExperimentRunner {
-	static func run(live: Bool) async -> [String: Any] {
-		var report: [String: Any] = ["mode": live ? "live" : "selfcheck"]
+	/// The identity under test. `.iphone`/`device` is the provisioned baseline;
+	/// `.mac`/`mac-experiment` is the consistent Mac identity (E2), in its own
+	/// Keychain scope so the baseline profile is never touched.
+	static func machine(platform: ZagAppleAuthPlatform, scope: String) -> ZagAppleAuthMachine {
+		ZagAppleAuthMachine(scope: scope, platform: platform)
+	}
 
-		// 1. Fresh anisette through the integrated on-device provider (offline).
-		let provider = ZagOnDeviceAnisetteProvider(allowProvisioning: false)
+	/// Provision a fresh identity (an authorised live step). Reports only
+	/// counts and the offline consistency check — no anisette values.
+	static func provision(platform: ZagAppleAuthPlatform, scope: String) async -> [String: Any] {
+		var report: [String: Any] = ["mode": "provision", "platform": platform.rawValue, "scope": scope]
+		let m = machine(platform: platform, scope: scope)
+		do {
+			let headers = try await m.anisetteHeaders(allowProvisioning: true)
+			report["anisette_header_count"] = headers.count
+			report["client_info_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(headers, platform: platform)
+			report["result"] = "provisioned"
+		} catch {
+			report["result"] = "provision-failed"
+		}
+		return report
+	}
+
+	static func run(live: Bool, platform: ZagAppleAuthPlatform = .iphone, scope: String = "device") async -> [String: Any] {
+		var report: [String: Any] = ["mode": live ? "live" : "selfcheck", "platform": platform.rawValue, "scope": scope]
+		let m = machine(platform: platform, scope: scope)
+
+		// 1. Fresh anisette through the integrated on-device provider (offline),
+		//    with the offline client-info/platform consistency assertion.
+		let provider = ZagOnDeviceAnisetteProvider(machine: m, allowProvisioning: false)
 		do {
 			let anisette = try await provider.anisetteData()
 			report["anisette_header_count"] = anisette.headers.count
 			report["anisette_fresh"] = anisette.isFresh(at: Date())
+			report["client_info_consistent"] = ZagAppleAuthMachine.clientInfoConsistent(anisette.headers, platform: platform)
 		} catch {
 			report["anisette"] = anisetteLabel(error)
 		}
@@ -39,7 +65,7 @@ enum ZagSignInExperimentRunner {
 		let password = credential?.password ?? "selfcheck-not-sent"
 
 		// 3. One bounded sign-in attempt.
-		let machine = ZagAppleAuthMachine()
+		let machine = m
 		do {
 			let signIn = try await machine.signInExperiment(email: email, password: password, allowNetwork: live)
 			report["outcome"] = describe(signIn.outcome)

@@ -170,15 +170,31 @@ private let zagAppleAuthTransportCallback: @convention(c) (UnsafeMutableRawPoint
 }
 #endif
 
+/// The device environment the machine presents. Both run apple-auth's Mac ADI
+/// algorithm (`ProfilePlatform::mac`); they differ only in the client-info
+/// string and device fields, so `mac` is the internally-consistent pairing
+/// (macOS client-info + Mac algorithm) and `iphone` is the hybrid (iPhone
+/// client-info + Mac algorithm) used for the provisioned baseline profile.
+enum ZagAppleAuthPlatform: String, Sendable, Equatable {
+	case iphone
+	case mac
+
+	/// The OS token the anisette client-info must carry for this platform.
+	var clientInfoOS: String { self == .mac ? "macOS" : "iPhone OS" }
+}
+
 /// The on-device machine. A single actor serialises access to the underlying
 /// apple-auth client, which is created, used and freed within each call.
 actor ZagAppleAuthMachine {
 	let scope: String
+	let platform: ZagAppleAuthPlatform
 	private let store: ZagAppleAuthMachineStore
 	private let now: @Sendable () -> Date
 
-	init(scope: String = "device", store: ZagAppleAuthMachineStore = ZagAppleAuthMachineStore(), now: @escaping @Sendable () -> Date = { Date() }) {
+	init(scope: String = "device", platform: ZagAppleAuthPlatform = .iphone,
+		 store: ZagAppleAuthMachineStore = ZagAppleAuthMachineStore(), now: @escaping @Sendable () -> Date = { Date() }) {
 		self.scope = scope
+		self.platform = platform
 		self.store = store
 		self.now = now
 	}
@@ -203,11 +219,12 @@ actor ZagAppleAuthMachine {
 		let persisted = try store.load(scope: scope)
 		if persisted == nil && !allowProvisioning { throw ZagAppleAuthError.notProvisioned }
 		let transport = ZagAppleAuthTransport(allowNetwork: allowProvisioning)
+		let platform = self.platform
 		// The apple-auth client calls are synchronous (the transport blocks on
 		// the network); run them off the actor's executor.
 		let result: Result<([String: String], Data), ZagAppleAuthError> = await withCheckedContinuation { continuation in
 			DispatchQueue.global(qos: .userInitiated).async {
-				continuation.resume(returning: Self.drive(persisted: persisted, transport: transport))
+				continuation.resume(returning: Self.drive(persisted: persisted, transport: transport, platform: platform))
 			}
 		}
 		let (headers, snapshot) = try result.get()
@@ -223,19 +240,23 @@ actor ZagAppleAuthMachine {
 	/// `body` with it, then frees it. The client pointer is valid only inside
 	/// `body`. Shared by the anisette and the gated sign-in paths so there is a
 	/// single apple-auth client implementation.
-	static func withClient<T>(persisted: Data?, transport: ZagAppleAuthTransport,
+	static func withClient<T>(persisted: Data?, transport: ZagAppleAuthTransport, platform: ZagAppleAuthPlatform,
 		_ body: (OpaquePointer) -> Result<T, ZagAppleAuthError>) -> Result<T, ZagAppleAuthError> {
 		let ctx = Unmanaged.passUnretained(transport).toOpaque()
 		var options = aauth_client_options(transport: zagAppleAuthTransportCallback, observer: nil, clock: nil, context: ctx)
 		var client: OpaquePointer?
+		// Serial absent for both platforms (no fabricated hardware identifier).
+		// Device fields nil -> apple-auth's default software identity for the
+		// platform (iPhone preset, or Mac preset for the consistent Mac pairing).
 		let created: aauth_status = "".withCString { serial in
 			var iphone = aauth_iphone_device(model: nil, ios_version: nil, ios_build: nil)
+			let devicePlatform = platform == .mac ? AAUTH_DEVICE_MAC : AAUTH_DEVICE_IPHONE
 			return withUnsafePointer(to: &options) { opt in
 				withUnsafePointer(to: &iphone) { ip in
 					func make(statePtr: UnsafePointer<UInt8>?, stateSize: Int) -> aauth_status {
-						var cfg = aauth_client_config(directory: nil, options: opt, platform: AAUTH_DEVICE_IPHONE,
-							mac_device: nil, iphone_device: ip, serial_number: serial, headers: nil,
-							headers_json: nil, state: statePtr, state_size: stateSize)
+						var cfg = aauth_client_config(directory: nil, options: opt, platform: devicePlatform,
+							mac_device: nil, iphone_device: platform == .mac ? nil : ip, serial_number: serial,
+							headers: nil, headers_json: nil, state: statePtr, state_size: stateSize)
 						return aauth_client_create(&cfg, &client)
 					}
 					if let persisted { return persisted.withUnsafeBytes { make(statePtr: $0.bindMemory(to: UInt8.self).baseAddress, stateSize: persisted.count) } }
@@ -250,8 +271,8 @@ actor ZagAppleAuthMachine {
 
 	/// Provisions if needed and permitted, reads the headers, and returns them
 	/// with a fresh state snapshot.
-	private static func drive(persisted: Data?, transport: ZagAppleAuthTransport) -> Result<([String: String], Data), ZagAppleAuthError> {
-		withClient(persisted: persisted, transport: transport) { client in
+	private static func drive(persisted: Data?, transport: ZagAppleAuthTransport, platform: ZagAppleAuthPlatform) -> Result<([String: String], Data), ZagAppleAuthError> {
+		withClient(persisted: persisted, transport: transport, platform: platform) { client in
 		let p = aauth_client_provision(client)
 		guard p == AAUTH_OK else {
 			return .failure(transport.allowNetwork ? .provisioningFailed(Int(p.rawValue)) : .transportBlocked)
@@ -279,6 +300,15 @@ actor ZagAppleAuthMachine {
 			let l = name.lowercased()
 			return l.hasPrefix("x-apple-") || l.hasPrefix("x-mme-")
 		}
+	}
+
+	/// Offline consistency check: the anisette `X-MMe-Client-Info` must name the
+	/// OS token for `platform` (macOS for a Mac identity, iPhone OS otherwise).
+	/// Guards against a client-info / algorithm mismatch — the leading -22410
+	/// hypothesis — within a single provisioned identity.
+	static func clientInfoConsistent(_ headers: [String: String], platform: ZagAppleAuthPlatform) -> Bool {
+		guard let info = headers.first(where: { $0.key.lowercased() == "x-mme-client-info" })?.value else { return false }
+		return info.contains(platform.clientInfoOS)
 	}
 
 	/// The GrandSlam status code (`ec`) embedded in an apple-auth error message
@@ -348,10 +378,11 @@ actor ZagAppleAuthMachine {
 		// no retries. With allowNetwork false the transport refuses everything.
 		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: 6)
 		let sentinel = ZagTwoFactorSentinel()
+		let platform = self.platform
 		return await withCheckedContinuation { continuation in
 			DispatchQueue.global(qos: .userInitiated).async {
 				continuation.resume(returning: Self.driveSignIn(persisted: persisted, transport: transport,
-															   email: email, password: password, sentinel: sentinel))
+															   email: email, password: password, sentinel: sentinel, platform: platform))
 			}
 		}
 		#else
@@ -363,8 +394,9 @@ actor ZagAppleAuthMachine {
 	private struct RawSignIn { var outcome: ZagAppleAuthSignInOutcome; var ec: Int?; var http: Int?; var message: String? }
 
 	private static func driveSignIn(persisted: Data, transport: ZagAppleAuthTransport,
-									email: String, password: String, sentinel: ZagTwoFactorSentinel) -> ZagAppleAuthSignInReport {
-		let result: Result<RawSignIn, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport) { client in
+									email: String, password: String, sentinel: ZagTwoFactorSentinel,
+									platform: ZagAppleAuthPlatform) -> ZagAppleAuthSignInReport {
+		let result: Result<RawSignIn, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport, platform: platform) { client in
 			// Ensure the profile is loaded (no-op for a provisioned profile; no HTTP).
 			let p = aauth_client_provision(client)
 			guard p == AAUTH_OK else {

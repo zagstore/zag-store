@@ -88,6 +88,16 @@ struct ZagOnDeviceAnisetteTests {
 		// Control characters are stripped.
 		check(!(ZagAppleAuthMachine.sanitizeAppleMessage("a\nb\tc").contains("\n")), "em strips control chars")
 
+		// 7b. Platform / client-info consistency (E2 Mac-identity experiment).
+		check(ZagAppleAuthPlatform.mac.clientInfoOS == "macOS"
+			  && ZagAppleAuthPlatform.iphone.clientInfoOS == "iPhone OS", "platform OS tokens")
+		let macHeaders = ["X-MMe-Client-Info": "<MacBookPro18,3> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"]
+		check(ZagAppleAuthMachine.clientInfoConsistent(macHeaders, platform: .mac), "mac headers consistent with .mac")
+		check(!ZagAppleAuthMachine.clientInfoConsistent(macHeaders, platform: .iphone), "mac headers inconsistent with .iphone")
+		check(ZagAppleAuthMachine.clientInfoConsistent(sampleHeaders, platform: .iphone), "iphone sample consistent with .iphone")
+		check(!ZagAppleAuthMachine.clientInfoConsistent(sampleHeaders, platform: .mac), "iphone sample inconsistent with .mac (the -22410 hybrid)")
+		check(!ZagAppleAuthMachine.clientInfoConsistent([:], platform: .mac), "missing client-info -> inconsistent")
+
 		// 8. The gated sign-in experiment is inert when the module is unlinked.
 		let signInMachine = ZagAppleAuthMachine()
 		do { _ = try await signInMachine.signInExperiment(email: "test@example.com", password: "x", allowNetwork: false)

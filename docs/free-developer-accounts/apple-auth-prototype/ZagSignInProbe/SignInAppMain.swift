@@ -12,13 +12,22 @@ import SwiftUI
 // The password is entered in a SecureField, stored only in the Keychain, used
 // once, and never shown, logged, argv-passed or written to a result file.
 
+// Experiment scopes. The Mac identity (E2) uses its own Keychain scope so the
+// provisioned iPhone-labelled baseline (`device`) is never touched.
+private let zagMacScope = "mac-experiment"
+
 @main
 struct ZagSignInProbeApp: App {
 	var body: some Scene {
 		WindowGroup {
-			if ProcessInfo.processInfo.environment["ZAG_RUN_SIGNIN"] == "1" {
-				LiveRunView()
-			} else {
+			switch ProcessInfo.processInfo.environment {
+			case let env where env["ZAG_RUN_SIGNIN"] == "1":
+				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true) }, file: "zag_signin_result.json")
+			case let env where env["ZAG_RUN_MAC_PROVISION"] == "1":
+				LiveRunView(task: { await ZagSignInExperimentRunner.provision(platform: .mac, scope: zagMacScope) }, file: "zag_mac_provision.json")
+			case let env where env["ZAG_RUN_MAC_SIGNIN"] == "1":
+				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .mac, scope: zagMacScope) }, file: "zag_mac_signin.json")
+			default:
 				CredentialEntryView()
 			}
 		}
@@ -26,13 +35,15 @@ struct ZagSignInProbeApp: App {
 }
 
 struct LiveRunView: View {
-	@State private var status = "Running one authorised sign-in attempt…"
+	let task: () async -> [String: Any]
+	let file: String
+	@State private var status = "Running one authorised attempt…"
 	var body: some View {
 		Text(status)
 			.padding()
 			.task {
-				let report = await ZagSignInExperimentRunner.run(live: true)
-				ZagSignInExperimentRunner.emit(report, name: "zag_signin_result.json")
+				let report = await task()
+				ZagSignInExperimentRunner.emit(report, name: file)
 				status = "Done: \(report["outcome"] ?? report["result"] ?? "—")"
 			}
 	}
