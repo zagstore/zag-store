@@ -219,3 +219,29 @@ now in the report to make any future ceiling stop explicit. Re-validated: host
 tests pass, arm64 iOS links, on-device preflight (network refused) clean, all
 three profiles intact. The fixed app is installed; the live launch command is
 unchanged. No further live attempt without separate authorization.
+
+---
+
+## Live attempt 2 (2026-11-24) — FULL SUCCESS: authenticated + session stored
+
+With the classifier fix, a supervised run reached the terminal success:
+
+```json
+{ "mode":"live-2fa", "outcome":"authenticated", "two_factor_completed":true,
+  "session_stored":true, "request_count":3, "http_trace":[lookup:200,srp-init:200,srp-complete:200],
+  "accepted_by_class":{"authentication":3},
+  "mac_legacy":"10/consistent","mac_experiment":"10/consistent","iphone":"10/consistent" }
+```
+
+Attempt 1's accepted code established trust for the identity, so this login
+authenticated directly at SRP-complete (3 requests, no re-challenge) and
+apple-auth returned `AAUTH_OK` with valid session material, retained in the
+this-device-only Keychain. `two_factor_completed` tracks `AAUTH_OK`; no code was
+exchanged this run (the 2FA was cleared on attempt 1).
+
+**Milestone.** A free Apple Account now authenticates fully on a stock iPhone,
+standalone — clean-room on-device anisette (legacy `Mac OS X;` identity), no Mac,
+no companion, no remote anisette server, no Android ADI — through the complete
+flow: provision → SRP → 2FA (code accepted) → authenticated session securely
+stored on device. All three ADI profiles remain intact; production and PR
+#63/#64 (draft) unchanged. No further live attempt is needed.
