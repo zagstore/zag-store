@@ -179,3 +179,43 @@ the `!` prefix in Claude Code:
 ```
 xcrun devicectl device process launch --device 8A6BBCC0-EA51-5B93-AF9C-578A9D39F89D --terminate-existing --environment-variables '{"ZAG_RUN_MACLEGACY_2FA":"1"}' dev.zagstore.ptteamprobe
 ```
+
+---
+
+## Live attempt 1 (2026-11-24) — 2FA accepted; our ceiling cut off the last step
+
+One supervised live run (trusted-device 2FA). Sanitized result:
+
+```json
+{ "mode":"live-2fa", "request_count":6, "http_trace":[6×200],
+  "accepted_by_class":{"authentication":5,"verificationInitiation":1},
+  "outcome":"two-factor-required (ceiling reached; SRP verified)",
+  "two_factor_completed":false, "session_stored":false,
+  "mac_legacy":"10/consistent","mac_experiment":"10/consistent","iphone":"10/consistent" }
+```
+
+**Reconstruction (fits the counts exactly).** lookup + SRP init + SRP complete
+(3 auth, 200) → consent granted → trusted-device push (1 verification, 200) →
+**code submitted and accepted** (200) → re-auth init (200) → re-auth **complete
+refused at the authentication ceiling**. `code-submission: 0` while re-auth ran
+is the tell: the trusted-device `validateCode` submit is served under
+`/grandslam/GsService2`, and the classifier checked that path *before* the
+code-submit signal, so it mis-counted the submit as authentication, exhausting
+the auth ceiling (5) and refusing the final re-auth `complete`.
+
+**Conclusion.** The code entered was accepted by Apple — the 2FA exchange
+succeeded on Apple's side — and our own classifier-ordering bug refused the last
+request, so `AAUTH_OK` was never observed and no session was stored. Standalone
+on-device authentication through the full 2FA flow is therefore essentially
+proven; we did not capture the terminal success only because of our bound.
+
+**Fix (offline, applied).** `classify` now checks the code-submit signal
+(securitycode path or `security-code` header) BEFORE the GsService2 rule, so a
+GsService2-hosted `validateCode` counts as code-submission. With that, the
+trusted-device sequence is auth 5 / verification 1 / code 1 (all within the
+5/2/1 ceilings) and the final re-auth `complete` is accepted. A regression test
+covers the GsService2-hosted validateCode case; `refusals` (class + reason) is
+now in the report to make any future ceiling stop explicit. Re-validated: host
+tests pass, arm64 iOS links, on-device preflight (network refused) clean, all
+three profiles intact. The fixed app is installed; the live launch command is
+unchanged. No further live attempt without separate authorization.

@@ -165,6 +165,7 @@ enum ZagSignInExperimentRunner {
 			if let tf = signIn.twoFactorCompleted { report["two_factor_completed"] = tf }
 			if let ss = signIn.sessionStored { report["session_stored"] = ss }
 			if let byClass = signIn.acceptedByClass { report["accepted_by_class"] = byClass }
+			if let refusals = signIn.refusals, !refusals.isEmpty { report["refusals"] = refusals }
 		} catch { report["outcome"] = "error" }
 
 		do { let cur = try await m.anisetteHeaders(allowProvisioning: false); report["profile_intact_header_count"] = cur.count }

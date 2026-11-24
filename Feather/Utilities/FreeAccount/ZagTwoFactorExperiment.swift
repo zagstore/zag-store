@@ -28,8 +28,12 @@ enum ZagAppleAuthRequestClass: String, Sendable, Equatable {
 	/// request header — the two ways apple-auth carries the entered code.
 	static func classify(url: String, method: String = "POST", hasSecurityCodeHeader: Bool = false) -> ZagAppleAuthRequestClass {
 		let u = url.lowercased()
-		if u.contains("/grandslam/gsservice2") { return .authentication }
+		// Code submission is checked FIRST: the trusted-device `validateCode`
+		// endpoint is served under /grandslam/GsService2, so the code-carrying
+		// request must be recognised before the GsService2 (authentication) rule,
+		// or it would be mis-counted as authentication and exhaust that ceiling.
 		if u.contains("securitycode") || hasSecurityCodeHeader { return .codeSubmission }
+		if u.contains("/grandslam/gsservice2") { return .authentication }
 		if u.hasPrefix("https://") { return .verificationInitiation }
 		return .other
 	}

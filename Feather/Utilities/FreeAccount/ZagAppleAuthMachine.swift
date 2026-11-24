@@ -117,6 +117,11 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 		return out
 	} }
 
+	/// Why requests were refused (class + reason only), for diagnosing where a
+	/// bounded sequence stopped. No URL, header or body.
+	private(set) var refusals: [(cls: String, reason: String)] = []
+	var refusalList: [[String: String]] { lock.withLock { refusals.map { ["class": $0.cls, "reason": $0.reason] } } }
+
 	/// The only response headers ever recorded — non-sensitive, for diagnosing a
 	/// 503/429 (transient vs persistent). Lower-cased for case-insensitive match.
 	static let allowedResponseHeaders: Set<String> = ["retry-after"]
@@ -178,12 +183,12 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 			// non-GsService2 request of the login is always one of these, so no
 			// delivery/verification request can fire without consent.
 			if cls == .verificationInitiation, !(consentGate?() ?? false) {
-				lock.lock(); ceilingRefusals += 1; log.append("REFUSED (no consent)"); lock.unlock(); return nil
+				lock.lock(); ceilingRefusals += 1; refusals.append((cls.rawValue, "no-consent")); log.append("REFUSED (no consent)"); lock.unlock(); return nil
 			}
 			lock.lock()
 			let already = classCounts[cls] ?? 0
 			guard already < policy.ceiling(for: cls), count < maxRequests else {
-				ceilingRefusals += 1; log.append("REFUSED (\(cls.rawValue) ceiling)"); lock.unlock(); return nil
+				ceilingRefusals += 1; refusals.append((cls.rawValue, "class-ceiling")); log.append("REFUSED (\(cls.rawValue) ceiling)"); lock.unlock(); return nil
 			}
 			classCounts[cls] = already + 1
 			count += 1
@@ -705,7 +710,8 @@ actor ZagAppleAuthMachine {
 										httpTrace: Self.httpTrace(transport.httpTrace, stageFor: Self.signInStage),
 										twoFactorCompleted: raw.outcome == .authenticated,
 										sessionStored: raw.sessionStored,
-										acceptedByClass: transport.acceptedByClass)
+										acceptedByClass: transport.acceptedByClass,
+										refusals: transport.refusalList)
 	}
 	#endif
 	#endif
@@ -762,6 +768,9 @@ struct ZagAppleAuthSignInReport: Equatable, Sendable {
 	/// Per-class accepted request counts (authentication / verification-initiation
 	/// / code-submission), for bound reporting. No request content.
 	var acceptedByClass: [String: Int]? = nil
+	/// Why any request was refused (class + reason), locating where a bounded
+	/// sequence stopped. No request content.
+	var refusals: [[String: String]]? = nil
 }
 
 #if canImport(ZagAppleAuth)

@@ -159,6 +159,10 @@ struct ZagOnDeviceAnisetteTests {
 		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/x/verify/phone/securitycode") == .codeSubmission, "SMS securitycode -> code-submission")
 		// Trusted-device submit is identified by the security-code request header:
 		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/opaque-validate", method: "GET", hasSecurityCodeHeader: true) == .codeSubmission, "validateCode w/ security-code header -> code-submission")
+		// Regression: validateCode served UNDER /grandslam/GsService2 must still be
+		// code-submission (the security-code header wins over the GsService2 path),
+		// else it is mis-counted as authentication and exhausts that ceiling.
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/GsService2/validate", method: "GET", hasSecurityCodeHeader: true) == .codeSubmission, "GsService2-hosted validateCode w/ header -> code-submission")
 		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/opaque-validate", method: "GET") == .verificationInitiation, "validate URL w/o header -> verification-initiation")
 		check(ZagAppleAuthRequestClass.classify(url: "not-a-url") == .other, "non-https -> other")
 		let pol = ZagTwoFactorPolicy()
