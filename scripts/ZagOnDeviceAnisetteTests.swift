@@ -174,6 +174,18 @@ struct ZagOnDeviceAnisetteTests {
 		check(consented.allows(.verificationInitiation, alreadyAccepted: 2) == false, "verification delivery refused past its ceiling")
 		check(consented.allows(.codeSubmission, alreadyAccepted: 0) == true && consented.allows(.codeSubmission, alreadyAccepted: 1) == false, "code submission capped at 1")
 		check(consented.allows(.authentication, alreadyAccepted: 4) == true && consented.allows(.authentication, alreadyAccepted: 5) == false, "authentication capped at 5")
+		// Developer-session apptokens is a POST to /grandslam/GsService2, so it is
+		// authentication-class: it can never be classified as verification and so is
+		// never consent-gated and can never initiate a 2FA delivery (audit item 5).
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/GsService2", method: "POST") == .authentication, "apptokens POST GsService2 -> authentication (never consent-gated)")
+		check(pol.allows(.authentication, alreadyAccepted: 0) == true, "authentication never requires consent (unlike verification)")
+		// Combined fresh-login -> developer-session flow raises the authentication
+		// ceiling by one: a full 2FA login (5 auth) plus the apptokens exchange (1
+		// auth) must fit, a further request must not (audit item 4).
+		var combined = ZagTwoFactorPolicy(); combined.authenticationCeiling += 1
+		check(combined.authenticationCeiling == 6, "combined flow raises authentication ceiling to 6")
+		check(combined.allows(.authentication, alreadyAccepted: 5) == true && combined.allows(.authentication, alreadyAccepted: 6) == false, "combined flow admits 5 login + 1 apptokens, no more")
+		check(combined.verificationInitiationCeiling == pol.verificationInitiationCeiling && combined.codeSubmissionCeiling == pol.codeSubmissionCeiling, "combined flow leaves verification/code ceilings untouched")
 		let denier = ZagDenyingTwoFactorController()
 		check(denier.consentToDeliver() == false && denier.provideCode() == nil && denier.didCancel, "denying controller cancels cleanly, no code")
 		let sessions = ZagAppleAuthSessionStore()
