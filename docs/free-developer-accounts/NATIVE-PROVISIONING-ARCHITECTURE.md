@@ -942,3 +942,44 @@ after that date would.
   authorization and have not been performed.
 - The verifier handles the `issuerAndSerialNumber` signer form Apple profiles
   use; the `subjectKeyIdentifier` (v3) form is rejected (fail closed).
+
+---
+
+## First real on-device signing experiment — the device harness (2026-11-24)
+
+The supervised experiment runs entirely inside the Zag Store (Feather) app on
+the iPhone; this CLI cannot drive the device, so this is the harness the
+operator runs. The passphrase is typed on-device and never leaves it.
+
+### Step 1 result (verified offline, on the Mac)
+The active login-keychain identity **"Apple Development: …(R3DNK3YV9S)"**, team
+OU `V54K5JYGS4`, valid to 2027-09-27, has certificate DER SHA-256 `7f64f574…`
+that **exactly matches `DeveloperCertificates[2]`** in profile `75c25062…`. The
+profile is CMS-valid and expires **2026-11-30**. Identity↔profile match holds.
+
+### What was built
+- `ZagSigningExperiment` — the runner. Import+validate identity (ThisDeviceOnly) → sign/verify a test payload → verify the profile with `ZagCMSVerifier` → require `ZagSigningPreflight.prepare` = ready → assemble a minimal single-binary `dev.zagstore.ptteamprobe` app around the running executable → `Zsign.signComponents` with the imported-identity signer callback → `Zsign.verifyComponents` (library's own re-check) → an INDEPENDENT (non-Zsign) verify (our `ZagCMSVerifier` on the embedded profile + Mach-O CMS-signature inspection + bundle id + entitlements) → package the IPA. Fails closed, no retry, **no install/launch**. The report is sanitized (no passphrase/key/full identifiers).
+- `ZagSigningExperimentView` — the on-device driver: pick `.p12` + profile (or "use this app's embedded profile"), passphrase `SecureField` (cleared after the single run), Run, sanitized step list.
+- A `#if ZAG_SIGNING_EXPERIMENT` entry under Settings → Experimental Features ("First Signing Experiment").
+
+### Key findings
+- **Signer wiring already proven.** The imported-identity `zsignSigner` returns the identical `ZagKeychainSigningKeys.signer(key)` callback the existing offline `ZagStrictSigningIntegrationTests` drives through `Zsign.signComponents`/`verifyComponents`. The imported `SecKey` yields the same signer.
+- **The real Apple cert chains without extra input.** Zsign embeds the Apple WWDR intermediates (`s_szAppleDevCACertG3`/`s_szAppleDevCACert`) and picks the one that actually issued the signing certificate, verifying its signature. So the imported Apple Development cert chains correctly with no `extraIntermediates` (the runner passes none), matching the production release path.
+
+### Operator run procedure (on the iPhone)
+1. **Export (Mac, done by you):** Keychain Access → export the "Apple Development: …(R3DNK3YV9S)" identity as a strong-password `.p12`, outside any repo/shared/cloud folder.
+2. **Build the experiment app:** build Feather with `-D ZAG_SIGNING_EXPERIMENT` (Other Swift Flags) under your Personal Team (automatic signing), onto the test iPhone via Xcode.
+3. **Transfer inputs to the iPhone:** AirDrop the `.p12`; the profile is already in the app (use "this app's embedded profile") or transfer `75c25062….mobileprovision`.
+4. **Run:** Settings → Experimental Features → **First Signing Experiment** → choose the `.p12`, choose/confirm the profile, type the passphrase, **Run**.
+5. **Capture:** screenshot the sanitized step list and the final "ready / not ready" line and paste it back here for analysis. **Do not install the IPA** — installation is a separate authorization.
+
+### Verification done this pass
+Focused arm64-iOS typecheck of the new runner + view (clean). The guarded
+`Zsign` calls match the `ZsignSwift` wrapper signatures; the full Zsign link
+happens in your Xcode build. Regression: CMS 11/11, imported-identity 59,
+dev-services 150/150.
+
+### Remaining blockers / honest status
+- **End-to-end signing is NOT yet proven** — no complete IPA has been signed; that happens when you run the harness on the device. This pass delivered the harness, not a signed artifact.
+- Steps 2–5 require your on-device action (export, build, transfer, run); I cannot drive the device from the CLI.
+- The device-membership preflight check is self-consistent on-device (the provisioning UDID is not readable via a public iOS API; the profile lists one device and the OS installed the app under it).

@@ -641,6 +641,13 @@ extension SettingsView {
 				Label("Live Test", systemImage: "flask")
 			}
 			#endif
+			#if ZAG_SIGNING_EXPERIMENT
+			// Supervised first real imported-identity signing experiment. Signs a
+			// minimal dev.zagstore.ptteamprobe app on-device; never installs it.
+			NavigationLink(destination: ZagSigningExperimentView().zagSettingsDestinationAvatar()) {
+				Label("First Signing Experiment", systemImage: "signature")
+			}
+			#endif
 		} header: {
 			Text("Experimental Features")
 		}
