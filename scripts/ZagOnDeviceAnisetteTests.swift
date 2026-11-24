@@ -72,6 +72,22 @@ struct ZagOnDeviceAnisetteTests {
 			  && ZagAppleAuthMachine.signInStage(requestCount: 3) == "srp-complete"
 			  && ZagAppleAuthMachine.signInStage(requestCount: 1) == "lookup", "maps request count to stage")
 
+		// 9. Apple `em` extraction + sanitization.
+		check(ZagAppleAuthMachine.grandSlamMessage("rejected (code -22410)") == nil, "em absent -> nil")
+		check(ZagAppleAuthMachine.grandSlamMessage("code -22410 em=[") == nil, "em malformed (unterminated) -> nil")
+		check(ZagAppleAuthMachine.grandSlamMessage("em=[]") == nil, "em empty -> nil")
+		check(ZagAppleAuthMachine.grandSlamMessage("em=[This action could not be completed.]")
+			  == "This action could not be completed.", "em plain passes through")
+		// Sensitive values inside em are redacted.
+		let sensitive = ZagAppleAuthMachine.grandSlamMessage("em=[problem for user@example.com now]") ?? ""
+		check(!sensitive.contains("@example.com") && !sensitive.contains("user@"), "em redacts an email address")
+		// Oversized em is length-bounded with an ellipsis.
+		let big = "em=[" + String(repeating: "warn ", count: 100) + "]"
+		let bounded = ZagAppleAuthMachine.grandSlamMessage(big, limit: 32) ?? ""
+		check(bounded.count <= 33 && bounded.hasSuffix("…"), "em is length-bounded")
+		// Control characters are stripped.
+		check(!(ZagAppleAuthMachine.sanitizeAppleMessage("a\nb\tc").contains("\n")), "em strips control chars")
+
 		// 8. The gated sign-in experiment is inert when the module is unlinked.
 		let signInMachine = ZagAppleAuthMachine()
 		do { _ = try await signInMachine.signInExperiment(email: "test@example.com", password: "x", allowNetwork: false)

@@ -309,6 +309,30 @@ actor ZagAppleAuthMachine {
 		}
 	}
 
+	/// Apple's human-readable `em` message, surfaced by the vendored patch as
+	/// `em=[…]`. Always sanitized (emails/tokens/identifiers redacted via
+	/// `ZagSensitiveRedactor`), control characters stripped and length-bounded.
+	/// The raw message is never returned, stored or printed. Returns nil when no
+	/// well-formed `em=[…]` is present.
+	static func grandSlamMessage(_ text: String, limit: Int = 160) -> String? {
+		guard let open = text.range(of: "em=[") else { return nil }
+		let rest = text[open.upperBound...]
+		guard let close = rest.range(of: "]") else { return nil }   // malformed / unterminated
+		let raw = String(rest[..<close.lowerBound])
+		if raw.isEmpty { return nil }
+		return sanitizeAppleMessage(raw, limit: limit)
+	}
+
+	/// Redacts, de-controls and length-bounds an Apple message for diagnostics.
+	static func sanitizeAppleMessage(_ raw: String, limit: Int = 160) -> String {
+		let redacted = ZagSensitiveRedactor.redact(raw)
+		let decontrolled = String(String.UnicodeScalarView(redacted.unicodeScalars.map {
+			($0.value < 0x20 || $0.value == 0x7F) ? UnicodeScalar(0x20)! : $0
+		}))
+		let collapsed = decontrolled.split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
+		return collapsed.count > limit ? String(collapsed.prefix(limit)) + "…" : collapsed
+	}
+
 	/// EXPERIMENT-ONLY, gated. Performs at most one GrandSlam SRP sign-in using
 	/// this machine's existing provisioned profile (no re-provisioning) and the
 	/// on-device anisette it already generates — the same apple-auth client as
@@ -336,13 +360,15 @@ actor ZagAppleAuthMachine {
 	}
 
 	#if canImport(ZagAppleAuth)
+	private struct RawSignIn { var outcome: ZagAppleAuthSignInOutcome; var ec: Int?; var http: Int?; var message: String? }
+
 	private static func driveSignIn(persisted: Data, transport: ZagAppleAuthTransport,
 									email: String, password: String, sentinel: ZagTwoFactorSentinel) -> ZagAppleAuthSignInReport {
-		let result: Result<ZagAppleAuthSignInOutcome, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport) { client in
+		let result: Result<RawSignIn, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport) { client in
 			// Ensure the profile is loaded (no-op for a provisioned profile; no HTTP).
 			let p = aauth_client_provision(client)
 			guard p == AAUTH_OK else {
-				return .success(transport.reachedApple ? .rejected(code: Int(p.rawValue)) : .transportFailed)
+				return .success(RawSignIn(outcome: transport.reachedApple ? .rejected(code: Int(p.rawValue)) : .transportFailed))
 			}
 			let ctx = Unmanaged.passUnretained(sentinel).toOpaque()
 			var verification = aauth_verification_options(
@@ -353,17 +379,20 @@ actor ZagAppleAuthMachine {
 				withUnsafePointer(to: &verification) { v in aauth_client_login(client, e, pw, v, &session) }
 			} }
 			if let session { aauth_account_session_free(session) }   // never persisted
-			if sentinel.requested { return .success(.twoFactorRequired) }
-			if rc == AAUTH_OK { return .success(.authenticated) }
+			if sentinel.requested { return .success(RawSignIn(outcome: .twoFactorRequired)) }
+			if rc == AAUTH_OK { return .success(RawSignIn(outcome: .authenticated)) }
 			let error = String(cString: aauth_client_last_error())
-			if let code = grandSlamCode(error) { return .success(.rejected(code: code)) }
-			if let http = grandSlamHTTPStatus(error) { return .success(.httpError(status: http)) }
-			return .success(transport.reachedApple ? .rejected(code: Int(rc.rawValue)) : .transportFailed)
+			let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error), message = grandSlamMessage(error)
+			let outcome: ZagAppleAuthSignInOutcome = ec.map { .rejected(code: $0) }
+				?? http.map { .httpError(status: $0) }
+				?? (transport.reachedApple ? .rejected(code: Int(rc.rawValue)) : .transportFailed)
+			return .success(RawSignIn(outcome: outcome, ec: ec, http: http, message: message))
 		}
-		let outcome: ZagAppleAuthSignInOutcome = { if case .success(let o) = result { return o }; return .transportFailed }()
-		return ZagAppleAuthSignInReport(outcome: outcome,
+		let raw: RawSignIn = { if case .success(let r) = result { return r }; return RawSignIn(outcome: .transportFailed) }()
+		return ZagAppleAuthSignInReport(outcome: raw.outcome,
 										stage: Self.signInStage(requestCount: transport.requestCount),
-										requestCount: transport.requestCount)
+										requestCount: transport.requestCount,
+										ec: raw.ec, httpStatus: raw.http, appleMessage: raw.message)
 	}
 	#endif
 }
@@ -386,6 +415,12 @@ struct ZagAppleAuthSignInReport: Equatable, Sendable {
 	let outcome: ZagAppleAuthSignInOutcome
 	var stage: String? = nil
 	var requestCount: Int = 0
+	/// Apple's GrandSlam `ec` (negative), when the rejection carried one.
+	var ec: Int? = nil
+	/// An Apple edge HTTP status (e.g. 503 / 429), when that was the failure.
+	var httpStatus: Int? = nil
+	/// Apple's `em` message, already sanitized and length-bounded (never raw).
+	var appleMessage: String? = nil
 }
 
 #if canImport(ZagAppleAuth)

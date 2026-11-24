@@ -45,6 +45,9 @@ enum ZagSignInExperimentRunner {
 			report["outcome"] = describe(signIn.outcome)
 			if let stage = signIn.stage { report["stage"] = stage }
 			report["request_count"] = signIn.requestCount
+			if let ec = signIn.ec { report["ec"] = ec }
+			if let http = signIn.httpStatus { report["http_status"] = http }
+			if let message = signIn.appleMessage { report["apple_message"] = message }
 		} catch {
 			report["outcome"] = "error"
 		}

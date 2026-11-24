@@ -18,6 +18,12 @@ flags=(-arch arm64 -isysroot "$sdk" -miphoneos-version-min=16.0 -Os)
 git clone --depth 1 --branch v3.6.2 https://github.com/Mbed-TLS/mbedtls "$work/mbedtls"
 git clone https://github.com/apple-auth/apple-auth "$work/aa"
 git -C "$work/aa" checkout 98c862f7bebc8283a9b87f1578e703f0765dc81d
+# Experimental diagnostic patch: surface Apple's GrandSlam `em` message.
+for p in "$here"/patches/*.patch; do
+  [ -e "$p" ] || continue
+  git -C "$work/aa" apply "$p"
+  echo "applied patch $(basename "$p")"
+done
 mkdir -p "$work/gen/apple_auth/nlohmann" "$work/obj"
 curl -fsSL -o "$work/gen/nlohmann/json.hpp" --create-dirs \
   https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp

@@ -1,0 +1,21 @@
+Surface Apple's GrandSlam `em` message alongside the `ec` code.
+
+apple-auth normally throws only "Apple authentication rejected (code <ec>)".
+For the supervised sign-in diagnosis we also need Apple's own human-readable
+message. This appends it as ` em=[<message>]` so the caller can extract and
+sanitize it; the raw message never leaves the device un-sanitized. Scope is one
+throw in status(); no cryptography, request construction or behaviour changes.
+
+--- a/src/client/authentication.cpp
++++ b/src/client/authentication.cpp
+@@ -29,7 +29,9 @@ void status(const Json& response) {
+     require(s.is_object(), "Malformed GrandSlam status");
+     auto code = s.value("ec", std::int64_t(0));
+     if (code != 0) {
+-        throw Error("Apple authentication rejected (code " + std::to_string(code) + ")");
++        auto message = s.value("em", std::string());
++        throw Error("Apple authentication rejected (code " + std::to_string(code) +
++                    (message.empty() ? "" : (" em=[" + message + "]")) + ")");
+     }
+ }
+ 

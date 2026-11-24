@@ -105,9 +105,21 @@ sign-in path ran with the transport refused — **zero Apple contact**.
 
 A JSON object with only: `mode`, `anisette_fresh`, `anisette_header_count`,
 `credential` (`present`/`absent`), `outcome` (`authenticated` /
-`two-factor-required (not submitted)` / `rejected(<code>)` / `transport-failed`
-/ `not-provisioned`), and `result`. No email, password, SRP value, salt, M1/M2,
+`two-factor-required (not submitted)` / `rejected(<code>)` / `http-error(<n>)` /
+`transport-failed` / `not-provisioned`), `stage` (`lookup` / `srp-init` /
+`srp-complete`), `request_count`, and — when present — `ec` (Apple's negative
+GrandSlam code), `http_status`, and `apple_message` (Apple's `em`, **sanitized**:
+emails/tokens/identifiers redacted, control characters stripped, length-bounded
+to 160; never the raw response). No email, password, SRP value, salt, M1/M2,
 DSID, token, cookie or anisette value ever appears.
+
+The `em` surfacing is a one-line patch to apple-auth's `status()`
+(`AppleAuthCore/apple-auth/patches/0001-surface-grandslam-em.patch`, applied by
+`build-apple-auth.sh`); it changes no cryptography, request construction,
+anisette headers or machine profile. Validated offline: host tests 26/26;
+compiles+links for `arm64-apple-ios`; the patched framework ran the offline
+self-check on the stock iPhone (`stage: pre-request`, `request_count: 0`,
+`transport-failed`, 10 fresh anisette headers, zero Apple contact).
 
 ## What authorization is needed
 

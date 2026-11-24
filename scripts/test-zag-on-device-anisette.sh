@@ -21,11 +21,16 @@ enum ZagDeadline {
 		try await operation()
 	}
 }
+// ZagFreeAccountSecretStore.swift (home of the real ZagSensitiveRedactor used
+// by the em sanitizer) references only this for validation; the redactor path
+// does not use it.
+enum ZagDeveloperTeam { static func isValidIdentifier(_ id: String) -> Bool { !id.isEmpty } }
 SWIFT
 
 swiftc -warnings-as-errors -parse-as-library -D DEBUG -target "$(uname -m)-apple-macos13" \
 	"$WORK/stubs.swift" \
 	"$FA/ZagAnisetteProvider.swift" \
+	"$FA/ZagFreeAccountSecretStore.swift" \
 	"$FA/ZagAppleAuthMachine.swift" \
 	"$FA/ZagOnDeviceAnisetteProvider.swift" \
 	"$ROOT/scripts/ZagOnDeviceAnisetteTests.swift" \
