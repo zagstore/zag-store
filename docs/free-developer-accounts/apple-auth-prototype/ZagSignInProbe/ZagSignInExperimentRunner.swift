@@ -75,7 +75,7 @@ enum ZagSignInExperimentRunner {
 		return out
 	}
 
-	static func run(live: Bool, platform: ZagAppleAuthPlatform = .iphone, scope: String = "device") async -> [String: Any] {
+	static func run(live: Bool, platform: ZagAppleAuthPlatform = .iphone, scope: String = "device", maxRequests: Int = 6) async -> [String: Any] {
 		var report: [String: Any] = ["mode": live ? "live" : "selfcheck", "platform": platform.rawValue, "scope": scope]
 		let m = machine(platform: platform, scope: scope)
 
@@ -107,7 +107,7 @@ enum ZagSignInExperimentRunner {
 		// 3. One bounded sign-in attempt.
 		let machine = m
 		do {
-			let signIn = try await machine.signInExperiment(email: email, password: password, allowNetwork: live)
+			let signIn = try await machine.signInExperiment(email: email, password: password, allowNetwork: live, maxRequests: maxRequests)
 			report["outcome"] = describe(signIn.outcome)
 			if let stage = signIn.stage { report["stage"] = stage }
 			report["request_count"] = signIn.requestCount

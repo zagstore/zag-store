@@ -36,7 +36,9 @@ struct ZagSignInProbeApp: App {
 			case let env where env["ZAG_RUN_MACLEGACY_SELFCHECK"] == "1":
 				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: false, platform: .macLegacy, scope: zagMacLegacyScope) }, file: "zag_maclegacy_selfcheck.json")
 			case let env where env["ZAG_RUN_MACLEGACY_SIGNIN"] == "1":
-				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .macLegacy, scope: zagMacLegacyScope) }, file: "zag_maclegacy_signin.json")
+				// Hard ceiling of 3 GrandSlam requests (lookup/init/complete): no
+				// 4th (2FA-delivery) request can fire.
+				LiveRunView(task: { await ZagSignInExperimentRunner.run(live: true, platform: .macLegacy, scope: zagMacLegacyScope, maxRequests: 3) }, file: "zag_maclegacy_signin.json")
 			default:
 				CredentialEntryView()
 			}

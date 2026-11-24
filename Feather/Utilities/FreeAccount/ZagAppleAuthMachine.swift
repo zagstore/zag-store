@@ -486,12 +486,15 @@ actor ZagAppleAuthMachine {
 	/// account session is freed immediately and never persisted; the password
 	/// is used once and never stored, logged or returned. Returns only a
 	/// classification. Requires an authorised live run (`allowNetwork`).
-	func signInExperiment(email: String, password: String, allowNetwork: Bool) async throws -> ZagAppleAuthSignInReport {
+	func signInExperiment(email: String, password: String, allowNetwork: Bool, maxRequests: Int = 6) async throws -> ZagAppleAuthSignInReport {
 		#if canImport(ZagAppleAuth)
 		guard let persisted = try store.load(scope: scope) else { return ZagAppleAuthSignInReport(outcome: .notProvisioned) }
-		// Bounded: lookup + SRP init + SRP complete (+ a possible 2FA bootstrap),
-		// no retries. With allowNetwork false the transport refuses everything.
-		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: 6)
+		// Bounded by `maxRequests`, no retries. The SRP sequence is lookup + SRP
+		// init + SRP complete (3); a hard cap of 3 refuses any further request,
+		// so no 2FA-delivery/verification request can fire (a 2FA requirement is
+		// still detected from the complete response and cancelled, never
+		// submitted). With allowNetwork false the transport refuses everything.
+		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: maxRequests)
 		let sentinel = ZagTwoFactorSentinel()
 		let platform = self.platform
 		return await withCheckedContinuation { continuation in
