@@ -120,6 +120,13 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 	/// 3 = SRP complete) without exposing any request content.
 	var requestCount: Int { lock.withLock { count } }
 
+	/// How many times a request was refused because the ceiling was reached — a
+	/// positive signal that the library tried to issue a further request (e.g. a
+	/// 2FA-initiation request after SRP completion) that we deliberately blocked,
+	/// as opposed to a transport/network failure on an accepted request.
+	private var ceilingRefusals = 0
+	var hitCeiling: Bool { lock.withLock { ceilingRefusals > 0 } }
+
 	private lazy var session: URLSession = {
 		let cfg = URLSessionConfiguration.ephemeral
 		cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -140,7 +147,7 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 		guard let u = URL(string: url), u.scheme == "https", let host = u.host, host.hasSuffix(".apple.com") else { return nil }
 		guard method == "GET" || method == "POST" else { return nil }
 		lock.lock()
-		guard count < maxRequests else { lock.unlock(); return nil }
+		guard count < maxRequests else { ceilingRefusals += 1; log.append("REFUSED (ceiling)"); lock.unlock(); return nil }
 		count += 1
 		lock.unlock()
 		var req = URLRequest(url: u)
@@ -433,6 +440,17 @@ actor ZagAppleAuthMachine {
 		}
 	}
 
+	/// Classifies a library `AAUTH_NETWORK_ERROR` after a sign-in attempt. It is
+	/// `twoFactorRequiredAtCeiling` ONLY when a request was refused at the
+	/// ceiling after every accepted request returned HTTP 200 — the library
+	/// issues that (post-completion) request only after verifying Apple's M2
+	/// proof and an unauthenticated account-state transition, so the SRP proof is
+	/// positively established. Otherwise it is a genuine transport failure. Never
+	/// derived from HTTP 200 alone.
+	static func networkErrorOutcome(hitCeiling: Bool, all200: Bool) -> ZagAppleAuthSignInOutcome {
+		(hitCeiling && all200) ? .twoFactorRequiredAtCeiling : .transportFailed
+	}
+
 	/// The provisioning stage from the request count: 1 lookup, 2 start, 3
 	/// finish. Non-sensitive; parallels `signInStage` for the trace labels.
 	static func provisionStage(requestCount: Int) -> String {
@@ -533,9 +551,16 @@ actor ZagAppleAuthMachine {
 			if rc == AAUTH_OK { return .success(RawSignIn(outcome: .authenticated)) }
 			let error = String(cString: aauth_client_last_error())
 			let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error), message = grandSlamMessage(error)
+			// A library network error that is actually our ceiling refusing a
+			// post-completion (2FA-initiation) request is distinguished from a
+			// genuine network failure; neither is ever reported as an Apple
+			// rejection.
+			let isNetworkError = rc.rawValue == AAUTH_NETWORK_ERROR.rawValue
+			let all200 = !transport.httpTrace.isEmpty && transport.httpTrace.allSatisfy { $0.status == 200 }
 			let outcome: ZagAppleAuthSignInOutcome = ec.map { .rejected(code: $0) }
 				?? http.map { .httpError(status: $0) }
-				?? (transport.reachedApple ? .rejected(code: Int(rc.rawValue)) : .transportFailed)
+				?? (isNetworkError ? Self.networkErrorOutcome(hitCeiling: transport.hitCeiling, all200: all200)
+					: (transport.reachedApple ? .rejected(code: Int(rc.rawValue)) : .transportFailed))
 			return .success(RawSignIn(outcome: outcome, ec: ec, http: http, message: message))
 		}
 		let raw: RawSignIn = { if case .success(let r) = result { return r }; return RawSignIn(outcome: .transportFailed) }()
@@ -566,6 +591,13 @@ enum ZagAppleAuthSignInOutcome: Equatable, Sendable {
 	case httpError(status: Int)// Apple edge HTTP failure (e.g. 503/429), no ec
 	case transportFailed       // no Apple response (offline, blocked, network error)
 	case notProvisioned        // no machine profile to sign in with
+	/// SRP completed (every accepted request returned 200) and the library then
+	/// tried a 2FA-initiation request that our configured ceiling refused. The
+	/// library issues that request only after verifying Apple's M2 proof and an
+	/// unauthenticated account-state transition, so this positively establishes
+	/// that the SRP sign-in succeeded and the account requires 2FA — never
+	/// inferred from HTTP 200 alone. No code was requested, sent or submitted.
+	case twoFactorRequiredAtCeiling
 }
 
 /// A sanitized sign-in report: the outcome plus the stage and request count,

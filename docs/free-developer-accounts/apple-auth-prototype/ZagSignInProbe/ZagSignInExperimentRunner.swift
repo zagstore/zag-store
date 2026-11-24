@@ -147,6 +147,7 @@ enum ZagSignInExperimentRunner {
 		case .twoFactorRequired: return "two-factor-required (not submitted)"
 		case .rejected(let code): return "rejected(\(code))"
 		case .httpError(let status): return "http-error(\(status))"
+		case .twoFactorRequiredAtCeiling: return "two-factor-required (ceiling reached; SRP verified)"
 		case .transportFailed: return "transport-failed"
 		case .notProvisioned: return "not-provisioned"
 		}

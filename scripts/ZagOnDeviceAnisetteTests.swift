@@ -139,6 +139,43 @@ struct ZagOnDeviceAnisetteTests {
 			  && built[2].stage == "srp-complete" && built[2].status == 503
 			  && built[2].metadata["retry-after"] == "120", "trace builder labels stages and keeps allowlisted metadata")
 
+		// 7e. Phase 1 — precise classification of a post-completion ceiling
+		//     refusal vs a genuine network error (never from HTTP 200 alone).
+		check(ZagAppleAuthMachine.networkErrorOutcome(hitCeiling: true, all200: true) == .twoFactorRequiredAtCeiling,
+			  "ceiling refusal after all-200 -> two-factor-required-at-ceiling")
+		check(ZagAppleAuthMachine.networkErrorOutcome(hitCeiling: false, all200: true) == .transportFailed,
+			  "network error without ceiling refusal -> transport-failed (not 2FA)")
+		check(ZagAppleAuthMachine.networkErrorOutcome(hitCeiling: true, all200: false) == .transportFailed,
+			  "ceiling refusal but a non-200 occurred -> transport-failed (not 2FA)")
+
+		// 7f. Phase 2 — request classification, per-class ceilings, consent gate,
+		//     controller cancellation, session-store round-trip.
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/GsService2") == .authentication, "GsService2 -> authentication")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/lookup") == .authentication, "lookup -> authentication")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/verify/phone", method: "PUT") == .verificationInitiation, "verify/phone -> verification-initiation")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/trustedDeviceSecondaryAuth") == .verificationInitiation, "trusted-device push -> verification-initiation")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/verify/phone/securitycode") == .codeSubmission, "securitycode -> code-submission")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/validateCode") == .codeSubmission, "validateCode -> code-submission")
+		check(ZagAppleAuthRequestClass.classify(url: "https://example.com/other") == .other, "unrelated -> other")
+		let pol = ZagTwoFactorPolicy()
+		check(pol.consentToDeliver == false, "consent defaults to NOT granted")
+		check(pol.authenticationCeiling == 5 && pol.verificationInitiationCeiling == 2 && pol.codeSubmissionCeiling == 1, "default per-class ceilings")
+		check(pol.allows(.verificationInitiation, alreadyAccepted: 0) == false, "verification delivery refused without consent")
+		var consented = pol; consented.consentToDeliver = true
+		check(consented.allows(.verificationInitiation, alreadyAccepted: 0) == true, "verification delivery allowed after consent")
+		check(consented.allows(.verificationInitiation, alreadyAccepted: 2) == false, "verification delivery refused past its ceiling")
+		check(consented.allows(.codeSubmission, alreadyAccepted: 0) == true && consented.allows(.codeSubmission, alreadyAccepted: 1) == false, "code submission capped at 1")
+		check(consented.allows(.authentication, alreadyAccepted: 4) == true && consented.allows(.authentication, alreadyAccepted: 5) == false, "authentication capped at 5")
+		let denier = ZagDenyingTwoFactorController()
+		check(denier.consentToDeliver() == false && denier.provideCode() == nil && denier.didCancel, "denying controller cancels cleanly, no code")
+		let sessions = ZagAppleAuthSessionStore()
+		try? sessions.delete(scope: "unit-test")
+		check(sessions.hasSession(scope: "unit-test") == false, "no session before save")
+		try? sessions.save(Data("opaque".utf8), scope: "unit-test")
+		check(sessions.hasSession(scope: "unit-test") == true, "session present after save")
+		try? sessions.delete(scope: "unit-test")
+		check(sessions.hasSession(scope: "unit-test") == false, "session gone after delete")
+
 		// 8. The gated sign-in experiment is inert when the module is unlinked.
 		let signInMachine = ZagAppleAuthMachine()
 		do { _ = try await signInMachine.signInExperiment(email: "test@example.com", password: "x", allowNetwork: false)

@@ -32,6 +32,7 @@ swiftc -warnings-as-errors -parse-as-library -D DEBUG -target "$(uname -m)-apple
 	"$FA/ZagAnisetteProvider.swift" \
 	"$FA/ZagFreeAccountSecretStore.swift" \
 	"$FA/ZagAppleAuthMachine.swift" \
+	"$FA/ZagTwoFactorExperiment.swift" \
 	"$FA/ZagOnDeviceAnisetteProvider.swift" \
 	"$ROOT/scripts/ZagOnDeviceAnisetteTests.swift" \
 	-o "$WORK/tests"
