@@ -1407,3 +1407,68 @@ is held pending the single remaining owner input:
 The read-only inventory needs only a fresh native session (the owner signs in
 within the experiment build); it does NOT need the preserved CSR/key, so a
 separate installation does not disturb the preserved-CSR experiment.
+
+---
+
+## dev.zagstore.aaprobe as read-only inventory host — NOT VIABLE (2026-11-25)
+
+Investigated reusing the native prototype `dev.zagstore.aaprobe` as the
+read-only inventory host before any new profile or canonical-app replacement.
+Read-only inspection only; nothing built against it, no Apple contact.
+
+### Why aaprobe cannot be the host (three independent blockers)
+1. **No device-matching profile.** An exhaustive sweep of all `.mobileprovision`
+   under `~/Library/MobileDevice`, `~/Documents`, the repo and DerivedData found
+   **14 profiles, none for `dev.zagstore.aaprobe`** (nor `dev.zagstore.ptteamprobe`).
+   The free-team (V54K5JYGS4) profiles present are **all expired** (Oct 2026) and
+   for unrelated bundle ids (`com.petarzagorski.vortx/mutube/ZagTVInstallTest`).
+   A free Personal Team profile is 7-day + bundle-id-specific; obtaining/renewing
+   one for aaprobe requires Xcode/Apple = Apple contact (forbidden here). So
+   aaprobe cannot be re-signed and upgraded with an existing valid profile.
+2. **Build inputs absent.** The probe links `-lapple_auth_client
+   -lapple_auth_core -lmbedtls_all` from `$(PROJECT_DIR)/libs`, which does not
+   exist in the repo; the native static libs are not committed, so the project
+   cannot be built here at all.
+3. **No usable session.** `AppMain.swift` only runs an offline
+   `zag_apple_auth_selftest` (ADI) or a supervised provisioning attempt. aaprobe
+   performs no Apple-Account sign-in and stores no developer session / DSID /
+   `x-apple-gs-token`, and has no sign-in UI. A read-only certificate inventory
+   needs a signed-in developer session, which aaprobe neither holds nor can
+   establish. §3 ("reuse the existing authentication session") is therefore moot.
+
+Did not integrate the inventory into aaprobe (§2's precondition failed). The
+preserved prototype `dev.zagstore.ptteamprobe` (non-extractable key, pending CSR,
+journals) was not touched; the canonical app was not touched.
+
+### Remaining installation choices (compared; none implemented)
+Only one unexpired, device-matching profile exists system-wide:
+`7S3MGZK59N.com.cwd43.gu29`, device `00008130…001C`, to 2027-09-23.
+
+| Option | Profile | Apple contact? | Data safety | Allowed now? |
+|---|---|---|---|---|
+| A. Upgrade canonical `com.cwd43.gu29` | the one valid profile | none | non-destructive upgrade preserves its container; but it **replaces the canonical app** | **No** — §6 forbids overwriting the canonical install |
+| B. New spare bundle id (e.g. `dev.zagstore.rocertinv`) on free team V54K5JYGS4 | must be minted in Xcode | **yes** (owner's own Xcode free-provisioning) | coexists; nothing overwritten | needs one owner Apple action |
+| C. Reuse `dev.zagstore.ptteamprobe` | none on disk | yes | **overwrites the preserved-CSR prototype** | **No** — §5 forbids |
+| D. aaprobe | none on disk | yes | — | **No** — blockers above |
+
+### Shortest safe path to the first live read-only inventory test
+Option **B** is the only path that touches neither the canonical app nor the
+preserved-CSR prototype and needs no action from me against Apple:
+1. **Owner, in Xcode** (their own authorized free-provisioning): create a free
+   Personal Team (V54K5JYGS4) development build/profile for a **spare** bundle id
+   such as `dev.zagstore.rocertinv`, targeting the connected iPhone. Xcode
+   registers the App ID + device and issues the 7-day development profile. (No
+   action by me; this is the owner's normal Apple interaction.)
+2. **Then I** build the full Feather read-only experiment (already proven to
+   compile with `ZagAppleAuth` linked + both flags via
+   `scripts/zag-build-readonly-cert-inventory.sh`), signed as that spare bundle
+   id with the free-team Apple Development cert + that profile, into an IPA that
+   coexists with everything.
+3. **Owner** installs it (`devicectl`), signs in to the free Apple Account in the
+   app (establishes the read-only session fresh), opens Settings › Experimental ›
+   "Replace a Certificate" → the inventory loads (one GET). Revoke/CSR stay
+   blocked at the transport.
+
+The read-only inventory needs only that fresh session, not the preserved CSR/key,
+so it does not disturb the `ptteamprobe` experiment. The single remaining owner
+input is the spare-bundle-id free-team profile from step 1.
