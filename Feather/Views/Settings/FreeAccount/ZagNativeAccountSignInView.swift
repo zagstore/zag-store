@@ -25,7 +25,16 @@ import SwiftUI
 final class ZagNativeSignInModel: ObservableObject {
 	@Published var appleID = ""
 	@Published var password = ""
-	@Published var code = ""
+	/// The 2FA verification code, kept as a six-character STRING so leading zeros
+	/// are preserved (never parsed to an Int). Input is sanitized to digits and
+	/// capped at six, so AutoFill, manual entry and a pasted code (possibly with
+	/// surrounding text or spaces) all converge on the bare six digits.
+	@Published var code = "" {
+		didSet {
+			let sanitized = String(code.filter(\.isNumber).prefix(6))
+			if sanitized != code { code = sanitized }
+		}
+	}
 	@Published private(set) var phase: ZagNativeSignInPhase = .signedOut
 	@Published private(set) var failure: ZagNativeSignInFailure?
 	@Published private(set) var isBusy = false
@@ -45,7 +54,11 @@ final class ZagNativeSignInModel: ObservableObject {
 	var canSubmitCredentials: Bool {
 		!isBusy && !appleID.isEmpty && password.count >= 4 && (phase == .signedOut || phase == .failed)
 	}
-	var canSubmitCode: Bool { !isBusy && phase == .awaitingCode && code.count >= 4 }
+	// Awaiting the code is NOT "busy" from the user's side: sign-in is blocked on
+	// the coordinator waiting for this input, so `isBusy` stays true throughout.
+	// Validation therefore depends only on the phase and a complete six-digit
+	// code (the didSet guarantees digits), never on `isBusy`.
+	var canSubmitCode: Bool { phase == .awaitingCode && code.count == 6 }
 
 	/// Restores a prior signed-in state with no network: if the machine still
 	/// holds a usable developer session, we are signed in. The token itself is
