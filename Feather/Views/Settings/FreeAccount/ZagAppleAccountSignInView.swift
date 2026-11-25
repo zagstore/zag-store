@@ -1,0 +1,236 @@
+#if canImport(SwiftUI)
+import SwiftUI
+
+// The real, production-reachable native Apple Account sign-in for the normal
+// Zag Store device build (not DEBUG, not an experiment build). It drives the
+// existing engine end to end — ZagAccountDirectory → ZagFreeAccountAuthenticator
+// (GrandSlam) → ZagBridgeAnisetteSource (on-device anisette) →
+// ZagIsideloadAuthenticationService — through the shared ZagFreeAccountSignInModel.
+// Sessions and the developer token are persisted by the engine in Zag Store's
+// own Keychain items; this screen holds no secret of its own and logs nothing.
+//
+// When the native bridge is not linked (e.g. a simulator build), the stack
+// cannot be constructed; the screen then states exactly that rather than
+// pretending to offer a sign-in it cannot perform.
+
+/// Owns the real sign-in model. The model is built asynchronously because the
+/// directory is an actor (`newSignIn()` is async), so it is created in `prepare()`
+/// from `.task`, not in `init`.
+@MainActor
+final class ZagAppleAccountSignInController: ObservableObject {
+	@Published private(set) var model: ZagFreeAccountSignInModel?
+	@Published private(set) var unavailableReason: String?
+
+	#if ZAG_APPLE_BRIDGE
+	private let directory: ZagAccountDirectory
+
+	init() {
+		var configuration = ZagAccountDirectory.Configuration()
+		configuration.namespace = "ZagStore.accounts"
+		configuration.makeService = { ZagIsideloadAuthenticationService() }
+		configuration.localState = ZagBridgeAnisetteLocalState()
+		directory = ZagAccountDirectory(
+			anisette: ZagBridgeAnisetteSource(),
+			secrets: ZagKeychainFreeAccountSecretStore(),
+			preferences: ZagUserDefaultsPreferences(),
+			configuration: configuration
+		)
+	}
+
+	func prepare() async {
+		guard model == nil else { return }
+		let m = ZagFreeAccountSignInModel(
+			authenticator: await directory.newSignIn(),
+			diagnostics: ZagFreeAccountDiagnostics()
+		)
+		model = m
+		await m.restore()   // restores a persisted session if one exists (no network when valid)
+	}
+	#else
+	init() {}
+	func prepare() async {
+		unavailableReason = "Native sign-in needs a device build with the Apple bridge linked. This build does not link it."
+	}
+	#endif
+}
+
+struct ZagAppleAccountSignInView: View {
+	@StateObject private var controller = ZagAppleAccountSignInController()
+
+	var body: some View {
+		Group {
+			if let model = controller.model {
+				ZagAppleAccountSignInContent(model: model)
+			} else {
+				List {
+					Section {
+						Label(controller.unavailableReason ?? "Preparing…",
+							  systemImage: controller.unavailableReason == nil ? "hourglass" : "exclamationmark.triangle")
+							.font(.footnote).foregroundStyle(.secondary)
+					} footer: {
+						Text("The sign-in engine, anisette provider and developer-token store are all present; a one-time account provisioning and your interactive sign-in are what remain before a live session can be obtained.")
+					}
+				}
+			}
+		}
+		.navigationTitle("Apple Account")
+		.navigationBarTitleDisplayMode(.inline)
+		.task { await controller.prepare() }
+	}
+}
+
+private struct ZagAppleAccountSignInContent: View {
+	@ObservedObject var model: ZagFreeAccountSignInModel
+	@AppStorage("Feather.userTintColor") private var tintHex = "#0090FF"
+	@FocusState private var focus: Field?
+	private enum Field { case appleID, password }
+	private var tint: Color { Color(hex: tintHex) }
+
+	var body: some View {
+		Form {
+			statusSection
+			switch model.phase {
+			case .signedIn, .expired: sessionSection
+			default:                  credentialsSection
+			}
+			if let notice = model.notice {
+				Section { Label(notice, systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
+			}
+			disclaimerSection
+		}
+		.sheet(isPresented: Binding(
+			get: { model.prompt != nil },
+			set: { shown in if !shown, model.prompt != nil { Task { await model.cancel() } } }
+		)) {
+			codeSheet
+		}
+	}
+
+	private var statusSection: some View {
+		Section {
+			HStack(spacing: 12) {
+				Image(systemName: statusIcon).font(.title2).foregroundStyle(statusColor).frame(width: 30)
+				VStack(alignment: .leading, spacing: 2) {
+					Text(statusTitle).font(.headline)
+					Text(statusDetail).font(.footnote).foregroundStyle(.secondary)
+				}
+				if model.isBusy { Spacer(); ProgressView() }
+			}
+		}
+	}
+
+	private var credentialsSection: some View {
+		Section("Sign in") {
+			TextField("Apple Account", text: $model.appleID)
+				.keyboardType(.emailAddress).textContentType(.username)
+				.textInputAutocapitalization(.never).autocorrectionDisabled()
+				.focused($focus, equals: .appleID).submitLabel(.next)
+				.onSubmit { focus = .password }
+			SecureField("Password", text: $model.password)
+				.textContentType(.password)
+				.focused($focus, equals: .password).submitLabel(.go)
+				.onSubmit { if model.canSubmitCredentials { Task { await model.signIn() } } }
+			Button {
+				focus = nil
+				Task { await model.signIn() }
+			} label: {
+				HStack { Spacer(); Text("Sign In").fontWeight(.semibold); Spacer() }
+			}
+			.disabled(!model.canSubmitCredentials)
+		}
+	}
+
+	private var sessionSection: some View {
+		Section("Session") {
+			if model.phase == .expired {
+				Label("This session has expired. Sign in again.", systemImage: "clock.badge.exclamationmark")
+					.font(.footnote).foregroundStyle(.orange)
+			} else {
+				Label("Signed in. A developer session is held in Zag Store's Keychain.", systemImage: "checkmark.seal")
+					.font(.footnote).foregroundStyle(.green)
+			}
+			Button(role: .destructive) { Task { await model.signOut() } } label: {
+				Text("Sign Out")
+			}.disabled(model.isBusy)
+		}
+	}
+
+	private var disclaimerSection: some View {
+		Section {
+			EmptyView()
+		} footer: {
+			Text("Your Apple Account password, two-factor codes and developer tokens stay on this iPhone and are never logged. Signing in may contact Apple to authenticate; nothing is revoked, signed or installed from this screen.")
+		}
+	}
+
+	private var codeSheet: some View {
+		NavigationStack {
+			Form {
+				if let prompt = model.prompt {
+					Section {
+						Text(prompt.message).font(.footnote).foregroundStyle(.secondary)
+						TextField("Code", text: $model.code)
+							.keyboardType(.numberPad).textContentType(.oneTimeCode)
+						if let alt = prompt.alternativeAction {
+							Button(alt) { Task { await model.requestCodeBySMS() } }.disabled(model.isBusy)
+						}
+					} header: {
+						Text(prompt.title)
+					} footer: {
+						if prompt.attemptsRemaining > 0 && prompt.isRetry {
+							Text("\(prompt.attemptsRemaining) attempts remaining.")
+						}
+					}
+				}
+			}
+			.navigationTitle("Two-Factor")
+			.navigationBarTitleDisplayMode(.inline)
+			.toolbar {
+				ToolbarItem(placement: .cancellationAction) {
+					Button("Cancel") { Task { await model.cancel() } }
+				}
+				ToolbarItem(placement: .confirmationAction) {
+					Button("Verify") { Task { await model.submitCode() } }.disabled(!model.canSubmitCode)
+				}
+			}
+		}
+		.presentationDetents([.medium])
+	}
+
+	// MARK: Status derivation
+
+	private var statusIcon: String {
+		switch model.phase {
+		case .signedIn:   return "person.crop.circle.badge.checkmark"
+		case .expired:    return "person.crop.circle.badge.clock"
+		case .failed:     return "person.crop.circle.badge.exclamationmark"
+		case .awaitingCode: return "ellipsis.bubble"
+		default:          return "person.crop.circle"
+		}
+	}
+	private var statusColor: Color {
+		switch model.phase {
+		case .signedIn: return .green
+		case .failed, .expired: return .orange
+		default: return tint
+		}
+	}
+	private var statusTitle: String {
+		switch model.phase {
+		case .signedOut:    return "Not signed in"
+		case .working:      return "Signing in…"
+		case .awaitingCode: return "Enter your code"
+		case .signedIn:     return "Signed in"
+		case .expired:      return "Session expired"
+		case .failed:       return "Sign-in failed"
+		}
+	}
+	private var statusDetail: String {
+		switch model.phase {
+		case .signedIn: return "Personal Team and certificate inventory are available."
+		case .failed:   return model.notice ?? "Check your Apple Account and password."
+		default:        return "Use your free Apple Account; two-factor is handled here."
+		}
+	}
+}
+#endif

@@ -429,6 +429,7 @@
 					"$(inherited)",
 					"-L$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64",
 					"-lZagAppleAuth",
+					"$(PROJECT_DIR)/AppleAuthCore/zag-apple-bridge/target/aarch64-apple-ios/release/libzag_apple_bridge.a",
 					"-lc++",
 				);
 				"SWIFT_INCLUDE_PATHS[sdk=iphoneos*]" = (
@@ -447,6 +448,7 @@
 				SUPPORTS_MACCATALYST = YES;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos*]" = "DEBUG $(inherited) ZAG_APPLE_AUTH_ADI ZAG_APPLE_BRIDGE";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "Feather/Supporting Files/Feather-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -506,6 +508,7 @@
 					"$(inherited)",
 					"-L$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64",
 					"-lZagAppleAuth",
+					"$(PROJECT_DIR)/AppleAuthCore/zag-apple-bridge/target/aarch64-apple-ios/release/libzag_apple_bridge.a",
 					"-lc++",
 				);
 				"SWIFT_INCLUDE_PATHS[sdk=iphoneos*]" = (
@@ -524,6 +527,7 @@
 				SUPPORTS_MACCATALYST = YES;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos*]" = "$(inherited) ZAG_APPLE_AUTH_ADI ZAG_APPLE_BRIDGE";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "Feather/Supporting Files/Feather-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Osize";

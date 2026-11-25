@@ -98,10 +98,17 @@ struct ZagAppleSigningSettingsView: View {
 			gateRow("On-device sign-in enabled", ok: adiEnabled,
 					detail: adiEnabled ? "The on-device anisette/ADI provider is active."
 									   : "Not enabled in this build; sign-in has no anisette source yet.")
-			statusRow(icon: "person.crop.circle", title: "Connect Apple Account",
-					  detail: signInLive ? "Sign in to your free Apple Account (password + two-factor on this iPhone)."
-										 : "Requires an on-device-sign-in build; the interaction is not a placeholder — the engine, token store and read-only inventory are all present.",
-					  state: .experimental)
+			NavigationLink(destination: ZagAppleAccountSignInView().zagSettingsDestinationAvatar()) {
+				Label {
+					VStack(alignment: .leading, spacing: 2) {
+						Text("Connect Apple Account")
+						Text(signInLive ? "Sign in with your free Apple Account (password + two-factor)."
+										: "Opens the real sign-in; live auth needs the on-device-sign-in build.")
+							.font(.caption).foregroundStyle(.secondary)
+					}
+				} icon: { Image(systemName: "person.crop.circle") }
+			}
+			.accessibilityIdentifier("settings.appleSigning.connect")
 			statusRow(icon: "person.2", title: "Personal Team",
 					  detail: "Discovered from the signed-in account; a free account has one Personal Team.",
 					  state: .pending)
