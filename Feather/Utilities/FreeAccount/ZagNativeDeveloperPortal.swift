@@ -88,7 +88,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// refused before transmission, independent of consent. Mutations are ALSO
 	/// denied at the consent layer (defence in depth), but the transport is the
 	/// hard boundary. A smaller request ceiling bounds the session.
-	static func readOnlyInventory(machine: ZagAppleAuthMachine = ZagAppleAuthMachine(),
+	static func readOnlyInventory(machine: ZagAppleAuthMachine = ZagAppleAuthMachine.nativeAccount(),
 								  maxRequests: Int = 8) -> ZagNativeDeveloperPortal {
 		ZagNativeDeveloperPortal(transport: ZagReadOnlyTransport(base: transport()),
 								 headers: { await machine.developerHeaders() ?? [:] },

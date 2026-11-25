@@ -107,7 +107,7 @@ struct ZagAppleSigningSettingsView: View {
 
 	private func refreshReadiness() async {
 		let linked = ZagAppleAuthMachine.isLinked
-		let provisioned = linked ? await ZagAppleAuthMachine().isProvisioned() : false
+		let provisioned = linked ? await ZagAppleAuthMachine.nativeAccount().isProvisioned() : false
 		let authed = linked && ZagDeveloperTokenStore().hasToken(scope: "device")
 		readiness = ZagNativeSigningReadiness(
 			buildSupportsLiveAuth: liveAuthAvailable,

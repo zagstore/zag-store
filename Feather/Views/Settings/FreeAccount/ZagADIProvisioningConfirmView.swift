@@ -21,7 +21,7 @@ final class ZagADIProvisioningConfirmModel: ObservableObject {
 
 	/// The native ADI machine. Reads its provisioning state from the Keychain
 	/// locally (no network); provisioning itself is only triggered by `provision()`.
-	private let machine = ZagAppleAuthMachine()
+	private let machine = ZagAppleAuthMachine.nativeAccount()
 
 	func refresh() async {
 		guard ZagAppleAuthMachine.isLinked else { return }

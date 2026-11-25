@@ -26,6 +26,21 @@ enum ZagAppleAuthError: Error, Equatable {
 	case keychain(OSStatus)
 }
 
+enum ZagDeveloperSessionOutcome: Equatable {
+	case ok, expired, failed, transportFailed, noSession, notProvisioned
+}
+
+// The fields the classifier reads from the real report (ZagAppleAuthMachine.swift).
+struct ZagAppleAuthSignInReport: Equatable {
+	var outcome: ZagAppleAuthSignInOutcome
+	var stage: String? = nil
+	var requestCount: Int = 0
+	var ec: Int? = nil
+	var httpStatus: Int? = nil
+	var appleMessage: String? = nil
+	var developerOutcome: ZagDeveloperSessionOutcome? = nil
+}
+
 var failures = 0
 func check(_ ok: Bool, _ what: String) {
 	if ok { print("ok  - \(what)") } else { failures += 1; print("FAIL- \(what)") }
@@ -74,8 +89,38 @@ enum ZagNativeSignInClassifierTestMain {
 		check(ZagNativeSignInClassifier.failure(error: .transportBlocked).recovery == .retry, "transportBlocked → retry")
 		check(ZagNativeSignInClassifier.failure(error: .keychain(-25300)).recovery == .retry, "keychain → retry")
 
+		// Report-based classification: stage + ec surfaced, lookup vs SRP distinguished
+		let lookup = ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .rejected(code: -80045), stage: "lookup", requestCount: 1, ec: -80045), developerOK: false)
+		check(lookup?.recovery == .deviceIdentity
+			  && (lookup?.detail?.contains("-80045") ?? false) && (lookup?.detail?.contains("lookup") ?? false),
+			  "lookup-stage rejection → device identity; detail carries stage + ec")
+		let cred = ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .rejected(code: -20101), stage: "srp-complete", requestCount: 3, ec: -20101), developerOK: false)
+		check(cred?.recovery == .checkCredentials && (cred?.message.contains("Apple Account or password") ?? false),
+			  "SRP-stage known credential ec → check credentials")
+		let proto = ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .rejected(code: -77777), stage: "srp-complete", requestCount: 3, ec: -77777, appleMessage: "could not complete"), developerOK: false)
+		check(proto?.recovery == .deviceIdentity && (proto?.detail?.contains("could not complete") ?? false),
+			  "SRP-stage unknown ec → device identity; sanitized message in detail")
+		let code2fa = ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .rejected(code: -21669), stage: "srp-complete", requestCount: 3, ec: -21669), developerOK: false)
+		check(code2fa?.recovery == .checkCredentials && (code2fa?.message.contains("verification code") ?? false),
+			  "2FA code rejection via report → check credentials")
+		let httpR = ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .httpError(status: 503), stage: "srp-init", requestCount: 2, httpStatus: 503), developerOK: false)
+		check(httpR?.recovery == .waitAndRetry && (httpR?.detail?.contains("HTTP 503") ?? false),
+			  "report httpError 503 → wait; detail shows HTTP status")
+		let devFail = ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .authenticated, developerOutcome: .failed), developerOK: false)
+		check(devFail?.recovery == .retry && (devFail?.detail?.contains("failed") ?? false),
+			  "authenticated + developer session failed → retry; detail names developer outcome")
+		check(ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .authenticated, developerOutcome: .ok), developerOK: true) == nil,
+			  "authenticated + developer OK via report → not a failure")
+
 		// Recovery text is always present and non-empty
-		let all: [ZagNativeSignInFailure.Recovery] = [.retry, .checkCredentials, .provisionADI, .unsupportedBuild, .waitAndRetry]
+		let all: [ZagNativeSignInFailure.Recovery] = [.retry, .checkCredentials, .provisionADI, .unsupportedBuild, .waitAndRetry, .deviceIdentity]
 		for r in all {
 			check(!ZagNativeSignInFailure(message: "x", recovery: r).recoveryText.isEmpty, "recovery text non-empty for \(r)")
 		}

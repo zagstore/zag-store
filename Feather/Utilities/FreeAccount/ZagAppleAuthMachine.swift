@@ -346,6 +346,20 @@ actor ZagAppleAuthMachine {
 		#endif
 	}
 
+	/// The machine for the production native Apple Account path — provisioning,
+	/// sign-in and read-only inventory. It uses `.macLegacy`: the `Mac OS X;`
+	/// client-info the current Apple GSA edge accepts (SideStore #1745 /
+	/// LiveContainer #1744). The `.iphone` default is a hybrid (iPhone client-info
+	/// with the Mac ADI algorithm) whose client-info the edge rejects, which is
+	/// why a sign-in that reaches Apple came back rejected. The ADI algorithm and
+	/// stored identity are identical to `.mac`/`.iphone` (all Mac-derived), so an
+	/// existing `device`-scope profile is reused; only the on-the-wire client-info
+	/// changes. One factory keeps provisioning, sign-in and inventory on the same
+	/// platform and scope, with no cross-phase drift.
+	static func nativeAccount() -> ZagAppleAuthMachine {
+		ZagAppleAuthMachine(scope: "device", platform: .macLegacy)
+	}
+
 	/// Whether a provisioned machine profile is already stored (no network).
 	func isProvisioned() -> Bool { (try? store.load(scope: scope)) != nil }
 

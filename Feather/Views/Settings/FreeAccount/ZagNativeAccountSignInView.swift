@@ -38,7 +38,7 @@ final class ZagNativeSignInModel: ObservableObject {
 	private var stageObservation: Task<Void, Never>?
 	private var runTask: Task<Void, Never>?
 
-	init(machine: ZagAppleAuthMachine = ZagAppleAuthMachine()) {
+	init(machine: ZagAppleAuthMachine = ZagAppleAuthMachine.nativeAccount()) {
 		self.machine = machine
 	}
 
@@ -128,7 +128,7 @@ final class ZagNativeSignInModel: ObservableObject {
 			return
 		}
 		let developerOK = report.developerOutcome == .ok
-		if let f = ZagNativeSignInClassifier.failure(outcome: report.outcome, developerOK: developerOK) {
+		if let f = ZagNativeSignInClassifier.failure(report: report, developerOK: developerOK) {
 			finish(failure: f)
 			return
 		}
@@ -291,6 +291,9 @@ struct ZagNativeAccountSignInContent: View {
 					Text(failure.message).font(.footnote)
 					if !failure.recoveryText.isEmpty {
 						Text(failure.recoveryText).font(.caption).foregroundStyle(.secondary)
+					}
+					if let detail = failure.detail, !detail.isEmpty {
+						Text(detail).font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
 					}
 				}
 			} icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
