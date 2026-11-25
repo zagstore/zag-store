@@ -759,11 +759,17 @@ actor ZagAppleAuthMachine {
 		// Persist a verified token (opaque, this-device-only) so it can be reused
 		// for developer-services requests without another login. Only on a fully
 		// verified token (present + GS header); the bytes are never logged.
-		if let persistScope, tokenPresent, hasGSToken {
-			try? ZagDeveloperTokenStore().save(
-				ZagPersistedDeveloperToken(accountID: accountId, token: token, expiresAtMs: expiry), scope: persistScope)
+		var stored = true
+		if let persistScope, tokenPresent, expiryValid, hasGSToken {
+			let developerToken = ZagPersistedDeveloperToken(accountID: accountId, token: token, expiresAtMs: expiry)
+			do {
+				try ZagDeveloperTokenStore().save(developerToken, scope: persistScope)
+				stored = ZagDeveloperTokenStore().load(scope: persistScope) == developerToken
+			} catch {
+				stored = false
+			}
 		}
-		return ZagDeveloperSessionReport(outcome: Self.developerSessionOutcome(ok: true, tokenPresent: tokenPresent, expiryValid: expiryValid, headerHasToken: hasGSToken),
+		return ZagDeveloperSessionReport(outcome: Self.developerSessionOutcome(ok: stored, tokenPresent: tokenPresent, expiryValid: expiryValid, headerHasToken: hasGSToken),
 										 requestCount: transport.requestCount, tokenPresent: tokenPresent,
 										 expiresInDays: expiresInDays, headerCount: headerCount, hasGSTokenHeader: hasGSToken,
 										 httpTrace: Self.httpTrace(transport.httpTrace, stageFor: stageFor))
@@ -795,6 +801,7 @@ actor ZagAppleAuthMachine {
 			return .success(obj)
 		}
 		if case .success(let headers) = result, !headers.isEmpty,
+		   ZagDeveloperTokenStore().load(scope: scope) == token,
 		   headers.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) { return headers }
 		return nil
 	}

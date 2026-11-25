@@ -129,15 +129,18 @@ struct ZagAppIDPlan: Equatable, Sendable {
 		for identifier in bundleIdentifiers where !existing.contains(identifier) && !missing.contains(identifier) {
 			missing.append(identifier)
 		}
-		guard registered != nil else {
-			return ZagAppIDPlan(outcome: .register(missing), capacity: .unknown(limit: limit))
+		// The listing is an inventory, not a quota response. Preserve undated
+		// rows for reuse, but don't count them as active quota usage. Apple
+		// decides whether a new ID fits when the list cannot establish capacity.
+		let capacity: ZagCapacity
+		if registered == nil || active.contains(where: { $0.expiresAt == nil }) {
+			capacity = .unknown(limit: limit)
+		} else {
+			let expiries = Dictionary(grouping: active, by: \.bundleIdentifier).values.compactMap {
+				$0.compactMap(\.expiresAt).max()
+			}
+			capacity = ZagCapacity(source: .apple, used: existing.count, limit: limit, nextSlotFreesAt: expiries.min())
 		}
-		let capacity = ZagCapacity(
-			source: .apple,
-			used: active.count,
-			limit: limit,
-			nextSlotFreesAt: active.compactMap(\.expiresAt).min()
-		)
 		if missing.isEmpty { return ZagAppIDPlan(outcome: .reuseAll, capacity: capacity) }
 		guard missing.count <= capacity.available else {
 			return ZagAppIDPlan(

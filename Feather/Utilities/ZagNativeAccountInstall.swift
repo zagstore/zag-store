@@ -107,16 +107,26 @@ enum ZagNativeAccountInstall {
 		ZagDeveloperTokenStore().load(scope: "device")?.isUsable(at: Date()) == true
 	}
 
-	static func install(source: URL, name: String, expectedScope: ZagSigningScope? = nil) async throws -> ZagInstallVerification {
-		try await withExclusiveOperation { try await performInstall(source: source, name: name, expectedScope: expectedScope) }
+	static func currentAccountMatches(_ scope: ZagSigningScope) -> Bool {
+		guard let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()) else { return false }
+		return ZagSigningAuthorization.nativeAccount(token: token, teamID: scope.teamID).scope == scope
 	}
 
-	private static func performInstall(source: URL, name: String, expectedScope: ZagSigningScope?) async throws -> ZagInstallVerification {
+	static func install(source: URL, name: String, expectedScope: ZagSigningScope? = nil,
+						onCertificateReady: (@Sendable () async -> Void)? = nil) async throws -> ZagInstallVerification {
+		try await withExclusiveOperation {
+			try await performInstall(source: source, name: name, expectedScope: expectedScope, onCertificateReady: onCertificateReady)
+		}
+	}
+
+	private static func performInstall(source: URL, name: String, expectedScope: ZagSigningScope?,
+									   onCertificateReady: (@Sendable () async -> Void)?) async throws -> ZagInstallVerification {
 		let pairing = ZagRPPairingCore.shared
 		guard pairing.hasSavedPairing else { throw Failure.pairing }
 		guard let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()) else {
 			throw Failure.signIn
 		}
+		if let expectedScope, !currentAccountMatches(expectedScope) { throw Failure.signIn }
 
 		let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
 		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -144,7 +154,7 @@ enum ZagNativeAccountInstall {
 			$0 + (($1.entitlements.dictionary[ZagFreeAccountEntitlements.appGroupsKey] as? [String])?.count ?? 0)
 		}
 		let portal = portal(token: token, consent: consent, maxRequests: 24 + 8 * components.count + groupCount)
-		guard let team = try await portal.teams().first(where: { $0.isPersonalTeam && (expectedScope == nil || $0.teamID == expectedScope?.teamID) }) else { throw Failure.personalTeam }
+		guard let team = ZagNativeDeveloperTeam.personalTeam(in: try await portal.teams(), expectedID: expectedScope?.teamID) else { throw Failure.personalTeam }
 		let authorization = ZagSigningAuthorization.nativeAccount(token: token, teamID: team.teamID)
 		let scope = authorization.scope
 		guard expectedScope == nil || expectedScope == scope else { throw Failure.signIn }
@@ -152,7 +162,8 @@ enum ZagNativeAccountInstall {
 		let keyFactory = ZagKeychainSigningKeyFactory(keys: keys)
 		let cache = ProfileCache(scope: scope)
 		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: keyFactory,
-			secrets: secrets, certificateMinimumRemaining: 0, saveProfile: { cache.save($0) }, account: scope.accountID)
+			secrets: secrets, certificateMinimumRemaining: 0, saveProfile: { cache.save($0) },
+			onCertificateReady: onCertificateReady, account: scope.accountID)
 		var request = ZagProvisioningRequest(accountID: scope.accountID, team: scope.teamID, deviceUDID: device.udid,
 											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: installedFreeApps)
 		let componentIDs = Set(components.map(\.originalBundleIdentifier))

@@ -594,7 +594,7 @@ enum ZagExperimentFailureMap {
 		case .notAuthorized: "experiment.notArmed"
 		case .installSlotsFull: "portal.appIDCapacity"
 		case .deviceLimitReached: "portal.deviceLimit"
-		case .appIDCapacityExhausted: "portal.appIDCapacity"
+		case .appIDCapacityExhausted, .appIDServerLimitReached: "portal.appIDCapacity"
 		case .identifierUnavailable: "portal.identifierUnavailable"
 		case .certificateMustBeRevoked: "portal.certificateLimit"
 		case .certificateRequestUnresolved: "cert.unresolved"

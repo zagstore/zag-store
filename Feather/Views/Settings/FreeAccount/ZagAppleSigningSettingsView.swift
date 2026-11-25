@@ -22,10 +22,8 @@ struct ZagAppleSigningSettingsView: View {
 	/// never implies a session or profile exists before it does.
 	@ObservedObject private var pairing = ZagRPPairingCore.shared
 	@State private var signedIn = false
-	/// The Personal Team id, discovered from the same authenticated session the
-	/// sign-in screen uses. The certificate inventory lists against this team;
-	/// an empty team is rejected (401/403) by Apple's services.
-	@State private var teamID = ""
+	/// The Personal Team and account captured by the same discovery request.
+	@State private var teamScope: ZagSigningScope?
 
 	/// Whether this build links the native engine. Device builds do; the
 	/// simulator does not, in which case the whole feature is unavailable.
@@ -49,14 +47,18 @@ struct ZagAppleSigningSettingsView: View {
 	}
 
 	private func refresh() async {
-		guard engineLinked else { signedIn = false; teamID = ""; return }
-		signedIn = ZagDeveloperTokenStore().load(scope: "device")?.isUsable(at: Date()) == true
-		guard signedIn else { teamID = ""; return }
-		// Same authenticated native machine + persisted developer session as the
-		// sign-in screen's Personal Team retrieval, so the certificate inventory
-		// lists against the real team rather than an empty (rejected) one.
+		guard engineLinked else { signedIn = false; teamScope = nil; return }
+		let token = ZagDeveloperTokenStore().load(scope: "device")
+		signedIn = token?.isUsable(at: Date()) == true
+		teamScope = nil
+		guard signedIn, let token else { return }
 		#if canImport(ZagAppleAuth)
-		teamID = (try? await ZagNativeDeveloperPortal.readOnlyInventory().teams().first(where: \.isPersonalTeam))?.teamID ?? ""
+		let portal = ZagNativeDeveloperPortal.readOnlyInventory(expectedAccountID: token.accountID)
+		let teams = (try? await portal.teams()) ?? []
+		guard ZagDeveloperTokenStore().load(scope: "device")?.accountID == token.accountID else { return }
+		if let team = ZagNativeDeveloperTeam.personalTeam(in: teams) {
+			teamScope = ZagSigningAuthorization.nativeAccount(token: token, teamID: team.teamID).scope
+		}
 		#endif
 	}
 
@@ -106,8 +108,10 @@ struct ZagAppleSigningSettingsView: View {
 
 	private var certificateSection: some View {
 		Section {
-			if signedIn && !teamID.isEmpty {
-				NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.inventory(team: teamID)).zagSettingsDestinationAvatar()) {
+			if signedIn, let teamScope {
+				NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.inventory(
+					team: teamScope.teamID, expectedScope: teamScope
+				)).zagSettingsDestinationAvatar()) {
 					Label("Signing certificate", systemImage: "checkmark.seal")
 				}
 			} else {

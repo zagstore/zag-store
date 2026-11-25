@@ -115,6 +115,7 @@ extension Result where Failure == ZagProvisioningFailure {
 	static func main() async {
 		await nativeCertificateInventory()
 		await nativeInstallAndRestart()
+		await nativeAppIDsAcrossAccounts()
 		await firstProvisioning()
 		await reuseAndRefresh()
 		await limitsCheckedBeforeChanges()

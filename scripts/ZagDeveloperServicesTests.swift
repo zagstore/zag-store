@@ -55,8 +55,14 @@ throws_(.sessionRejected, { _ = try ZagDeveloperServicesProtocol.parse(plist(["r
 throws_(.existingCertificateOrPendingRequest, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 7460]), httpStatus: 200) }, "parse 7460 -> existingCertificateOrPendingRequest")
 throws_(.existingCertificateOrPendingRequest, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": "7460"]), httpStatus: 409, action: .submitCSR) }, "CSR conflict remains definitive on HTTP 409 with a 7460 plist")
 throws_(.appIDLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9120]), httpStatus: 200, action: .addAppID) }, "App ID 9120 reports App ID capacity")
-throws_(.deviceLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9120]), httpStatus: 200) }, "resultCode 9120 -> deviceLimitReached")
-throws_(.appIDLimitReached,  { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9412]), httpStatus: 200) }, "resultCode 9412 -> appIDLimitReached")
+throws_(.malformedResponse, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9120]), httpStatus: 200, action: .listAppIDs) }, "9120 on inventory is not a quota refusal")
+throws_(.malformedResponse, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9412]), httpStatus: 200, action: .addAppID) }, "invalid bundle ID 9412 is not a quota refusal")
+throws_(.malformedResponse, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 35]), httpStatus: 200, action: .listAppIDs) }, "generic validation code 35 is not a quota refusal")
+throws_(.appIDLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": "37"]), httpStatus: 400, action: .addAppID) }, "SideSign quota code 37 survives the HTTP 400 envelope")
+let appIDFault = ZagDeveloperServicesProtocol.fault(body: plist(["resultCode": 35, "userString": "Invalid name com.example.private for user@example.org and 123456789"]),
+	httpStatus: 200, action: .addAppID, redacting: ["123456789"])
+check(appIDFault?.resultCode == 35 && appIDFault?.message == "Invalid name [redacted] for [redacted] and [redacted]",
+	  "App ID diagnostics preserve the code and redact the bundle ID, email and account number")
 throws_(.certificateLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 3540]), httpStatus: 200) }, "resultCode 3540 -> certificateLimitReached")
 throws_(.identifierUnavailable("Identifier is not available"), { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9999, "userString": "Identifier is not available"]), httpStatus: 200) }, "identifier message -> identifierUnavailable")
 throws_(.malformedResponse, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 55555, "userString": "???"]), httpStatus: 200) }, "unknown non-zero code -> malformedResponse")

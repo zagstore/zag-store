@@ -122,6 +122,15 @@ import Foundation
 		let full = ZagAppIDPlan.make(bundleIdentifiers: ids + ["c"], registered: registered, now: now)
 		check(full.outcome == .capacityExhausted(needed: 3, available: 2, nextSlotFreesAt: now + day),
 			  "too many new IDs is reported with when a slot frees; nothing revoked")
+		let fresh = ZagAppIDPlan.make(bundleIdentifiers: ids, registered: [], now: now)
+		check(fresh.outcome == .register(ids) && fresh.capacity.used == 0, "fresh teams have room to register IDs")
+		let duplicateRows = ZagAppIDPlan.make(bundleIdentifiers: ids, registered: registered + registered, now: now)
+		check(duplicateRows.outcome == .register(ids) && duplicateRows.capacity.used == 8, "duplicate inventory rows occupy one slot each")
+		let undated = registered + [ZagRegisteredAppID(identifier: "UNKNOWN", bundleIdentifier: "other", expiresAt: nil)]
+		let incomplete = ZagAppIDPlan.make(bundleIdentifiers: ids + ["other"], registered: undated, now: now)
+		check(incomplete.outcome == .register(ids) && incomplete.capacity.source == .unknown,
+			"an undated ID can be reused without making inventory an authoritative quota count")
+
 		let reuse = ZagAppIDPlan.make(bundleIdentifiers: ["b0", "b1"], registered: registered, now: now)
 		check(reuse.outcome == .reuseAll, "refresh reuses existing App IDs and needs no slot")
 		let partial = ZagAppIDPlan.make(bundleIdentifiers: ["b0", "new"], registered: registered, now: now)

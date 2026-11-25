@@ -71,16 +71,16 @@ struct SigningView: View {
 					}
 					Text("Sign and install with your Personal Team. Zag Store may register this iPhone and app with Apple and issue a signing certificate and provisioning profiles.")
 						.font(.footnote).foregroundStyle(.secondary)
-					if let issue = _certificateIssue {
+					if let issue = _certificateIssue, ZagNativeAccountInstall.currentAccountMatches(issue.scope) {
 						Section("Development Certificate") {
 							Text(issue.failure.message).font(.footnote)
 							if let recovery = issue.recovery {
 								NavigationLink("Recover Certificate Request") {
-									ZagCertificateRecoveryView(model: recovery, teamName: issue.teamName, onResolved: _startAccountInstall)
+									ZagCertificateRecoveryView(model: recovery, teamName: issue.teamName, onResolved: { _startAccountInstall(resuming: issue.scope) })
 								}
 							}
 							NavigationLink("Manage Development Certificates") {
-								ZagCertificateReplacementView(model: .inventory(team: issue.scope.teamID, expectedScope: issue.scope), onRevoked: _startAccountInstall)
+								ZagCertificateReplacementView(model: .inventory(team: issue.scope.teamID, expectedScope: issue.scope), onRevoked: { _startAccountInstall(resuming: issue.scope) })
 							}
 							Text("Signing continues after the certificate request is resolved.")
 								.font(.footnote).foregroundStyle(.secondary)
@@ -891,7 +891,10 @@ extension SigningView {
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		if _signingMethod == .freeAppleAccount {
 			if _isSigning { return "Signing and Installing…" }
-			return _certificateIssue == nil ? "Sign and Install" : "Resume Sign and Install"
+			if let issue = _certificateIssue, ZagNativeAccountInstall.currentAccountMatches(issue.scope) {
+				return "Resume Sign and Install"
+			}
+			return "Sign and Install"
 		}
 		#endif
 		return .localized("Start Signing")
@@ -915,8 +918,12 @@ extension SigningView {
 	}
 
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-	private func _startAccountInstall() {
+	private func _startAccountInstall(resuming scope: ZagSigningScope? = nil) {
 		guard !_isSigning else { return }
+		if let issue = _certificateIssue, !ZagNativeAccountInstall.currentAccountMatches(issue.scope) {
+			_certificateIssue = nil
+		}
+		let expectedScope = scope ?? _certificateIssue?.scope
 		guard let source = Storage.shared.getAppDirectory(for: app) else {
 			_accountInstallMessage = ZagNativeAccountInstall.Failure.invalidApp.localizedDescription
 			return
@@ -926,7 +933,8 @@ extension SigningView {
 			defer { _isSigning = false }
 			do {
 				let result = try await ZagNativeAccountInstall.install(
-					source: source, name: app.name ?? "App", expectedScope: _certificateIssue?.scope
+					source: source, name: app.name ?? "App", expectedScope: expectedScope,
+					onCertificateReady: { @MainActor in _certificateIssue = nil }
 				)
 				_certificateIssue = nil
 				switch result {

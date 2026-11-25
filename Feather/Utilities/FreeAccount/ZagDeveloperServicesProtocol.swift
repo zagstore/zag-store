@@ -110,6 +110,10 @@ enum ZagDeveloperServicesProtocol {
 	/// error code, so callers only ever see a success dictionary.
 	static func parse(_ body: Data, httpStatus: Int, action: ZagDeveloperServicesAction? = nil) throws -> [String: Any] {
 		guard (200..<300).contains(httpStatus) else {
+			if action == .addAppID, [400, 409, 422].contains(httpStatus),
+			   let payload = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any] {
+				try throwIfError(payload, action: action)
+			}
 			if action == .submitCSR, httpStatus == 409,
 			   let payload = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any],
 			   resultCode(payload) == 7460 {
@@ -123,15 +127,7 @@ enum ZagDeveloperServicesProtocol {
 			  let dict = object as? [String: Any] else {
 			throw ZagPortalError.malformedResponse
 		}
-		if action == .addAppID || action == .addDevice {
-			switch (action, resultCode(dict)) {
-			case (.addAppID, 9120): throw ZagPortalError.appIDLimitReached
-			case (.addAppID, 9401): throw ZagPortalError.identifierUnavailable("App identifier")
-			case (.addAppID, 35), (.addAppID, 9412), (.addDevice, 35): throw ZagPortalError.malformedResponse
-			default: break
-			}
-		}
-		try throwIfError(dict)
+		try throwIfError(dict, action: action)
 		return dict
 	}
 
@@ -139,30 +135,49 @@ enum ZagDeveloperServicesProtocol {
 	/// resultCode 0 (or absent with no error string) is success. The specific
 	/// codes are the documented Xcode/AltStore ones; unknown non-zero codes map
 	/// to `.malformedResponse` so nothing proceeds on an unrecognised state.
-	static func throwIfError(_ dict: [String: Any]) throws {
+	static func throwIfError(_ dict: [String: Any], action: ZagDeveloperServicesAction? = nil) throws {
 		let code = resultCode(dict) ?? 0
-		if code == 0 { return }
-		let message = (dict["userString"] as? String) ?? (dict["resultString"] as? String) ?? ""
-		switch code {
-		case 1100, 1:                 throw ZagPortalError.sessionRejected        // invalid/expired session
-		case 7460:                    throw ZagPortalError.existingCertificateOrPendingRequest  // OBSERVED: "You already have a current iOS Development certificate or a pending certificate request." (NOT a throttle)
-		case 9120, 9401:              throw ZagPortalError.deviceLimitReached     // device limit
-		case 9412, 35:                throw ZagPortalError.appIDLimitReached      // App ID limit (free: per-week)
-		case 3540, 7458:              throw ZagPortalError.certificateLimitReached// cert limit
-		// 7788 was previously grouped with 7460 as a "throttle"; that grouping was
-		// never evidenced and 7460 is now known NOT to be a throttle, so 7788 falls
-		// through to the unknown path below rather than asserting a meaning we
-		// cannot support. Genuine throttling is HTTP 429 (handled in parse()).
-		default:
-			// An identifier owned by another team surfaces a distinctive message.
-			if message.lowercased().contains("not available") || message.lowercased().contains("already in use") {
-				throw ZagPortalError.identifierUnavailable(message)
-			}
-			throw ZagPortalError.malformedResponse
+		if code == 0 {
+			if dict["resultCode"] != nil && resultCode(dict) == nil { throw ZagPortalError.malformedResponse }
+			return
+		}
+		let message = rawMessage(dict)
+		switch classification(for: code, action: action, message: message) {
+		case .sessionRejected: throw ZagPortalError.sessionRejected
+		case .deviceLimitReached: throw ZagPortalError.deviceLimitReached
+		case .appIDLimitReached: throw ZagPortalError.appIDLimitReached
+		case .certificateLimitReached: throw ZagPortalError.certificateLimitReached
+		case .existingCertificateOrPendingRequest: throw ZagPortalError.existingCertificateOrPendingRequest
+		case .identifierUnavailable: throw ZagPortalError.identifierUnavailable(sanitizeMessage(message))
+		default: throw ZagPortalError.malformedResponse
 		}
 	}
 
-	private static func resultCode(_ dict: [String: Any]) -> Int? {
+	private static func rawMessage(_ dict: [String: Any]) -> String {
+		["userString", "resultString", "errorString"].compactMap { dict[$0] as? String }
+			.first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? ""
+	}
+
+	private static func classification(for code: Int, action: ZagDeveloperServicesAction?, message: String) -> ZagDeveloperServicesFault.Classification {
+		switch (action, code) {
+		case (_, 1100), (_, 1): return .sessionRejected
+		case (_, 7460): return .existingCertificateOrPendingRequest
+		case (_, 3540), (_, 7458): return .certificateLimitReached
+		// AltSign's QH65B2 addAppId maps 9120 and SideSign maps 37.
+		// These codes have no App ID quota meaning outside registration.
+		case (.addAppID, 37), (.addAppID, 9120): return .appIDLimitReached
+		case (.addAppID, 9401): return .identifierUnavailable
+		case (.addAppID, 9412), (.addDevice, 35): return .ambiguousRejection
+		default:
+			let lower = message.lowercased()
+			if lower.contains("identifier") && (lower.contains("not available") || lower.contains("already in use")) {
+				return .identifierUnavailable
+			}
+			return .ambiguousRejection
+		}
+	}
+
+	static func resultCode(_ dict: [String: Any]) -> Int? {
 		(dict["resultCode"] as? NSNumber)?.intValue ?? (dict["resultCode"] as? String).flatMap(Int.init)
 	}
 
@@ -173,36 +188,31 @@ enum ZagDeveloperServicesProtocol {
 	/// Classification is CONSERVATIVE: only HTTP 429 and the verified throttle
 	/// codes are a confirmed rate-limit — every other unknown non-zero code is
 	/// `ambiguousRejection`, never silently called a throttle.
-	static func fault(body: Data, httpStatus: Int) -> ZagDeveloperServicesFault? {
-		guard (200..<300).contains(httpStatus) else {
-			let classification: ZagDeveloperServicesFault.Classification =
-				httpStatus == 401 || httpStatus == 403 ? .sessionRejected
-				: httpStatus == 429 ? .confirmedRateLimit : .network
-			return ZagDeveloperServicesFault(classification: classification, resultCode: nil, httpStatus: httpStatus, message: "")
+	static func fault(body: Data, httpStatus: Int, action: ZagDeveloperServicesAction? = nil, redacting: [String] = []) -> ZagDeveloperServicesFault? {
+		let dict = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any]
+		let code = dict.flatMap(resultCode)
+		let raw = dict.map(rawMessage) ?? ""
+		var message = raw
+		for value in redacting.filter({ !$0.isEmpty }).sorted(by: { $0.count > $1.count }) {
+			message = message.replacingOccurrences(of: value, with: "[redacted]", options: .caseInsensitive)
 		}
-		guard let dict = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any] else {
-			return ZagDeveloperServicesFault(classification: .malformed, resultCode: nil, httpStatus: httpStatus, message: "")
-		}
-		let code = (dict["resultCode"] as? NSNumber)?.intValue ?? (dict["resultCode"] as? Int) ?? 0
-		if code == 0 { return nil }
-		let raw = (dict["userString"] as? String) ?? (dict["resultString"] as? String) ?? ""
-		let message = sanitizeMessage(raw)
 		let classification: ZagDeveloperServicesFault.Classification
-		switch code {
-		case 1100, 1:     classification = .sessionRejected
-		case 7460:        classification = .existingCertificateOrPendingRequest   // OBSERVED (HTTP 200 + 7460): existing cert / pending request, NOT a throttle
-		case 9120, 9401:  classification = .deviceLimitReached
-		case 9412, 35:    classification = .appIDLimitReached
-		case 3540, 7458:  classification = .certificateLimitReached
-		// 7788 is intentionally NOT mapped here: its old "confirmedRateLimit" label
-		// was inherited without evidence, and the only code grouped with it (7460)
-		// proved to be a certificate conflict. It now falls to ambiguousRejection
-		// (the explicit "unknown" bucket). Genuine throttling is HTTP 429 above.
-		default:
-			classification = (raw.lowercased().contains("not available") || raw.lowercased().contains("already in use"))
-				? .identifierUnavailable : .ambiguousRejection
+		switch httpStatus {
+		case 401, 403: classification = .sessionRejected
+		case 429: classification = .confirmedRateLimit
+		case 200..<300:
+			if let code, code != 0 {
+				classification = Self.classification(for: code, action: action, message: raw)
+			} else if dict == nil || (dict?["resultCode"] != nil && code == nil) {
+				classification = .malformed
+			} else {
+				return nil
+			}
+		case 400, 409, 422:
+			classification = code.flatMap { $0 == 0 ? nil : Self.classification(for: $0, action: action, message: raw) } ?? .network
+		default: classification = .network
 		}
-		return ZagDeveloperServicesFault(classification: classification, resultCode: code, httpStatus: httpStatus, message: message)
+		return ZagDeveloperServicesFault(classification: classification, resultCode: code, httpStatus: httpStatus, message: sanitizeMessage(message))
 	}
 
 	/// Redacts and bounds an Apple error string for diagnostics: removes anything
@@ -210,11 +220,11 @@ enum ZagDeveloperServicesProtocol {
 	/// the length. Never returns credentials, identifiers or long opaque tokens.
 	static func sanitizeMessage(_ text: String, limit: Int = 160) -> String {
 		var s = text
-		for pattern in ["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[A-Za-z0-9+/_-]{24,}={0,2}"] {
+		for pattern in ["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[A-Za-z0-9+/_-]{24,}={0,2}", "\\b[A-Z0-9]{10}\\b", "\\b(?:[A-Za-z0-9_-]+\\.){2,}[A-Za-z0-9_-]+\\b"] {
 			s = s.replacingOccurrences(of: pattern, with: "[redacted]", options: .regularExpression)
 		}
-		s = String(s.unicodeScalars.filter { !$0.properties.isDefaultIgnorableCodePoint && ($0.value >= 32) })
-		s = s.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }).joined(separator: " ")
+		s = s.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+		s = String(s.unicodeScalars.filter { !$0.properties.isDefaultIgnorableCodePoint && !CharacterSet.controlCharacters.contains($0) })
 		return s.count > limit ? String(s.prefix(limit)) + "…" : s
 	}
 
@@ -252,7 +262,7 @@ enum ZagDeveloperServicesProtocol {
 	/// ISO8601 (with or without fractional seconds) or a native Date.
 	static func date(_ value: Any?) -> Date? {
 		if let date = value as? Date { return date }
-		guard let string = value as? String else { return nil }
+		guard let string = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
 		return iso8601.date(from: string) ?? iso8601NoFraction.date(from: string)
 	}
 	static let iso8601: ISO8601DateFormatter = {
@@ -301,6 +311,14 @@ struct ZagDeveloperServicesFault: Equatable, Sendable {
 		if !message.isEmpty { out["apple_message"] = message }
 		return out
 	}
+}
+
+/// Captures the App ID operation and its sanitized failure without changing
+/// the typed errors used by certificate recovery and other portal clients.
+struct ZagAppIDServerRejection: Error, Equatable, Sendable {
+	let action: ZagDeveloperServicesAction
+	let error: ZagPortalError
+	let fault: ZagDeveloperServicesFault
 }
 
 struct ZagParsedCertificate: Equatable, Sendable {

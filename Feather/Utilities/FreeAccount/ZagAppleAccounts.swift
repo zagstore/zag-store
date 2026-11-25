@@ -148,7 +148,6 @@ struct ZagSigningAuthorization: Equatable, Sendable {
 	var limits: ZagTeamLimits { .forTeam(teamKind) }
 	func isValid(at now: Date) -> Bool { now < validUntil }
 
-	#if canImport(ZagAppleAuth)
 	static func nativeAccount(token: ZagPersistedDeveloperToken, teamID: String) -> ZagSigningAuthorization {
 		let digest = Array(SHA256.hash(data: Data("app.zagstore.native-account:\(token.accountID)".utf8)))
 		let account = UUID(uuid: (digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
@@ -156,7 +155,6 @@ struct ZagSigningAuthorization: Equatable, Sendable {
 		let expiry = token.expiresAtMs == 0 ? Date.distantFuture : Date(timeIntervalSince1970: Double(token.expiresAtMs) / 1000)
 		return ZagSigningAuthorization(scope: .init(accountID: account, teamID: teamID), teamKind: .personalFree, validUntil: expiry)
 	}
-	#endif
 
 	/// An authorisation to sign for a connected App Store Connect developer
 	/// account (the paid Developer Account method). Its proof is not a GrandSlam

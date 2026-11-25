@@ -606,7 +606,7 @@ struct ZagFreeAccountLifecycle: Sendable {
 		// Retrying cannot help until the user signs in (or a build that can).
 		case .sessionRejected, .unavailable, .notAuthorized: return .signedOut
 		case .network, .rateLimited, .timedOut, .unexpectedResponse: return .network
-		case .appIDCapacityExhausted: return .appIDCapacity
+		case .appIDCapacityExhausted, .appIDServerLimitReached: return .appIDCapacity
 		case .installSlotsFull: return .installSlots
 		case .cancelled: return .cancelled
 		// An unresolved certificate request waits for the user; never retried.

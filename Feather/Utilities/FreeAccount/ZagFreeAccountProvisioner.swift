@@ -136,6 +136,7 @@ struct ZagProvisioningFailure: LocalizedError, Equatable, Sendable {
 		case installSlotsFull(installed: [String])
 		case deviceLimitReached
 		case appIDCapacityExhausted(needed: Int, available: Int, nextSlotFreesAt: Date?)
+		case appIDServerLimitReached
 		case identifierUnavailable(String)
 		/// The certificate limit is reached; the user chooses one to revoke.
 		case certificateMustBeRevoked(candidates: [ZagDevelopmentCertificate])
@@ -158,16 +159,28 @@ struct ZagProvisioningFailure: LocalizedError, Equatable, Sendable {
 
 	let kind: Kind
 	let step: Step
+	var appleAppIDRejection: ZagAppIDServerRejection? = nil
 
 	var errorDescription: String? { message }
 
 	var message: String {
+		guard let rejection = appleAppIDRejection else { return summary }
+		let operation = rejection.action == .addAppID ? "App ID registration" : "App ID inventory"
+		var result = "Apple rejected \(operation) (HTTP \(rejection.fault.httpStatus)"
+		if let code = rejection.fault.resultCode { result += ", code \(code)" }
+		result += "). "
+		return result + (rejection.fault.message.isEmpty ? summary : rejection.fault.message)
+	}
+
+	private var summary: String {
 		switch kind {
 		case .invalidRequest: return "This app cannot be signed with a free Apple Account."
 		case .notAuthorized: return "This Apple Account is not signed in. Sign in to it to sign or refresh its apps."
 		case .installSlotsFull: return "Three apps signed with this Apple Account are already installed. Remove one first."
 		case .deviceLimitReached: return "This Apple Account already has three registered devices."
-		case .appIDCapacityExhausted: return "This Apple Account has used its 10 App IDs for this week."
+		case .appIDCapacityExhausted(let needed, let available, _):
+			return "This app needs \(needed) new App IDs. Zag Store counted \(available) available slots for this team."
+		case .appIDServerLimitReached: return "Apple refused to register another App ID because this team reached its limit."
 		case .identifierUnavailable: return "Another developer owns this app's identifier."
 		case .certificateMustBeRevoked(let candidates):
 			return candidates.isEmpty
@@ -209,6 +222,7 @@ actor ZagFreeAccountProvisioner {
 	private let diagnostics: ZagFreeAccountDiagnostics
 	private let operationTimeout: TimeInterval
 	private let certificateMinimumRemaining: TimeInterval
+	private let onCertificateReady: (@Sendable () async -> Void)?
 	private let saveProfile: (@Sendable (ZagIssuedProfile) -> Void)?
 	private let now: @Sendable () -> Date
 	private(set) var currentStep: ZagProvisioningFailure.Step?
@@ -230,6 +244,7 @@ actor ZagFreeAccountProvisioner {
 		operationTimeout: TimeInterval = 30,
 		certificateMinimumRemaining: TimeInterval = 7 * 86_400,
 		saveProfile: (@Sendable (ZagIssuedProfile) -> Void)? = nil,
+		onCertificateReady: (@Sendable () async -> Void)? = nil,
 		account: UUID? = nil,
 		now: @escaping @Sendable () -> Date = { Date() }
 	) {
@@ -241,6 +256,7 @@ actor ZagFreeAccountProvisioner {
 		self.operationTimeout = operationTimeout
 		self.certificateMinimumRemaining = certificateMinimumRemaining
 		self.saveProfile = saveProfile
+		self.onCertificateReady = onCertificateReady
 		self.now = now
 	}
 
@@ -283,7 +299,7 @@ actor ZagFreeAccountProvisioner {
 		case .certificateMustBeRevoked: .certificateMustBeRevoked
 		case .certificateRequestUnresolved: .certificateUnresolved
 		case .deviceLimitReached: .deviceLimit
-		case .appIDCapacityExhausted, .installSlotsFull: .appIDCapacity
+		case .appIDCapacityExhausted, .appIDServerLimitReached, .installSlotsFull: .appIDCapacity
 		case .identifierUnavailable: .identifierUnavailable
 		case .invalidProfile: .profileProblem
 		case .keyStorage, .sessionRejected, .network, .rateLimited, .unexpectedResponse, .timedOut: .ownerUnrecognised
@@ -381,18 +397,23 @@ actor ZagFreeAccountProvisioner {
 		// 4. Certificate.
 		currentStep = .certificate
 		let identity = try await signingIdentity(for: request, team: team, changes: &changes)
+		await onCertificateReady?()
 
 		// 5. App IDs.
 		currentStep = .appIDs
 		var appIDs: [String: ZagRegisteredAppID] = [:]
-		for appID in registered where appID.isActive(at: now()) { appIDs[appID.bundleIdentifier] = appID }
+		for appID in registered where appID.isActive(at: now()) {
+			if let existing = appIDs[appID.bundleIdentifier],
+			   (existing.expiresAt ?? .distantPast) >= (appID.expiresAt ?? .distantPast) { continue }
+			appIDs[appID.bundleIdentifier] = appID
+		}
 		if case .register(let missing) = plan.outcome {
 			for bundle in missing {
 				let name = components.first { $0.bundle == bundle }?.request.name ?? bundle
 				do {
 					appIDs[bundle] = try await call { try await portal.registerAppID(bundleIdentifier: bundle, name: name, team: team) }
 				} catch ZagPortalError.appIDLimitReached {
-					throw ZagProvisioningFailure(kind: .appIDCapacityExhausted(needed: missing.count, available: 0, nextSlotFreesAt: plan.capacity.nextSlotFreesAt), step: .appIDs)
+					throw ZagProvisioningFailure(kind: .appIDServerLimitReached, step: .appIDs)
 				} catch ZagPortalError.identifierUnavailable(let identifier) {
 					throw ZagProvisioningFailure(kind: .identifierUnavailable(identifier), step: .appIDs)
 				}
@@ -927,6 +948,8 @@ actor ZagFreeAccountProvisioner {
 		if Task.isCancelled { throw ZagProvisioningFailure(kind: .cancelled, step: step) }
 		do {
 			return try await ZagDeadline.run(seconds: operationTimeout, operation)
+		} catch let rejection as ZagAppIDServerRejection {
+			throw ZagProvisioningFailure(kind: Self.kind(for: rejection.error), step: step, appleAppIDRejection: rejection)
 		} catch let error as ZagPortalError {
 			switch error {
 			case .appIDLimitReached, .identifierUnavailable, .certificateLimitReached, .existingCertificateOrPendingRequest: throw error
@@ -951,7 +974,7 @@ actor ZagFreeAccountProvisioner {
 			case .malformedResponse: return .unexpectedResponse
 			case .identifierUnavailable(let identifier): return .identifierUnavailable(identifier)
 			case .deviceLimitReached: return .deviceLimitReached
-			case .appIDLimitReached: return .appIDCapacityExhausted(needed: 1, available: 0, nextSlotFreesAt: nil)
+			case .appIDLimitReached: return .appIDServerLimitReached
 			case .certificateLimitReached: return .certificateMustBeRevoked(candidates: [])
 			case .existingCertificateOrPendingRequest: return .certificateMustBeRevoked(candidates: [])
 			case .livePortalDisabled: return .unavailable

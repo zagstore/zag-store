@@ -13,9 +13,15 @@ struct ZagNativeDeveloperTeam: Codable, Equatable, Sendable {
 	var isPersonalTeam: Bool {
 		let membership = type?.lowercased()
 		return ZagDeveloperTeam.isValidIdentifier(teamID)
-			&& status.lowercased() != "inactive"
+			&& !["inactive", "expired", "disabled", "revoked", "pending"].contains(status.lowercased())
 			&& (membership?.contains("free") == true || membership?.contains("personal") == true
 				|| name.lowercased().hasSuffix("(personal team)"))
+	}
+
+	static func personalTeam(in teams: [Self], expectedID: String? = nil) -> Self? {
+		let matching = teams.filter { $0.isPersonalTeam && (expectedID == nil || $0.teamID == expectedID) }
+		guard Set(matching.map(\.teamID)).count == 1 else { return nil }
+		return matching.first
 	}
 
 }
@@ -93,9 +99,10 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// denied at the consent layer (defence in depth), but the transport is the
 	/// hard boundary. A smaller request ceiling bounds the session.
 	static func readOnlyInventory(machine: ZagAppleAuthMachine = ZagAppleAuthMachine.nativeAccount(),
+								  expectedAccountID: String? = nil,
 								  maxRequests: Int? = nil) -> ZagNativeDeveloperPortal {
 		ZagNativeDeveloperPortal(transport: ZagReadOnlyTransport(base: transport()),
-								 headers: { await machine.developerHeaders() ?? [:] },
+								 headers: { await machine.developerHeaders(expectedAccountID: expectedAccountID) ?? [:] },
 								 consent: ZagDenyingMutationConsent(), maxRequests: maxRequests)
 	}
 	#endif
@@ -131,7 +138,18 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		   ![401, 403, 429].contains(response.statusCode) {
 			fault.set("HTTP \(response.statusCode)")
 		}
-		return try ZagDeveloperServicesProtocol.parse(response.body, httpStatus: response.statusCode, action: action)
+		do {
+			return try ZagDeveloperServicesProtocol.parse(response.body, httpStatus: response.statusCode, action: action)
+		} catch let error as ZagPortalError where action == .listAppIDs || action == .addAppID {
+			let sensitiveHeaders = requestHeaders.filter {
+				["x-apple-gs-token", "x-apple-i-identity-id", "x-apple-i-md", "x-apple-i-md-m", "x-apple-i-md-lu", "x-mme-device-id"]
+					.contains($0.key.lowercased())
+			}
+			let identifiers = [teamID, parameters["identifier"] as? String, parameters["name"] as? String].compactMap { $0 }
+			guard let details = ZagDeveloperServicesProtocol.fault(body: response.body, httpStatus: response.statusCode,
+				action: action, redacting: identifiers + Array(sensitiveHeaders.values)) else { throw error }
+			throw ZagAppIDServerRejection(action: action, error: error, fault: details)
+		}
 	}
 
 	/// A short, secret-free reason for a transport refusal.
@@ -172,13 +190,18 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	func appIDs(team: String) async throws -> [ZagRegisteredAppID] {
 		let dict = try await send(.listAppIDs, teamID: team)
+		if dict["appIds"] == nil, ZagDeveloperServicesProtocol.resultCode(dict) == 0 { return [] }
 		guard let rows = dict["appIds"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
-		return rows.compactMap { row in
-			guard let identifier = (row["appIdId"] as? String) ?? (row["appIdentifierId"] as? String),
-				  let bundle = (row["identifier"] as? String) else { return nil }
-			return ZagRegisteredAppID(identifier: identifier, bundleIdentifier: bundle,
-									  expiresAt: ZagDeveloperServicesProtocol.date(row["expirationDate"]))
+		return try rows.map(Self.appID)
+	}
+
+	private static func appID(_ row: [String: Any]) throws -> ZagRegisteredAppID {
+		guard let identifier = (row["appIdId"] as? String) ?? (row["appIdentifierId"] as? String),
+			  !identifier.isEmpty, let bundle = row["identifier"] as? String, !bundle.isEmpty else {
+			throw ZagPortalError.malformedResponse
 		}
+		return ZagRegisteredAppID(identifier: identifier, bundleIdentifier: bundle,
+			expiresAt: ZagDeveloperServicesProtocol.date(row["expirationDate"]))
 	}
 
 	private func appGroupRows(team: String) async throws -> [[String: Any]] {
@@ -278,11 +301,10 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		let cleanName = name.folding(options: .diacriticInsensitive, locale: nil)
 			.components(separatedBy: allowed.inverted).joined().trimmingCharacters(in: .whitespaces)
 		let dict = try await send(.addAppID, teamID: team, parameters: ["identifier": bundleIdentifier, "name": cleanName.isEmpty ? "Zag Store App" : cleanName])
-		let row = (dict["appId"] as? [String: Any]) ?? [:]
-		guard let identifier = row["appIdId"] as? String else { throw ZagPortalError.malformedResponse }
-		return ZagRegisteredAppID(identifier: identifier,
-								  bundleIdentifier: (row["identifier"] as? String) ?? bundleIdentifier,
-								  expiresAt: ZagDeveloperServicesProtocol.date(row["expirationDate"]))
+		guard let row = dict["appId"] as? [String: Any] else { throw ZagPortalError.malformedResponse }
+		let appID = try Self.appID(row)
+		guard appID.bundleIdentifier == bundleIdentifier else { throw ZagPortalError.malformedResponse }
+		return appID
 	}
 
 	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup {

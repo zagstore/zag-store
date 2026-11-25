@@ -181,7 +181,12 @@ final class ZagNativeSignInModel: ObservableObject {
 		// the session). Only the developer token is forgotten, which is what
 		// developerHeaders() checks — so the model reads as signed out. The
 		// model always uses the default "device" scope machine.
-		try? ZagDeveloperTokenStore().delete(scope: "device")
+		do {
+			try ZagDeveloperTokenStore().delete(scope: "device")
+		} catch {
+			notice = "Zag Store could not remove the current Apple Account session. Try signing out again before switching accounts."
+			return
+		}
 		teams = []
 		notice = nil
 		phase = .signedOut
@@ -219,12 +224,12 @@ final class ZagNativeSignInModel: ObservableObject {
 		// The read-only Developer Services inventory exists only in the native
 		// (xcframework) build; off-device there is nothing to read.
 		#if canImport(ZagAppleAuth)
-		let native = ZagNativeDeveloperPortal.readOnlyInventory(machine: machine)
-		if let discovered = try? await native.teams() {
-			teams = discovered.map {
-				ZagDeveloperTeam(identifier: $0.teamID, name: $0.name,
-								 kind: $0.type == nil || $0.type == "individual" ? .personalFree : .individualPaid)
-			}
+		guard let token = ZagDeveloperTokenStore().load(scope: "device") else { teams = []; return }
+		let native = ZagNativeDeveloperPortal.readOnlyInventory(machine: machine, expectedAccountID: token.accountID)
+		let discovered = (try? await native.teams()) ?? []
+		guard ZagDeveloperTokenStore().load(scope: "device")?.accountID == token.accountID else { return }
+		teams = discovered.map {
+			ZagDeveloperTeam(identifier: $0.teamID, name: $0.name, kind: $0.isPersonalTeam ? .personalFree : .individualPaid)
 		}
 		#endif
 	}
