@@ -617,7 +617,7 @@ extension SettingsView {
 			}
 			.accessibilityIdentifier("settings.appleSigning")
 		} header: {
-			Text("Accounts")
+			Text(" Accounts")
 		}
 	}
 
@@ -678,7 +678,7 @@ extension SettingsView {
 			// Native certificate-replacement workflow (7460 recovery). Backed by the
 			// disabled portal unless a live portal is explicitly enabled; every
 			// mutation is separately confirmed and nothing is guaranteed.
-			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
+			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.inventory(team: "")).zagSettingsDestinationAvatar()) {
 				Label("Replace a Certificate", systemImage: "arrow.triangle.2.circlepath")
 			}
 			#endif

@@ -5,9 +5,7 @@ import Foundation
 /// Imported certificates are signed on this device with Zsign. BYOC signs on
 /// the Zag Store website with the user's own certificate, so the app only
 /// links to it. Free Apple Account signing will create a development
-/// certificate and profiles for the user's Personal Team and then sign with
-/// the same Zsign path as imported certificates; it stays hidden until it can
-/// sign and install end to end (`ZagSigningMethodAvailability.freeAccountEnabled`).
+/// certificate and profiles for the user's Personal Team and signs with Zsign.
 enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 	case freeAppleAccount
 	case importedCertificate
@@ -52,10 +50,11 @@ enum ZagSigningMethodStatus: Equatable, Sendable {
 }
 
 enum ZagSigningMethodAvailability {
-	/// Free Apple Account signing is not listed until authentication,
-	/// provisioning, signing and installation all work against Apple's real
-	/// services and a device (phases 2-4 of docs/free-developer-accounts).
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	static let freeAccountEnabled = true
+	#else
 	static let freeAccountEnabled = false
+	#endif
 
 	/// Developer Account (App Store Connect API) signing is not listed until
 	/// its milestones (ASC_API_ARCHITECTURE.md) are validated against Apple

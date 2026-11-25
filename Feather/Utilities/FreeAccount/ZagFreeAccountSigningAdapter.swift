@@ -3,15 +3,8 @@ import Foundation
 import ZsignSwift
 #endif
 
-// Free-account signing in production code, behind a gate that is closed in
-// this version (`ZagFreeAccountSigning.isEnabled`): from a provisioning
-// result to a signed app, its installation through the existing RPPairing
-// installer, a verified record, and refreshes routed to the app's own
-// account and team. The AppTesters signing path (`ZsignHandler`) and the
-// RPPairing installer are unchanged.
-
 enum ZagFreeAccountSigning {
-	#if ZAG_LIVE_EXPERIMENT && ZAG_APPLE_BRIDGE && ZAG_ZSIGN_STRICT && !DEBUG
+	#if ZAG_ZSIGN_STRICT && (canImport(ZagAppleAuth) || ZAG_LIVE_EXPERIMENT)
 	/// G5 experiment build only (plan §3.2): the campaign's one test app.
 	static let isEnabled = true
 	#else
@@ -20,9 +13,7 @@ enum ZagFreeAccountSigning {
 	#endif
 }
 
-/// Whether free-account signing may run. Release builds can only make the
-/// production gate, which is closed; the open gate exists in Debug builds,
-/// for simulated accounts and local test authorities.
+/// Signing availability for the native, paid and simulated account paths.
 struct ZagFreeAccountSigningGate: Equatable, Sendable {
 	let isOpen: Bool
 

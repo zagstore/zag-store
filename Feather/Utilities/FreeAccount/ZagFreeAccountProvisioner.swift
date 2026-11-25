@@ -112,7 +112,7 @@ enum ZagCertificateRecoveryOutcome: Equatable, Sendable {
 	case checkFailed(ZagProvisioningFailure.Kind)
 }
 
-struct ZagProvisioningFailure: Error, Equatable, Sendable {
+struct ZagProvisioningFailure: LocalizedError, Equatable, Sendable {
 	enum Step: String, Sendable {
 		case request
 		case installSlots
@@ -154,6 +154,8 @@ struct ZagProvisioningFailure: Error, Equatable, Sendable {
 
 	let kind: Kind
 	let step: Step
+
+	var errorDescription: String? { message }
 
 	var message: String {
 		switch kind {

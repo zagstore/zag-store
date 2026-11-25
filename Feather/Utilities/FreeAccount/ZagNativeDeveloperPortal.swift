@@ -1,21 +1,6 @@
 import Foundation
 
-// NATIVE free-account developer portal (Phase 3) — DISABLED BY DEFAULT.
-//
-// The first live `ZagDeveloperPortalService` for the standalone free-account
-// path: it drives the developer-services ("QH65B2") operations over a bounded
-// HTTPS transport to developerservices2.apple.com, authenticated purely by
-// apple-auth's `developer_headers` (the native on-device token). It reuses the
-// existing models, signing-key factory, provisioner, profile parser and Zsign
-// raw-signer unchanged — only the live portal was missing.
-//
-// Safety: constructed only behind an explicit enable (never by default); every
-// ACCOUNT-MUTATING operation is refused unless a consent gate returns true for
-// that specific operation; read-only discovery is not gated. The transport is
-// pinned to one Apple host, no redirects off it, ephemeral, size-capped, with a
-// hard request ceiling and no retries. The token is held only in request
-// headers and is never logged, persisted here or placed in diagnostics.
-
+// Native developer services uses the persisted Apple session and scoped consent.
 /// A developer team as returned by read-only discovery (`viewDeveloper` /
 /// listTeams). Not part of `ZagDeveloperPortalService`: discovery precedes it.
 struct ZagNativeDeveloperTeam: Codable, Equatable, Sendable {
@@ -24,19 +9,21 @@ struct ZagNativeDeveloperTeam: Codable, Equatable, Sendable {
 	/// e.g. "active"; Apple also reports membership type for free accounts.
 	let status: String
 	let type: String?
+
+	var isPersonalTeam: Bool {
+		let membership = type?.lowercased()
+		return ZagDeveloperTeam.isValidIdentifier(teamID)
+			&& status.lowercased() != "inactive"
+			&& (membership?.contains("free") == true || membership?.contains("personal") == true
+				|| name.lowercased().hasSuffix("(personal team)"))
+	}
+
 }
 
 // ZagNativePortalError, ZagAccountMutationConsent and ZagDenyingMutationConsent
 // live in ZagDeveloperServicesProtocol.swift (pure), so the consent coordinator
 // and host tests compile without the app model graph.
 
-/// The live native portal. Disabled by default: the designated initializer is
-/// internal and the convenience factory returns the disabled stub unless an
-/// explicit enable is passed.
-// Conforms to ZagReplacementPortal (ZagCertificateReplacementService.swift): it
-// already implements all three operations that service needs, and surfaces the
-// last request's sanitized failure reason (HTTP status / transport refusal) so
-// the inventory banner is never an opaque "network problem".
 extension ZagNativeDeveloperPortal: ZagReplacementPortal {
 	var lastFailureReason: String? { fault.reason }
 }
@@ -65,19 +52,19 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	private let now: @Sendable () -> Date
 	/// Shared across one provisioning sequence; counts every request, mutating
 	/// or not, and refuses past the ceiling. No retries anywhere.
-	private let budget: ZagRequestBudget
+	private let budget: ZagRequestBudget?
 	/// The last request's sanitized failure reason (see `ZagPortalFaultBox`).
 	private let fault = ZagPortalFaultBox()
 
 	init(transport: ZagHTTPTransport,
 		 headers: @escaping HeadersProvider,
 		 consent: ZagAccountMutationConsent = ZagDenyingMutationConsent(),
-		 maxRequests: Int = 16,
+		 maxRequests: Int? = 16,
 		 now: @escaping @Sendable () -> Date = { Date() }) {
 		self.transport = transport
 		self.headers = headers
 		self.consent = consent
-		self.budget = ZagRequestBudget(limit: maxRequests)
+		self.budget = maxRequests.map { ZagRequestBudget(limit: $0) }
 		self.now = now
 	}
 
@@ -93,7 +80,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// a real consent gate is supplied at the live step.
 	static func live(machine: ZagAppleAuthMachine,
 					 consent: ZagAccountMutationConsent = ZagDenyingMutationConsent(),
-					 maxRequests: Int = 16) -> ZagNativeDeveloperPortal {
+					 maxRequests: Int? = 16) -> ZagNativeDeveloperPortal {
 		ZagNativeDeveloperPortal(transport: transport(),
 								 headers: { await machine.developerHeaders() ?? [:] },
 								 consent: consent, maxRequests: maxRequests)
@@ -106,7 +93,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// denied at the consent layer (defence in depth), but the transport is the
 	/// hard boundary. A smaller request ceiling bounds the session.
 	static func readOnlyInventory(machine: ZagAppleAuthMachine = ZagAppleAuthMachine.nativeAccount(),
-								  maxRequests: Int = 8) -> ZagNativeDeveloperPortal {
+								  maxRequests: Int? = nil) -> ZagNativeDeveloperPortal {
 		ZagNativeDeveloperPortal(transport: ZagReadOnlyTransport(base: transport()),
 								 headers: { await machine.developerHeaders() ?? [:] },
 								 consent: ZagDenyingMutationConsent(), maxRequests: maxRequests)
@@ -117,13 +104,14 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	private func send(_ action: ZagDeveloperServicesAction, teamID: String?, parameters: [String: Any] = [:]) async throws -> [String: Any] {
 		if action.isMutating && !consent.mayPerform(action) { throw ZagNativePortalError.consentRequired(action) }
-		guard budget.take() else { throw ZagNativePortalError.requestCeilingReached }
+		guard budget?.take() != false else { throw ZagNativePortalError.requestCeilingReached }
 		var requestHeaders = try await headers()
 		guard !requestHeaders.isEmpty, requestHeaders.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) else {
 			throw ZagPortalError.sessionRejected
 		}
 		requestHeaders["Content-Type"] = "text/x-xml-plist"
 		requestHeaders["Accept"] = "text/x-xml-plist"
+		requestHeaders["Accept-Language"] = "en-us"
 		let request = ZagHTTPRequest(
 			url: try ZagDeveloperServicesProtocol.endpoint(action),
 			method: "POST",
@@ -169,7 +157,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 				teamID: id,
 				name: (row["name"] as? String) ?? id,
 				status: (row["status"] as? String) ?? "unknown",
-				type: (row["type"] as? String) ?? (memberships?["name"] as? String))
+				type: (memberships?["name"] as? String) ?? (row["type"] as? String))
 		}
 	}
 
@@ -191,9 +179,14 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		}
 	}
 
-	func appGroups(team: String) async throws -> [ZagRegisteredAppGroup] {
+	private func appGroupRows(team: String) async throws -> [[String: Any]] {
 		let dict = try await send(.listAppGroups, teamID: team)
-		return ((dict["applicationGroupList"] as? [[String: Any]]) ?? []).compactMap { row in
+		guard let rows = dict["applicationGroupList"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
+		return rows
+	}
+
+	func appGroups(team: String) async throws -> [ZagRegisteredAppGroup] {
+		try await appGroupRows(team: team).compactMap { row in
 			(row["identifier"] as? String).map { ZagRegisteredAppGroup(identifier: $0) }
 		}
 	}
@@ -211,28 +204,21 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		return ZagCertificateRevocation.candidates(from: try await listCertificateRows(team: team))
 	}
 
-	/// The development-certificate listing for a free (Personal Team) account.
-	/// Uses the classic QH65B2 `listAllDevelopmentCerts.action` — the SAME service
-	/// family as `listTeams`, which succeeds — because the `/services/v1/` JSON
-	/// API returns 401/403 for a free team (verified against live feedback; this
-	/// is also the path AltSign/SideStore use for free accounts). The classic row
-	/// names the revoke handle `certificateId`; it is normalised to `id` so the
-	/// shared parser/candidate builder (which also handles classic rows) works
-	/// unchanged. Read-only: `listCertificates` is non-mutating, so the read-only
-	/// transport allows it.
 	private func listCertificateRows(team: String) async throws -> [[String: Any]] {
-		let dict = try await send(.listCertificates, teamID: team)
-		let rows = (dict["certificates"] as? [[String: Any]]) ?? (dict["certRequests"] as? [[String: Any]]) ?? []
-		return rows.map { row in
-			guard row["id"] == nil, let cid = row["certificateId"] else { return row }
-			var r = row; r["id"] = cid; return r
+		let response = try await sendV1(path: "certificates", methodOverride: "GET",
+									   body: ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
+		if !(200..<300).contains(response.statusCode) { fault.set("HTTP \(response.statusCode)") }
+		let rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
+		guard rows.allSatisfy({ ZagDeveloperServicesProtocol.parseCertificate($0) != nil }) else {
+			throw ZagPortalError.malformedResponse
 		}
+		return rows
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
 		let dict = try await send(.downloadProfile, teamID: team, parameters: ["appIdId": appID.identifier])
 		guard let profile = dict["provisioningProfile"] as? [String: Any],
-			  let encoded = (profile["encodedProfile"] as? Data) else { throw ZagPortalError.malformedResponse }
+			  let encoded = (profile["encodedProfile"] as? Data) ?? (profile["encodedProfile"] as? String).flatMap({ Data(base64Encoded: $0) }) else { throw ZagPortalError.malformedResponse }
 		return try ZagIssuedProfile(profileData: encoded)
 	}
 
@@ -245,7 +231,10 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	}
 
 	func registerAppID(bundleIdentifier: String, name: String, team: String) async throws -> ZagRegisteredAppID {
-		let dict = try await send(.addAppID, teamID: team, parameters: ["identifier": bundleIdentifier, "name": name])
+		let allowed = CharacterSet.alphanumerics.union(.whitespaces)
+		let cleanName = name.folding(options: .diacriticInsensitive, locale: nil)
+			.components(separatedBy: allowed.inverted).joined().trimmingCharacters(in: .whitespaces)
+		let dict = try await send(.addAppID, teamID: team, parameters: ["identifier": bundleIdentifier, "name": cleanName.isEmpty ? "Zag Store App" : cleanName])
 		let row = (dict["appId"] as? [String: Any]) ?? [:]
 		guard let identifier = row["appIdId"] as? String else { throw ZagPortalError.malformedResponse }
 		return ZagRegisteredAppID(identifier: identifier,
@@ -260,8 +249,14 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	}
 
 	func assignAppGroups(_ groups: [String], to appID: ZagRegisteredAppID, team: String) async throws {
+		let rows = try await appGroupRows(team: team)
+		let groupIDs = try groups.map { group in
+			guard let row = rows.first(where: { $0["identifier"] as? String == group }),
+				  let id = row["applicationGroup"] as? String else { throw ZagPortalError.malformedResponse }
+			return id
+		}
 		_ = try await send(.assignAppGroups, teamID: team,
-						   parameters: ["appIdId": appID.identifier, "applicationGroups": groups])
+						   parameters: ["appIdId": appID.identifier, "applicationGroups": groupIDs])
 	}
 
 	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
@@ -275,8 +270,20 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		// identity, and a stable id keeps the account from accruing certificates
 		// that look like they came from many machines.
 		let dict = try await send(.submitCSR, teamID: team, parameters: ["csrContent": pem, "machineName": "Zag Store", "machineId": ZagMachineIdentifier.current()])
-		guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]),
-			  let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der else {
+		guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]) else {
+			throw ZagPortalError.malformedResponse
+		}
+		if let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der {
+			return ZagIssuedCertificate(certificate: Self.certificate(parsed), data: der)
+		}
+		let id = (row["certificateId"] ?? row["certRequestId"]) as? String
+		let serial = ZagDeveloperServicesProtocol.parseCertificate(row)?.serialNumber
+		let listed = try await listCertificateRows(team: team)
+		guard let match = listed.first(where: { candidate in
+			if let id, candidate["id"] as? String == id { return true }
+			guard let serial, !serial.isEmpty else { return false }
+			return ZagDeveloperServicesProtocol.parseCertificate(candidate)?.serialNumber.caseInsensitiveCompare(serial) == .orderedSame
+		}), let parsed = ZagDeveloperServicesProtocol.parseCertificate(match), let der = parsed.der else {
 			throw ZagPortalError.malformedResponse
 		}
 		return ZagIssuedCertificate(certificate: Self.certificate(parsed), data: der)
@@ -293,7 +300,8 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 			throw ZagNativePortalError.consentRequired(.revokeCertificate)   // active cert without override
 		}
 		let response = try await sendV1(path: ZagCertificateRevocation.endpointPath(id: certificate.id),
-										methodOverride: ZagCertificateRevocation.methodOverride, body: Data())
+										methodOverride: ZagCertificateRevocation.methodOverride,
+									body: ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
 		_ = try ZagCertificateRevocation.parse(response.body, httpStatus: response.statusCode)
 	}
 
@@ -301,11 +309,12 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	/// One request to the `/services/v1/` JSON API over the pinned transport.
 	private func sendV1(path: String, methodOverride: String, body: Data) async throws -> ZagHTTPResponse {
-		guard budget.take() else { throw ZagNativePortalError.requestCeilingReached }
+		guard budget?.take() != false else { throw ZagNativePortalError.requestCeilingReached }
 		var requestHeaders = try await headers()
 		guard !requestHeaders.isEmpty, requestHeaders.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) else {
 			throw ZagPortalError.sessionRejected
 		}
+		requestHeaders["Accept-Language"] = "en-us"
 		for (k, v) in ZagDeveloperServicesV1.headers(methodOverride: methodOverride) { requestHeaders[k] = v }
 		let request = ZagHTTPRequest(url: try ZagDeveloperServicesV1.endpoint(path), method: "POST", headers: requestHeaders, body: body)
 		fault.set(nil)
@@ -315,7 +324,9 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	/// Maps a parsed certificate (transport-independent) to the app model.
 	private static func certificate(_ p: ZagParsedCertificate) -> ZagDevelopmentCertificate {
-		ZagDevelopmentCertificate(serialNumber: p.serialNumber, name: p.name, machineName: p.machineName,
-								  expiresAt: p.expiresAt ?? Date.distantPast, data: p.der)
+		let inspected = p.der.flatMap(ZagCertificateInspection.init(der:))
+		return ZagDevelopmentCertificate(serialNumber: inspected?.serialNumber ?? p.serialNumber.uppercased(),
+										 name: p.name, machineName: p.machineName,
+										 expiresAt: inspected?.expiresAt ?? p.expiresAt ?? Date.distantPast, data: p.der)
 	}
 }

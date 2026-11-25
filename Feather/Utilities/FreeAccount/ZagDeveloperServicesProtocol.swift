@@ -216,7 +216,7 @@ enum ZagDeveloperServicesProtocol {
 	static func parseCertificate(_ row: [String: Any]) -> ZagParsedCertificate? {
 		let attrs = (row["attributes"] as? [String: Any]) ?? row
 		var der: Data? = attrs["certContent"] as? Data
-		if der == nil, let b64 = attrs["certificateContent"] as? String { der = Data(base64Encoded: b64) }
+		if der == nil, let b64 = (attrs["certificateContent"] ?? attrs["certContent"]) as? String { der = Data(base64Encoded: b64) }
 		let serial = (attrs["serialNumber"] as? String) ?? (attrs["serialNum"] as? String)
 		guard serial != nil || der != nil else { return nil }
 		return ZagParsedCertificate(
@@ -303,12 +303,12 @@ enum ZagDeveloperServicesV1 {
 		return url
 	}
 
-	/// Body for listing development certificates: a JSON object carrying the
-	/// url-encoded query (teamId + certificate-type filter), as AltSign sends it.
-	static func listCertificatesBody(teamID: String, certificateTypes: String = "IOS_DEVELOPMENT,DEVELOPMENT") throws -> Data {
-		let raw = "teamId=\(teamID)&filter[certificateType]=\(certificateTypes)"
-		let encoded = raw.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "=&-_"))) ?? raw
-		return try JSONSerialization.data(withJSONObject: ["urlEncodedQueryParams": encoded], options: [])
+	/// SideSign sends only the team ID for Personal Team certificate inventory.
+	static func listCertificatesBody(teamID: String) throws -> Data {
+		guard !teamID.isEmpty, teamID.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) }) else {
+			throw ZagPortalError.malformedResponse
+		}
+		return try JSONSerialization.data(withJSONObject: ["urlEncodedQueryParams": "teamId=\(teamID)"])
 	}
 
 	/// Parses a JSON:API response and returns the `data` array, mapping any
@@ -324,7 +324,9 @@ enum ZagDeveloperServicesV1 {
 			if detail.contains("limit") || detail.contains("maximum") { throw ZagPortalError.certificateLimitReached }
 			throw ZagPortalError.malformedResponse
 		}
-		return (obj["data"] as? [[String: Any]]) ?? []
+		try ZagDeveloperServicesProtocol.throwIfError(obj)
+		guard let rows = obj["data"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
+		return rows
 	}
 
 	/// The headers the v1 API needs beyond the developer-headers bag:

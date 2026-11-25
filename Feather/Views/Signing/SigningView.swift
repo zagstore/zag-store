@@ -20,6 +20,11 @@ struct SigningView: View {
 	@State private var _isFilePickerPresenting = false
 	@State private var _isImagePickerPresenting = false
 	@State private var _isSigning = false
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	@ObservedObject private var _accountPairing = ZagRPPairingCore.shared
+	@State private var _signingMethod: ZagSigningMethod = .importedCertificate
+	@State private var _accountInstallMessage: String?
+	#endif
 	@State private var _selectedPhoto: PhotosPickerItem? = nil
 	@State var appIcon: UIImage?
     @State private var _originalEntitlementAudit: ZagOriginalEntitlementAudit.Report?
@@ -50,10 +55,27 @@ struct SigningView: View {
 	var body: some View {
 		NBNavigationView("Sign App", displayMode: .inline) {
 			Form {
-				_customizationOptions(for: app)
-				_cert()
-                _signingPreflightSection()
-				_customizationProperties(for: app)
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				Picker("Signing Method", selection: $_signingMethod) {
+					Text(ZagSigningMethod.importedCertificate.title).tag(ZagSigningMethod.importedCertificate)
+					Text(ZagSigningMethod.freeAppleAccount.title).tag(ZagSigningMethod.freeAppleAccount)
+				}
+				if _signingMethod == .freeAppleAccount {
+					if !ZagNativeAccountInstall.hasSession {
+						NavigationLink("Connect Apple Account") { ZagAppleSigningSettingsView() }
+					} else if case .paired = _accountPairing.state {
+						EmptyView()
+					} else {
+						Text("Pair this iPhone in Settings to install apps.").foregroundStyle(.secondary)
+					}
+					Text("Sign and install with your Personal Team. Zag Store may register this iPhone and app with Apple and issue a signing certificate and provisioning profiles.")
+						.font(.footnote).foregroundStyle(.secondary)
+				} else {
+					_certificateOptions
+				}
+				#else
+				_certificateOptions
+				#endif
 				
 				// horrible
 				Rectangle()
@@ -71,7 +93,7 @@ struct SigningView: View {
 							Button {
 								_start()
 							} label: {
-								NBSheetButton(title: .localized("Start Signing"), style: .prominent)
+								NBSheetButton(title: _signButtonTitle, style: .prominent)
 									.padding()
 							}
 							.buttonStyle(.plain)
@@ -121,6 +143,17 @@ struct SigningView: View {
 			.disabled(_isSigning)
 			.animation(.smooth, value: _isSigning)
 		}
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		.alert("Apple Account Installation", isPresented: Binding(
+			get: { _accountInstallMessage != nil },
+			set: { if !$0 { _accountInstallMessage = nil } }
+		)) {
+			Button("OK", role: .cancel) { _accountInstallMessage = nil }
+		} message: {
+			Text(_accountInstallMessage ?? "")
+		}
+		.interactiveDismissDisabled(_isSigning && _signingMethod == .freeAppleAccount)
+		#endif
 		.onAppear {
 			// ppq protection
 			if
@@ -838,7 +871,62 @@ private enum ZagOriginalEntitlementAudit {
 
 // MARK: - Extension: View (import)
 extension SigningView {
+	private var _signButtonTitle: String {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if _signingMethod == .freeAppleAccount { return _isSigning ? "Signing and Installing…" : "Sign and Install" }
+		#endif
+		return .localized("Start Signing")
+	}
+
+	private var _canStartSigning: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if _signingMethod == .freeAppleAccount {
+			guard case .paired(_, _, let udid) = _accountPairing.state else { return false }
+			return !udid.isEmpty && ZagNativeAccountInstall.hasSession && !_isSigning
+		}
+		#endif
+		return true
+	}
+
+	@ViewBuilder
+	private var _certificateOptions: some View {
+		_customizationOptions(for: app)
+		_cert()
+		_signingPreflightSection()
+		_customizationProperties(for: app)
+	}
+
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private func _startAccountInstall() {
+		guard !_isSigning else { return }
+		guard let source = Storage.shared.getAppDirectory(for: app) else {
+			_accountInstallMessage = ZagNativeAccountInstall.Failure.invalidApp.localizedDescription
+			return
+		}
+		_isSigning = true
+		Task { @MainActor in
+			defer { _isSigning = false }
+			do {
+				switch try await ZagNativeAccountInstall.install(source: source, name: app.name ?? "App") {
+				case .verified: _accountInstallMessage = "Installed and verified on this iPhone. Open the app from the Home Screen."
+				case .unverifiable(let reason): _accountInstallMessage = "Installation could not be verified. \(reason)"
+				case .mismatch, .notInstalled:
+					_accountInstallMessage = ZagNativeAccountInstall.Failure.installationUnverified.localizedDescription
+				}
+			} catch {
+				_accountInstallMessage = error.localizedDescription
+			}
+		}
+	}
+	#endif
+
 	private func _start() {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if _signingMethod == .freeAppleAccount {
+			_startAccountInstall()
+			return
+		}
+		#endif
 		if ZagCertificateSelection.asksEveryTime,
 		   _temporaryOptions.signingOption == .default {
 			Task { @MainActor in

@@ -1,14 +1,6 @@
 #if canImport(SwiftUI)
 import SwiftUI
 
-// User-facing native workflow for certificate replacement. Experimental and
-// gated (ZAG_CERT_REPLACEMENT_EXPERIMENT): it drives ZagCertificateReplacementDriver,
-// which is itself live only behind the disabled portal. Every screen is derived
-// from the coordinator state, so the UI can never present a step the state
-// machine has not reached. The two mutations are two separate buttons, each
-// behind its own confirmation; the UI never claims replacement is guaranteed to
-// resolve 7460.
-
 /// A masked view of a candidate for display — never a full serial or fingerprint.
 struct ZagReplacementCandidateView: Identifiable, Equatable {
 	let id: String
@@ -42,24 +34,29 @@ final class ZagCertificateReplacementModel: ObservableObject {
 	private let activeGuard: ZagActiveCertificateGuard
 	/// The preserved device-generated CSR; supplied by the provisioner. The UI
 	/// never sees the key — only this request object is passed through to submit.
-	private let preservedCSR: () -> ZagCertificateRequest?
+	private let preservedCSR: (() -> ZagCertificateRequest?)?
+	private let nativeScope: ZagSigningScope?
+	var issuesCertificateHere: Bool { preservedCSR != nil }
 
 	init(driver: ZagCertificateReplacementDriver, activeGuard: ZagActiveCertificateGuard,
-		 readOnly: Bool = false, preservedCSR: @escaping () -> ZagCertificateRequest?) {
+		 readOnly: Bool = false, nativeScope: ZagSigningScope? = nil, preservedCSR: (() -> ZagCertificateRequest?)?) {
 		self.driver = driver
 		self.activeGuard = activeGuard
 		self.readOnly = readOnly
 		self.preservedCSR = preservedCSR
+		self.nativeScope = nativeScope
 	}
 
 	func onAppear() async {
-		await driver.recoverOnLaunch()
+		if nativeScope == nil { await driver.recoverOnLaunch() }
 		state = await driver.currentState()
 		await refreshInventory()
 	}
 
 	func refreshInventory() async {
-		busy = true; defer { busy = false }
+		guard !busy else { return }
+		busy = true
+		defer { busy = false }
 		do {
 			let certs = try await driver.inventory()
 			rawInventory = certs
@@ -75,60 +72,88 @@ final class ZagCertificateReplacementModel: ObservableObject {
 	}
 
 	func confirmRevoke() async {
-		busy = true; defer { busy = false }
-		do { try await driver.confirmAndRevoke(); banner = nil }
-		catch { banner = Self.describe(error) }
+		guard !busy else { return }
+		busy = true
+		defer { busy = false }
+		do {
+			#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+			if let scope = nativeScope {
+				try await ZagNativeAccountInstall.withExclusiveOperation {
+					if case .selected(let target) = await driver.currentState(),
+					   let identity = try Self.nativeIdentity(scope),
+					   target.serialNumber.caseInsensitiveCompare(identity.serialNumber) == .orderedSame {
+						throw ZagReplacementError.targetNowActive
+					}
+					try await driver.confirmAndRevoke()
+				}
+			} else {
+				try await driver.confirmAndRevoke()
+			}
+			#else
+			try await driver.confirmAndRevoke()
+			#endif
+			banner = nil
+		} catch {
+			banner = Self.describe(error)
+		}
 		state = await driver.currentState()
 	}
 
 	func reconcile() async {
-		busy = true; defer { busy = false }
+		guard !busy else { return }
+		busy = true
+		defer { busy = false }
 		do { try await driver.reconcileAfterAmbiguousRevoke(); banner = nil }
 		catch { banner = Self.describe(error) }
 		state = await driver.currentState()
 	}
 
 	func authorizeAndSubmitCSR() async {
-		guard let request = preservedCSR() else { banner = "No preserved certificate request is available."; return }
-		busy = true; defer { busy = false }
+		guard let request = preservedCSR?() else { banner = "No preserved certificate request is available."; return }
+		guard !busy else { return }
+		busy = true
+		defer { busy = false }
 		do { _ = try await driver.authorizeAndSubmitCSR(request); banner = nil }
 		catch { banner = Self.describe(error) }
 		state = await driver.currentState()
 	}
 
-	/// The gated Settings entry point. In the default experimental build the
-	/// portal is the DISABLED portal (no live contact possible). When the
-	/// read-only live flag is set and the Apple-auth bridge is present, the
-	/// portal is the native read-only portal: inventory can run, but revoke and
-	/// CSR are blocked at the transport boundary. The screen is marked read-only
-	/// so it never offers a mutation.
-	static func gatedPreview(team: String = "") -> ZagCertificateReplacementModel {
-		let guard0 = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil)
-		let portal: ZagReplacementPortal
-		var readOnly = false
-		#if canImport(ZagAppleAuth)
-		// The native bridge is linked (standard device build): connect to the REAL
-		// developer-services portal, wrapped in the read-only transport so the
-		// certificate inventory is live-capable while every mutating endpoint
-		// (revoke, CSR) is blocked below the UI — not merely hidden. The portal
-		// also fails closed without a signed-in developer session, so opening this
-		// screen never mutates Apple state. This replaces the former disabled
-		// preview: the inventory is connected to real services, read-only.
-		portal = ZagNativeDeveloperPortal.readOnlyInventory()
-		readOnly = true
-		#else
-		// No native bridge (e.g. a simulator build): a disabled portal that cannot
-		// reach Apple at all.
-		portal = ZagDisabledReplacementPortal()
+	static func inventory(team: String) -> ZagCertificateReplacementModel {
+		let consent = ZagMutationConsentCoordinator()
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()) {
+			let scope = ZagSigningAuthorization.nativeAccount(token: token, teamID: team).scope
+			let activeGuard = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: (try? nativeIdentity(scope))?.serialNumber)
+			let portal = ZagNativeAccountInstall.portal(token: token, consent: consent)
+			let driver = ZagCertificateReplacementDriver(
+				portal: portal, consent: consent, activeGuard: activeGuard,
+				journal: ZagInMemoryReplacementJournal(), team: team
+			)
+			return ZagCertificateReplacementModel(driver: driver, activeGuard: activeGuard, nativeScope: scope, preservedCSR: nil)
+		}
 		#endif
-		let driver = ZagCertificateReplacementDriver(
-			portal: portal, consent: ZagMutationConsentCoordinator(),
-			activeGuard: guard0, journal: ZagInMemoryReplacementJournal(), team: team)
-		return ZagCertificateReplacementModel(driver: driver, activeGuard: guard0, readOnly: readOnly, preservedCSR: { nil })
+		let activeGuard = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil)
+		#if canImport(ZagAppleAuth)
+		let portal: ZagReplacementPortal = ZagNativeDeveloperPortal.readOnlyInventory()
+		#else
+		let portal: ZagReplacementPortal = ZagDisabledReplacementPortal()
+		#endif
+		let driver = ZagCertificateReplacementDriver(portal: portal, consent: consent,
+			activeGuard: activeGuard, journal: ZagInMemoryReplacementJournal(), team: team)
+		return ZagCertificateReplacementModel(driver: driver, activeGuard: activeGuard, readOnly: true, preservedCSR: nil)
 	}
 
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private static func nativeIdentity(_ scope: ZagSigningScope) throws -> ZagSigningIdentity? {
+		guard let data = try ZagNativeAccountInstall.secrets.load(.signingPrivateKey, account: scope.accountID, team: scope.teamID) else {
+			return nil
+		}
+		return try JSONDecoder().decode(ZagSigningIdentity.self, from: data)
+	}
+	#endif
+
 	static func describe(_ error: Error) -> String {
-		guard let e = error as? ZagReplacementError else { return "The step could not be completed." }
+		guard let e = error as? ZagReplacementError else { return error.localizedDescription }
 		switch e {
 		case .notSelectable:          return "That step is not available from the current state."
 		case .targetNoLongerPresent:  return "That certificate is no longer listed; the list was refreshed. Nothing was changed."
@@ -153,14 +178,7 @@ struct ZagCertificateReplacementView: View {
 
 	var body: some View {
 		List {
-			disclaimerSection
-			if model.readOnly {
-				Section {
-					Label("Read-only session", systemImage: "lock.shield")
-					Text("This session can only read the certificate list. Revoking a certificate and requesting a new one are disabled and cannot be sent — not just hidden here, but blocked before any request leaves this iPhone.")
-						.font(.footnote).foregroundStyle(.secondary)
-				}
-			}
+
 			if let banner = model.banner {
 				Section { Text(banner).font(.footnote).foregroundStyle(.orange) }
 			}
@@ -174,7 +192,11 @@ struct ZagCertificateReplacementView: View {
 			case .revokeConfirmed, .revoking:
 				Section { ProgressView("Revoking…") }
 			case .revoked:
-				csrAuthorizationSection
+				if model.issuesCertificateHere {
+					csrAuthorizationSection
+				} else {
+					Section { Label("Certificate revoked. Return to Sign App to request a certificate and continue.", systemImage: "checkmark.seal") }
+				}
 			case .revokeHalted(_, let reason):
 				reconciliationSection(reason: reason)
 			case .csrAuthorized, .submitting:
@@ -189,20 +211,17 @@ struct ZagCertificateReplacementView: View {
 			}
 			}
 		}
-		.navigationTitle(model.readOnly ? "Certificate inventory" : "Replace a certificate")
+		.navigationTitle("Development Certificates")
 		.task { await model.onAppear() }
-	}
-
-	private var disclaimerSection: some View {
-		Section {
-			Text("Some Apple Accounts already have the maximum number of development certificates. Replacing one may let a new request succeed, but it is not guaranteed to — Apple may still refuse. Nothing is revoked or requested without your explicit confirmation at each step.")
-				.font(.footnote).foregroundStyle(.secondary)
-		}
 	}
 
 	private var inventorySection: some View {
 		Section("Development certificates") {
-			if model.inventory.isEmpty { Text("No certificates are listed.").foregroundStyle(.secondary) }
+			if model.busy && model.inventory.isEmpty {
+				ProgressView("Loading certificates…")
+			} else if model.inventory.isEmpty && model.banner == nil {
+				Text("No certificates are listed.").foregroundStyle(.secondary)
+			}
 			ForEach(model.inventory) { cert in
 				VStack(alignment: .leading, spacing: 4) {
 					HStack {
@@ -214,7 +233,7 @@ struct ZagCertificateReplacementView: View {
 					Text("Serial \(cert.maskedSerial)").font(.caption).foregroundStyle(.secondary)
 					if let exp = cert.expires { Text("Expires \(exp.formatted(date: .abbreviated, time: .omitted))").font(.caption).foregroundStyle(.secondary) }
 					if !cert.isActiveProtected {
-						Text("This iPhone has no key for this certificate; its usage is unknown. Revoking it may break any app or workflow that relies on it.")
+						Text("Revoking this certificate may prevent apps signed with it from opening.")
 							.font(.caption2).foregroundStyle(.orange)
 						if !model.readOnly {
 							Button("Select for replacement") { Task { await model.select(cert) } }
@@ -230,7 +249,7 @@ struct ZagCertificateReplacementView: View {
 
 	private func revokeConfirmationSection(target: ZagReplacementTarget) -> some View {
 		Section("Confirm revocation") {
-			Text("You chose certificate …\(String(target.serialNumber.suffix(6))). This will permanently revoke it. Because this iPhone has no key for it and its usage is unknown, anything still relying on it will stop working. This cannot be undone.")
+			Text("Revoking certificate …\(String(target.serialNumber.suffix(6))) is permanent. Apps signed with it may stop opening.")
 				.font(.footnote)
 			Button(role: .destructive) { Task { await model.confirmRevoke() } } label: {
 				Text("Revoke this certificate")

@@ -51,15 +51,13 @@ struct ZagAppleSigningSettingsView: View {
 	private func refresh() async {
 		guard engineLinked else { signedIn = false; provisioned = false; teamID = ""; return }
 		provisioned = await ZagAppleAuthMachine.nativeAccount().isProvisioned()
-		signedIn = ZagDeveloperTokenStore().hasToken(scope: "device")
+		signedIn = ZagDeveloperTokenStore().load(scope: "device")?.isUsable(at: Date()) == true
 		guard signedIn else { teamID = ""; return }
 		// Same authenticated native machine + persisted developer session as the
 		// sign-in screen's Personal Team retrieval, so the certificate inventory
 		// lists against the real team rather than an empty (rejected) one.
 		#if canImport(ZagAppleAuth)
-		if let first = try? await ZagNativeDeveloperPortal.readOnlyInventory().teams().first {
-			teamID = first.teamID
-		}
+		teamID = (try? await ZagNativeDeveloperPortal.readOnlyInventory().teams().first(where: \.isPersonalTeam))?.teamID ?? ""
 		#endif
 	}
 
@@ -84,11 +82,14 @@ struct ZagAppleSigningSettingsView: View {
 	// MARK: Apple Account
 
 	private var accountSection: some View {
-		Section("Apple Account") {
-			NavigationLink(destination: ZagAppleAccountSignInView().zagSettingsDestinationAvatar()) {
+		Section("Apple Accounts") {
+			NavigationLink {
+				ZagAppleAccountSignInView().zagSettingsDestinationAvatar()
+					.onDisappear { Task { await refresh() } }
+			} label: {
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
-						Text(signedIn ? "Apple Account" : "Sign in with your Apple Account")
+						Text(signedIn ? "Manage Apple Account" : "Sign in with your Apple Account")
 						Text(signedIn ? "Signed in on this iPhone. Tap to manage the session."
 									  : "Use your free Apple Account and two-factor code.")
 							.font(.caption).foregroundStyle(.secondary)
@@ -106,22 +107,22 @@ struct ZagAppleSigningSettingsView: View {
 
 	private var certificateSection: some View {
 		Section {
-			if signedIn {
-				NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview(team: teamID)).zagSettingsDestinationAvatar()) {
+			if signedIn && !teamID.isEmpty {
+				NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.inventory(team: teamID)).zagSettingsDestinationAvatar()) {
 					Label("Signing certificate", systemImage: "checkmark.seal")
 				}
 			} else {
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
 						Text("Signing certificate").foregroundStyle(.secondary)
-						Text("Sign in to view and manage your certificate.").font(.caption).foregroundStyle(.secondary)
+						Text("Connect a Personal Team to view your certificates.").font(.caption).foregroundStyle(.secondary)
 					}
 				} icon: { Image(systemName: "checkmark.seal").foregroundStyle(.secondary) }
 			}
 		} header: {
 			Text("Certificate")
 		} footer: {
-			Text("A development certificate for this iPhone's signing key. If your account already holds the maximum (Apple error 7460), you can replace one — always with a separate confirmation, and the certificate currently in use is always protected.")
+			Text("Zag Store reuses the development certificate that matches this iPhone’s signing key. Revocation requires confirmation.")
 		}
 	}
 
@@ -143,13 +144,13 @@ struct ZagAppleSigningSettingsView: View {
 		} header: {
 			Text("Device")
 		} footer: {
-			Text("Being set up on this iPhone is local state only. It is confirmed with Apple — and this device registered to your account — when you sign in, never from stored state alone.")
+			Text("Zag Store registers the paired iPhone with your Personal Team when you sign an app.")
 		}
 	}
 
 	private var deviceDetail: String {
 		if signedIn {
-			return "Verified with Apple during sign-in. A free-account profile lasts 7 days and is renewed where permitted."
+			return "Your Apple Account session is available on this iPhone."
 		}
 		return provisioned
 			? "A setup profile is stored on this iPhone, but it is confirmed only when you sign in — stored setup alone is not a guarantee."
@@ -170,7 +171,7 @@ struct ZagAppleSigningSettingsView: View {
 		} header: {
 			Text("Signing method")
 		} footer: {
-			Text("Native Apple Account signing is offered alongside — never instead of — AppTesters, Imported Certificate, BYOC and Developer Account. It signs through the on-device signer and never redirects an install you did not choose.")
+			Text("Choose Free Apple Account on the Sign App screen.")
 		}
 	}
 

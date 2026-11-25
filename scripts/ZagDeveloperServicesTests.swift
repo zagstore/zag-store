@@ -98,7 +98,7 @@ check(v1ep.absoluteString == "https://developerservices2.apple.com/services/v1/c
 let v1body = try! ZagDeveloperServicesV1.listCertificatesBody(teamID: "ABCDE12345")
 let v1json = try! JSONSerialization.jsonObject(with: v1body) as! [String: Any]
 check((v1json["urlEncodedQueryParams"] as? String)?.contains("teamId=ABCDE12345") == true, "v1 cert body carries url-encoded teamId")
-check((v1json["urlEncodedQueryParams"] as? String)?.contains("certificateType") == true, "v1 cert body carries certificateType filter")
+check((v1json["urlEncodedQueryParams"] as? String) == "teamId=ABCDE12345", "v1 Personal Team inventory sends only teamId")
 let v1hdrs = ZagDeveloperServicesV1.headers(methodOverride: "GET")
 check(v1hdrs["X-HTTP-Method-Override"] == "GET" && v1hdrs["Content-Type"] == "application/vnd.api+json", "v1 headers set method override + json:api content type")
 func v1(_ d: [String: Any]) -> Data { try! JSONSerialization.data(withJSONObject: d) }

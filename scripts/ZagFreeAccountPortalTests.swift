@@ -113,6 +113,7 @@ extension Result where Failure == ZagProvisioningFailure {
 	}
 
 	static func main() async {
+		await nativeCertificateInventory()
 		await firstProvisioning()
 		await reuseAndRefresh()
 		await limitsCheckedBeforeChanges()
@@ -121,6 +122,61 @@ extension Result where Failure == ZagProvisioningFailure {
 		await failures()
 		await liveDisabled()
 		print("SUCCESS: \(passed) free-account provisioning checks passed")
+	}
+
+	static func nativeCertificateInventory() async {
+		actor Transport: ZagHTTPTransport {
+			var requests: [ZagHTTPRequest] = []
+
+			func send(_ request: ZagHTTPRequest) async throws -> ZagHTTPResponse {
+				requests.append(request)
+				let body: Data
+				if request.url.path.hasSuffix("submitDevelopmentCSR.action") {
+					body = try PropertyListSerialization.data(
+						fromPropertyList: ["resultCode": 0, "certRequest": ["certificateId": "CERT1"]],
+						format: .xml, options: 0
+					)
+				} else {
+					body = Data("""
+						{"data":[{"id":"CERT1","attributes":{"serialNumber":"00AB","certificateContent":"AQID","expirationDate":"2030-01-01T00:00:00Z"}}]}
+						""".utf8)
+				}
+				return ZagHTTPResponse(statusCode: 200, headers: [:], body: body)
+			}
+		}
+
+		let transport = Transport()
+		let consent = ZagMutationConsentCoordinator()
+		let portal = ZagNativeDeveloperPortal(
+			transport: transport, headers: { ["X-Apple-GS-Token": "persisted-test-token"] }, consent: consent
+		)
+		do {
+			let candidates = try await portal.revocableCertificates(team: team)
+			check(candidates.map(\.id) == ["CERT1"], "native inventory decodes v1 certificate IDs")
+			let csr = ZagCertificateRequest(data: Data([1]))
+			do {
+				_ = try await portal.submitCertificateRequest(csr, team: team)
+				check(false, "native CSR requires consent")
+			} catch ZagNativePortalError.consentRequired(.submitCSR) {
+				check(true, "native CSR requires consent")
+			}
+			consent.authorize([.submitCSR])
+			let issued = try await portal.submitCertificateRequest(csr, team: team)
+			check(issued.certificate.serialNumber == "AB" && issued.data == Data([1, 2, 3]),
+				  "native CSR resolves a response containing only the certificate ID")
+			let requests = await transport.requests
+			check(requests.map { $0.url.lastPathComponent } == ["certificates", "submitDevelopmentCSR.action", "certificates"],
+				  "production portal issues read, CSR and a single read-back")
+			check(requests.allSatisfy { $0.headers["X-Apple-GS-Token"] == "persisted-test-token" },
+				  "production portal uses the injected session for each operation")
+			let inventory = requests[0]
+			let query = try JSONSerialization.jsonObject(with: inventory.body ?? Data()) as? [String: String]
+			check(inventory.method == "POST" && inventory.headers["X-HTTP-Method-Override"] == "GET"
+				  && inventory.headers["Accept"] == "application/vnd.api+json"
+				  && query == ["urlEncodedQueryParams": "teamId=\(team)"], "Personal Team certificate request matches the v1 wire format")
+		} catch {
+			check(false, "native inventory and CSR flow: \(error)")
+		}
 	}
 
 	static func firstProvisioning() async {

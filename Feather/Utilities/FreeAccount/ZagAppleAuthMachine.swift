@@ -774,9 +774,10 @@ actor ZagAppleAuthMachine {
 	/// provider. Returns nil when no usable token is persisted or the machine is
 	/// not provisioned. Reads only (never writes/alters any ADI profile). The
 	/// token and the returned headers are never logged.
-	func developerHeaders(now: Date = Date()) -> [String: String]? {
+	func developerHeaders(now: Date = Date(), expectedAccountID: String? = nil) -> [String: String]? {
 		guard let persisted = try? store.load(scope: scope),
-			  let token = ZagDeveloperTokenStore().load(scope: scope), token.isUsable(at: now) else { return nil }
+			  let token = ZagDeveloperTokenStore().load(scope: scope), token.isUsable(at: now),
+			  expectedAccountID == nil || token.accountID == expectedAccountID else { return nil }
 		let platform = self.platform
 		// A refused transport: developer_headers is local, so no request is made;
 		// this guarantees the bridge can never reach the network.
