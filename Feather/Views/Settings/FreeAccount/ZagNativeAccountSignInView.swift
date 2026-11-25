@@ -82,6 +82,29 @@ final class ZagNativeSignInModel: ObservableObject {
 		coordinator = ZagTwoFactorCoordinator()
 		observeStage()
 
+		#if canImport(ZagAppleAuth)
+		// On-device ADI provisioning. signInWith2FA requires a provisioned
+		// machine; provisioning happens here, once, if it has not already. The
+		// campaign authorises native on-device ADI provisioning explicitly, and
+		// the owner initiating sign-in is the consent. This contacts only
+		// Apple's ADI endpoint to identify this iPhone — it signs, installs,
+		// issues and revokes nothing — and it leaves all other app data intact.
+		let alreadyProvisioned = await machine.isProvisioned()
+		if !alreadyProvisioned {
+			notice = "Setting up this iPhone with Apple (one-time)…"
+			do {
+				_ = try await machine.anisetteHeaders(allowProvisioning: true)
+				notice = nil
+			} catch let error as ZagAppleAuthError {
+				finish(failure: ZagNativeSignInClassifier.failure(error: error))
+				return
+			} catch {
+				finish(failure: ZagNativeSignInFailure(message: "On-device setup with Apple could not complete.", recovery: .provisionADI))
+				return
+			}
+		}
+		#endif
+
 		let email = appleID
 		let secret = password
 		password = ""   // do not retain the plaintext past hand-off
