@@ -35,7 +35,15 @@ for name in ["recordSubmission(", "authorizeSubmission("]:
     callers = sorted(p.name for p, t in swift.items() if re.search(r"\.\s*" + re.escape(name), code(t)))
     assert callers == ["ZagCertificateBudget.swift"], (name, callers)
 callers = sorted({p.name for p, t in swift.items() if re.search(r"\.submitCertificateRequest\(", code(t))})
-assert callers == ["ZagASCProvisioner.swift", "ZagFreeAccountProvisioner.swift"], callers
+# Callers of the submit PROTOCOL method. The free-account provisioner and the
+# consent-gated revoke-and-replace service (ZagCertificateReplacementService,
+# via ZagReplacementPortal) both reach the one free-account portal, whose
+# submit calls ZagCertificateBudget.consume first (asserted above: the op
+# string and consume live only in ZagIsideloadBridge, consume precedes the
+# send). So every one of these funnels through the single budget-enforcing
+# send — no caller sends a request or consumes the budget itself. The ASC
+# provisioner submits only to the separate ASC portal (verified below).
+assert callers == ["ZagASCProvisioner.swift", "ZagCertificateReplacementService.swift", "ZagFreeAccountProvisioner.swift"], callers
 # The developer-account (ASC) provisioner submits only to an ASC portal: its
 # portal is typed ZagASCProvisioningPortal, and only the ASC portal conforms,
 # so the free-account portal (and its certificate budget) is out of its reach.

@@ -42,10 +42,17 @@ swiftc -warnings-as-errors -parse-as-library -D DEBUG -D ZAG_APPLE_BRIDGE -targe
 "$WORK/tests"
 
 PROJECT="$ROOT/Feather.xcodeproj/project.pbxproj"
-if grep -qE 'ZAG_APPLE_BRIDGE|zag_apple_bridge|zag-apple-bridge' "$PROJECT"; then
-	echo "FAIL: the Xcode project compiles or links the bridge"; exit 1
+# The native bridge is linked in the standard device build (the standalone
+# architecture keeps the capability present). The invariant is no longer "the
+# bridge is not linked"; it is the distinction between LINKED CAPABILITY and
+# AUTHORISED LIVE EXECUTION: the live-execution conditions are command-line
+# only, so a committed project must never enable them — otherwise a shipping
+# build would turn live authentication and strict signing on by default. The
+# gate check below independently confirms the live switches stay off.
+if grep -qE 'ZAG_LIVE_EXPERIMENT|ZAG_ZSIGN_STRICT' "$PROJECT"; then
+	echo "FAIL: the Xcode project commits a live-execution condition (ZAG_LIVE_EXPERIMENT/ZAG_ZSIGN_STRICT)"; exit 1
 fi
-echo "PASS: no Xcode configuration compiles or links the bridge"
+echo "PASS: the bridge may be linked, but no committed configuration enables live execution"
 for gate in "ZagFreeAccountAuthentication.swift:enum ZagLiveAuthentication" "ZagDeveloperPortal.swift:enum ZagLivePortal" "ZagAnisetteProvider.swift:enum ZagAnisetteLive"; do
 	file=${gate%%:*}; name=${gate#*:}
 	sed -n "/$name {/,/^}/p" "$ROOT/Feather/Utilities/FreeAccount/$file" | grep -qE '^\s*static let isEnabled = false$' \
