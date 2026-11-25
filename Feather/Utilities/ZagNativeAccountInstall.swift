@@ -1,10 +1,11 @@
 #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 import Foundation
+import CryptoKit
 
 @MainActor
 enum ZagNativeAccountInstall {
 	enum Failure: LocalizedError {
-		case busy, signIn, personalTeam, pairing, invalidApp, identity, installationUnverified
+		case busy, signIn, personalTeam, pairing, invalidApp
 
 		var errorDescription: String? {
 			switch self {
@@ -13,8 +14,6 @@ enum ZagNativeAccountInstall {
 			case .personalTeam: "No active Personal Team was found for this Apple Account."
 			case .pairing: "Pair this iPhone in Settings before signing and installing."
 			case .invalidApp: "Zag Store could not read the app or one of its extensions."
-			case .identity: "Zag Store could not load the signing identity for this Apple Account."
-			case .installationUnverified: "The installer finished, but Zag Store could not verify the app and its provisioning profile on this iPhone."
 			}
 		}
 	}
@@ -54,6 +53,36 @@ enum ZagNativeAccountInstall {
 		}
 	}
 
+	/// Only Apple-signed profiles are reused. The provisioner rechecks the
+	/// profile against the selected certificate, app and device before signing.
+	private struct ProfileCache: Sendable {
+		let directory: URL
+
+		init(scope: ZagSigningScope) {
+			directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+				.appendingPathComponent("ZagStore/Profiles/\(scope.accountID)/\(scope.teamID)", isDirectory: true)
+		}
+
+		private func path(for bundle: String) -> URL {
+			let digest = SHA256.hash(data: Data(bundle.utf8)).map { String(format: "%02x", $0) }.joined()
+			return directory.appendingPathComponent(digest).appendingPathExtension("mobileprovision")
+		}
+
+		func profile(for bundle: String) -> ZagIssuedProfile? {
+			guard let data = try? Data(contentsOf: path(for: bundle)), data.count <= 1 << 20 else { return nil }
+			return try? ZagIssuedProfile(profileData: data)
+		}
+
+		func save(_ profile: ZagIssuedProfile) {
+			do {
+				try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+				try profile.data.write(to: path(for: profile.bundleIdentifier), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+			} catch {
+				// Cache failure never changes the validity of the fresh profile.
+			}
+		}
+	}
+
 	private static var running = false
 	static let namespace = "app.zagstore.native-account"
 	static var secrets: ZagKeychainFreeAccountSecretStore { .init(service: namespace) }
@@ -65,14 +94,14 @@ enum ZagNativeAccountInstall {
 		return try await operation()
 	}
 
-	static func portal(token: ZagPersistedDeveloperToken, consent: ZagAccountMutationConsent) -> ZagNativeDeveloperPortal {
+	static func portal(token: ZagPersistedDeveloperToken, consent: ZagAccountMutationConsent, maxRequests: Int? = nil) -> ZagNativeDeveloperPortal {
 		let machine = ZagAppleAuthMachine.nativeAccount()
 		return ZagNativeDeveloperPortal(transport: ZagNativeDeveloperPortal.transport(), headers: {
 			guard let headers = await machine.developerHeaders(expectedAccountID: token.accountID) else {
 				throw ZagPortalError.sessionRejected
 			}
 			return headers
-		}, consent: consent, maxRequests: nil)
+		}, consent: consent, maxRequests: maxRequests)
 	}
 	static var hasSession: Bool {
 		ZagDeveloperTokenStore().load(scope: "device")?.isUsable(at: Date()) == true
@@ -83,7 +112,8 @@ enum ZagNativeAccountInstall {
 	}
 
 	private static func performInstall(source: URL, name: String, expectedScope: ZagSigningScope?) async throws -> ZagInstallVerification {
-		guard let device = ZagDeveloperAccountLive.pairedDevice else { throw Failure.pairing }
+		let pairing = ZagRPPairingCore.shared
+		guard pairing.hasSavedPairing else { throw Failure.pairing }
 		guard let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()) else {
 			throw Failure.signIn
 		}
@@ -98,27 +128,58 @@ enum ZagNativeAccountInstall {
 			try component(at: app.appendingPathComponent($0), name: appendingName(name, path: $0))
 		}
 
+		let (device, installed) = try await pairing.signingDeviceInventory()
+		let installedProfiles = (try? await ZagRPPairingFreeAccountInstaller.readProfiles().get()) ?? []
+		let profiles = installedProfiles.compactMap { try? ZagIssuedProfile(profileData: $0) }
+		let installedFreeApps = Set(profiles.filter {
+			installed[$0.bundleIdentifier] != nil && $0.expiresAt > Date()
+				&& $0.expiresAt.timeIntervalSince($0.createdAt) <= 7 * 86_400 + 60
+		}.map(\.bundleIdentifier))
+
 		let consent = ZagMutationConsentCoordinator()
 		consent.authorize([.addDevice, .addAppID, .submitCSR, .downloadProfile, .addAppGroup, .assignAppGroups])
 		defer { consent.cancel() }
-		let portal = portal(token: token, consent: consent)
+		let components = [main] + extensions
+		let groupCount = components.reduce(0) {
+			$0 + (($1.entitlements.dictionary[ZagFreeAccountEntitlements.appGroupsKey] as? [String])?.count ?? 0)
+		}
+		let portal = portal(token: token, consent: consent, maxRequests: 24 + 8 * components.count + groupCount)
 		guard let team = try await portal.teams().first(where: { $0.isPersonalTeam && (expectedScope == nil || $0.teamID == expectedScope?.teamID) }) else { throw Failure.personalTeam }
 		let authorization = ZagSigningAuthorization.nativeAccount(token: token, teamID: team.teamID)
 		let scope = authorization.scope
 		guard expectedScope == nil || expectedScope == scope else { throw Failure.signIn }
 		let keys = ZagKeychainSigningKeys(namespace: namespace)
-		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: ZagKeychainSigningKeyFactory(keys: keys),
-													secrets: secrets, account: scope.accountID)
-		let request = ZagProvisioningRequest(accountID: scope.accountID, team: scope.teamID, deviceUDID: device.udid,
-											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: [])
-		let result: ZagProvisioningResult
-		switch await provisioner.provision(request, authorization: authorization) {
-		case .success(let provisioned):
-			result = provisioned
-		case .failure(let failure):
+		let keyFactory = ZagKeychainSigningKeyFactory(keys: keys)
+		let cache = ProfileCache(scope: scope)
+		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: keyFactory,
+			secrets: secrets, certificateMinimumRemaining: 0, saveProfile: { cache.save($0) }, account: scope.accountID)
+		var request = ZagProvisioningRequest(accountID: scope.accountID, team: scope.teamID, deviceUDID: device.udid,
+											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: installedFreeApps)
+		let componentIDs = Set(components.map(\.originalBundleIdentifier))
+		let mappedIDs = Set(componentIDs.compactMap { id in
+			id == main.originalBundleIdentifier
+				? ZagBundleIdentifierMapping.mapped(id, team: scope.teamID)
+				: ZagBundleIdentifierMapping.mappedExtension(id, appOriginal: main.originalBundleIdentifier, team: scope.teamID)
+		})
+		request.reusableProfiles = (profiles + mappedIDs.compactMap { cache.profile(for: $0) }).filter {
+			$0.teamIdentifier == scope.teamID && mappedIDs.contains($0.bundleIdentifier)
+				&& (try? ZagCMSVerifier.verify($0.data).get()) != nil
+		}
+		do {
+			return try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: app,
+				provisioner: provisioner, secrets: secrets,
+				signer: ZagFreeAccountSigningAdapter(signer: ZagZsignCodeSigner(), keychainKeys: keys),
+				installer: ZagRPPairingFreeAccountInstaller(),
+				verifyTarget: {
+					guard ZagDeveloperTokenStore().load(scope: "device")?.accountID == token.accountID else { throw Failure.signIn }
+					guard pairing.hasSavedPairing, pairing.pairedIdentity == device else { throw Failure.pairing }
+				})
+		} catch let failure as ZagProvisioningFailure {
 			switch failure.kind {
 			case .certificateRequestUnresolved:
-				let recovery = ZagCertificateRecoveryModel(scope: scope, service: LockedRecovery(provisioner: provisioner)) { scope in
+				let reader = Self.portal(token: token, consent: ZagDenyingMutationConsent())
+				let recoveryProvisioner = ZagFreeAccountProvisioner(portal: reader, keys: keyFactory, secrets: secrets, account: scope.accountID)
+				let recovery = ZagCertificateRecoveryModel(scope: scope, service: LockedRecovery(provisioner: recoveryProvisioner)) { scope in
 					guard let current = ZagDeveloperTokenStore().load(scope: "device"), current.isUsable(at: Date()) else {
 						throw Failure.signIn
 					}
@@ -133,22 +194,6 @@ enum ZagNativeAccountInstall {
 				throw failure
 			}
 		}
-		guard let data = try secrets.load(.signingPrivateKey, account: scope.accountID, team: scope.teamID) else {
-			throw Failure.identity
-		}
-		let identity = try JSONDecoder().decode(ZagSigningIdentity.self, from: data)
-		let adapter = ZagFreeAccountSigningAdapter(signer: ZagZsignCodeSigner(), keychainKeys: keys)
-		let record = try adapter.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: Date())
-		guard ZagDeveloperTokenStore().load(scope: "device")?.accountID == token.accountID else { throw Failure.signIn }
-		guard ZagDeveloperAccountLive.pairedDevice?.udid == device.udid else { throw Failure.pairing }
-		let installer = ZagRPPairingFreeAccountInstaller()
-		try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier)
-		return await installer.verify(ZagInstallExpectation(
-			bundleIdentifier: record.bundleIdentifier, profileUUID: result.app.profile.uuid,
-			profileExpiresAt: result.app.profile.expiresAt, certificateExpiresAt: record.certificateExpiresAt,
-			signerCommonName: ZagCertificateInspection(der: identity.certificate)?.commonName,
-			teamIdentifier: result.team, extensionProfileUUIDs: result.extensions.map(\.profile.uuid)
-		))
 	}
 
 	private static func component(at app: URL, name: String) throws -> ZagProvisioningRequest.Component {

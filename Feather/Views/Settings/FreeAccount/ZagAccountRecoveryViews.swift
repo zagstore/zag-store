@@ -133,6 +133,8 @@ struct ZagStoredAccountDataView<Extra: View>: View {
 struct ZagCertificateRecoveryView: View {
 	@ObservedObject var model: ZagCertificateRecoveryModel
 	var teamName: String
+	var onResolved: (() -> Void)? = nil
+	@Environment(\.dismiss) private var dismiss
 
 	var body: some View {
 		Form {
@@ -201,6 +203,15 @@ struct ZagCertificateRecoveryView: View {
 		.navigationBarTitleDisplayMode(.inline)
 		.zagWallpaperSurface()
 		.task { await model.load() }
+		.onChange(of: model.phase) { phase in
+			guard phase == .idle, let onResolved else { return }
+			switch model.outcome {
+			case .recovered, .abandoned:
+				dismiss()
+				onResolved()
+			default: break
+			}
+		}
 		.confirmationDialog(
 			"Abandon This Certificate Request?",
 			isPresented: Binding(get: { model.phase == .confirmingAbandon }, set: { if !$0 { model.cancelAbandon() } }),

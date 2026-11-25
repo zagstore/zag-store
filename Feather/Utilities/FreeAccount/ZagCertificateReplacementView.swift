@@ -81,7 +81,7 @@ final class ZagCertificateReplacementModel: ObservableObject {
 				try await ZagNativeAccountInstall.withExclusiveOperation {
 					if case .selected(let target) = await driver.currentState(),
 					   let identity = try Self.nativeIdentity(scope),
-					   target.serialNumber.caseInsensitiveCompare(identity.serialNumber) == .orderedSame {
+					   ZagActiveCertificateGuard.sameSerial(target.serialNumber, identity.serialNumber) {
 						throw ZagReplacementError.targetNowActive
 					}
 					try await driver.confirmAndRevoke()
@@ -176,6 +176,8 @@ final class ZagCertificateReplacementModel: ObservableObject {
 
 struct ZagCertificateReplacementView: View {
 	@StateObject var model: ZagCertificateReplacementModel
+	var onRevoked: (() -> Void)? = nil
+	@Environment(\.dismiss) private var dismiss
 
 	var body: some View {
 		List {
@@ -214,6 +216,11 @@ struct ZagCertificateReplacementView: View {
 		}
 		.navigationTitle("Development Certificates")
 		.task { await model.onAppear() }
+		.onChange(of: model.state) { state in
+			guard case .revoked = state, let onRevoked else { return }
+			dismiss()
+			onRevoked()
+		}
 	}
 
 	private var inventorySection: some View {

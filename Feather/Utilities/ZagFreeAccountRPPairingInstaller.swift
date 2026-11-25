@@ -12,10 +12,18 @@ import Zip
 /// signed app before installation can be reported as verified.
 /// The G5 experiment also records its separate four-way read-back result.
 struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
-	enum Failure: Error, Equatable {
+	enum Failure: LocalizedError, Equatable {
 		case disabled
 		case packaging
 		case install(String)
+
+		var errorDescription: String? {
+			switch self {
+			case .disabled: "Apple Account installation is unavailable in this build."
+			case .packaging: "Zag Store could not package the signed app for installation."
+			case .install(let reason): reason
+			}
+		}
 	}
 
 	var gate = ZagFreeAccountSigningGate.production
@@ -68,7 +76,7 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 		let listed: Result<ZagRPPairingCore.InstalledAppInfo?, Error> = await withCheckedContinuation { continuation in
 			Task { @MainActor in
 				do {
-					try ZagRPPairingCore.shared.refreshInstalledApps { result in
+					try ZagRPPairingCore.shared.refreshInstalledApps(joinExisting: true) { result in
 						continuation.resume(returning: result.map { _ in ZagRPPairingCore.shared.installedApps[expectation.bundleIdentifier] })
 					}
 				} catch {
@@ -82,6 +90,8 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 		case .success(nil):
 			return .notInstalled
 		case .success(let app?):
+			if let version = expectation.version, !app.version.isEmpty, app.version != version { return .mismatch("installed version") }
+			if let build = expectation.build, !app.build.isEmpty, app.build != build { return .mismatch("installed build") }
 			if let expected = expectation.signerCommonName, !app.signerIdentity.isEmpty, app.signerIdentity != expected {
 				return .mismatch("signer")
 			}

@@ -43,8 +43,9 @@ enum ZagDeveloperAccountLive {
 	/// The paired device, if any.
 	@MainActor
 	static var pairedDevice: ZagTargetDevice? {
-		guard case .paired(let name, _, let udid) = ZagRPPairingCore.shared.state, !udid.isEmpty else { return nil }
-		return ZagTargetDevice(udid: udid, name: name)
+		let pairing = ZagRPPairingCore.shared
+		guard pairing.hasSavedPairing, let identity = pairing.pairedIdentity else { return nil }
+		return ZagTargetDevice(udid: identity.udid, name: identity.name)
 	}
 
 	/// The Library's imported (unsigned) apps that can be signed.

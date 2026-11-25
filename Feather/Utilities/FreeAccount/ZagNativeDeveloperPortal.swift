@@ -123,7 +123,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 			response = try await transport.send(request)
 		} catch let error as ZagTransportError {
 			fault.set(Self.transportReason(error))
-			throw ZagPortalError.network
+			throw error
 		}
 		// A non-2xx that parse collapses to `.network` (not 401/403/429) keeps its
 		// status, so the banner shows e.g. "HTTP 404" instead of a bare "network".
@@ -366,7 +366,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		let request = ZagHTTPRequest(url: try ZagDeveloperServicesV1.endpoint(path), method: "POST", headers: requestHeaders, body: body)
 		fault.set(nil)
 		do { return try await transport.send(request) }
-		catch let error as ZagTransportError { fault.set(Self.transportReason(error)); throw ZagPortalError.network }
+		catch let error as ZagTransportError { fault.set(Self.transportReason(error)); throw error }
 	}
 
 	/// Maps a parsed certificate (transport-independent) to the app model.

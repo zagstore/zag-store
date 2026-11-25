@@ -84,8 +84,13 @@ struct ZagActiveCertificateGuard: Sendable {
 
 	func classify(_ cert: ZagRevocableCertificate) -> Usage {
 		if let s = activeSHA1, let c = cert.sha1, c.caseInsensitiveCompare(s) == .orderedSame { return .activeProtected }
-		if let s = activeSerial, cert.serialNumber.caseInsensitiveCompare(s) == .orderedSame { return .activeProtected }
+		if let s = activeSerial, Self.sameSerial(cert.serialNumber, s) { return .activeProtected }
 		return .unknownUsage
+	}
+
+	static func sameSerial(_ lhs: String, _ rhs: String) -> Bool {
+		guard !lhs.isEmpty, !rhs.isEmpty else { return false }
+		return lhs.uppercased().drop(while: { $0 == "0" }) == rhs.uppercased().drop(while: { $0 == "0" })
 	}
 
 	/// Revocation is allowed for a non-active certificate, or for the active one

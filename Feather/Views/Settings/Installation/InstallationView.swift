@@ -55,9 +55,9 @@ private struct RPPairingView: View {
 				"Pairing",
 				titleSystemImage: "iphone.radiowaves.left.and.right",
                 usesPairingIcon: true,
-				value: pairingCore.localPairingCleanupPending ? "Cleanup Required" : (pairingCore.pairingFileExists ? "Saved Locally" : "Setup Required"),
-				systemImage: pairingCore.pairingFileExists && !pairingCore.localPairingCleanupPending ? "checkmark.circle.fill" : "exclamationmark.circle",
-				color: pairingCore.pairingFileExists && !pairingCore.localPairingCleanupPending ? .green : .orange
+				value: pairingCore.localPairingCleanupPending ? "Cleanup Required" : (pairingCore.hasSavedPairing ? "Saved Locally" : "Setup Required"),
+				systemImage: pairingCore.hasSavedPairing ? "checkmark.circle.fill" : "exclamationmark.circle",
+				color: pairingCore.hasSavedPairing ? .green : .orange
 			)
 
 			Button {

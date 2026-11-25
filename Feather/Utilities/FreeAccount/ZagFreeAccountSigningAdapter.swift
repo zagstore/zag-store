@@ -77,7 +77,7 @@ struct ZagZsignCodeSigner: ZagCodeSigner {
 }
 #endif
 
-enum ZagFreeAccountSigningError: Error, Equatable {
+enum ZagFreeAccountSigningError: LocalizedError, Equatable {
 	/// Free-account signing is not enabled in this build.
 	case disabled
 	/// No valid authorisation for the result's account and team.
@@ -99,6 +99,21 @@ enum ZagFreeAccountSigningError: Error, Equatable {
 	/// The identity carries key bytes, and writing them for the signer is
 	/// not allowed (`allowsKeyFiles`).
 	case keyFilesNotAllowed
+	var errorDescription: String? {
+		switch self {
+		case .disabled: "Apple Account signing is unavailable in this build."
+		case .notAuthorized: "The Apple Account session expired before signing completed."
+		case .identityMismatch: "The signing certificate does not match the provisioning profile."
+		case .bundleMismatch: "The app’s bundle identifier changed before signing."
+		case .extensionsNeedPerBundleSigning: "One or more app extensions could not be matched to provisioning profiles."
+		case .staging: "The app’s signing files could not be prepared."
+		case .signer(let reason): "Zsign could not sign the app. \(reason)"
+		case .verification(let reason): "The signed app failed verification. \(reason)"
+		case .keychainSigningUnavailable: "Keychain signing is unavailable in this build."
+		case .keychainKeyMissing: "The signing key could not be read from this iPhone’s Keychain."
+		case .keyFilesNotAllowed: "This signing method requires a Keychain-backed signing key."
+		}
+	}
 }
 
 /// Signs one provisioned app with Zsign.
@@ -319,6 +334,10 @@ struct ZagInstallExpectation: Equatable, Sendable {
 	var teamIdentifier: String?
 	/// Each extension's profile, which the device installs alongside the app's.
 	var extensionProfileUUIDs: [String] = []
+	var version: String?
+	var build: String?
+	var certificateSerial: String?
+	var extensionIdentifiers: [String: String] = [:]
 }
 
 /// Compares the provisioning profiles the device reports as installed
@@ -342,13 +361,21 @@ enum ZagInstalledProfileCheck {
 			return .mismatch("profile App ID")
 		}
 		guard abs(app.ExpirationDate.timeIntervalSince(expectation.profileExpiresAt)) < 1 else { return .mismatch("profile expiry") }
+		if let serial = expectation.certificateSerial, !containsCertificate(app, serial: serial) { return .mismatch("profile certificate") }
 		var earliest = app.ExpirationDate
 		for uuid in expectation.extensionProfileUUIDs {
 			guard let profile = byUUID[uuid] else { return .unverifiable("an extension's profile is not among the device's installed profiles") }
 			guard profile.TeamIdentifier.first == team else { return .mismatch("extension profile team") }
+			if let bundle = expectation.extensionIdentifiers[uuid],
+			   profile.Entitlements?["application-identifier"]?.value as? String != "\(team).\(bundle)" { return .mismatch("extension profile App ID") }
+			if let serial = expectation.certificateSerial, !containsCertificate(profile, serial: serial) { return .mismatch("extension profile certificate") }
 			earliest = min(earliest, profile.ExpirationDate)
 		}
 		return .verified(profileExpiresAt: earliest, certificateExpiresAt: expectation.certificateExpiresAt)
+	}
+
+	private static func containsCertificate(_ profile: Certificate, serial: String) -> Bool {
+		profile.DeveloperCertificates?.contains { ZagCertificateInspection(der: $0)?.serialNumber == serial } == true
 	}
 }
 
@@ -369,6 +396,50 @@ enum ZagInstallVerification: Equatable, Sendable {
 protocol ZagFreeAccountInstaller: Sendable {
 	func install(signedApp: URL, bundleIdentifier: String) async throws
 	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification
+}
+
+/// The native signing entry point and offline integration tests run this same
+/// sequence. The caller owns account selection, source staging and the device
+/// transport. A verified install always comes from the device's read-back.
+enum ZagNativeSigningPipeline {
+	enum Failure: LocalizedError {
+		case missingIdentity
+
+		var errorDescription: String? { "Zag Store could not load the provisioned signing identity." }
+	}
+
+	static func run(
+		_ request: ZagProvisioningRequest, authorization: ZagSigningAuthorization, app: URL,
+		provisioner: ZagFreeAccountProvisioner, secrets: ZagFreeAccountSecretStore,
+		signer: ZagAppSigning, installer: ZagFreeAccountInstaller,
+		verifyTarget: @MainActor () throws -> Void, now: @Sendable () -> Date = { Date() }
+	) async throws -> ZagInstallVerification {
+		let result = try await provisioner.provision(request, authorization: authorization).get()
+		guard let data = try secrets.load(.signingPrivateKey, account: request.accountID, team: request.team) else {
+			throw Failure.missingIdentity
+		}
+		let identity = try JSONDecoder().decode(ZagSigningIdentity.self, from: data)
+		let record = try signer.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: now())
+		let info = (try? Data(contentsOf: app.appendingPathComponent("Info.plist")))
+			.flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) } as? [String: Any]
+		let expectation = ZagInstallExpectation(
+			bundleIdentifier: record.bundleIdentifier, profileUUID: result.app.profile.uuid,
+			profileExpiresAt: result.app.profile.expiresAt, certificateExpiresAt: record.certificateExpiresAt,
+			signerCommonName: ZagCertificateInspection(der: identity.certificate)?.commonName,
+			teamIdentifier: result.team, extensionProfileUUIDs: result.extensions.map(\.profile.uuid),
+			version: info?["CFBundleShortVersionString"] as? String,
+			build: info?["CFBundleVersion"] as? String, certificateSerial: identity.serialNumber,
+			extensionIdentifiers: Dictionary(result.extensions.map { ($0.profile.uuid, $0.bundleIdentifier) }, uniquingKeysWith: { first, _ in first })
+		)
+		try Task.checkCancellation()
+		guard result.expiresAt > now(), identity.expiresAt > now() else {
+			throw ZagFreeAccountSigningError.verification("The signing certificate or provisioning profile expired before installation.")
+		}
+		try await verifyTarget()
+		try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier)
+		try await verifyTarget()
+		return await installer.verify(expectation)
+	}
 }
 
 // MARK: - Lifecycle

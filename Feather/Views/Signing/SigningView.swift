@@ -64,10 +64,10 @@ struct SigningView: View {
 				if _signingMethod == .freeAppleAccount {
 					if !ZagNativeAccountInstall.hasSession {
 						NavigationLink("Connect Apple Account") { ZagAppleSigningSettingsView() }
-					} else if case .paired = _accountPairing.state {
-						EmptyView()
-					} else {
+					} else if !_accountPairing.hasSavedPairing {
 						Text("Pair this iPhone in Settings to install apps.").foregroundStyle(.secondary)
+					} else if _accountPairing.pairedIdentity == nil {
+						Text("Zag Store will identify this iPhone using its saved pairing when you start.").foregroundStyle(.secondary)
 					}
 					Text("Sign and install with your Personal Team. Zag Store may register this iPhone and app with Apple and issue a signing certificate and provisioning profiles.")
 						.font(.footnote).foregroundStyle(.secondary)
@@ -76,13 +76,13 @@ struct SigningView: View {
 							Text(issue.failure.message).font(.footnote)
 							if let recovery = issue.recovery {
 								NavigationLink("Recover Certificate Request") {
-									ZagCertificateRecoveryView(model: recovery, teamName: issue.teamName)
+									ZagCertificateRecoveryView(model: recovery, teamName: issue.teamName, onResolved: _startAccountInstall)
 								}
 							}
 							NavigationLink("Manage Development Certificates") {
-								ZagCertificateReplacementView(model: .inventory(team: issue.scope.teamID, expectedScope: issue.scope))
+								ZagCertificateReplacementView(model: .inventory(team: issue.scope.teamID, expectedScope: issue.scope), onRevoked: _startAccountInstall)
 							}
-							Text("Return here and tap Resume Sign and Install after resolving the certificate issue.")
+							Text("Signing continues after the certificate request is resolved.")
 								.font(.footnote).foregroundStyle(.secondary)
 						}
 					}
@@ -900,8 +900,7 @@ extension SigningView {
 	private var _canStartSigning: Bool {
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		if _signingMethod == .freeAppleAccount {
-			guard case .paired(_, _, let udid) = _accountPairing.state else { return false }
-			return !udid.isEmpty && ZagNativeAccountInstall.hasSession && !_isSigning
+			return _accountPairing.hasSavedPairing && ZagNativeAccountInstall.hasSession && !_isSigning
 		}
 		#endif
 		return true
@@ -933,8 +932,10 @@ extension SigningView {
 				switch result {
 				case .verified: _accountInstallMessage = "Installed and verified on this iPhone. Open the app from the Home Screen."
 				case .unverifiable(let reason): _accountInstallMessage = "Installation could not be verified. \(reason)"
-				case .mismatch, .notInstalled:
-					_accountInstallMessage = ZagNativeAccountInstall.Failure.installationUnverified.localizedDescription
+				case .mismatch(let reason):
+					_accountInstallMessage = "The installed app could not be verified (\(reason))."
+				case .notInstalled:
+					_accountInstallMessage = "The app did not appear in the paired iPhone’s installed-app list."
 				}
 			} catch let issue as ZagNativeAccountInstall.CertificateIssue {
 				_certificateIssue = issue

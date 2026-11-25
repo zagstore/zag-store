@@ -18,6 +18,7 @@ struct ZagProvisioningRequest: Sendable {
 	let extensions: [Component]
 	/// Mapped bundle IDs on the device already signed by this team.
 	let installedFreeAccountApps: Set<String>
+	var reusableProfiles: [ZagIssuedProfile] = []
 }
 
 /// Everything signing needs: the identity and, per bundle, the profile and
@@ -173,7 +174,7 @@ struct ZagProvisioningFailure: LocalizedError, Equatable, Sendable {
 				? "Apple refused the certificate request. An existing certificate or a pending request may be blocking issuance. Review the team’s certificates before retrying."
 				: "Apple refused to issue a certificate. Review the team’s certificates before deciding whether to replace one."
 		case .certificateRequestUnresolved: return "An earlier certificate request may have succeeded, but Zag Store cannot confirm it. Check this Apple Account's certificates before requesting another."
-		case .invalidProfile: return "Apple issued a provisioning profile Zag Store cannot use."
+		case .invalidProfile(let problem): return "The provisioning profile failed validation (\(problem.rawValue))."
 		case .keyStorage: return "The signing key could not be stored in this device's Keychain."
 		case .sessionRejected: return "Your Apple Account session has expired. Sign in again."
 		case .network: return "Apple's developer services could not be reached."
@@ -207,6 +208,8 @@ actor ZagFreeAccountProvisioner {
 	private let secrets: ZagFreeAccountSecretStore
 	private let diagnostics: ZagFreeAccountDiagnostics
 	private let operationTimeout: TimeInterval
+	private let certificateMinimumRemaining: TimeInterval
+	private let saveProfile: (@Sendable (ZagIssuedProfile) -> Void)?
 	private let now: @Sendable () -> Date
 	private(set) var currentStep: ZagProvisioningFailure.Step?
 	/// Account and team scopes with an operation running. Provisioning,
@@ -225,6 +228,8 @@ actor ZagFreeAccountProvisioner {
 		secrets: ZagFreeAccountSecretStore,
 		diagnostics: ZagFreeAccountDiagnostics = ZagFreeAccountDiagnostics(),
 		operationTimeout: TimeInterval = 30,
+		certificateMinimumRemaining: TimeInterval = 7 * 86_400,
+		saveProfile: (@Sendable (ZagIssuedProfile) -> Void)? = nil,
 		account: UUID? = nil,
 		now: @escaping @Sendable () -> Date = { Date() }
 	) {
@@ -234,6 +239,8 @@ actor ZagFreeAccountProvisioner {
 		self.secrets = secrets
 		self.diagnostics = diagnostics
 		self.operationTimeout = operationTimeout
+		self.certificateMinimumRemaining = certificateMinimumRemaining
+		self.saveProfile = saveProfile
 		self.now = now
 	}
 
@@ -418,13 +425,24 @@ actor ZagFreeAccountProvisioner {
 		var results: [ZagProvisioningResult.Component] = []
 		for component in components {
 			guard let appID = appIDs[component.bundle] else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .profiles) }
-			let profile = try await call { try await portal.profile(for: appID, team: team) }
+			let cached = request.reusableProfiles
+				.filter { profile in
+					let groups = profile.entitlements.dictionary[ZagFreeAccountEntitlements.appGroupsKey] as? [String] ?? []
+					return Set(groupsByBundle[component.bundle] ?? []).isSubset(of: groups)
+						&& ZagProvisioningProfileCheck.check(profile, team: team, bundleIdentifier: component.bundle,
+							deviceUDID: request.deviceUDID, certificateSerial: identity.serialNumber, now: now()) == nil
+				}
+				.max { $0.expiresAt < $1.expiresAt }
+			let profile: ZagIssuedProfile
+			if let cached { profile = cached }
+			else { profile = try await call { try await portal.profile(for: appID, team: team) } }
 			if let problem = ZagProvisioningProfileCheck.check(
 				profile, team: team, bundleIdentifier: component.bundle,
 				deviceUDID: request.deviceUDID, certificateSerial: identity.serialNumber, now: now()
 			) {
 				throw ZagProvisioningFailure(kind: .invalidProfile(problem), step: .profiles)
 			}
+			if cached == nil { saveProfile?(profile) }
 			let resolved = ZagFreeAccountEntitlements.resolve(
 				requested: component.request.entitlements.dictionary,
 				profile: profile.entitlements.dictionary,
@@ -465,7 +483,7 @@ actor ZagFreeAccountProvisioner {
 		let stored = (try? secrets.load(.signingPrivateKey, account: request.accountID, team: team))
 			.flatMap { $0 }
 			.flatMap { try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
-		let remote = try await call { try await portal.certificates(team: team) }
+		let listed = try await call { try await portal.certificates(team: team) }
 		// The stored identity counts as "key on this device" only if its key is
 		// still there and still belongs to its certificate (a Keychain key can
 		// be missing after a reset, a restore or a removed item). Otherwise a
@@ -476,10 +494,19 @@ actor ZagFreeAccountProvisioner {
 		if stored != nil && usable == nil {
 			diagnostics.record("Stored signing key missing or not matching its certificate; a new one is needed", at: now())
 		}
+		let remote = listed.map { certificate in
+			if let usable, certificate.expiresAt == .distantPast,
+			   ZagActiveCertificateGuard.sameSerial(certificate.serialNumber, usable.serialNumber) {
+				return ZagDevelopmentCertificate(serialNumber: usable.serialNumber, name: certificate.name,
+					machineName: certificate.machineName, expiresAt: usable.expiresAt, data: certificate.data)
+			}
+			return certificate
+		}
 		let plan = ZagCertificatePlan.make(
 			remote: remote,
 			localKeySerials: usable.map { [$0.serialNumber] } ?? [],
 			limit: nil,
+			minimumRemaining: certificateMinimumRemaining,
 			now: now()
 		)
 		switch plan {
@@ -782,7 +809,11 @@ actor ZagFreeAccountProvisioner {
 			pending.attempts += 1
 			diagnostics.record("Retrying the pending certificate request (attempt \(pending.attempts))", at: now())
 		} else {
-			try? secrets.delete(.pendingSigningKey, account: account, team: team)
+			do {
+				try secrets.delete(.pendingSigningKey, account: account, team: team)
+			} catch {
+				throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
+			}
 			try? keys.discardKeys(account: account, team: team, except: inUse.map { [$0.keySlot] } ?? [])
 			let made: (privateKey: Data, request: ZagCertificateRequest, keySlot: String?)
 			do {

@@ -17,6 +17,11 @@ clean:
 	rm -rf packages
 	rm -rf Payload
 
+iphoneos: RPPairingCore/build/device/libzag_rppairing_core.a
+
+RPPairingCore/build/device/libzag_rppairing_core.a: RPPairingCore/build-rust.sh RPPairingCore/rust-core/Cargo.toml RPPairingCore/rust-core/Cargo.lock RPPairingCore/rust-core/src/lib.rs
+	bash RPPairingCore/build-rust.sh
+
 $(PLATFORMS):
 	rm -rf _build
 

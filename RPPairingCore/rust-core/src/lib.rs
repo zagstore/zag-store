@@ -534,14 +534,13 @@ where
 
     match mode {
         SessionMode::Production => {
-            rpc.connect(&mut pairing_file, || async { "000000".to_string() })
-                .await
-                .map_err(|error| format!("RPPairing pair-verify failed: {error}"))?;
-
-            pairing_file
-                .write_to_file(pairing_path)
-                .await
-                .map_err(|error| format!("Unable to persist verified RPPairing credentials: {error}"))?;
+            timeout(Duration::from_secs(20), async {
+                rpc.attempt_pair_verify().await?;
+                rpc.validate_pairing(&mut pairing_file).await
+            })
+            .await
+            .map_err(|_| "Timed out verifying saved RPPairing credentials".to_string())?
+            .map_err(|error| format!("RPPairing pair-verify failed: {error}"))?;
         }
         SessionMode::Diagnostic => {
             rpc.attempt_pair_verify()
@@ -1472,8 +1471,10 @@ pub unsafe extern "C" fn zag_installed_apps(
             }
         };
         runtime.block_on(async move {
-            if let Err(error) = run_installed_apps(device_ip, pairing_path, callback).await {
-                emit(callback, -6, error);
+            match timeout(Duration::from_secs(45), run_installed_apps(device_ip, pairing_path, callback)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => emit(callback, -6, error),
+                Err(_) => emit(callback, -6, "Timed out reading installed apps over RPPairing".to_string()),
             }
         });
     });
@@ -1490,6 +1491,19 @@ async fn run_installed_apps(
         &pairing_path,
         |_stage, _message| {},
         |mut adapter, mut handshake| async move {
+            // The saved host plist has no hardware UDID. Read it from the
+            // authenticated tunnel so existing pairings migrate without a PIN.
+            let udid = match handshake.properties.get("UniqueDeviceID").and_then(plist::Value::as_string) {
+                Some(value) if !value.is_empty() => Some(value.to_owned()),
+                _ => timeout(Duration::from_secs(6), async {
+                    let mut lockdown = LockdownClient::connect_rsd(&mut adapter, &mut handshake).await?;
+                    lockdown.get_value(Some("UniqueDeviceID"), None).await
+                }).await.ok().and_then(Result::ok).and_then(|value| value.into_string()),
+            };
+            if let Some(udid) = udid.filter(|value| !value.is_empty()) {
+                emit(callback, 405, udid);
+            }
+
             let mut installation_proxy =
                 InstallationProxyClient::connect_rsd(&mut adapter, &mut handshake)
                     .await
@@ -1711,8 +1725,10 @@ pub unsafe extern "C" fn zag_installed_profiles(
             }
         };
         runtime.block_on(async move {
-            if let Err(error) = run_installed_profiles(device_ip, pairing_path, output_dir, callback).await {
-                emit(callback, -8, error);
+            match timeout(Duration::from_secs(45), run_installed_profiles(device_ip, pairing_path, output_dir, callback)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => emit(callback, -8, error),
+                Err(_) => emit(callback, -8, "Timed out reading provisioning profiles over RPPairing".to_string()),
             }
         });
     });
@@ -1808,9 +1824,10 @@ pub unsafe extern "C" fn zag_gate4_install(
             }
         };
         runtime.block_on(async move {
-            if let Err(error) = run_gate4_install(device_ip, pairing_path, ipa_path, callback).await
-            {
-                emit(callback, -4, error);
+            match timeout(Duration::from_secs(30 * 60), run_gate4_install(device_ip, pairing_path, ipa_path, callback)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => emit(callback, -4, error),
+                Err(_) => emit(callback, -4, "Installation timed out. Check installed apps before retrying.".to_string()),
             }
         });
     });

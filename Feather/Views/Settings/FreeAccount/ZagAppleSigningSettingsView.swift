@@ -20,8 +20,8 @@ struct ZagAppleSigningSettingsView: View {
 	/// Real on-device state, read in `.task` (the machine's provisioning check is
 	/// actor-isolated). Both default to a conservative "not yet" so the screen
 	/// never implies a session or profile exists before it does.
+	@ObservedObject private var pairing = ZagRPPairingCore.shared
 	@State private var signedIn = false
-	@State private var provisioned = false
 	/// The Personal Team id, discovered from the same authenticated session the
 	/// sign-in screen uses. The certificate inventory lists against this team;
 	/// an empty team is rejected (401/403) by Apple's services.
@@ -49,8 +49,7 @@ struct ZagAppleSigningSettingsView: View {
 	}
 
 	private func refresh() async {
-		guard engineLinked else { signedIn = false; provisioned = false; teamID = ""; return }
-		provisioned = await ZagAppleAuthMachine.nativeAccount().isProvisioned()
+		guard engineLinked else { signedIn = false; teamID = ""; return }
 		signedIn = ZagDeveloperTokenStore().load(scope: "device")?.isUsable(at: Date()) == true
 		guard signedIn else { teamID = ""; return }
 		// Same authenticated native machine + persisted developer session as the
@@ -131,13 +130,10 @@ struct ZagAppleSigningSettingsView: View {
 	private var deviceSection: some View {
 		Section {
 			HStack(alignment: .firstTextBaseline, spacing: 12) {
-				// Green only when sign-in has verified this device with Apple
-				// end-to-end. A stored ADI profile on its own is NOT a success: it
-				// may be stale or rejected, so it is shown as neutral, not green.
-				Image(systemName: signedIn ? "checkmark.circle.fill" : "iphone")
-					.foregroundStyle(signedIn ? .green : tint).frame(width: 24)
+				Image(systemName: pairing.hasSavedPairing ? "checkmark.circle.fill" : "iphone")
+					.foregroundStyle(pairing.hasSavedPairing ? .green : tint).frame(width: 24)
 				VStack(alignment: .leading, spacing: 2) {
-					Text("Device provisioning").font(.subheadline.weight(.medium))
+					Text("Installation pairing").font(.subheadline.weight(.medium))
 					Text(deviceDetail).font(.caption).foregroundStyle(.secondary)
 				}
 			}
@@ -149,12 +145,9 @@ struct ZagAppleSigningSettingsView: View {
 	}
 
 	private var deviceDetail: String {
-		if signedIn {
-			return "Your Apple Account session is available on this iPhone."
-		}
-		return provisioned
-			? "A setup profile is stored on this iPhone, but it is confirmed only when you sign in — stored setup alone is not a guarantee."
-			: "Set up automatically the first time you sign in. A free-account profile lasts 7 days."
+		if let identity = pairing.pairedIdentity, pairing.hasSavedPairing { return "\(identity.name) is paired for installation." }
+		if pairing.hasSavedPairing { return "Pairing is saved. Zag Store will read this iPhone’s identifier when you install." }
+		return "Set up pairing in Settings to install signed apps."
 	}
 
 	// MARK: Signing method (explicit choice; existing methods preserved)

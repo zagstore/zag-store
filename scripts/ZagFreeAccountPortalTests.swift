@@ -114,6 +114,7 @@ extension Result where Failure == ZagProvisioningFailure {
 
 	static func main() async {
 		await nativeCertificateInventory()
+		await nativeInstallAndRestart()
 		await firstProvisioning()
 		await reuseAndRefresh()
 		await limitsCheckedBeforeChanges()
@@ -203,6 +204,108 @@ extension Result where Failure == ZagProvisioningFailure {
 			}
 		} catch {
 			check(false, "native inventory and CSR flow: \(error)")
+		}
+	}
+
+	@MainActor
+	static func nativeInstallAndRestart() async {
+		enum Interruption: Error { case duringInstall }
+		final class Signer: ZagAppSigning, @unchecked Sendable {
+			private let lock = NSLock()
+			private var staged: ZagProvisioningResult?
+			var result: ZagProvisioningResult? { lock.withLock { staged } }
+
+			func sign(appAt app: URL, with result: ZagProvisioningResult, identity: ZagSigningIdentity,
+					  authorization: ZagSigningAuthorization, now: Date) throws -> ZagSignedAppRecord {
+				guard identity.serialNumber == result.certificateSerial, authorization.scope.teamID == result.team,
+					  result.app.entitlements.dictionary["application-identifier"] as? String == "\(result.team).\(result.app.bundleIdentifier)" else {
+					throw ZagFreeAccountSigningError.identityMismatch
+				}
+				try Data(result.app.bundleIdentifier.utf8).write(to: app.appendingPathComponent("simulated-signature"))
+				lock.withLock { staged = result }
+				return .init(bundleIdentifier: result.app.bundleIdentifier,
+					originalBundleIdentifier: result.app.originalBundleIdentifier, signedAt: now,
+					profileExpiresAt: result.expiresAt, certificateExpiresAt: identity.expiresAt)
+			}
+		}
+		actor Installer: ZagFreeAccountInstaller {
+			let interrupted: Bool
+			var installed: String?
+			init(interrupted: Bool) { self.interrupted = interrupted }
+
+			func install(signedApp: URL, bundleIdentifier: String) async throws {
+				let signature = try String(contentsOf: signedApp.appendingPathComponent("simulated-signature"), encoding: .utf8)
+				guard signature == bundleIdentifier else { throw ZagFreeAccountSigningError.verification("signature") }
+				if interrupted { throw Interruption.duringInstall }
+				installed = bundleIdentifier
+			}
+
+			func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification {
+				guard installed == expectation.bundleIdentifier else { return .notInstalled }
+				guard expectation.version == "1.2", expectation.build == "7",
+					  expectation.teamIdentifier == team, !expectation.profileUUID.isEmpty else { return .mismatch("handoff") }
+				return .verified(profileExpiresAt: expectation.profileExpiresAt, certificateExpiresAt: expectation.certificateExpiresAt)
+			}
+		}
+
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+		defer { try? FileManager.default.removeItem(at: root) }
+		let credentials = root.appendingPathComponent("rppairing.plist")
+		let metadata = root.appendingPathComponent("rppairing-device.plist")
+		let device = ZagPairedDeviceIdentity(name: "Test iPhone", model: "iPhone", udid: "0000ABCD-0123456789ABCDEF")!
+		do {
+			try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+			func writeHost(_ byte: UInt8) throws {
+				try PropertyListSerialization.data(fromPropertyList: [
+					"identifier": "Zag Store", "public_key": Data(repeating: byte, count: 32),
+					"private_key": Data(repeating: 2, count: 32)
+				], format: .xml, options: 0).write(to: credentials)
+			}
+			try writeHost(1)
+			let migration = ZagSavedPairing(credentials: credentials, metadata: metadata)
+			check(migration.hasCredentials && migration.restore(cleanupPending: false) == nil,
+				  "legacy credentials allow identity migration without pairing again")
+			try migration.save(device)
+			let restarted = ZagSavedPairing(credentials: credentials, metadata: metadata)
+			check(restarted.restore(cleanupPending: false) == device && restarted.restore(cleanupPending: true) == nil,
+				  "a restarted core restores the saved device and respects pending cleanup")
+			try writeHost(3)
+			check(restarted.restore(cleanupPending: false) == nil, "a replaced host key invalidates stale device metadata")
+			try writeHost(1)
+			let restored = restarted.restore(cleanupPending: false)!
+			let harness = await Harness.make()
+			let authorization = await harness.authorization()
+			let component = request().app
+			var request = ZagProvisioningRequest(accountID: harness.account, team: team, deviceUDID: restored.udid,
+				deviceName: restored.name, app: component, extensions: [], installedFreeAccountApps: [])
+			try PropertyListSerialization.data(fromPropertyList: [
+				"CFBundleShortVersionString": "1.2", "CFBundleVersion": "7"
+			], format: .xml, options: 0).write(to: root.appendingPathComponent("Info.plist"))
+			let signer = Signer()
+			do {
+				_ = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+					provisioner: harness.provisioner, secrets: harness.secrets, signer: signer, installer: Installer(interrupted: true),
+					verifyTarget: {}, now: { harness.clock.now })
+				check(false, "interrupted installer must report its failure")
+			} catch Interruption.duringInstall {
+				check(true, "the production pipeline surfaces a simulated installation interruption")
+			}
+			guard let result = signer.result else { return check(false, "signing produced a provisioning result") }
+			request.reusableProfiles = [result.app.profile]
+			let newProvisioner = ZagFreeAccountProvisioner(portal: harness.portal, keys: ZagSimulatedSigningKeyFactory(),
+				secrets: harness.secrets, account: harness.account, now: { harness.clock.now })
+			let verification = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+				provisioner: newProvisioner, secrets: harness.secrets, signer: signer, installer: Installer(interrupted: false),
+				verifyTarget: {}, now: { harness.clock.now })
+			let calls = await harness.portal.calls
+			check(calls.filter { $0 == .registerDevice }.count == 1 && calls.filter { $0 == .registerAppID }.count == 1
+				  && calls.filter { $0 == .submitCertificateRequest }.count == 1 && calls.filter { $0 == .profile }.count == 1,
+				  "resumed pipeline reuses the device, App ID, certificate and valid profile")
+			check(verification == .verified(profileExpiresAt: result.app.profile.expiresAt,
+				certificateExpiresAt: harness.storedIdentity!.expiresAt),
+				  "resumed pipeline signs, installs and independently verifies the intended app")
+		} catch {
+			check(false, "native signing restart and installation: \(error)")
 		}
 	}
 
