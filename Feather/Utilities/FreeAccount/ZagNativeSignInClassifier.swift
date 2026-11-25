@@ -105,7 +105,8 @@ enum ZagNativeSignInClassifier {
 	/// authentication and the developer session both succeeded.
 	static func failure(report: ZagAppleAuthSignInReport, developerOK: Bool) -> ZagNativeSignInFailure? {
 		let detail = diagnostic(stage: report.stage, ec: report.ec, http: report.httpStatus,
-								message: report.appleMessage, requestCount: report.requestCount)
+								message: report.appleMessage, requestCount: report.requestCount,
+								refusals: report.refusals ?? [])
 		switch report.outcome {
 		case .authenticated:
 			guard !developerOK else { return nil }
@@ -142,13 +143,20 @@ enum ZagNativeSignInClassifier {
 	}
 
 	/// A sanitized, human-readable one-line diagnostic. Contains only the stage,
-	/// Apple `ec`, HTTP status and Apple's pre-sanitized message — no secrets.
-	static func diagnostic(stage: String?, ec: Int?, http: Int?, message: String?, requestCount: Int) -> String? {
+	/// Apple `ec`, HTTP status, Apple's pre-sanitized message and — when a request
+	/// was refused before it left the device — the refusal's class and reason
+	/// (e.g. `verificationInitiation/no-consent`, `transport/method-put`). No
+	/// secrets: the refusal record is only a class name and a fixed reason string.
+	static func diagnostic(stage: String?, ec: Int?, http: Int?, message: String?, requestCount: Int,
+						   refusals: [[String: String]] = []) -> String? {
 		var parts: [String] = []
 		if let stage { parts.append("stage \(stage)") } else { parts.append("request \(requestCount)") }
 		if let ec { parts.append("Apple ec \(ec)") }
 		if let http { parts.append("HTTP \(http)") }
 		if let message, !message.isEmpty { parts.append(message) }
+		if let r = refusals.first, let cls = r["class"], let reason = r["reason"] {
+			parts.append("refused: \(cls)/\(reason)")
+		}
 		return parts.isEmpty ? nil : parts.joined(separator: " · ")
 	}
 }

@@ -38,6 +38,7 @@ struct ZagAppleAuthSignInReport: Equatable {
 	var ec: Int? = nil
 	var httpStatus: Int? = nil
 	var appleMessage: String? = nil
+	var refusals: [[String: String]]? = nil
 	var developerOutcome: ZagDeveloperSessionOutcome? = nil
 }
 
@@ -118,6 +119,16 @@ enum ZagNativeSignInClassifierTestMain {
 		check(ZagNativeSignInClassifier.failure(
 			report: ZagAppleAuthSignInReport(outcome: .authenticated, developerOutcome: .ok), developerOK: true) == nil,
 			  "authenticated + developer OK via report → not a failure")
+
+		// A pre-request transport refusal surfaces its class/reason in the detail,
+		// so a "could not reach Apple" is never opaque (e.g. a consent-gated
+		// provisioning request, or a method/host refusal).
+		let refused = ZagNativeSignInClassifier.failure(
+			report: ZagAppleAuthSignInReport(outcome: .transportFailed, requestCount: 0,
+				refusals: [["class": "verificationInitiation", "reason": "no-consent"]]), developerOK: false)
+		check(refused?.recovery == .retry
+			  && (refused?.detail?.contains("verificationInitiation/no-consent") ?? false),
+			  "transport refusal → retry; detail names the refusal class/reason")
 
 		// Recovery text is always present and non-empty
 		let all: [ZagNativeSignInFailure.Recovery] = [.retry, .checkCredentials, .provisionADI, .unsupportedBuild, .waitAndRetry, .deviceIdentity]

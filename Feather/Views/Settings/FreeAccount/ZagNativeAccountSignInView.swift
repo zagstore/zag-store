@@ -80,19 +80,25 @@ final class ZagNativeSignInModel: ObservableObject {
 		// Pressing Sign In is the consent. This contacts only Apple's ADI
 		// endpoint to identify this iPhone — it signs, installs, issues and
 		// revokes nothing — and it leaves all other app data intact.
-		let alreadyProvisioned = await machine.isProvisioned()
-		if !alreadyProvisioned {
-			notice = "Setting up this iPhone with Apple (one-time)…"
-			do {
-				_ = try await machine.anisetteHeaders(allowProvisioning: true)
-				notice = nil
-			} catch let error as ZagAppleAuthError {
-				finish(failure: ZagNativeSignInClassifier.failure(error: error))
-				return
-			} catch {
-				finish(failure: ZagNativeSignInFailure(message: "On-device setup with Apple could not complete.", recovery: .provisionADI))
-				return
-			}
+		// Always refresh the on-device ADI session through the provisioning
+		// transport (not the gated sign-in transport) before authenticating. This
+		// rewrites the stored ADI state so the sign-in's own provisioning step
+		// derives its one-time password locally and issues no gated network
+		// request. A stale profile (e.g. upgraded from an earlier build) would
+		// otherwise force that request onto the gated transport, where it is
+		// refused before any password is sent. The round-trip is local and fast
+		// once provisioned; the first time it establishes this iPhone's identity.
+		let firstTime = !(await machine.isProvisioned())
+		notice = firstTime ? "Setting up this iPhone with Apple (one-time)…" : "Preparing this iPhone…"
+		do {
+			_ = try await machine.anisetteHeaders(allowProvisioning: true)
+			notice = nil
+		} catch let error as ZagAppleAuthError {
+			finish(failure: ZagNativeSignInClassifier.failure(error: error))
+			return
+		} catch {
+			finish(failure: ZagNativeSignInFailure(message: "On-device setup with Apple could not complete.", recovery: .provisionADI))
+			return
 		}
 		#endif
 
@@ -170,8 +176,12 @@ final class ZagNativeSignInModel: ObservableObject {
 		stageObservation = Task { @MainActor [weak self] in
 			for await stage in coordinator.$stage.values {
 				guard let self else { return }
-				// Only reflect live intermediate stages; the terminal phase is
-				// set by signIn() from the engine's final outcome.
+				// Only reflect live intermediate stages, and never override a
+				// terminal phase: once signIn() has finished (success or failure)
+				// a late/buffered stage value must not resurrect "Signing in…"
+				// alongside the result. finish()/finishSignedIn() cancel this
+				// task; this guard closes the buffered-value race on top of that.
+				if Task.isCancelled || self.phase == .failed || self.phase == .signedIn { continue }
 				switch stage {
 				case .idle:            self.phase = .signedOut
 				case .authenticating:  self.phase = .authenticating
@@ -203,6 +213,7 @@ final class ZagNativeSignInModel: ObservableObject {
 	private func finish(failure: ZagNativeSignInFailure?) {
 		isBusy = false
 		stageObservation?.cancel()
+		notice = nil
 		self.failure = failure
 		phase = failure == nil ? .signedOut : .failed
 	}
@@ -210,6 +221,7 @@ final class ZagNativeSignInModel: ObservableObject {
 	private func finishSignedIn() {
 		isBusy = false
 		stageObservation?.cancel()
+		notice = nil
 		failure = nil
 		phase = .signedIn
 	}

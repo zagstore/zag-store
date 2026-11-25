@@ -19,13 +19,16 @@ enum ZagAppleAuthRequestClass: String, Sendable, Equatable {
 	case other
 
 	/// Classifies a request robustly, without depending on the opaque URL-bag
-	/// values for the verification endpoints. The only URL fact relied upon is the
+	/// values for the verification endpoints. Two URL facts are relied upon: the
 	/// hardcoded `/grandslam/GsService2` path (the URL-bag lookup and every SRP
-	/// request, including the post-2FA re-auth). apple-auth issues no other
-	/// request during login except the 2FA steps, so every non-GsService2 request
-	/// is a verification step and is consent-gated. Code submission is identified
-	/// by the SMS `securitycode` path or the trusted-device `security-code`
-	/// request header — the two ways apple-auth carries the entered code.
+	/// request, including the post-2FA re-auth), and the ADI provisioning
+	/// round-trip (`midStartProvisioning` / `midFinishProvisioning`, whose URLs
+	/// are resolved from the URL-bag and so are NOT under `/grandslam/GsService2`).
+	/// Both establish the authenticated session: neither is a 2FA-delivery step,
+	/// so neither may be consent-gated. Everything else apple-auth issues during
+	/// login is a verification step and IS consent-gated. Code submission is
+	/// identified by the SMS `securitycode` path or the trusted-device
+	/// `security-code` request header — the two ways apple-auth carries the code.
 	static func classify(url: String, method: String = "POST", hasSecurityCodeHeader: Bool = false) -> ZagAppleAuthRequestClass {
 		let u = url.lowercased()
 		// Code submission is checked FIRST: the trusted-device `validateCode`
@@ -33,7 +36,11 @@ enum ZagAppleAuthRequestClass: String, Sendable, Equatable {
 		// request must be recognised before the GsService2 (authentication) rule,
 		// or it would be mis-counted as authentication and exhaust that ceiling.
 		if u.contains("securitycode") || hasSecurityCodeHeader { return .codeSubmission }
-		if u.contains("/grandslam/gsservice2") { return .authentication }
+		// GsService2 (lookup + SRP) and ADI provisioning (midStart/midFinish) are
+		// authentication, never 2FA delivery. Gating provisioning would refuse the
+		// sign-in's own on-device identity round-trip before any password is sent —
+		// the "could not reach Apple" pre-request failure this prevents.
+		if u.contains("/grandslam/gsservice2") || u.contains("provisioning") { return .authentication }
 		if u.hasPrefix("https://") { return .verificationInitiation }
 		return .other
 	}
@@ -41,11 +48,14 @@ enum ZagAppleAuthRequestClass: String, Sendable, Equatable {
 
 /// Separate request ceilings per class, plus the explicit consent flag that
 /// gates any verification-delivery request. Defaults cover the full flow:
-/// authentication 5 (lookup + init + complete + the re-auth init/complete after
-/// 2FA), verification initiation 2 (SMS config + delivery; 1 suffices for
-/// trusted-device), code submission 1. Consent defaults to NOT granted.
+/// authentication 7 (ADI midStart + midFinish provisioning, then the URL-bag
+/// lookup + SRP init + complete + the re-auth init/complete after 2FA),
+/// verification initiation 2 (SMS config + delivery; 1 suffices for
+/// trusted-device), code submission 1. Consent defaults to NOT granted. Only the
+/// authentication bound is sized for provisioning; the consent-gated verification
+/// bound is unchanged, so 2FA delivery stays bounded and consent-gated.
 struct ZagTwoFactorPolicy: Sendable, Equatable {
-	var authenticationCeiling = 5
+	var authenticationCeiling = 7
 	var verificationInitiationCeiling = 2
 	var codeSubmissionCeiling = 1
 	var consentToDeliver = false

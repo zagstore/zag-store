@@ -165,15 +165,21 @@ struct ZagOnDeviceAnisetteTests {
 		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/GsService2/validate", method: "GET", hasSecurityCodeHeader: true) == .codeSubmission, "GsService2-hosted validateCode w/ header -> code-submission")
 		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/auth/opaque-validate", method: "GET") == .verificationInitiation, "validate URL w/o header -> verification-initiation")
 		check(ZagAppleAuthRequestClass.classify(url: "not-a-url") == .other, "non-https -> other")
+		// ADI provisioning (midStart/midFinish, resolved from the URL-bag and NOT
+		// under /grandslam/GsService2) is authentication, never verification: it
+		// must not be consent-gated, or the sign-in's own provisioning step is
+		// refused before any password is sent (the pre-request sign-in failure).
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/midStartProvisioning", method: "POST") == .authentication, "ADI midStartProvisioning -> authentication (never consent-gated)")
+		check(ZagAppleAuthRequestClass.classify(url: "https://gsa.apple.com/grandslam/midFinishProvisioning", method: "POST") == .authentication, "ADI midFinishProvisioning -> authentication (never consent-gated)")
 		let pol = ZagTwoFactorPolicy()
 		check(pol.consentToDeliver == false, "consent defaults to NOT granted")
-		check(pol.authenticationCeiling == 5 && pol.verificationInitiationCeiling == 2 && pol.codeSubmissionCeiling == 1, "default per-class ceilings")
+		check(pol.authenticationCeiling == 7 && pol.verificationInitiationCeiling == 2 && pol.codeSubmissionCeiling == 1, "default per-class ceilings (auth sized for provisioning)")
 		check(pol.allows(.verificationInitiation, alreadyAccepted: 0) == false, "verification delivery refused without consent")
 		var consented = pol; consented.consentToDeliver = true
 		check(consented.allows(.verificationInitiation, alreadyAccepted: 0) == true, "verification delivery allowed after consent")
 		check(consented.allows(.verificationInitiation, alreadyAccepted: 2) == false, "verification delivery refused past its ceiling")
 		check(consented.allows(.codeSubmission, alreadyAccepted: 0) == true && consented.allows(.codeSubmission, alreadyAccepted: 1) == false, "code submission capped at 1")
-		check(consented.allows(.authentication, alreadyAccepted: 4) == true && consented.allows(.authentication, alreadyAccepted: 5) == false, "authentication capped at 5")
+		check(consented.allows(.authentication, alreadyAccepted: 6) == true && consented.allows(.authentication, alreadyAccepted: 7) == false, "authentication capped at 7 (provisioning + login)")
 		// Developer-session apptokens is a POST to /grandslam/GsService2, so it is
 		// authentication-class: it can never be classified as verification and so is
 		// never consent-gated and can never initiate a 2FA delivery (audit item 5).
@@ -183,8 +189,8 @@ struct ZagOnDeviceAnisetteTests {
 		// ceiling by one: a full 2FA login (5 auth) plus the apptokens exchange (1
 		// auth) must fit, a further request must not (audit item 4).
 		var combined = ZagTwoFactorPolicy(); combined.authenticationCeiling += 1
-		check(combined.authenticationCeiling == 6, "combined flow raises authentication ceiling to 6")
-		check(combined.allows(.authentication, alreadyAccepted: 5) == true && combined.allows(.authentication, alreadyAccepted: 6) == false, "combined flow admits 5 login + 1 apptokens, no more")
+		check(combined.authenticationCeiling == 8, "combined flow raises authentication ceiling to 8")
+		check(combined.allows(.authentication, alreadyAccepted: 7) == true && combined.allows(.authentication, alreadyAccepted: 8) == false, "combined flow admits provisioning + login + apptokens, no more")
 		check(combined.verificationInitiationCeiling == pol.verificationInitiationCeiling && combined.codeSubmissionCeiling == pol.codeSubmissionCeiling, "combined flow leaves verification/code ceilings untouched")
 		let denier = ZagDenyingTwoFactorController()
 		check(denier.consentToDeliver() == false && denier.provideCode() == nil && denier.didCancel, "denying controller cancels cleanly, no code")

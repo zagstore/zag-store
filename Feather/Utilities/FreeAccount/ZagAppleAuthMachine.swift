@@ -172,9 +172,13 @@ final class ZagAppleAuthTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 	}
 
 	func perform(url: String, method: String, headers: [String: String], body: Data) -> (Int, Data, [[String]])? {
-		guard allowNetwork else { lock.lock(); log.append("BLOCKED (offline)"); lock.unlock(); return nil }
-		guard let u = URL(string: url), u.scheme == "https", let host = u.host, host.hasSuffix(".apple.com") else { return nil }
-		guard allowedMethods.contains(method) else { return nil }
+		guard allowNetwork else { lock.lock(); log.append("BLOCKED (offline)"); refusals.append(("transport", "offline")); lock.unlock(); return nil }
+		guard let u = URL(string: url), u.scheme == "https", let host = u.host, host.hasSuffix(".apple.com") else {
+			lock.lock(); log.append("REFUSED (host/scheme)"); refusals.append(("transport", "host-or-scheme")); lock.unlock(); return nil
+		}
+		guard allowedMethods.contains(method) else {
+			lock.lock(); log.append("REFUSED (method)"); refusals.append(("transport", "method-\(method.lowercased())")); lock.unlock(); return nil
+		}
 		if let policy = twoFactorPolicy {
 			let hasCodeHeader = headers.contains { $0.key.lowercased() == "security-code" }
 			let cls = ZagAppleAuthRequestClass.classify(url: url, method: method, hasSecurityCodeHeader: hasCodeHeader)

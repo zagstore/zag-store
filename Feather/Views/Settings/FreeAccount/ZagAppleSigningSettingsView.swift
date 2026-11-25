@@ -1,311 +1,129 @@
 #if canImport(SwiftUI)
 import SwiftUI
 
-// First-class "Apple Account & Signing" home for Zag Store's native standalone
-// signing feature. It is the single coherent entry point for the native engine
-// that already lives in Feather/Utilities/FreeAccount — Apple-Account
-// authentication, Personal-Team selection, certificate inventory and the
-// consent-gated 7460 replacement workflow, device provisioning, on-device
-// (non-extractable) signing through Zsign, signature verification and the
-// installation handoff.
+// "Apple Account & Signing" — the single native home for signing apps with a
+// free Apple Account entirely on this iPhone. A clean, native Settings surface:
+// account, certificate, device and signing method. No experimental scaffolding,
+// readiness ladders or developer-only diagnostics; provisioning and the
+// developer session are handled by the sign-in flow itself, not exposed as
+// separate steps here. Debug/inspection screens exist only in DEBUG builds.
 //
-// Honesty is a hard requirement of this screen (see the task boundaries and
-// ZagCertificateReplacementView): it must NEVER imply that provisioning or
-// signing has succeeded before it is verified live. So every live-capable row
-// is explicitly labelled with the build's actual mode:
-//   • Offline            — no native bridge linked; live Apple contact impossible.
-//   • Read-only (live)   — the bridge is linked and the first live session is
-//                          limited to the certificate inventory; every mutating
-//                          Developer Services endpoint is blocked at the
-//                          transport (ZagReadOnlyTransport), not merely hidden.
-// Mutations (revoke, CSR) remain behind their own separate confirmations and are
-// never performed automatically.
+// Honesty is still a hard requirement: nothing is reported as signed in,
+// provisioned or installed until it is actually true (the rows read real
+// on-device state), and every irreversible certificate operation keeps its own
+// explicit confirmation inside ZagCertificateReplacementView.
 
 struct ZagAppleSigningSettingsView: View {
 	@AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
 	private var tint: Color { Color(hex: themeColorHex) }
 
-	/// True when this build links the real native Apple-auth module, i.e. a live
-	/// path is compiled in. The shipping build does not link it, so this is false
-	/// and the feature is offline by design.
-	private var bridgeLinked: Bool {
-		#if canImport(ZagAppleAuth)
-		return true
-		#else
-		return false
-		#endif
-	}
+	/// Real on-device state, read in `.task` (the machine's provisioning check is
+	/// actor-isolated). Both default to a conservative "not yet" so the screen
+	/// never implies a session or profile exists before it does.
+	@State private var signedIn = false
+	@State private var provisioned = false
 
-	// With the native bridge linked (the standard device build), the certificate
-	// inventory is connected to the real developer-services portal through the
-	// read-only transport: inventory can run live, every mutation is blocked.
-	// Without the bridge (e.g. simulator) the feature is fully offline.
-	private var modeTitle: String { bridgeLinked ? "Read-only (live inventory)" : "Offline" }
-	private var modeColor: Color { bridgeLinked ? .orange : .secondary }
+	/// Whether this build links the native engine. Device builds do; the
+	/// simulator does not, in which case the whole feature is unavailable.
+	private var engineLinked: Bool { ZagAppleAuthMachine.isLinked }
 
 	var body: some View {
 		List {
 			overviewSection
-			readinessSection
-			accountSection
-			certificateSection
-			provisioningSection
-			signingSection
-			signingMethodSection
+			if engineLinked {
+				accountSection
+				certificateSection
+				deviceSection
+				signingMethodSection
+			} else {
+				unavailableSection
+			}
 			safetySection
 		}
 		.navigationTitle("Apple Account & Signing")
-		.task { await refreshReadiness() }
+		.task { await refresh() }
 	}
 
-	// MARK: Overview / honest status
+	private func refresh() async {
+		guard engineLinked else { signedIn = false; provisioned = false; return }
+		provisioned = await ZagAppleAuthMachine.nativeAccount().isProvisioned()
+		signedIn = ZagDeveloperTokenStore().hasToken(scope: "device")
+	}
+
+	// MARK: Overview
 
 	private var overviewSection: some View {
 		Section {
 			HStack(spacing: 12) {
 				Image(systemName: "key.horizontal.fill")
-					.font(.title2).foregroundStyle(tint)
-					.frame(width: 30)
+					.font(.title2).foregroundStyle(tint).frame(width: 30)
 				VStack(alignment: .leading, spacing: 3) {
 					Text("Native signing").font(.headline)
 					Text("Sign apps with your own free Apple Account, entirely on this iPhone — no Mac and no external signing service.")
 						.font(.footnote).foregroundStyle(.secondary)
 				}
 			}
-			LabeledContent {
-				Text(modeTitle).font(.subheadline.weight(.medium)).foregroundStyle(modeColor)
-			} label: {
-				Label("Current mode", systemImage: "dot.radiowaves.left.and.right")
-			}
 		} footer: {
-			Text("This feature is experimental. Nothing is sent to Apple, no certificate is created or revoked, and no app is signed or installed until you explicitly authorise each step. Steps that have not been verified against Apple are shown as experimental and never reported as complete.")
-		}
-	}
-
-	// MARK: Readiness (four distinct prerequisites + the single next action)
-
-	/// The live readiness, from locally-read facts only (no Apple contact). The
-	/// machine's provisioning state is actor-isolated, so it is refreshed in a
-	/// `.task` into this state rather than computed synchronously. Certificate
-	/// availability stays unverified until a real certificate is confirmed (it
-	/// cannot be asserted offline). Authentication alone never implies signing.
-	@State private var readiness = ZagNativeSigningReadiness(
-		buildSupportsLiveAuth: false, authenticated: false, adiProvisioned: false,
-		certificateAvailable: false, signingGateOpen: false)
-
-	/// Whether this build actually links and enables live on-device sign-in. In
-	/// the shipping AppTesters build this is false by design (live auth is only in
-	/// the supervised live-test build), which is why an unguarded sign-in attempt
-	/// could only ever fail. Surfacing it is what turns "Failed" into a reason.
-	private var liveAuthAvailable: Bool {
-		#if ZAG_APPLE_BRIDGE
-		return ZagLiveAuthentication.isEnabled && ZagIsideloadBridge.liveCompiled
-		#else
-		return false
-		#endif
-	}
-
-	private func refreshReadiness() async {
-		let linked = ZagAppleAuthMachine.isLinked
-		let provisioned = linked ? await ZagAppleAuthMachine.nativeAccount().isProvisioned() : false
-		let authed = linked && ZagDeveloperTokenStore().hasToken(scope: "device")
-		readiness = ZagNativeSigningReadiness(
-			buildSupportsLiveAuth: liveAuthAvailable,
-			authenticated: authed,
-			adiProvisioned: provisioned,
-			certificateAvailable: false,   // verified only against a real certificate; none issued yet
-			signingGateOpen: ZagFreeAccountSigning.isEnabled
-		)
-	}
-
-	private var readinessSection: some View {
-		let r = readiness
-		return Section {
-			ForEach(ZagNativeSigningStage.allCases, id: \.rawValue) { stage in
-				readinessRow(stage, status: r.status(of: stage))
-			}
-			recoveryRow(r.recovery)
-		} header: {
-			Text("Readiness")
-		} footer: {
-			Text("Authentication, device provisioning, certificate availability and signing readiness are checked independently. Native signing becomes available only when all four are verified — being signed in is never sufficient on its own. The next step is highlighted above.")
-		}
-	}
-
-	private func readinessRow(_ stage: ZagNativeSigningStage, status: ZagNativeSigningStageStatus) -> some View {
-		let icon: String
-		let color: Color
-		let label: String
-		switch status {
-		case .done:    icon = "checkmark.circle.fill"; color = .green;     label = "Ready"
-		case .blocked: icon = stage.systemImage;       color = .orange;    label = "Next step"
-		case .pending: icon = "circle";                color = .secondary; label = "Waiting"
-		}
-		return HStack(spacing: 12) {
-			Image(systemName: icon).foregroundStyle(color).frame(width: 24)
-			Text(stage.title).font(.subheadline)
-			Spacer(minLength: 8)
-			Text(label).font(.caption2.weight(status == .blocked ? .bold : .regular)).foregroundStyle(color)
-		}
-	}
-
-	@ViewBuilder
-	private func recoveryRow(_ recovery: ZagNativeSigningRecovery) -> some View {
-		switch recovery {
-		case .signIn:
-			NavigationLink(destination: ZagAppleAccountSignInView().zagSettingsDestinationAvatar()) {
-				recoveryLabel(recovery)
-			}
-		case .confirmADIProvisioning:
-			NavigationLink(destination: ZagADIProvisioningConfirmView().zagSettingsDestinationAvatar()) {
-				recoveryLabel(recovery)
-			}
-		case .provisionCertificate:
-			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
-				recoveryLabel(recovery)
-			}
-		case .enableLiveBuild, .enableSigningBuild, .ready:
-			recoveryLabel(recovery)
-		}
-	}
-
-	private func recoveryLabel(_ recovery: ZagNativeSigningRecovery) -> some View {
-		HStack(alignment: .firstTextBaseline, spacing: 12) {
-			Image(systemName: recovery == .ready ? "checkmark.seal.fill" : "arrow.forward.circle")
-				.foregroundStyle(recovery == .ready ? .green : tint).frame(width: 24)
-			VStack(alignment: .leading, spacing: 2) {
-				Text(recovery.actionTitle).font(.subheadline.weight(.medium))
-				Text(recovery.detail).font(.caption).foregroundStyle(.secondary)
-			}
+			Text("Your Apple Account password, two-factor codes, signing key and app contents stay on this iPhone and are never logged. Nothing is sent to Apple, signed or installed until you ask for it.")
 		}
 	}
 
 	// MARK: Apple Account
 
-	/// The native Apple-auth module is linked (device builds link it by default).
-	private var machineLinked: Bool { ZagAppleAuthMachine.isLinked }
-	/// The on-device anisette/ADI provider is enabled in this build. Off in
-	/// production until the live sign-in gate passes; without it, sign-in has no
-	/// anisette source and cannot obtain a GrandSlam session.
-	private var adiEnabled: Bool { ZagAppleAuthADI.isEnabled }
-	/// Whether sign-in can run live in this build: both gates must be satisfied.
-	private var signInLive: Bool { machineLinked && adiEnabled }
-
 	private var accountSection: some View {
-		Section {
-			gateRow("Native module linked", ok: machineLinked,
-					detail: machineLinked ? "The on-device Apple-auth engine is compiled into this build."
-										  : "This build (e.g. simulator) does not link the engine.")
-			gateRow("On-device sign-in enabled", ok: adiEnabled,
-					detail: adiEnabled ? "The on-device anisette/ADI provider is active."
-									   : "Not enabled in this build; sign-in has no anisette source yet.")
+		Section("Apple Account") {
 			NavigationLink(destination: ZagAppleAccountSignInView().zagSettingsDestinationAvatar()) {
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
-						Text("Connect Apple Account")
-						Text(signInLive ? "Sign in with your free Apple Account (password + two-factor)."
-										: "Opens the real sign-in; live auth needs the on-device-sign-in build.")
+						Text(signedIn ? "Apple Account" : "Sign in with your Apple Account")
+						Text(signedIn ? "Signed in on this iPhone. Tap to manage the session."
+									  : "Use your free Apple Account and two-factor code.")
 							.font(.caption).foregroundStyle(.secondary)
 					}
-				} icon: { Image(systemName: "person.crop.circle") }
+				} icon: {
+					Image(systemName: signedIn ? "person.crop.circle.badge.checkmark" : "person.crop.circle")
+						.foregroundStyle(signedIn ? .green : tint)
+				}
 			}
 			.accessibilityIdentifier("settings.appleSigning.connect")
-			statusRow(icon: "person.2", title: "Personal Team",
-					  detail: "Discovered from the signed-in account; a free account has one Personal Team.",
-					  state: .pending)
-		} header: {
-			Text("Apple Account")
-		} footer: {
-			Text(signInLive
-				 ? "Signing in obtains and persists a developer session (x-apple-gs-token) in Zag Store's own Keychain. Passwords, two-factor codes and tokens are never logged."
-				 : "The developer-session token path is implemented (sign-in → token store → developer headers → inventory). It is not a platform limitation: enabling the on-device sign-in build plus a one-time account provisioning is what remains before a live session can be obtained here.")
 		}
 	}
 
-	private func gateRow(_ title: String, ok: Bool, detail: String) -> some View {
-		HStack(alignment: .firstTextBaseline, spacing: 12) {
-			Image(systemName: ok ? "checkmark.circle.fill" : "circle")
-				.foregroundStyle(ok ? .green : .secondary).frame(width: 24)
-			VStack(alignment: .leading, spacing: 2) {
-				Text(title).font(.subheadline.weight(.medium))
-				Text(detail).font(.caption).foregroundStyle(.secondary)
-			}
-		}
-	}
-
-	// MARK: Signing certificate (+ 7460 replacement)
+	// MARK: Signing certificate (+ consent-gated replacement)
 
 	private var certificateSection: some View {
 		Section {
-			statusRow(icon: "checkmark.seal", title: "Signing certificate",
-					  detail: "A development certificate for this iPhone's non-extractable signing key.",
-					  state: .pending)
-			// The one native workflow wired in every build: the certificate
-			// inventory and the consent-gated 7460 replacement. Backed by the
-			// disabled portal unless a live bridge build enables the read-only
-			// inventory; revoke and CSR are always separately confirmed and are
-			// blocked at the transport in a read-only session.
 			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
-				Label(bridgeLinked ? "Certificate inventory" : "Certificate inventory & replacement",
-					  systemImage: "arrow.triangle.2.circlepath")
+				Label("Signing certificate", systemImage: "checkmark.seal")
 			}
 		} header: {
 			Text("Certificate")
 		} footer: {
-			Text("Some Apple Accounts already hold the maximum number of development certificates (Apple error 7460). Replacing one may let a new request succeed, but Apple may still refuse — it is never guaranteed, and the certificate in use is always protected.")
+			Text("A development certificate for this iPhone's signing key. If your account already holds the maximum (Apple error 7460), you can replace one — always with a separate confirmation, and the certificate currently in use is always protected.")
 		}
 	}
 
-	// MARK: Device provisioning
+	// MARK: Device
 
-	private var provisioningSection: some View {
+	private var deviceSection: some View {
 		Section {
-			statusRow(icon: "iphone", title: "Device registration",
-					  detail: "This iPhone is registered with your account during provisioning.",
-					  state: .pending)
-			statusRow(icon: "doc.badge.gearshape", title: "Provisioning profile",
-					  detail: "A free-account profile lasts 7 days and is renewed automatically where permitted.",
-					  state: .pending)
-			#if DEBUG || ZAG_LIVE_EXPERIMENT
-			NavigationLink(destination: ZagInstalledProfilesDebugView().zagSettingsDestinationAvatar()) {
-				Label("Installed profiles (read only)", systemImage: "lock.doc")
+			HStack(alignment: .firstTextBaseline, spacing: 12) {
+				Image(systemName: provisioned ? "checkmark.circle.fill" : "iphone")
+					.foregroundStyle(provisioned ? .green : tint).frame(width: 24)
+				VStack(alignment: .leading, spacing: 2) {
+					Text("Device provisioning").font(.subheadline.weight(.medium))
+					Text(provisioned
+						 ? "This iPhone is set up with Apple. A free-account profile lasts 7 days and is renewed automatically where permitted."
+						 : "Set up automatically the first time you sign in. A free-account profile lasts 7 days.")
+						.font(.caption).foregroundStyle(.secondary)
+				}
 			}
-			#endif
 		} header: {
-			Text("Device provisioning")
+			Text("Device")
 		}
 	}
 
-	// MARK: Signing & installation workflow
-
-	private var signingSection: some View {
-		Section {
-			workflowRow(1, "Download the IPA", "From your chosen source.")
-			workflowRow(2, "Verify the source artifact", "Before anything is signed.")
-			workflowRow(3, "Provision a signing identity", "Reusing this iPhone's key; a new certificate only with your consent.")
-			workflowRow(4, "Sign locally with Zsign", "On this iPhone; the private key never leaves the Keychain.")
-			workflowRow(5, "Verify the signed IPA", "Independently of the signing library.")
-			workflowRow(6, "Install and report", "Through Zag Store's existing installation, preserving current options.")
-		} header: {
-			Text("Signing & installation")
-		} footer: {
-			Text("Your Apple Account credentials, signing keys and app contents never leave this iPhone. Live signing and installation require a native-bridge build and separate authorisation; until then these steps are experimental.")
-		}
-	}
-
-	// MARK: Signing method (explicit, user-selectable; existing methods preserved)
-
-	/// The current readiness of the native method, from the real availability
-	/// model. Conservative free-account state (signed-out) until a live session
-	/// exists, so it honestly reports the next required step rather than success.
-	private var nativeMethodStatus: String {
-		let none = ZagSigningMethodAvailability.ImportedCertificates(total: 0, usable: 0, nearestExpiry: nil)
-		switch ZagSigningMethodAvailability.status(of: .freeAppleAccount, imported: none, freeAccount: .signedOut) {
-		case .ready(let d):          return d
-		case .actionRequired(let m): return m
-		case .external(let m):       return m
-		}
-	}
+	// MARK: Signing method (explicit choice; existing methods preserved)
 
 	private var signingMethodSection: some View {
 		Section {
@@ -315,14 +133,22 @@ struct ZagAppleSigningSettingsView: View {
 					Text(ZagSigningMethod.freeAppleAccount.title).font(.subheadline.weight(.medium))
 					Text(ZagSigningMethod.freeAppleAccount.summary).font(.caption).foregroundStyle(.secondary)
 				}
-				Spacer(minLength: 8)
-				Text(nativeMethodStatus).font(.caption2).foregroundStyle(.orange)
-					.multilineTextAlignment(.trailing)
 			}
 		} header: {
 			Text("Signing method")
 		} footer: {
-			Text("Native Apple Account signing is an explicit choice, offered alongside — never instead of — AppTesters, Imported Certificate, BYOC and Developer Account. It routes an install through the on-device signer (ZagFreeAccountSigningAdapter) and the provisioning coordinator; it runs only after you sign in and a signing identity is provisioned, and it never redirects an install you did not choose.")
+			Text("Native Apple Account signing is offered alongside — never instead of — AppTesters, Imported Certificate, BYOC and Developer Account. It signs through the on-device signer and never redirects an install you did not choose.")
+		}
+	}
+
+	// MARK: Unavailable (engine not linked, e.g. simulator)
+
+	private var unavailableSection: some View {
+		Section {
+			Label("Native signing is unavailable in this build.", systemImage: "exclamationmark.triangle")
+				.font(.footnote).foregroundStyle(.secondary)
+		} footer: {
+			Text("This build does not link the on-device Apple engine (for example, the simulator). Use the iPhone build to sign with a free Apple Account.")
 		}
 	}
 
@@ -330,46 +156,10 @@ struct ZagAppleSigningSettingsView: View {
 
 	private var safetySection: some View {
 		Section {
-			Label("This feature keeps its own Keychain state in Zag Store's own access group.", systemImage: "lock.shield")
+			Label("Keeps its own Keychain state in Zag Store's access group.", systemImage: "lock.shield")
 				.font(.footnote)
-			Label("It does not read or migrate any other app's signing key or certificate request.", systemImage: "hand.raised")
+			Label("Never reads or modifies another app's signing key or certificate.", systemImage: "hand.raised")
 				.font(.footnote)
-		} footer: {
-			Text("A signing identity created here is isolated to Zag Store. Identities held by other apps (for example a separate development prototype) are not accessible and are never modified.")
-		}
-	}
-
-	// MARK: Row helpers
-
-	private enum RowState { case pending, experimental }
-
-	private func statusRow(icon: String, title: String, detail: String, state: RowState) -> some View {
-		HStack(alignment: .firstTextBaseline, spacing: 12) {
-			Image(systemName: icon).foregroundStyle(tint).frame(width: 24)
-			VStack(alignment: .leading, spacing: 2) {
-				Text(title).font(.subheadline.weight(.medium))
-				Text(detail).font(.caption).foregroundStyle(.secondary)
-			}
-			Spacer(minLength: 8)
-			switch state {
-			case .pending:
-				Text("Not set up").font(.caption2).foregroundStyle(.secondary)
-			case .experimental:
-				Text("Experimental").font(.caption2.weight(.bold)).foregroundStyle(.orange)
-			}
-		}
-	}
-
-	private func workflowRow(_ n: Int, _ title: String, _ detail: String) -> some View {
-		HStack(alignment: .firstTextBaseline, spacing: 12) {
-			Text("\(n)")
-				.font(.caption.weight(.bold)).foregroundStyle(tint)
-				.frame(width: 20, height: 20)
-				.background(tint.opacity(0.12), in: Circle())
-			VStack(alignment: .leading, spacing: 2) {
-				Text(title).font(.subheadline)
-				Text(detail).font(.caption).foregroundStyle(.secondary)
-			}
 		}
 	}
 }
