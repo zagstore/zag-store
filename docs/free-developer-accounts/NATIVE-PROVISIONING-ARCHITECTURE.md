@@ -1268,3 +1268,66 @@ Produce the experimental build with `ZAG_CERT_REPLACEMENT_EXPERIMENT` +
 owner; sign in to the free Apple Account; open Settings › Experimental ›
 "Replace a Certificate"; the inventory loads on appear (or via "Refresh list").
 That single read is the whole test. (This preparation did not run it.)
+
+---
+
+## First live read-only session — packaging verdict: BLOCKED (2026-11-25)
+
+Attempted to prepare an installable read-only-live experimental IPA using only an
+already-authorized identity/profile and a non-destructive, Keychain-preserving
+install. **Did not package, install, or contact Apple.** Two blockers; neither is
+a worked-around-able signing problem, so stopped per instruction.
+
+### Verified OK (not blockers)
+- **Signing identity available:** `iPhone Distribution: Youtan Wu (7S3MGZK59N)`
+  (and `Apple Development: zagorskey (R3DNK3YV9S)`), both in the login keychain.
+- **Profile valid + device-matching:** the adhoc profile embedded in the current
+  canonical IPA — team `7S3MGZK59N`, app-id `7S3MGZK59N.com.cwd43.gu29`, **1**
+  provisioned device `00008130…001C` (the iPhone the canonical app is installed
+  from), **ExpirationDate 2027-09-23** (not expired).
+- **Read-only transport proven:** all mutating Developer Services operations are
+  blocked before transmission (18/18 checks: QH65B2 submitCSR/revoke/addDevice/
+  downloadProfile, v1 DELETE, v1 no-override, unknown action — all blocked;
+  inventory GET allowed; recording base never receives a mutation).
+
+### Blocker 1 — the ZagAppleAuth bridge is not linked in the app target
+The read-only-live path compiles only under
+`ZAG_CERT_REPLACEMENT_READONLY_LIVE && canImport(ZagAppleAuth)`, and the token the
+inventory authenticates with (`ZagAppleAuthMachine.developerHeaders()`) exists
+only under `canImport(ZagAppleAuth)`. The **Feather Xcode target links no
+`ZagAppleAuth` module** (no `project.pbxproj`/`.xcconfig` reference; the shipped
+canonical app embeds no such framework). So an experimental build with the two
+flags compiles the live path OUT and the screen falls back to the DISABLED
+portal — it cannot perform the live read. The G5 experiment build links a
+different, STATIC C bridge (`libzag_apple_bridge.a` via `OTHER_LDFLAGS`, behind
+`ZAG_APPLE_BRIDGE`), which is not the Swift module `canImport(ZagAppleAuth)`
+needs. Wiring the Swift module into the app target is a build-system change that
+is not an established Zag Store workflow — i.e., the requested "existing
+ZagAppleAuth bridge" is not wired for the full app.
+
+### Blocker 2 — the native state's app identity is unverified; install risks data loss
+The currently-installed canonical app is `7S3MGZK59N.com.cwd43.gu29` and **links
+no bridge**, so it cannot hold a native GrandSlam session, the device-generated
+signing key, the CSR, or the native journals — those were created by a
+bridge-linked prototype build under an app identity not confirmable from here.
+Consequently:
+- Signing the experiment as `com.cwd43.gu29`/7S3MGZK59N upgrades the canonical
+  app non-destructively, but that container has no native session → the inventory
+  has nothing to authenticate with.
+- Signing to match the app that DOES hold the native state needs that identity +
+  an unexpired, device-matching profile, which cannot be confirmed available.
+A non-destructive, Keychain-preserving install that also yields a working live
+read cannot be guaranteed. Installing over the app that holds the native state
+with a different identity would force a destructive replacement — explicitly to
+be avoided.
+
+### Minimal unblock (owner decisions; no Apple contact)
+1. Confirm which app identity/bundle id holds the native auth session + device
+   key + CSR + journals on the iPhone, and provide its signing identity + an
+   unexpired, device-matching provisioning profile.
+2. Confirm the sanctioned way the full Feather app links the `ZagAppleAuth`
+   module for an experiment build (or authorize wiring the xcframework into the
+   target).
+With (1)+(2), a non-destructive upgrade IPA for that identity with
+`ZAG_CERT_REPLACEMENT_EXPERIMENT` + `ZAG_CERT_REPLACEMENT_READONLY_LIVE` + the
+bridge can be built and handed over for the single read-only inventory run.
