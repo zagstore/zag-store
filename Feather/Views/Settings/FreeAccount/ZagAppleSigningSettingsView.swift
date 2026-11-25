@@ -36,22 +36,12 @@ struct ZagAppleSigningSettingsView: View {
 		#endif
 	}
 
-	/// The compile-time live mode of the certificate-replacement experiment.
-	private var liveMode: ZagCertReplacementLiveMode { ZagCertReplacementExperiment.mode }
-
-	private var modeTitle: String {
-		switch liveMode {
-		case .disabled:          return bridgeLinked ? "Bridge linked · mutations disabled" : "Offline"
-		case .readOnlyInventory: return "Read-only (live inventory)"
-		}
-	}
-
-	private var modeColor: Color {
-		switch liveMode {
-		case .disabled:          return .secondary
-		case .readOnlyInventory: return .orange
-		}
-	}
+	// With the native bridge linked (the standard device build), the certificate
+	// inventory is connected to the real developer-services portal through the
+	// read-only transport: inventory can run live, every mutation is blocked.
+	// Without the bridge (e.g. simulator) the feature is fully offline.
+	private var modeTitle: String { bridgeLinked ? "Read-only (live inventory)" : "Offline" }
+	private var modeColor: Color { bridgeLinked ? .orange : .secondary }
 
 	var body: some View {
 		List {
@@ -120,7 +110,7 @@ struct ZagAppleSigningSettingsView: View {
 			// inventory; revoke and CSR are always separately confirmed and are
 			// blocked at the transport in a read-only session.
 			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
-				Label(liveMode == .readOnlyInventory ? "Certificate inventory" : "Certificate inventory & replacement",
+				Label(bridgeLinked ? "Certificate inventory" : "Certificate inventory & replacement",
 					  systemImage: "arrow.triangle.2.circlepath")
 			}
 		} header: {

@@ -425,6 +425,16 @@
 					"$(PROJECT_DIR)/Feather/Resources",
 					"$(PROJECT_DIR)/RPPairingCore/build/device",
 				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-L$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64",
+					"-lZagAppleAuth",
+					"-lc++",
+				);
+				"SWIFT_INCLUDE_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64/Headers",
+				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
 				MARKETING_VERSION = "$(FEATHER_PROJECT_VERSION)-debug";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(FEATHER_PRODUCT_BUNDLE_IDENTIFIER)$(FEATHER_DISAMBIGUATOR)";
@@ -491,6 +501,16 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/Feather/Resources",
 					"$(PROJECT_DIR)/RPPairingCore/build/device",
+				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-L$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64",
+					"-lZagAppleAuth",
+					"-lc++",
+				);
+				"SWIFT_INCLUDE_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64/Headers",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
 				MARKETING_VERSION = "$(FEATHER_PROJECT_VERSION)";

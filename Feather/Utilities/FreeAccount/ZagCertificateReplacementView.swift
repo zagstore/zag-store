@@ -106,14 +106,19 @@ final class ZagCertificateReplacementModel: ObservableObject {
 		let guard0 = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil)
 		let portal: ZagReplacementPortal
 		var readOnly = false
-		#if ZAG_CERT_REPLACEMENT_READONLY_LIVE && canImport(ZagAppleAuth)
-		if ZagCertReplacementExperiment.mode == .readOnlyInventory {
-			portal = ZagNativeDeveloperPortal.readOnlyInventory()
-			readOnly = true
-		} else {
-			portal = ZagDisabledReplacementPortal()
-		}
+		#if canImport(ZagAppleAuth)
+		// The native bridge is linked (standard device build): connect to the REAL
+		// developer-services portal, wrapped in the read-only transport so the
+		// certificate inventory is live-capable while every mutating endpoint
+		// (revoke, CSR) is blocked below the UI — not merely hidden. The portal
+		// also fails closed without a signed-in developer session, so opening this
+		// screen never mutates Apple state. This replaces the former disabled
+		// preview: the inventory is connected to real services, read-only.
+		portal = ZagNativeDeveloperPortal.readOnlyInventory()
+		readOnly = true
 		#else
+		// No native bridge (e.g. a simulator build): a disabled portal that cannot
+		// reach Apple at all.
 		portal = ZagDisabledReplacementPortal()
 		#endif
 		let driver = ZagCertificateReplacementDriver(
