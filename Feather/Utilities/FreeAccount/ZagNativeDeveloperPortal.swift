@@ -166,20 +166,32 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// Development certificates via the `/services/v1/` JSON API (POST +
 	/// X-HTTP-Method-Override: GET), not the QH65B2 plist action. Read-only.
 	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] {
-		let response = try await sendV1(path: "certificates", methodOverride: "GET",
-										body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
-		let rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
-		return rows.compactMap { ZagDeveloperServicesProtocol.parseCertificate($0).map(Self.certificate) }
+		try await listCertificateRows(team: team).compactMap { ZagDeveloperServicesProtocol.parseCertificate($0).map(Self.certificate) }
 	}
 
-	/// Read-only revocation candidates: the same `/services/v1/certificates`
-	/// listing as `certificates(team:)`, but preserving the v1 `id` and a DER
-	/// SHA-1 so a later revoke can target the EXACT certificate. No new endpoint.
+	/// Read-only revocation candidates: the same listing as `certificates(team:)`,
+	/// preserving the certificate id and a DER SHA-1 so a later (consent-gated,
+	/// here blocked) revoke could target the EXACT certificate.
 	func revocableCertificates(team: String) async throws -> [ZagRevocableCertificate] {
-		let response = try await sendV1(path: "certificates", methodOverride: "GET",
-										body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
-		let rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
-		return ZagCertificateRevocation.candidates(from: rows)
+		return ZagCertificateRevocation.candidates(from: try await listCertificateRows(team: team))
+	}
+
+	/// The development-certificate listing for a free (Personal Team) account.
+	/// Uses the classic QH65B2 `listAllDevelopmentCerts.action` — the SAME service
+	/// family as `listTeams`, which succeeds — because the `/services/v1/` JSON
+	/// API returns 401/403 for a free team (verified against live feedback; this
+	/// is also the path AltSign/SideStore use for free accounts). The classic row
+	/// names the revoke handle `certificateId`; it is normalised to `id` so the
+	/// shared parser/candidate builder (which also handles classic rows) works
+	/// unchanged. Read-only: `listCertificates` is non-mutating, so the read-only
+	/// transport allows it.
+	private func listCertificateRows(team: String) async throws -> [[String: Any]] {
+		let dict = try await send(.listCertificates, teamID: team)
+		let rows = (dict["certificates"] as? [[String: Any]]) ?? (dict["certRequests"] as? [[String: Any]]) ?? []
+		return rows.map { row in
+			guard row["id"] == nil, let cid = row["certificateId"] else { return row }
+			var r = row; r["id"] = cid; return r
+		}
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
