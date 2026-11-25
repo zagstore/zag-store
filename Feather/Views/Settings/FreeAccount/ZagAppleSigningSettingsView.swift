@@ -90,14 +90,27 @@ struct ZagAppleSigningSettingsView: View {
 	/// availability stays unverified until a real certificate is confirmed (it
 	/// cannot be asserted offline). Authentication alone never implies signing.
 	@State private var readiness = ZagNativeSigningReadiness(
-		authenticated: false, adiProvisioned: false,
+		buildSupportsLiveAuth: false, authenticated: false, adiProvisioned: false,
 		certificateAvailable: false, signingGateOpen: false)
+
+	/// Whether this build actually links and enables live on-device sign-in. In
+	/// the shipping AppTesters build this is false by design (live auth is only in
+	/// the supervised live-test build), which is why an unguarded sign-in attempt
+	/// could only ever fail. Surfacing it is what turns "Failed" into a reason.
+	private var liveAuthAvailable: Bool {
+		#if ZAG_APPLE_BRIDGE
+		return ZagLiveAuthentication.isEnabled && ZagIsideloadBridge.liveCompiled
+		#else
+		return false
+		#endif
+	}
 
 	private func refreshReadiness() async {
 		let linked = ZagAppleAuthMachine.isLinked
 		let provisioned = linked ? await ZagAppleAuthMachine().isProvisioned() : false
 		let authed = linked && ZagDeveloperTokenStore().hasToken(scope: "device")
 		readiness = ZagNativeSigningReadiness(
+			buildSupportsLiveAuth: liveAuthAvailable,
 			authenticated: authed,
 			adiProvisioned: provisioned,
 			certificateAvailable: false,   // verified only against a real certificate; none issued yet
@@ -151,7 +164,7 @@ struct ZagAppleSigningSettingsView: View {
 			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
 				recoveryLabel(recovery)
 			}
-		case .enableSigningBuild, .ready:
+		case .enableLiveBuild, .enableSigningBuild, .ready:
 			recoveryLabel(recovery)
 		}
 	}
@@ -200,11 +213,6 @@ struct ZagAppleSigningSettingsView: View {
 			statusRow(icon: "person.2", title: "Personal Team",
 					  detail: "Discovered from the signed-in account; a free account has one Personal Team.",
 					  state: .pending)
-			#if DEBUG
-			NavigationLink(destination: ZagFreeAccountDebugSignInView().zagSettingsDestinationAvatar()) {
-				Label("Open sign-in (simulated)", systemImage: "person.badge.key")
-			}
-			#endif
 		} header: {
 			Text("Apple Account")
 		} footer: {

@@ -13,18 +13,27 @@ private func check(_ cond: Bool, _ what: String) {
 
 @main enum ReadinessTestMain {
 static func main() {
-	// 1. Nothing done: first missing is authentication; recovery is sign-in.
-	let none = ZagNativeSigningReadiness(authenticated: false, adiProvisioned: false,
+	// 1. Nothing done, and the build does not support live auth: that is the
+	//    first gate (the real AppTesters build), recovery explains the build.
+	let none = ZagNativeSigningReadiness(buildSupportsLiveAuth: false, authenticated: false, adiProvisioned: false,
 										 certificateAvailable: false, signingGateOpen: false)
-	check(none.firstMissing == .authentication, "all-unmet → first missing is authentication")
-	check(none.recovery == .signIn, "all-unmet → recovery is signIn")
-	check(none.canSign == false, "all-unmet → cannot sign")
-	check(none.status(of: .authentication) == .blocked, "authentication is the one actionable stage")
-	check(none.status(of: .adiProvisioning) == .pending, "adi waits (pending) behind authentication")
+	check(none.firstMissing == .buildSupport, "no build support → first missing is buildSupport")
+	check(none.recovery == .enableLiveBuild, "no build support → recovery explains the build, not a dead sign-in")
+	check(none.canSign == false, "no build support → cannot sign")
+	check(none.status(of: .buildSupport) == .blocked, "buildSupport is the one actionable stage")
+	check(none.status(of: .authentication) == .pending, "authentication waits (pending) behind build support")
 	check(none.status(of: .signing) == .pending, "signing waits (pending)")
 
+	// 1b. Build supports live auth but nothing else: sign-in is the next step.
+	let buildOnly = ZagNativeSigningReadiness(buildSupportsLiveAuth: true, authenticated: false, adiProvisioned: false,
+											  certificateAvailable: false, signingGateOpen: false)
+	check(buildOnly.firstMissing == .authentication, "build-supported, unauthenticated → first missing is authentication")
+	check(buildOnly.recovery == .signIn, "build-supported, unauthenticated → recovery is signIn")
+	check(buildOnly.status(of: .buildSupport) == .done, "buildSupport done when the build supports live auth")
+	check(buildOnly.canSign == false, "build-supported but unauthenticated → cannot sign")
+
 	// 2. Authenticated only: provisioning is next.
-	let auth = ZagNativeSigningReadiness(authenticated: true, adiProvisioned: false,
+	let auth = ZagNativeSigningReadiness(buildSupportsLiveAuth: true, authenticated: true, adiProvisioned: false,
 										 certificateAvailable: false, signingGateOpen: false)
 	check(auth.firstMissing == .adiProvisioning, "authenticated → first missing is ADI provisioning")
 	check(auth.recovery == .confirmADIProvisioning, "authenticated → recovery is confirm ADI")
@@ -32,7 +41,7 @@ static func main() {
 	check(auth.canSign == false, "authenticated alone → cannot sign")
 
 	// 3. Authenticated + provisioned: certificate is next.
-	let prov = ZagNativeSigningReadiness(authenticated: true, adiProvisioned: true,
+	let prov = ZagNativeSigningReadiness(buildSupportsLiveAuth: true, authenticated: true, adiProvisioned: true,
 										 certificateAvailable: false, signingGateOpen: false)
 	check(prov.firstMissing == .certificate, "auth+adi → first missing is certificate")
 	check(prov.recovery == .provisionCertificate, "auth+adi → recovery is provision certificate")
@@ -40,20 +49,20 @@ static func main() {
 
 	// 4. The critical guard: authenticated + gate OPEN but NO certificate must
 	//    NOT permit signing (signing is never enabled by authentication alone).
-	let authGateNoCert = ZagNativeSigningReadiness(authenticated: true, adiProvisioned: true,
+	let authGateNoCert = ZagNativeSigningReadiness(buildSupportsLiveAuth: true, authenticated: true, adiProvisioned: true,
 												   certificateAvailable: false, signingGateOpen: true)
 	check(authGateNoCert.canSign == false, "gate open + authenticated but no certificate → still cannot sign")
 	check(authGateNoCert.firstMissing == .certificate, "missing certificate is surfaced even with the gate open")
 
 	// 5. Certificate present but build gate closed: the gate is the blocker.
-	let gateClosed = ZagNativeSigningReadiness(authenticated: true, adiProvisioned: true,
+	let gateClosed = ZagNativeSigningReadiness(buildSupportsLiveAuth: true, authenticated: true, adiProvisioned: true,
 											   certificateAvailable: true, signingGateOpen: false)
 	check(gateClosed.firstMissing == .signing, "certificate present, gate closed → signing stage is the blocker")
 	check(gateClosed.recovery == .enableSigningBuild, "gate closed → recovery names the build gate")
 	check(gateClosed.canSign == false, "gate closed → cannot sign")
 
 	// 6. Everything verified: ready.
-	let ready = ZagNativeSigningReadiness(authenticated: true, adiProvisioned: true,
+	let ready = ZagNativeSigningReadiness(buildSupportsLiveAuth: true, authenticated: true, adiProvisioned: true,
 										  certificateAvailable: true, signingGateOpen: true)
 	check(ready.firstMissing == nil, "all met → nothing missing")
 	check(ready.recovery == .ready, "all met → ready")

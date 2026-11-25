@@ -86,16 +86,30 @@ private struct ZagAppleAccountSignInContent: View {
 	private enum Field { case appleID, password }
 	private var tint: Color { Color(hex: tintHex) }
 
+	/// Whether this build can actually perform live sign-in. False in the shipping
+	/// AppTesters build by design — surfacing it stops the dead-end where tapping
+	/// Sign In could only ever return "Failed".
+	private var liveAuthAvailable: Bool {
+		#if ZAG_APPLE_BRIDGE
+		return ZagLiveAuthentication.isEnabled && ZagIsideloadBridge.liveCompiled
+		#else
+		return false
+		#endif
+	}
+
 	var body: some View {
 		Form {
 			statusSection
+			if !liveAuthAvailable { unavailableBanner }
 			switch model.phase {
 			case .signedIn, .expired: sessionSection
 			default:                  credentialsSection
 			}
-			if let notice = model.notice {
+			if let failure = model.failure { failureSection(failure) }
+			else if let notice = model.notice {
 				Section { Label(notice, systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
 			}
+			if !model.diagnosticEntries.isEmpty { diagnosticsSection }
 			disclaimerSection
 		}
 		.sheet(isPresented: Binding(
@@ -129,14 +143,52 @@ private struct ZagAppleAccountSignInContent: View {
 			SecureField("Password", text: $model.password)
 				.textContentType(.password)
 				.focused($focus, equals: .password).submitLabel(.go)
-				.onSubmit { if model.canSubmitCredentials { Task { await model.signIn() } } }
+				.onSubmit { if model.canSubmitCredentials && liveAuthAvailable { Task { await model.signIn() } } }
 			Button {
 				focus = nil
 				Task { await model.signIn() }
 			} label: {
 				HStack { Spacer(); Text("Sign In").fontWeight(.semibold); Spacer() }
 			}
-			.disabled(!model.canSubmitCredentials)
+			.disabled(!model.canSubmitCredentials || !liveAuthAvailable)
+		}
+	}
+
+	private var unavailableBanner: some View {
+		Section {
+			Label {
+				VStack(alignment: .leading, spacing: 3) {
+					Text("Sign-in unavailable in this build").font(.subheadline.weight(.medium))
+					Text("Native Apple Account sign-in is not enabled in this build. It requires the supervised live-test build; until then, sign-in here cannot reach Apple. You can still install apps with an imported certificate.")
+						.font(.caption).foregroundStyle(.secondary)
+				}
+			} icon: { Image(systemName: "lock.slash").foregroundStyle(.orange) }
+		}
+	}
+
+	private func failureSection(_ failure: ZagFreeAccountFailure) -> some View {
+		Section {
+			Label {
+				VStack(alignment: .leading, spacing: 3) {
+					Text(failure.message).font(.footnote)
+					Text(failure.recovery).font(.caption).foregroundStyle(.secondary)
+				}
+			} icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+		} header: {
+			Text("Why sign-in did not complete")
+		}
+	}
+
+	private var diagnosticsSection: some View {
+		Section {
+			ForEach(Array(model.diagnosticEntries.suffix(6).enumerated()), id: \.offset) { _, entry in
+				Text(entry.message).font(.caption2.monospaced()).foregroundStyle(.secondary)
+					.textSelection(.enabled)
+			}
+		} header: {
+			Text("Diagnostics (no secrets)")
+		} footer: {
+			Text("Local only. Identifies the stage that failed — bridge, anisette/ADI, GrandSlam, two-factor, token or Keychain — without recording passwords, codes, tokens or device identifiers.")
 		}
 	}
 
@@ -228,8 +280,10 @@ private struct ZagAppleAccountSignInContent: View {
 	private var statusDetail: String {
 		switch model.phase {
 		case .signedIn: return "Personal Team and certificate inventory are available."
-		case .failed:   return model.notice ?? "Check your Apple Account and password."
-		default:        return "Use your free Apple Account; two-factor is handled here."
+		case .failed:   return model.failure?.message ?? model.notice ?? "Sign-in did not complete."
+		default:
+			return liveAuthAvailable ? "Use your free Apple Account; two-factor is handled here."
+									 : "This build cannot sign in to Apple; see below."
 		}
 	}
 }

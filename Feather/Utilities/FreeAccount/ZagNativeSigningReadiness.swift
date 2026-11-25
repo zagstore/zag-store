@@ -12,6 +12,7 @@ import Foundation
 // addition to a session, an on-device ADI profile and the build-level gate.
 
 enum ZagNativeSigningStage: Int, CaseIterable, Sendable {
+	case buildSupport
 	case authentication
 	case adiProvisioning
 	case certificate
@@ -19,6 +20,7 @@ enum ZagNativeSigningStage: Int, CaseIterable, Sendable {
 
 	var title: String {
 		switch self {
+		case .buildSupport: return "On-device sign-in support"
 		case .authentication: return "Apple Account"
 		case .adiProvisioning: return "Device provisioning (ADI)"
 		case .certificate: return "Signing certificate"
@@ -28,6 +30,7 @@ enum ZagNativeSigningStage: Int, CaseIterable, Sendable {
 
 	var systemImage: String {
 		switch self {
+		case .buildSupport: return "cpu.fill"
 		case .authentication: return "person.crop.circle"
 		case .adiProvisioning: return "cpu"
 		case .certificate: return "checkmark.seal"
@@ -42,6 +45,7 @@ enum ZagNativeSigningStageStatus: Equatable, Sendable { case done, blocked, pend
 
 /// The single next action the user can take. Each maps to a concrete UI step.
 enum ZagNativeSigningRecovery: Equatable, Sendable {
+	case enableLiveBuild
 	case signIn
 	case confirmADIProvisioning
 	case provisionCertificate
@@ -50,6 +54,7 @@ enum ZagNativeSigningRecovery: Equatable, Sendable {
 
 	var actionTitle: String {
 		switch self {
+		case .enableLiveBuild:       return "Sign-in unavailable in this build"
 		case .signIn:                return "Connect Apple Account"
 		case .confirmADIProvisioning:return "Set up this device"
 		case .provisionCertificate:  return "Provision a certificate"
@@ -60,6 +65,7 @@ enum ZagNativeSigningRecovery: Equatable, Sendable {
 
 	var detail: String {
 		switch self {
+		case .enableLiveBuild:        return "Native Apple Account sign-in is not enabled in this build; it requires the supervised live-test build. Use an imported certificate for now."
 		case .signIn:                 return "Sign in with your free Apple Account to begin."
 		case .confirmADIProvisioning: return "Register this device with Apple once. You confirm before anything is sent."
 		case .provisionCertificate:   return "Request a development certificate for this iPhone's signing key."
@@ -70,6 +76,10 @@ enum ZagNativeSigningRecovery: Equatable, Sendable {
 }
 
 struct ZagNativeSigningReadiness: Equatable, Sendable {
+	/// This build actually links and enables on-device live authentication
+	/// (the native bridge is live-compiled and live auth is turned on). When
+	/// false, no amount of signing in can succeed, so it is the first gate.
+	var buildSupportsLiveAuth: Bool
 	/// A usable Apple Account session is present.
 	var authenticated: Bool
 	/// An on-device ADI provisioning profile exists for this machine.
@@ -82,6 +92,7 @@ struct ZagNativeSigningReadiness: Equatable, Sendable {
 
 	private func isMet(_ stage: ZagNativeSigningStage) -> Bool {
 		switch stage {
+		case .buildSupport:    return buildSupportsLiveAuth
 		case .authentication:  return authenticated
 		case .adiProvisioning: return adiProvisioned
 		case .certificate:     return certificateAvailable
@@ -99,14 +110,17 @@ struct ZagNativeSigningReadiness: Equatable, Sendable {
 		return firstMissing == stage ? .blocked : .pending
 	}
 
-	/// Signing is permitted ONLY when every prerequisite is verified — a session,
-	/// on-device provisioning, a real certificate + assets, and the build gate.
-	/// Authentication alone is never sufficient.
-	var canSign: Bool { authenticated && adiProvisioned && certificateAvailable && signingGateOpen }
+	/// Signing is permitted ONLY when every prerequisite is verified — the build
+	/// supports live auth, a session, on-device provisioning, a real certificate
+	/// + assets, and the build gate. Authentication alone is never sufficient.
+	var canSign: Bool {
+		buildSupportsLiveAuth && authenticated && adiProvisioned && certificateAvailable && signingGateOpen
+	}
 
 	/// The single next action to present.
 	var recovery: ZagNativeSigningRecovery {
 		switch firstMissing {
+		case .buildSupport:    return .enableLiveBuild
 		case .authentication:  return .signIn
 		case .adiProvisioning: return .confirmADIProvisioning
 		case .certificate:     return .provisionCertificate
