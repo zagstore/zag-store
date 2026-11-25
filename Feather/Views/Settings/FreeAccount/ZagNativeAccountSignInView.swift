@@ -94,7 +94,13 @@ final class ZagNativeSignInModel: ObservableObject {
 			_ = try await machine.anisetteHeaders(allowProvisioning: true)
 			notice = nil
 		} catch let error as ZagAppleAuthError {
-			finish(failure: ZagNativeSignInClassifier.failure(error: error))
+			var failure = ZagNativeSignInClassifier.failure(error: error)
+			// Expose the actual sanitized native fault (operation, status code,
+			// provisioning stage, HTTP status) rather than a bare message.
+			if case .provisioningFailed(let code) = error {
+				failure.detail = await machine.provisioningDiagnostic(code: code)
+			}
+			finish(failure: failure)
 			return
 		} catch {
 			finish(failure: ZagNativeSignInFailure(message: "On-device setup with Apple could not complete.", recovery: .provisionADI))

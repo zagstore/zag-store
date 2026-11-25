@@ -108,19 +108,30 @@ struct ZagAppleSigningSettingsView: View {
 	private var deviceSection: some View {
 		Section {
 			HStack(alignment: .firstTextBaseline, spacing: 12) {
-				Image(systemName: provisioned ? "checkmark.circle.fill" : "iphone")
-					.foregroundStyle(provisioned ? .green : tint).frame(width: 24)
+				// Green only when sign-in has verified this device with Apple
+				// end-to-end. A stored ADI profile on its own is NOT a success: it
+				// may be stale or rejected, so it is shown as neutral, not green.
+				Image(systemName: signedIn ? "checkmark.circle.fill" : "iphone")
+					.foregroundStyle(signedIn ? .green : tint).frame(width: 24)
 				VStack(alignment: .leading, spacing: 2) {
 					Text("Device provisioning").font(.subheadline.weight(.medium))
-					Text(provisioned
-						 ? "This iPhone is set up with Apple. A free-account profile lasts 7 days and is renewed automatically where permitted."
-						 : "Set up automatically the first time you sign in. A free-account profile lasts 7 days.")
-						.font(.caption).foregroundStyle(.secondary)
+					Text(deviceDetail).font(.caption).foregroundStyle(.secondary)
 				}
 			}
 		} header: {
 			Text("Device")
+		} footer: {
+			Text("Being set up on this iPhone is local state only. It is confirmed with Apple — and this device registered to your account — when you sign in, never from stored state alone.")
 		}
+	}
+
+	private var deviceDetail: String {
+		if signedIn {
+			return "Verified with Apple during sign-in. A free-account profile lasts 7 days and is renewed where permitted."
+		}
+		return provisioned
+			? "A setup profile is stored on this iPhone, but it is confirmed only when you sign in — stored setup alone is not a guarantee."
+			: "Set up automatically the first time you sign in. A free-account profile lasts 7 days."
 	}
 
 	// MARK: Signing method (explicit choice; existing methods preserved)

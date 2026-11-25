@@ -375,25 +375,57 @@ actor ZagAppleAuthMachine {
 		#if canImport(ZagAppleAuth)
 		let persisted = try store.load(scope: scope)
 		if persisted == nil && !allowProvisioning { throw ZagAppleAuthError.notProvisioned }
-		let transport = ZagAppleAuthTransport(allowNetwork: allowProvisioning)
 		let platform = self.platform
 		// The apple-auth client calls are synchronous (the transport blocks on
-		// the network); run them off the actor's executor.
-		let result: Result<([String: String], Data), ZagAppleAuthError> = await withCheckedContinuation { continuation in
-			DispatchQueue.global(qos: .userInitiated).async {
-				continuation.resume(returning: Self.drive(persisted: persisted, transport: transport, platform: platform))
+		// the network); run them off the actor's executor. Each attempt gets a
+		// fresh transport so its request counts/HTTP trace reflect that attempt.
+		func attempt(_ state: Data?) async -> (Result<([String: String], Data), ZagAppleAuthError>, ZagAppleAuthTransport) {
+			let transport = ZagAppleAuthTransport(allowNetwork: allowProvisioning)
+			let r: Result<([String: String], Data), ZagAppleAuthError> = await withCheckedContinuation { continuation in
+				DispatchQueue.global(qos: .userInitiated).async {
+					continuation.resume(returning: Self.drive(persisted: state, transport: transport, platform: platform))
+				}
 			}
+			return (r, transport)
+		}
+		var (result, transport) = await attempt(persisted)
+		// ADI lifecycle recovery: a stored profile that Apple no longer accepts —
+		// stale, incomplete, or written by an earlier build/platform — makes
+		// aauth_client_provision fail. When we hold such a profile and are allowed
+		// to provision, discard it and provision once from scratch. A provisioning
+		// failure with no stored profile to blame is reported as-is (not retried).
+		var recovered = false
+		if allowProvisioning, persisted != nil, case .failure(.provisioningFailed) = result {
+			try? store.delete(scope: scope)
+			(result, transport) = await attempt(nil)
+			recovered = true
 		}
 		lastRequestCount = transport.requestCount
 		lastReachedApple = transport.reachedApple
 		lastHTTPStatuses = Self.httpStatuses(transport.log)
 		lastHTTPTrace = Self.httpTrace(transport.httpTrace, stageFor: Self.provisionStage)
+		lastProvisionRecovered = recovered
 		let (headers, snapshot) = try result.get()
 		try store.save(snapshot, scope: scope)
 		return Self.anisetteSubset(headers)
 		#else
 		throw ZagAppleAuthError.unavailable
 		#endif
+	}
+
+	/// Whether the most recent `anisetteHeaders` call had to discard a stored ADI
+	/// profile and re-provision from scratch (stale/invalid-profile recovery).
+	private(set) var lastProvisionRecovered = false
+
+	/// A sanitized provisioning diagnostic for the most recent `anisetteHeaders`
+	/// attempt: the failing operation, the native status code, the provisioning
+	/// stage (derived from how many requests were accepted) and the last HTTP
+	/// status seen. No secrets — only operation, code, stage and status.
+	func provisioningDiagnostic(code: Int) -> String {
+		var parts = ["op provision", "code \(code)", "stage \(Self.provisionStage(requestCount: lastRequestCount))"]
+		if let http = lastHTTPStatuses.last { parts.append("HTTP \(http)") }
+		if lastProvisionRecovered { parts.append("after fresh re-provision") }
+		return parts.joined(separator: " · ")
 	}
 
 	#if canImport(ZagAppleAuth)
