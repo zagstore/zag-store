@@ -118,11 +118,12 @@ final class ZagCertificateReplacementModel: ObservableObject {
 		state = await driver.currentState()
 	}
 
-	static func inventory(team: String) -> ZagCertificateReplacementModel {
+	static func inventory(team: String, expectedScope: ZagSigningScope? = nil) -> ZagCertificateReplacementModel {
 		let consent = ZagMutationConsentCoordinator()
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-		if let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()) {
-			let scope = ZagSigningAuthorization.nativeAccount(token: token, teamID: team).scope
+		if let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()),
+		   case let scope = ZagSigningAuthorization.nativeAccount(token: token, teamID: team).scope,
+		   expectedScope == nil || expectedScope == scope {
 			let activeGuard = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: (try? nativeIdentity(scope))?.serialNumber)
 			let portal = ZagNativeAccountInstall.portal(token: token, consent: consent)
 			let driver = ZagCertificateReplacementDriver(
@@ -134,7 +135,7 @@ final class ZagCertificateReplacementModel: ObservableObject {
 		#endif
 		let activeGuard = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil)
 		#if canImport(ZagAppleAuth)
-		let portal: ZagReplacementPortal = ZagNativeDeveloperPortal.readOnlyInventory()
+		let portal: ZagReplacementPortal = expectedScope == nil ? ZagNativeDeveloperPortal.readOnlyInventory() : ZagDisabledReplacementPortal()
 		#else
 		let portal: ZagReplacementPortal = ZagDisabledReplacementPortal()
 		#endif
@@ -221,6 +222,11 @@ struct ZagCertificateReplacementView: View {
 				ProgressView("Loading certificates…")
 			} else if model.inventory.isEmpty && model.banner == nil {
 				Text("No certificates are listed.").foregroundStyle(.secondary)
+			}
+			if !model.rawInventory.isEmpty {
+				let available = model.rawInventory.filter { $0.sha1 != nil }.count
+				Text("Apple supplied certificate data for \(available) of \(model.rawInventory.count) entries in this list.")
+					.font(.footnote).foregroundStyle(.secondary)
 			}
 			ForEach(model.inventory) { cert in
 				VStack(alignment: .leading, spacing: 4) {

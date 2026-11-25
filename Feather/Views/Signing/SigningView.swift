@@ -24,6 +24,7 @@ struct SigningView: View {
 	@ObservedObject private var _accountPairing = ZagRPPairingCore.shared
 	@State private var _signingMethod: ZagSigningMethod = .importedCertificate
 	@State private var _accountInstallMessage: String?
+	@State private var _certificateIssue: ZagNativeAccountInstall.CertificateIssue?
 	#endif
 	@State private var _selectedPhoto: PhotosPickerItem? = nil
 	@State var appIcon: UIImage?
@@ -70,6 +71,21 @@ struct SigningView: View {
 					}
 					Text("Sign and install with your Personal Team. Zag Store may register this iPhone and app with Apple and issue a signing certificate and provisioning profiles.")
 						.font(.footnote).foregroundStyle(.secondary)
+					if let issue = _certificateIssue {
+						Section("Development Certificate") {
+							Text(issue.failure.message).font(.footnote)
+							if let recovery = issue.recovery {
+								NavigationLink("Recover Certificate Request") {
+									ZagCertificateRecoveryView(model: recovery, teamName: issue.teamName)
+								}
+							}
+							NavigationLink("Manage Development Certificates") {
+								ZagCertificateReplacementView(model: .inventory(team: issue.scope.teamID, expectedScope: issue.scope))
+							}
+							Text("Return here and tap Resume Sign and Install after resolving the certificate issue.")
+								.font(.footnote).foregroundStyle(.secondary)
+						}
+					}
 				} else {
 					_certificateOptions
 				}
@@ -873,7 +889,10 @@ private enum ZagOriginalEntitlementAudit {
 extension SigningView {
 	private var _signButtonTitle: String {
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-		if _signingMethod == .freeAppleAccount { return _isSigning ? "Signing and Installing…" : "Sign and Install" }
+		if _signingMethod == .freeAppleAccount {
+			if _isSigning { return "Signing and Installing…" }
+			return _certificateIssue == nil ? "Sign and Install" : "Resume Sign and Install"
+		}
 		#endif
 		return .localized("Start Signing")
 	}
@@ -907,12 +926,18 @@ extension SigningView {
 		Task { @MainActor in
 			defer { _isSigning = false }
 			do {
-				switch try await ZagNativeAccountInstall.install(source: source, name: app.name ?? "App") {
+				let result = try await ZagNativeAccountInstall.install(
+					source: source, name: app.name ?? "App", expectedScope: _certificateIssue?.scope
+				)
+				_certificateIssue = nil
+				switch result {
 				case .verified: _accountInstallMessage = "Installed and verified on this iPhone. Open the app from the Home Screen."
 				case .unverifiable(let reason): _accountInstallMessage = "Installation could not be verified. \(reason)"
 				case .mismatch, .notInstalled:
 					_accountInstallMessage = ZagNativeAccountInstall.Failure.installationUnverified.localizedDescription
 				}
+			} catch let issue as ZagNativeAccountInstall.CertificateIssue {
+				_certificateIssue = issue
 			} catch {
 				_accountInstallMessage = error.localizedDescription
 			}

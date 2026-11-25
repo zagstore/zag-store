@@ -22,6 +22,7 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		case network
 		case rateLimited
 		case malformed
+		case certificateConflict
 		/// The call never answers (for timeouts and cancellation).
 		case noResponse
 		/// Certificate requests only, once: the certificate is issued, then the
@@ -93,6 +94,7 @@ actor ZagSimulatedDeveloperPortal: ZagDeveloperPortalService {
 		case .network: throw ZagPortalError.network
 		case .rateLimited: throw ZagPortalError.rateLimited
 		case .malformed: throw ZagPortalError.malformedResponse
+		case .certificateConflict: throw ZagPortalError.existingCertificateOrPendingRequest
 		case .noResponse:
 			try await Task.sleep(nanoseconds: 120_000_000_000)
 			throw ZagPortalError.network

@@ -124,8 +124,9 @@ enum ZagCertificateRevocation {
 				: httpStatus == 429 ? ZagPortalError.rateLimited : ZagPortalError.network
 		}
 		if body.isEmpty { return true }
-		guard let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { return true }
+		guard let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { throw ZagPortalError.malformedResponse }
 		if let errors = obj["errors"] as? [[String: Any]], !errors.isEmpty { throw ZagPortalError.malformedResponse }
+		try ZagDeveloperServicesProtocol.throwIfError(obj)
 		return true
 	}
 }

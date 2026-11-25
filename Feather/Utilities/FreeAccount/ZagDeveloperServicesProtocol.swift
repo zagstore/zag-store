@@ -108,8 +108,13 @@ enum ZagDeveloperServicesProtocol {
 	/// Parsed, validated developer-services response: the top-level plist with
 	/// its result code checked. Throws a mapped `ZagPortalError` on any Apple
 	/// error code, so callers only ever see a success dictionary.
-	static func parse(_ body: Data, httpStatus: Int) throws -> [String: Any] {
+	static func parse(_ body: Data, httpStatus: Int, action: ZagDeveloperServicesAction? = nil) throws -> [String: Any] {
 		guard (200..<300).contains(httpStatus) else {
+			if action == .submitCSR, httpStatus == 409,
+			   let payload = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any],
+			   resultCode(payload) == 7460 {
+				throw ZagPortalError.existingCertificateOrPendingRequest
+			}
 			throw httpStatus == 401 || httpStatus == 403 ? ZagPortalError.sessionRejected
 				: httpStatus == 429 ? ZagPortalError.rateLimited
 				: ZagPortalError.network
@@ -117,6 +122,14 @@ enum ZagDeveloperServicesProtocol {
 		guard let object = try? PropertyListSerialization.propertyList(from: body, format: nil),
 			  let dict = object as? [String: Any] else {
 			throw ZagPortalError.malformedResponse
+		}
+		if action == .addAppID || action == .addDevice {
+			switch (action, resultCode(dict)) {
+			case (.addAppID, 9120): throw ZagPortalError.appIDLimitReached
+			case (.addAppID, 9401): throw ZagPortalError.identifierUnavailable("App identifier")
+			case (.addAppID, 35), (.addAppID, 9412), (.addDevice, 35): throw ZagPortalError.malformedResponse
+			default: break
+			}
 		}
 		try throwIfError(dict)
 		return dict
@@ -127,7 +140,7 @@ enum ZagDeveloperServicesProtocol {
 	/// codes are the documented Xcode/AltStore ones; unknown non-zero codes map
 	/// to `.malformedResponse` so nothing proceeds on an unrecognised state.
 	static func throwIfError(_ dict: [String: Any]) throws {
-		let code = (dict["resultCode"] as? NSNumber)?.intValue ?? (dict["resultCode"] as? Int) ?? 0
+		let code = resultCode(dict) ?? 0
 		if code == 0 { return }
 		let message = (dict["userString"] as? String) ?? (dict["resultString"] as? String) ?? ""
 		switch code {
@@ -147,6 +160,10 @@ enum ZagDeveloperServicesProtocol {
 			}
 			throw ZagPortalError.malformedResponse
 		}
+	}
+
+	private static func resultCode(_ dict: [String: Any]) -> Int? {
+		(dict["resultCode"] as? NSNumber)?.intValue ?? (dict["resultCode"] as? String).flatMap(Int.init)
 	}
 
 	/// Captures a developer-services error WITHOUT throwing, so the raw Apple
@@ -215,8 +232,13 @@ enum ZagDeveloperServicesProtocol {
 	/// an `attributes` sub-dict is used when present (v1 JSON). Pure.
 	static func parseCertificate(_ row: [String: Any]) -> ZagParsedCertificate? {
 		let attrs = (row["attributes"] as? [String: Any]) ?? row
-		var der: Data? = attrs["certContent"] as? Data
-		if der == nil, let b64 = (attrs["certificateContent"] ?? attrs["certContent"]) as? String { der = Data(base64Encoded: b64) }
+		let der = [attrs["certificateContent"], attrs["certContent"]].compactMap { value -> Data? in
+			if let data = value as? Data { return data.isEmpty ? nil : data }
+			guard let encoded = value as? String else { return nil }
+			let lines = encoded.split(whereSeparator: \.isNewline).filter { !$0.hasPrefix("-----") }
+			guard let data = Data(base64Encoded: lines.joined()), !data.isEmpty else { return nil }
+			return data
+		}.first
 		let serial = (attrs["serialNumber"] as? String) ?? (attrs["serialNum"] as? String)
 		guard serial != nil || der != nil else { return nil }
 		return ZagParsedCertificate(

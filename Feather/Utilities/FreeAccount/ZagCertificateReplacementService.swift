@@ -73,6 +73,8 @@ enum ZagCertificateReplacementService {
 		guard let match = freshListing.first(where: { $0.id == selected.id }) else {
 			return .failure(.targetNoLongerPresent)
 		}
+		guard match.serialNumber.caseInsensitiveCompare(selected.serialNumber) == .orderedSame,
+			  !match.serialNumber.isEmpty else { return .failure(.fingerprintMismatch) }
 		// Fingerprint must agree when both are known; a changed/absent fingerprint
 		// on a reused id is treated as a mismatch (fail closed, never revoke).
 		switch (selected.sha1, match.sha1) {
@@ -173,6 +175,7 @@ actor ZagCertificateReplacementDriver {
 		guard case .selected(let target) = state else { throw ZagReplacementError.notSelectable }
 		// Re-verify against a fresh read-only listing immediately before mutating.
 		let fresh = try? await portal.revocableCertificates(team: team)
+		guard state == .selected(target: target) else { throw ZagReplacementError.notSelectable }
 		let verified = ZagCertificateReplacementService.verifyTargetForRevoke(
 			selected: target, freshListing: fresh, activeGuard: activeGuard)
 		let cert: ZagRevocableCertificate

@@ -527,7 +527,7 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 		let lost = await provisioner.provision(request, authorization: try! await directory.authorize(scope))
 		let model = ZagCertificateRecoveryModel(scope: scope, service: provisioner) { try await directory.authorize($0) }
 		await model.load()
-		check(lost.failureKind == .network && model.request?.attempts == 1 && model.phase == .idle,
+		check(lost.failureKind == .certificateRequestUnresolved && model.request?.attempts == 1 && model.phase == .idle,
 			  "recovery: a lost certificate response is shown as an unresolved request")
 
 		for _ in 0..<3 { await model.checkAgain() }
@@ -563,7 +563,10 @@ func signedIn(_ state: ZagFreeAccountState?) -> ZagFreeAccountSession? {
 		model.cancelAbandon()
 		check(model.phase == .idle && model.request != nil, "recovery: cancelling the confirmation abandons nothing")
 		model.requestAbandon()
-		await model.confirmAbandon()
+		model.startAbandon()
+		model.cancelAbandon()
+		check(model.phase == .abandoning, "recovery: dismissing a confirmed dialog keeps the abandon action in progress")
+		while model.phase == .abandoning { await Task.yield() }
 		let afterAbandon = await submissions(portal)
 		check(model.outcome == .abandoned && model.request == nil && afterAbandon == 1 && world.secrets.keys(of: tester).allSatisfy { !$0.contains("pendingSigningKey") }
 			  && model.message?.contains("certificate slot") == true,

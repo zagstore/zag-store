@@ -125,34 +125,54 @@ extension Result where Failure == ZagProvisioningFailure {
 	}
 
 	static func nativeCertificateInventory() async {
+		let fixture = try! Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+		let certificate = ZagCertificateInspection(der: fixture)!
 		actor Transport: ZagHTTPTransport {
+			let fixture: Data
+			let serial: String
 			var requests: [ZagHTTPRequest] = []
+			var inventoryStatus = 200
+
+			init(fixture: Data, serial: String) {
+				self.fixture = fixture
+				self.serial = serial
+			}
+
+			func failInventory() { inventoryStatus = 429 }
 
 			func send(_ request: ZagHTTPRequest) async throws -> ZagHTTPResponse {
 				requests.append(request)
+				let path = request.url.lastPathComponent
 				let body: Data
-				if request.url.path.hasSuffix("submitDevelopmentCSR.action") {
+				if path == "submitDevelopmentCSR.action" {
 					body = try PropertyListSerialization.data(
 						fromPropertyList: ["resultCode": 0, "certRequest": ["certificateId": "CERT1"]],
 						format: .xml, options: 0
 					)
+				} else if path == "CERT1" {
+					body = try JSONSerialization.data(withJSONObject: [
+						"data": ["id": "CERT1", "attributes": ["certificateContent": fixture.base64EncodedString()]]
+					])
 				} else {
-					body = Data("""
-						{"data":[{"id":"CERT1","attributes":{"serialNumber":"00AB","certificateContent":"AQID","expirationDate":"2030-01-01T00:00:00Z"}}]}
-						""".utf8)
+					body = try JSONSerialization.data(withJSONObject: [
+						"data": [["id": "CERT1", "attributes": ["serialNumber": serial]]]
+					])
 				}
-				return ZagHTTPResponse(statusCode: 200, headers: [:], body: body)
+				return ZagHTTPResponse(statusCode: path == "certificates" ? inventoryStatus : 200, headers: [:], body: body)
 			}
 		}
 
-		let transport = Transport()
+		let transport = Transport(fixture: fixture, serial: certificate.serialNumber)
 		let consent = ZagMutationConsentCoordinator()
 		let portal = ZagNativeDeveloperPortal(
 			transport: transport, headers: { ["X-Apple-GS-Token": "persisted-test-token"] }, consent: consent
 		)
 		do {
 			let candidates = try await portal.revocableCertificates(team: team)
-			check(candidates.map(\.id) == ["CERT1"], "native inventory decodes v1 certificate IDs")
+			check(candidates.map(\.id) == ["CERT1"] && candidates.first?.sha1 == nil,
+				  "native inventory distinguishes metadata-only rows")
+			let hydrated = try await portal.certificates(team: team)
+			check(hydrated.first?.data == fixture, "native recovery loads verified DER from the individual certificate resource")
 			let csr = ZagCertificateRequest(data: Data([1]))
 			do {
 				_ = try await portal.submitCertificateRequest(csr, team: team)
@@ -162,11 +182,11 @@ extension Result where Failure == ZagProvisioningFailure {
 			}
 			consent.authorize([.submitCSR])
 			let issued = try await portal.submitCertificateRequest(csr, team: team)
-			check(issued.certificate.serialNumber == "AB" && issued.data == Data([1, 2, 3]),
+			check(issued.certificate.serialNumber == certificate.serialNumber && issued.data == fixture,
 				  "native CSR resolves a response containing only the certificate ID")
 			let requests = await transport.requests
-			check(requests.map { $0.url.lastPathComponent } == ["certificates", "submitDevelopmentCSR.action", "certificates"],
-				  "production portal issues read, CSR and a single read-back")
+			check(requests.map { $0.url.lastPathComponent } == ["certificates", "certificates", "CERT1", "submitDevelopmentCSR.action", "certificates", "CERT1"],
+				  "production portal uses read-only details and submits exactly one CSR")
 			check(requests.allSatisfy { $0.headers["X-Apple-GS-Token"] == "persisted-test-token" },
 				  "production portal uses the injected session for each operation")
 			let inventory = requests[0]
@@ -174,6 +194,13 @@ extension Result where Failure == ZagProvisioningFailure {
 			check(inventory.method == "POST" && inventory.headers["X-HTTP-Method-Override"] == "GET"
 				  && inventory.headers["Accept"] == "application/vnd.api+json"
 				  && query == ["urlEncodedQueryParams": "teamId=\(team)"], "Personal Team certificate request matches the v1 wire format")
+			await transport.failInventory()
+			do {
+				_ = try await portal.submitCertificateRequest(csr, team: team)
+				check(false, "failed read-back should surface an unconfirmed CSR")
+			} catch ZagPortalError.malformedResponse {
+				check(true, "a read-back 429 after CSR success does not classify the CSR as refused")
+			}
 		} catch {
 			check(false, "native inventory and CSR flow: \(error)")
 		}
@@ -272,6 +299,39 @@ extension Result where Failure == ZagProvisioningFailure {
 		check(candidates.map(\.serialNumber) == ["BBBB", "AAAA"], "at the certificate limit the user is offered certificates to revoke, soonest-expiring first")
 		let issued = await limit.portal.issuedCertificates.count
 		check(issued == 2, "no certificate is revoked automatically")
+
+		let conflict = await Harness.make()
+		await conflict.portal.seedCertificate(serial: "16EED9", expiresAt: conflict.clock.now + 100 * 86_400)
+		await conflict.portal.fail(.submitCertificateRequest, with: .certificateConflict)
+		let refused = await conflict.run(request())
+		guard case .certificateMustBeRevoked(let listed)? = refused.failure?.kind else {
+			return check(false, "Apple 7460 must surface as a certificate conflict")
+		}
+		let pending = try! conflict.secrets.load(.pendingSigningKey, account: conflict.account, team: team)
+			.map { try JSONDecoder().decode(ZagPendingSigningKey.self, from: $0) }
+		check(listed.map(\.serialNumber) == ["16EED9"] && pending?.submissionUnconfirmed == false,
+			  "Apple 7460 preserves the key and records explicit refusal")
+		conflict.clock.advance(ZagPendingSigningKey.lifetime + 1)
+		await conflict.portal.fail(.submitCertificateRequest, with: nil)
+		let resumed = await conflict.run(request())
+		let published = try! conflict.secrets.load(.signingPrivateKey, account: conflict.account, team: team)
+			.map { try JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
+		check(resumed.value?.changes.createdCertificate == true && published?.privateKey == pending?.privateKey,
+			  "signing resumes with the preserved key after Apple allows issuance")
+
+		let ambiguous = await Harness.make()
+		await ambiguous.portal.fail(.submitCertificateRequest, with: .network)
+		let lost = await ambiguous.run(request())
+		await ambiguous.portal.fail(.submitCertificateRequest, with: nil)
+		let retry = await ambiguous.run(request())
+		let calls = await ambiguous.portal.calls
+		check(lost.failure?.kind == .certificateRequestUnresolved && retry.failure?.kind == .certificateRequestUnresolved
+			  && calls.filter { $0 == .submitCertificateRequest }.count == 1,
+			  "an ambiguous CSR with no inventory match stays pending and does not resubmit")
+		let abandoned = await ambiguous.provisioner.abandonUnresolvedCertificateRequest(accountID: ambiguous.account, team: team)
+		let afterAbandon = await ambiguous.run(request())
+		check(abandoned == .abandoned && afterAbandon.value?.changes.createdCertificate == true,
+			  "explicit abandonment allows a fresh request and resumes provisioning")
 
 		let expiring = await Harness.make()
 		_ = await expiring.run(request())

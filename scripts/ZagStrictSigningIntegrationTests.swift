@@ -385,13 +385,13 @@ extension Tests {
 		guard await provision() != nil, let first = secrets.identity(account, team) else { return check(false, "first identity") }
 		issuer.days = 365
 
-		// The request fails before Apple answers: the working identity is untouched.
-		portal.failNext(2)
+		// Apple explicitly refuses the request: the working identity is untouched.
+		portal.refuseNext(2)
 		let failed = await provision()
 		check(failed == nil && secrets.identity(account, team) == first && works(first)
 			  && secrets.pending(account, team).map { factory.hasKey(account: account, team: team, keySlot: $0.keySlot) } == true
 			  && secrets.pending(account, team)?.attempts == 1,
-			  "L2: an interrupted certificate request leaves the working identity and its key in use; the new key stays pending")
+			  "L2: a refused certificate request leaves the working identity and its key in use; the new key stays pending")
 		_ = await provision()
 		check(portal.submitted.count == 3 && portal.submitted[1] == portal.submitted[2] && secrets.pending(account, team)?.attempts == 2
 			  && secrets.identity(account, team) == first,
@@ -403,7 +403,7 @@ extension Tests {
 			  "L2: on success the identity switches to the new key in one write; the old key is then removed")
 
 		// Retries are bounded: after three attempts a new key and request are made.
-		portal.failNext(4)
+		portal.refuseNext(4)
 		for _ in 0..<4 { _ = await provision() }
 		let attempts = Array(portal.submitted.suffix(4))
 		check(attempts[0] == attempts[1] && attempts[1] == attempts[2] && attempts[3] != attempts[2]
@@ -473,17 +473,18 @@ extension Tests {
 			  "recovery: Check Again finds the certificate of a lost response by its key and uses it, sending nothing")
 		let nothing = await provisioner.checkUnresolvedCertificateRequest(accountID: account, team: team, authorization: authorization)
 		check(nothing == .nothingPending && portal.submitted.count == beforeCheck, "recovery: Check Again with nothing unresolved changes nothing")
-		// A request that failed before Apple acted: the full listing shows it.
+		// Even a complete listing cannot resolve a submission with no match.
 		try? keys.delete(account: account, team: team, slot: byCheck.keySlot)
 		portal.failNext(1)
 		_ = await provision()
 		let beforeNotIssued = portal.submitted.count
 		let settled = await provisioner.checkUnresolvedCertificateRequest(accountID: account, team: team, authorization: authorization)
-		check(settled == .notIssued && portal.submitted.count == beforeNotIssued && secrets.pending(account, team)?.submissionUnconfirmed == false,
-			  "recovery: Check Again settles a request the full listing shows was not issued, sending nothing")
+		check(settled == .unresolved && portal.submitted.count == beforeNotIssued && secrets.pending(account, team)?.submissionUnconfirmed == true,
+			  "recovery: Check Again preserves the pending key when even the full listing cannot establish issuance")
+		_ = await provisioner.abandonUnresolvedCertificateRequest(accountID: account, team: team)
 		guard await provision() != nil, let resent = secrets.identity(account, team) else { return check(false, "after not issued") }
-		check(portal.submitted.count == beforeNotIssued + 1 && portal.submitted.last == portal.submitted[beforeNotIssued - 1] && works(resent),
-			  "recovery: after that, the next signing sends the same request once")
+		check(portal.submitted.count == beforeNotIssued + 1 && portal.submitted.last != portal.submitted[beforeNotIssued - 1] && works(resent),
+			  "recovery: after explicit abandonment, signing sends one new request")
 		portal.hidesCertificateData = true
 
 		// A refusal from Apple (rate limit) means nothing was issued: the next
@@ -504,9 +505,12 @@ extension Tests {
 		_ = await provision()
 		check(secrets.pending(account, team)?.submissionUnconfirmed == true, "recovery: a request is marked unconfirmed before it is sent")
 		let crashAt = portal.submitted.count
-		guard await provision() != nil, let latest = secrets.identity(account, team) else { return check(false, "after an unsent request") }
-		check(portal.submitted.count == crashAt + 1 && portal.submitted.last == portal.submitted[crashAt - 1] && works(latest),
-			  "recovery: when the full listing shows nothing was issued, the same request is sent once more")
+		let blocked = await provision()
+		check(blocked == nil && portal.submitted.count == crashAt, "recovery: an interrupted request is not automatically repeated")
+		_ = await provisioner.abandonUnresolvedCertificateRequest(accountID: account, team: team)
+		guard await provision() != nil, let latest = secrets.identity(account, team) else { return check(false, "after an abandoned request") }
+		check(portal.submitted.count == crashAt + 1 && portal.submitted.last != portal.submitted[crashAt - 1] && works(latest),
+			  "recovery: explicitly abandoning the interrupted request lets the user start fresh")
 
 		// Pending keys belong to one account and team.
 		let other = UUID()
@@ -700,12 +704,11 @@ extension Tests {
 				  "ambiguous: after \(name), the issued certificate is recovered from the listing; Apple was asked once")
 		}
 
-		// Check Again while a retry of the same request is out: it must not
-		// settle that request from a listing read before the response.
+		// Check Again while a retry after a definite rejection is out.
 		loseKeyInUse()
-		portal.failNext(1)
+		portal.refuseNext(1)
 		_ = await provision()
-		guard secrets.pending(account, team)?.submissionUnconfirmed == true else { return check(false, "check race: setup") }
+		guard secrets.pending(account, team)?.submissionUnconfirmed == false else { return check(false, "check race: setup") }
 		let sentBeforeRace = portal.submitted.count, issuedBeforeRace = portal.issuedCount
 		portal.holdNext(.beforeIssue)
 		portal.loseNext(1)

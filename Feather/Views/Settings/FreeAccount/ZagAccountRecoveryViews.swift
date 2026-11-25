@@ -144,7 +144,9 @@ struct ZagCertificateRecoveryView: View {
 						.foregroundStyle(model.request == nil ? .green : .orange)
 					VStack(alignment: .leading, spacing: 4) {
 						Text(model.request == nil ? "No Unresolved Request" : "Certificate Request Unresolved").font(.headline)
-						Text("A certificate request for \(teamName) was sent, but its answer was lost. Apple may have issued a certificate. Zag Store stops requesting certificates for this team until this is settled.")
+						Text(model.request == nil
+							 ? "Return to Sign App to continue."
+							 : "Zag Store could not confirm the result of a request for \(teamName). Apple may have issued a certificate. Check the inventory before requesting another.")
 							.font(.subheadline)
 							.foregroundStyle(.secondary)
 							.fixedSize(horizontal: false, vertical: true)
@@ -204,7 +206,7 @@ struct ZagCertificateRecoveryView: View {
 			isPresented: Binding(get: { model.phase == .confirmingAbandon }, set: { if !$0 { model.cancelAbandon() } }),
 			titleVisibility: .visible
 		) {
-			Button("Abandon Request", role: .destructive) { Task { await model.confirmAbandon() } }
+			Button("Abandon Request", role: .destructive) { model.startAbandon() }
 			Button("Cancel", role: .cancel) { model.cancelAbandon() }
 		} message: {
 			Text("Apple may already have issued a certificate for this request. If it did, that certificate keeps using one of the team's certificate slots until it expires or you revoke it. Zag Store will not revoke it. The next signing requests a new certificate.")

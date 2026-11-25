@@ -53,6 +53,8 @@ let okNoCode = try! ZagDeveloperServicesProtocol.parse(plist(["teams": []]), htt
 check(okNoCode["teams"] != nil, "absent resultCode treated as success")
 throws_(.sessionRejected, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 1100, "userString": "bad session"]), httpStatus: 200) }, "resultCode 1100 -> sessionRejected")
 throws_(.existingCertificateOrPendingRequest, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 7460]), httpStatus: 200) }, "parse 7460 -> existingCertificateOrPendingRequest")
+throws_(.existingCertificateOrPendingRequest, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": "7460"]), httpStatus: 409, action: .submitCSR) }, "CSR conflict remains definitive on HTTP 409 with a 7460 plist")
+throws_(.appIDLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9120]), httpStatus: 200, action: .addAppID) }, "App ID 9120 reports App ID capacity")
 throws_(.deviceLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9120]), httpStatus: 200) }, "resultCode 9120 -> deviceLimitReached")
 throws_(.appIDLimitReached,  { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9412]), httpStatus: 200) }, "resultCode 9412 -> appIDLimitReached")
 throws_(.certificateLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 3540]), httpStatus: 200) }, "resultCode 3540 -> certificateLimitReached")
@@ -119,12 +121,13 @@ check(consent.mayPerform(.addDevice) == false, "cancel revokes all consent")
 check(ZagDenyingMutationConsent().mayPerform(.addDevice) == false, "denying consent denies everything")
 
 // MARK: Profile-identity audit (reuse decision; sanitized bool/count output only).
-let soon = Date().addingTimeInterval(6 * 86_400)     // ~7-day free-account profile
+let auditTime = Date(timeIntervalSince1970: 1_795_000_000)
+let soon = auditTime.addingTimeInterval(6 * 86_400)     // ~7-day free-account profile
 let aud = ZagProfileIdentityAudit.audit(
 	profileTeam: "V54K5JYGS4", profileDevices: ["00009999-000ABCDEF1234567"],
 	profileCertificateSerials: ["A", "B", "C"], profileBundle: "dev.zagstore.ptteamprobe",
 	profileExpiresAt: soon, discoveredTeam: "v54k5jygs4",
-	expectedDeviceUDID: "00009999-000abcdef1234567", targetBundle: "dev.zagstore.ptteamprobe")
+	expectedDeviceUDID: "00009999-000abcdef1234567", targetBundle: "dev.zagstore.ptteamprobe", now: auditTime)
 check(aud.teamMatchesDiscovered, "team matches discovered (case-insensitive)")
 check(aud.deviceInProfile, "this device's UDID found in profile (case-insensitive)")
 check(aud.bundleMatchesTarget, "profile bundle matches target")
@@ -168,6 +171,8 @@ check((try? ZagCertificateRevocation.parse(Data(), httpStatus: 200)) == true, "e
 check((try? ZagCertificateRevocation.parse(Data("{\"data\":null}".utf8), httpStatus: 200)) == true, "2xx json without errors -> revoked")
 throws_(.sessionRejected, { _ = try ZagCertificateRevocation.parse(Data(), httpStatus: 403) }, "revoke HTTP 403 -> sessionRejected")
 throws_(.malformedResponse, { _ = try ZagCertificateRevocation.parse(Data("{\"errors\":[{\"detail\":\"no\"}]}".utf8), httpStatus: 200) }, "revoke errors -> malformedResponse")
+throws_(.malformedResponse, { _ = try ZagCertificateRevocation.parse(Data("<html>Unexpected</html>".utf8), httpStatus: 200) }, "revocation with an unreadable body remains unconfirmed")
+
 
 // MARK: Pending-CSR journal (idempotency: no duplicate request, no orphaned key).
 let now = Date()

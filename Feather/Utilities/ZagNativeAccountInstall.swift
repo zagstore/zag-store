@@ -19,6 +19,41 @@ enum ZagNativeAccountInstall {
 		}
 	}
 
+	struct CertificateIssue: LocalizedError {
+		let failure: ZagProvisioningFailure
+		let scope: ZagSigningScope
+		let teamName: String
+		let recovery: ZagCertificateRecoveryModel?
+
+		var errorDescription: String? { failure.message }
+	}
+
+	/// The native installer creates provisioners per operation. Use the same
+	/// lock for recovery so two instances cannot modify the same journal.
+	private struct LockedRecovery: ZagCertificateRecoveryService {
+		let provisioner: ZagFreeAccountProvisioner
+
+		func unresolvedCertificateRequest(accountID: UUID, team: String) async -> ZagUnresolvedCertificateRequest? {
+			await provisioner.unresolvedCertificateRequest(accountID: accountID, team: team)
+		}
+
+		func checkUnresolvedCertificateRequest(accountID: UUID, team: String, authorization: ZagSigningAuthorization) async -> ZagCertificateRecoveryOutcome {
+			do {
+				return try await ZagNativeAccountInstall.withExclusiveOperation {
+					await provisioner.checkUnresolvedCertificateRequest(accountID: accountID, team: team, authorization: authorization)
+				}
+			} catch { return .checkFailed(.unavailable) }
+		}
+
+		func abandonUnresolvedCertificateRequest(accountID: UUID, team: String) async -> ZagCertificateRecoveryOutcome {
+			do {
+				return try await ZagNativeAccountInstall.withExclusiveOperation {
+					await provisioner.abandonUnresolvedCertificateRequest(accountID: accountID, team: team)
+				}
+			} catch { return .checkFailed(.unavailable) }
+		}
+	}
+
 	private static var running = false
 	static let namespace = "app.zagstore.native-account"
 	static var secrets: ZagKeychainFreeAccountSecretStore { .init(service: namespace) }
@@ -43,11 +78,11 @@ enum ZagNativeAccountInstall {
 		ZagDeveloperTokenStore().load(scope: "device")?.isUsable(at: Date()) == true
 	}
 
-	static func install(source: URL, name: String) async throws -> ZagInstallVerification {
-		try await withExclusiveOperation { try await performInstall(source: source, name: name) }
+	static func install(source: URL, name: String, expectedScope: ZagSigningScope? = nil) async throws -> ZagInstallVerification {
+		try await withExclusiveOperation { try await performInstall(source: source, name: name, expectedScope: expectedScope) }
 	}
 
-	private static func performInstall(source: URL, name: String) async throws -> ZagInstallVerification {
+	private static func performInstall(source: URL, name: String, expectedScope: ZagSigningScope?) async throws -> ZagInstallVerification {
 		guard let device = ZagDeveloperAccountLive.pairedDevice else { throw Failure.pairing }
 		guard let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()) else {
 			throw Failure.signIn
@@ -67,15 +102,37 @@ enum ZagNativeAccountInstall {
 		consent.authorize([.addDevice, .addAppID, .submitCSR, .downloadProfile, .addAppGroup, .assignAppGroups])
 		defer { consent.cancel() }
 		let portal = portal(token: token, consent: consent)
-		guard let team = try await portal.teams().first(where: \.isPersonalTeam) else { throw Failure.personalTeam }
+		guard let team = try await portal.teams().first(where: { $0.isPersonalTeam && (expectedScope == nil || $0.teamID == expectedScope?.teamID) }) else { throw Failure.personalTeam }
 		let authorization = ZagSigningAuthorization.nativeAccount(token: token, teamID: team.teamID)
 		let scope = authorization.scope
+		guard expectedScope == nil || expectedScope == scope else { throw Failure.signIn }
 		let keys = ZagKeychainSigningKeys(namespace: namespace)
 		let provisioner = ZagFreeAccountProvisioner(portal: portal, keys: ZagKeychainSigningKeyFactory(keys: keys),
 													secrets: secrets, account: scope.accountID)
 		let request = ZagProvisioningRequest(accountID: scope.accountID, team: scope.teamID, deviceUDID: device.udid,
 											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: [])
-		let result = try await provisioner.provision(request, authorization: authorization).get()
+		let result: ZagProvisioningResult
+		switch await provisioner.provision(request, authorization: authorization) {
+		case .success(let provisioned):
+			result = provisioned
+		case .failure(let failure):
+			switch failure.kind {
+			case .certificateRequestUnresolved:
+				let recovery = ZagCertificateRecoveryModel(scope: scope, service: LockedRecovery(provisioner: provisioner)) { scope in
+					guard let current = ZagDeveloperTokenStore().load(scope: "device"), current.isUsable(at: Date()) else {
+						throw Failure.signIn
+					}
+					let authorization = ZagSigningAuthorization.nativeAccount(token: current, teamID: scope.teamID)
+					guard authorization.scope == scope else { throw Failure.signIn }
+					return authorization
+				}
+				throw CertificateIssue(failure: failure, scope: scope, teamName: team.name, recovery: recovery)
+			case .certificateMustBeRevoked:
+				throw CertificateIssue(failure: failure, scope: scope, teamName: team.name, recovery: nil)
+			default:
+				throw failure
+			}
+		}
 		guard let data = try secrets.load(.signingPrivateKey, account: scope.accountID, team: scope.teamID) else {
 			throw Failure.identity
 		}

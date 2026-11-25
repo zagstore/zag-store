@@ -131,7 +131,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		   ![401, 403, 429].contains(response.statusCode) {
 			fault.set("HTTP \(response.statusCode)")
 		}
-		return try ZagDeveloperServicesProtocol.parse(response.body, httpStatus: response.statusCode)
+		return try ZagDeveloperServicesProtocol.parse(response.body, httpStatus: response.statusCode, action: action)
 	}
 
 	/// A short, secret-free reason for a transport refusal.
@@ -163,7 +163,8 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	func devices(team: String) async throws -> [ZagRegisteredDevice] {
 		let dict = try await send(.listDevices, teamID: team)
-		return ((dict["devices"] as? [[String: Any]]) ?? []).compactMap { row in
+		guard let rows = dict["devices"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
+		return rows.compactMap { row in
 			guard let udid = (row["deviceNumber"] as? String) ?? (row["udid"] as? String) else { return nil }
 			return ZagRegisteredDevice(udid: udid, name: (row["name"] as? String) ?? "device")
 		}
@@ -171,7 +172,8 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	func appIDs(team: String) async throws -> [ZagRegisteredAppID] {
 		let dict = try await send(.listAppIDs, teamID: team)
-		return ((dict["appIds"] as? [[String: Any]]) ?? []).compactMap { row in
+		guard let rows = dict["appIds"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
+		return rows.compactMap { row in
 			guard let identifier = (row["appIdId"] as? String) ?? (row["appIdentifierId"] as? String),
 				  let bundle = (row["identifier"] as? String) else { return nil }
 			return ZagRegisteredAppID(identifier: identifier, bundleIdentifier: bundle,
@@ -194,14 +196,29 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// Development certificates via the `/services/v1/` JSON API (POST +
 	/// X-HTTP-Method-Override: GET), not the QH65B2 plist action. Read-only.
 	func certificates(team: String) async throws -> [ZagDevelopmentCertificate] {
-		try await listCertificateRows(team: team).compactMap { ZagDeveloperServicesProtocol.parseCertificate($0).map(Self.certificate) }
+		let rows = try await listCertificateRows(team: team)
+		var certificates: [ZagDevelopmentCertificate] = []
+		for row in rows {
+			guard let parsed = ZagDeveloperServicesProtocol.parseCertificate(row) else { throw ZagPortalError.malformedResponse }
+			let complete = await certificateDetail(for: row, parsed: parsed, team: team)
+			certificates.append(Self.certificate(complete))
+		}
+		return certificates
 	}
 
 	/// Read-only revocation candidates: the same listing as `certificates(team:)`,
 	/// preserving the certificate id and a DER SHA-1 so a later (consent-gated,
 	/// here blocked) revoke could target the EXACT certificate.
 	func revocableCertificates(team: String) async throws -> [ZagRevocableCertificate] {
-		return ZagCertificateRevocation.candidates(from: try await listCertificateRows(team: team))
+		let rows = try await listCertificateRows(team: team)
+		return ZagCertificateRevocation.candidates(from: rows).map { candidate in
+			let parsed = rows.first { $0["id"] as? String == candidate.id }.flatMap(ZagDeveloperServicesProtocol.parseCertificate)
+			guard let der = parsed?.der, ZagCertificateInspection(der: der) != nil else {
+				return ZagRevocableCertificate(id: candidate.id, serialNumber: candidate.serialNumber, sha1: nil,
+											   name: candidate.name, machineName: candidate.machineName, expiresAt: candidate.expiresAt)
+			}
+			return candidate
+		}
 	}
 
 	private func listCertificateRows(team: String) async throws -> [[String: Any]] {
@@ -213,6 +230,32 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 			throw ZagPortalError.malformedResponse
 		}
 		return rows
+	}
+
+	/// The collection may contain only serial and display metadata. Try the
+	/// individual resource and accept its DER only for the exact listed ID and serial.
+	private func certificateDetail(for row: [String: Any], parsed: ZagParsedCertificate, team: String) async -> ZagParsedCertificate {
+		if let der = parsed.der, ZagCertificateInspection(der: der) != nil { return parsed }
+		guard let id = row["id"] as? String, Self.isCertificateID(id),
+			  let body = try? ZagDeveloperServicesV1.listCertificatesBody(teamID: team),
+			  let response = try? await sendV1(path: "certificates/\(id)", methodOverride: "GET", body: body),
+			  (200..<300).contains(response.statusCode),
+			  let document = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any],
+			  let resource = document["data"] as? [String: Any], resource["id"] as? String == id,
+			  let detail = ZagDeveloperServicesProtocol.parseCertificate(resource), let der = detail.der,
+			  let inspected = ZagCertificateInspection(der: der),
+			  parsed.serialNumber.isEmpty || Self.normalizedSerial(inspected.serialNumber) == Self.normalizedSerial(parsed.serialNumber) else {
+			return parsed
+		}
+		return detail
+	}
+
+	private static func isCertificateID(_ id: String) -> Bool {
+		!id.isEmpty && id.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }
+	}
+
+	private static func normalizedSerial(_ serial: String) -> String {
+		String(serial.uppercased().drop(while: { $0 == "0" }))
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
@@ -263,8 +306,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		// The CSR is PEM; the private key stays in the Keychain (only the public
 		// request is sent). No key material is ever in this request.
 		let pem = ZagDeveloperServicesProtocol.pem(request.data)
-		// submitDevelopmentCSR is a QH65B2 plist action; the DER comes straight
-		// back under "certRequest" (verified: AltSign/SideStore do not re-list).
+
 		// machineId is a STABLE per-install identifier (not a fresh value per
 		// request): the established protocol labels the request with the machine's
 		// identity, and a stable id keeps the account from accruing certificates
@@ -273,20 +315,24 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]) else {
 			throw ZagPortalError.malformedResponse
 		}
-		if let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der {
+		if let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der, !der.isEmpty {
 			return ZagIssuedCertificate(certificate: Self.certificate(parsed), data: der)
 		}
 		let id = (row["certificateId"] ?? row["certRequestId"]) as? String
 		let serial = ZagDeveloperServicesProtocol.parseCertificate(row)?.serialNumber
-		let listed = try await listCertificateRows(team: team)
+		// Apple accepted the CSR response. A later inventory error cannot prove
+		// that the CSR was refused, even if that read returns 401 or 429.
+		guard id != nil || serial?.isEmpty == false,
+			  let listed = try? await listCertificateRows(team: team) else { throw ZagPortalError.malformedResponse }
 		guard let match = listed.first(where: { candidate in
 			if let id, candidate["id"] as? String == id { return true }
 			guard let serial, !serial.isEmpty else { return false }
-			return ZagDeveloperServicesProtocol.parseCertificate(candidate)?.serialNumber.caseInsensitiveCompare(serial) == .orderedSame
-		}), let parsed = ZagDeveloperServicesProtocol.parseCertificate(match), let der = parsed.der else {
-			throw ZagPortalError.malformedResponse
-		}
-		return ZagIssuedCertificate(certificate: Self.certificate(parsed), data: der)
+			guard let candidateSerial = ZagDeveloperServicesProtocol.parseCertificate(candidate)?.serialNumber else { return false }
+			return Self.normalizedSerial(candidateSerial) == Self.normalizedSerial(serial)
+		}), let parsed = ZagDeveloperServicesProtocol.parseCertificate(match) else { throw ZagPortalError.malformedResponse }
+		let complete = await certificateDetail(for: match, parsed: parsed, team: team)
+		guard let der = complete.der, !der.isEmpty else { throw ZagPortalError.malformedResponse }
+		return ZagIssuedCertificate(certificate: Self.certificate(complete), data: der)
 	}
 
 	/// Revokes ONE certificate via `/services/v1/` DELETE. Consent-gated on
@@ -299,6 +345,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		guard activeGuard.mayRevoke(certificate, explicitOverride: override) else {
 			throw ZagNativePortalError.consentRequired(.revokeCertificate)   // active cert without override
 		}
+		guard Self.isCertificateID(certificate.id) else { throw ZagPortalError.malformedResponse }
 		let response = try await sendV1(path: ZagCertificateRevocation.endpointPath(id: certificate.id),
 										methodOverride: ZagCertificateRevocation.methodOverride,
 									body: ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
@@ -327,6 +374,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		let inspected = p.der.flatMap(ZagCertificateInspection.init(der:))
 		return ZagDevelopmentCertificate(serialNumber: inspected?.serialNumber ?? p.serialNumber.uppercased(),
 										 name: p.name, machineName: p.machineName,
-										 expiresAt: inspected?.expiresAt ?? p.expiresAt ?? Date.distantPast, data: p.der)
+										 expiresAt: inspected?.expiresAt ?? p.expiresAt ?? Date.distantPast,
+										 data: inspected == nil ? nil : p.der)
 	}
 }
