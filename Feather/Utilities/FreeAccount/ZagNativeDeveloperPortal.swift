@@ -34,8 +34,23 @@ struct ZagNativeDeveloperTeam: Codable, Equatable, Sendable {
 /// internal and the convenience factory returns the disabled stub unless an
 /// explicit enable is passed.
 // Conforms to ZagReplacementPortal (ZagCertificateReplacementService.swift): it
-// already implements all three operations that service needs.
-extension ZagNativeDeveloperPortal: ZagReplacementPortal {}
+// already implements all three operations that service needs, and surfaces the
+// last request's sanitized failure reason (HTTP status / transport refusal) so
+// the inventory banner is never an opaque "network problem".
+extension ZagNativeDeveloperPortal: ZagReplacementPortal {
+	var lastFailureReason: String? { fault.reason }
+}
+
+/// A tiny thread-safe box for the last request's sanitized failure reason.
+/// Reference type so a `let` on the value-type portal still records across a
+/// non-mutating `send`. Holds ONLY a short, secret-free string (an HTTP status
+/// or a transport-refusal reason) — never a token, header value or body.
+final class ZagPortalFaultBox: @unchecked Sendable {
+	private let lock = NSLock()
+	private var value: String?
+	func set(_ s: String?) { lock.lock(); value = s; lock.unlock() }
+	var reason: String? { lock.lock(); defer { lock.unlock() }; return value }
+}
 
 struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// Supplies the current developer headers (token bag). Async so it can be
@@ -51,6 +66,8 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// Shared across one provisioning sequence; counts every request, mutating
 	/// or not, and refuses past the ceiling. No retries anywhere.
 	private let budget: ZagRequestBudget
+	/// The last request's sanitized failure reason (see `ZagPortalFaultBox`).
+	private let fault = ZagPortalFaultBox()
 
 	init(transport: ZagHTTPTransport,
 		 headers: @escaping HeadersProvider,
@@ -112,13 +129,31 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 			method: "POST",
 			headers: requestHeaders,
 			body: try ZagDeveloperServicesProtocol.requestBody(teamID: teamID, parameters: parameters))
+		fault.set(nil)
 		let response: ZagHTTPResponse
 		do {
 			response = try await transport.send(request)
 		} catch let error as ZagTransportError {
-			throw error == .offline || error == .timedOut ? ZagPortalError.network : ZagPortalError.network
+			fault.set(Self.transportReason(error))
+			throw ZagPortalError.network
+		}
+		// A non-2xx that parse collapses to `.network` (not 401/403/429) keeps its
+		// status, so the banner shows e.g. "HTTP 404" instead of a bare "network".
+		if !(200..<300).contains(response.statusCode),
+		   ![401, 403, 429].contains(response.statusCode) {
+			fault.set("HTTP \(response.statusCode)")
 		}
 		return try ZagDeveloperServicesProtocol.parse(response.body, httpStatus: response.statusCode)
+	}
+
+	/// A short, secret-free reason for a transport refusal.
+	private static func transportReason(_ error: ZagTransportError) -> String {
+		switch error {
+		case .offline:                 return "offline"
+		case .timedOut:                return "timed out"
+		case .readOnlyBlocked(let w):  return "read-only blocked: \(w)"
+		default:                       return "transport refused"
+		}
 	}
 
 	// MARK: - Read-only discovery
@@ -273,8 +308,9 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		}
 		for (k, v) in ZagDeveloperServicesV1.headers(methodOverride: methodOverride) { requestHeaders[k] = v }
 		let request = ZagHTTPRequest(url: try ZagDeveloperServicesV1.endpoint(path), method: "POST", headers: requestHeaders, body: body)
+		fault.set(nil)
 		do { return try await transport.send(request) }
-		catch is ZagTransportError { throw ZagPortalError.network }
+		catch let error as ZagTransportError { fault.set(Self.transportReason(error)); throw ZagPortalError.network }
 	}
 
 	/// Maps a parsed certificate (transport-independent) to the app model.

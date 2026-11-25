@@ -102,8 +102,9 @@ private enum ZagSettingsSection: String, CaseIterable, Identifiable {
 	}
 }
 
+// About is a fixed section (rendered above Apple Accounts & Signing), so it is
+// not part of the reorderable set.
 private let zagDefaultSettingsSectionOrder: [ZagSettingsSection] = [
-	.aboutUs,
 	.certificates,
 	.display,
 	.features,
@@ -239,6 +240,7 @@ struct SettingsView: View {
                         _settingsSearchResults
                     } else {
 					_supportSection
+					_settingsSection(.aboutUs)
 					_appleSigningSection
 					ForEach(_settingsSectionOrder) { section in
 						_settingsSection(section)
@@ -605,8 +607,8 @@ extension SettingsView {
 			NavigationLink(destination: ZagAppleSigningSettingsView().zagSettingsDestinationAvatar()) {
 				Label {
 					VStack(alignment: .leading, spacing: 2) {
-						Text("Apple Account & Signing")
-						Text("Sign apps on-device with a free Apple Account · Experimental")
+						Text("Apple Accounts & Signing")
+						Text("Sign apps on-device with your free Apple Accounts")
 							.font(.caption).foregroundStyle(.secondary)
 					}
 				} icon: {
@@ -614,6 +616,8 @@ extension SettingsView {
 				}
 			}
 			.accessibilityIdentifier("settings.appleSigning")
+		} header: {
+			Text("Accounts")
 		}
 	}
 
@@ -980,7 +984,7 @@ extension SettingsView {
 		let stored = _storedSettingsSectionOrder
 			.split(separator: ",")
 			.compactMap { ZagSettingsSection(rawValue: String($0)) }
-			.filter { $0 != .reset }
+			.filter { $0 != .reset && $0 != .aboutUs }
 		let unique = stored.reduce(into: [ZagSettingsSection]()) { result, section in
 			if !result.contains(section) { result.append(section) }
 		}

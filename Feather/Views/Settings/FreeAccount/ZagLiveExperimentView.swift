@@ -332,7 +332,7 @@ struct ZagLiveExperimentView: View {
 				}
 			} footer: {
 				if model.constants.isNative {
-					Text("Native on-device campaign. Arm it below (within the campaign window), then sign in under Settings › Apple Account & Signing. No reinstall and no data loss — installing over the existing app keeps all settings, sources, certificates and Keychain entries.")
+					Text("Native on-device campaign. Arm it below (within the campaign window), then sign in under Settings › Apple Accounts & Signing. No reinstall and no data loss — installing over the existing app keeps all settings, sources, certificates and Keychain entries.")
 				} else {
 					Text("Arming (E5): open this screen once, delete Zag Store, reinstall the same build, and open it again. Only then does the state read armed.")
 				}
@@ -342,7 +342,7 @@ struct ZagLiveExperimentView: View {
 				Button("Arm Campaign") { model.arm() }
 					.disabled(model.state == .armed || model.isBusy)
 				if model.state == .armed {
-					Text("Armed. Sign in under Settings › Apple Account & Signing.").font(.footnote).foregroundStyle(.green)
+					Text("Armed. Sign in under Settings › Apple Accounts & Signing.").font(.footnote).foregroundStyle(.green)
 				}
 				if let outcome = model.outcome { Text(outcome).font(.footnote) }
 			} header: {

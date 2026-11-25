@@ -44,7 +44,7 @@ struct ZagAppleSigningSettingsView: View {
 			}
 			safetySection
 		}
-		.navigationTitle("Apple Account & Signing")
+		.navigationTitle("Apple Accounts & Signing")
 		.task { await refresh() }
 	}
 

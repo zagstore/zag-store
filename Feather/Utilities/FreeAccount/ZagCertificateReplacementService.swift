@@ -21,6 +21,13 @@ protocol ZagReplacementPortal: Sendable {
 	func revokeCertificate(_ certificate: ZagRevocableCertificate, guard activeGuard: ZagActiveCertificateGuard,
 						   override: Bool, team: String) async throws
 	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate
+	/// The last request's sanitized failure reason (HTTP status or transport
+	/// refusal), or nil. Default nil; the live native portal records it.
+	var lastFailureReason: String? { get }
+}
+
+extension ZagReplacementPortal {
+	var lastFailureReason: String? { nil }
 }
 
 // `ZagNativeDeveloperPortal` conforms to `ZagReplacementPortal` in its own file
@@ -47,7 +54,7 @@ enum ZagReplacementError: Error, Equatable, Sendable {
 	case ambiguousRevoke               // revoke outcome unknown — reconcile (read-only) before any mutation
 	case ambiguousSubmission           // CSR outcome unknown — reconcile before anything else
 	case sessionRejected
-	case network
+	case network(reason: String?)
 }
 
 enum ZagCertificateReplacementService {
@@ -149,7 +156,7 @@ actor ZagCertificateReplacementDriver {
 	func inventory() async throws -> [ZagRevocableCertificate] {
 		do { return try await portal.revocableCertificates(team: team) }
 		catch let e as ZagPortalError where e == .sessionRejected { throw ZagReplacementError.sessionRejected }
-		catch { throw ZagReplacementError.network }
+		catch { throw ZagReplacementError.network(reason: portal.lastFailureReason) }
 	}
 
 	/// Select the EXACT certificate; the coordinator rejects the active one.

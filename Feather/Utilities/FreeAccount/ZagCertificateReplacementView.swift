@@ -141,7 +141,9 @@ final class ZagCertificateReplacementModel: ObservableObject {
 		case .ambiguousRevoke:        return "The revocation result is unclear. Re-check the certificate list before doing anything else."
 		case .ambiguousSubmission:    return "The request result is unclear. Re-check the certificate list before doing anything else."
 		case .sessionRejected:        return "The Apple session was rejected. Sign in again."
-		case .network:                return "A network problem occurred. Nothing was changed."
+		case .network(let reason):
+			return reason.map { "The certificate list could not be read (\($0)). Nothing was changed." }
+				?? "A network problem occurred. Nothing was changed."
 		}
 	}
 }
