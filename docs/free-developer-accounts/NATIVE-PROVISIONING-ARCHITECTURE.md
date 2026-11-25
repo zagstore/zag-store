@@ -1331,3 +1331,79 @@ be avoided.
 With (1)+(2), a non-destructive upgrade IPA for that identity with
 `ZAG_CERT_REPLACEMENT_EXPERIMENT` + `ZAG_CERT_REPLACEMENT_READONLY_LIVE` + the
 bridge can be built and handed over for the single read-only inventory run.
+
+---
+
+## ZagAppleAuth integration + native-state recovery (2026-11-25)
+
+Resolves the integration blocker from `a00bcedd` without changing architecture.
+No Apple contact, no signing, no install, no new auth implementation.
+
+### 1. Recovered native prototype identity (read-only inspection)
+- **Native ADI/anisette probe:** `dev.zagstore.aaprobe` (`ZagAuthProbe.xcodeproj`),
+  signed by direct `codesign` with the **free Personal Team (V54K5JYGS4)** Apple
+  Development certificate + its Xcode-managed Personal Team profile, entitlements
+  `get-task-allow` (README §4). CONFIRMED from the project + its recipe.
+- **Native signing/CSR harness:** `dev.zagstore.ptteamprobe`, profile
+  `application-identifier = V54K5JYGS4.dev.zagstore.ptteamprobe`,
+  `keychain-access-groups [V54K5JYGS4.*]`. CONFIRMED (profile-match record).
+- **Keychain keying:** every native store (`ZagFreeAccountSecretStore`,
+  `ZagPendingCSRStore`, `ZagMachineIdentifier`, `ZagAppleAuthMachine` session)
+  sets only `kSecAttrService`, **no `kSecAttrAccessGroup`** → items live in each
+  app's **default group = its `application-identifier`**. CONFIRMED.
+- **Consequence (accessibility):** the persistent auth session, device-generated
+  key, CSR and journals are bound to the application-identifier of the app that
+  created them (most plausibly `V54K5JYGS4.dev.zagstore.ptteamprobe`) and are
+  **NOT readable by any other app identity** — no shared group exists to make
+  them so. CONFIRMED in principle.
+- **UNKNOWN (not resolvable without the device/owner):** which exact
+  application-identifier on *this* iPhone holds the preserved key/CSR/journals;
+  no local build artifact or ledger row records it.
+
+### 2. ZagAppleAuth integration (smallest maintainable)
+`ZagAppleAuth.xcframework` is a static lib + clang module map
+(`libZagAppleAuth.a` + `Headers/module.modulemap`); `ZagAppleAuthMachine` uses
+`import ZagAppleAuth`. The integration puts that xcframework on the Feather
+target's Swift import + link paths **via build settings** (no `project.pbxproj`
+change, fully reversible), in `scripts/zag-build-readonly-cert-inventory.sh`:
+`SWIFT_INCLUDE_PATHS += <xcf>/Headers`, `OTHER_LDFLAGS += -L<xcf> -lZagAppleAuth
+-lc++`, both experiment conditions. No second auth implementation — it links the
+real one. A compile-time guard (`#error` in `ZagReadOnlyDeveloperTransport.swift`)
+fails the build if the flag is set without the module, so the live path can
+never silently degrade to the stub.
+
+### 3./4. Build + validation (no install, no Apple contact)
+- **Negative build** (flag on, module absent): `** BUILD FAILED **` at the
+  `#error` — proves the dependency is enforced.
+- **Positive build** (module linked via the script): `** BUILD SUCCEEDED **`,
+  `Feather.app` (arm64) produced, `ZagAppleAuthMachine.o` + the cert-replacement
+  objects compiled, guard did not fire → **the live read-only path and the real
+  `developerHeaders()` are compiled in, not eliminated by `canImport`.**
+- **Inventory decode path** (host suite, 237 checks ALL PASS): a v1 GET request
+  carrying a MOCK developer token, through `ZagReadOnlyTransport` over a
+  recording base returning a scripted certificate listing, decodes to candidates;
+  the request is sent as GET and carries the token; a revoke with the same valid
+  token is still refused before the base sees it. The read-only transport remains
+  the hard boundary (18/18 mutation-block checks).
+
+### 5. Can an experimental IPA be prepared safely? NO — one owner input remains
+To preserve both existing installs, the read-only experiment must install as a
+**distinct bundle id** that coexists (the canonical `com.cwd43.gu29` and the
+native-state prototype `dev.zagstore.ptteamprobe` must not be overwritten). That
+needs a device-matching provisioning profile for that spare bundle id. **Zero
+profiles are installed locally**, and the only embedded profile found
+(`com.cwd43.gu29`, team 7S3MGZK59N) is bundle-id-specific. Minting a profile for
+a new bundle id requires Xcode/Apple (an App ID + profile) = Apple contact =
+forbidden; reusing `com.cwd43.gu29` overwrites the canonical app; reusing
+`dev.zagstore.ptteamprobe` overwrites the preserved-CSR prototype. So packaging
+is held pending the single remaining owner input:
+
+> A device-matching provisioning profile (free Personal Team V54K5JYGS4) for a
+> spare bundle id (e.g. `dev.zagstore.rocertinv`), OR explicit authorization to
+> upgrade-install over the canonical `com.cwd43.gu29` app (same identity, which
+> preserves its container), accepting that the read-only session is established
+> fresh in that build and the preserved-CSR prototype stays untouched.
+
+The read-only inventory needs only a fresh native session (the owner signs in
+within the experiment build); it does NOT need the preserved CSR/key, so a
+separate installation does not disturb the preserved-CSR experiment.

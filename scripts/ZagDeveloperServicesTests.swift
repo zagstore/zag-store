@@ -593,5 +593,42 @@ run {
 // The read-only experiment default mode is disabled (flag off in this build).
 check(ZagCertReplacementExperiment.mode == .disabled || ZagCertReplacementExperiment.mode == .readOnlyInventory, "experiment: mode is a defined value")
 
+// --- Full read-only inventory decode path: mock developer token + recording transport ---
+// Exercises the exact bytes a live read-only inventory would: a v1 GET request
+// carrying a (mock) developer token through ZagReadOnlyTransport over a recording
+// base that returns a scripted certificate listing, decoded by the real parser.
+run {
+	final class InventoryBase: ZagHTTPTransport, @unchecked Sendable {
+		var sawToken = false; var sawPath = ""; var method = ""
+		func send(_ request: ZagHTTPRequest) async throws -> ZagHTTPResponse {
+			sawToken = request.headers.contains { $0.key.lowercased() == "x-apple-gs-token" && !$0.value.isEmpty }
+			sawPath = request.url.path
+			method = request.headers.first(where: { $0.key.caseInsensitiveCompare("X-HTTP-Method-Override") == .orderedSame })?.value ?? request.method
+			let body = """
+			{"data":[{"id":"v1-RO-1","attributes":{"serialNumber":"FOR123","name":"iPhone Developer","expirationDate":"2027-09-06T17:51:01Z"}},
+			         {"id":"v1-RO-2","attributes":{"serialNumber":"723BE3EC","name":"Apple Development","expirationDate":"2027-09-27T01:37:10Z"}}]}
+			"""
+			return ZagHTTPResponse(statusCode: 200, headers: [:], body: Data(body.utf8))
+		}
+	}
+	let base = InventoryBase()
+	let ro = ZagReadOnlyTransport(base: base)
+	var headers = ZagDeveloperServicesV1.headers(methodOverride: "GET")
+	headers["X-Apple-GS-Token"] = "MOCK.DEVELOPER.TOKEN"   // mocked native developer token
+	let request = ZagHTTPRequest(url: try! ZagDeveloperServicesV1.endpoint("certificates"), method: "POST", headers: headers,
+								 body: try! ZagDeveloperServicesV1.listCertificatesBody(teamID: "V54K5JYGS4"))
+	let response = try! await ro.send(request)
+	let rows = try! ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
+	let candidates = ZagCertificateRevocation.candidates(from: rows)
+	check(base.sawToken, "inventory: the request carried the (mock) developer token")
+	check(base.method.caseInsensitiveCompare("GET") == .orderedSame, "inventory: sent as a GET (read-only)")
+	check(candidates.count == 2 && candidates.contains { $0.serialNumber == "FOR123" }, "inventory: scripted certificate listing decoded to candidates")
+	// A mutating call with the same token is still refused before the base sees it.
+	let before = base.sawPath
+	do { _ = try await ro.send(ZagHTTPRequest(url: try! ZagDeveloperServicesV1.endpoint("certificates/v1-RO-1"), method: "POST", headers: { var h = ZagDeveloperServicesV1.headers(methodOverride: "DELETE"); h["X-Apple-GS-Token"] = "MOCK.DEVELOPER.TOKEN"; return h }(), body: Data())); check(false, "inventory: revoke should be blocked") }
+	catch { _ = error }
+	check(base.sawPath == before, "inventory: the revoke never reached the base even with a valid token")
+}
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -1,5 +1,15 @@
 import Foundation
 
+// Fail the build loudly rather than silently degrade: a read-only-live
+// experiment MUST have the real native auth module linked. Without this, a build
+// with the flag but without ZagAppleAuth would quietly compile the live path out
+// (canImport false) and fall back to the disabled portal — defeating the
+// experiment. With it, a successful build PROVES the live read-only path and the
+// real developerHeaders() implementation are compiled in.
+#if ZAG_CERT_REPLACEMENT_READONLY_LIVE && !canImport(ZagAppleAuth)
+#error("ZAG_CERT_REPLACEMENT_READONLY_LIVE requires the ZagAppleAuth module to be linked (add ZagAppleAuth.xcframework to the Feather target). See scripts/zag-build-readonly-cert-inventory.sh.")
+#endif
+
 // A hard read-only boundary for the developer-services portal, BELOW the UI and
 // consent layers. It inspects every outgoing request and lets through only the
 // read-only developer-services endpoints; any mutating endpoint (a QH65B2
