@@ -81,19 +81,52 @@ struct ZagAppleSigningSettingsView: View {
 
 	// MARK: Apple Account
 
+	/// The native Apple-auth module is linked (device builds link it by default).
+	private var machineLinked: Bool { ZagAppleAuthMachine.isLinked }
+	/// The on-device anisette/ADI provider is enabled in this build. Off in
+	/// production until the live sign-in gate passes; without it, sign-in has no
+	/// anisette source and cannot obtain a GrandSlam session.
+	private var adiEnabled: Bool { ZagAppleAuthADI.isEnabled }
+	/// Whether sign-in can run live in this build: both gates must be satisfied.
+	private var signInLive: Bool { machineLinked && adiEnabled }
+
 	private var accountSection: some View {
-		Section("Apple Account") {
+		Section {
+			gateRow("Native module linked", ok: machineLinked,
+					detail: machineLinked ? "The on-device Apple-auth engine is compiled into this build."
+										  : "This build (e.g. simulator) does not link the engine.")
+			gateRow("On-device sign-in enabled", ok: adiEnabled,
+					detail: adiEnabled ? "The on-device anisette/ADI provider is active."
+									   : "Not enabled in this build; sign-in has no anisette source yet.")
 			statusRow(icon: "person.crop.circle", title: "Connect Apple Account",
-					  detail: bridgeLinked ? "Sign in to your free Apple Account." : "Available in a native-bridge build.",
+					  detail: signInLive ? "Sign in to your free Apple Account (password + two-factor on this iPhone)."
+										 : "Requires an on-device-sign-in build; the interaction is not a placeholder — the engine, token store and read-only inventory are all present.",
 					  state: .experimental)
 			statusRow(icon: "person.2", title: "Personal Team",
-					  detail: "Selected after sign-in; a free account has one Personal Team.",
+					  detail: "Discovered from the signed-in account; a free account has one Personal Team.",
 					  state: .pending)
 			#if DEBUG
 			NavigationLink(destination: ZagFreeAccountDebugSignInView().zagSettingsDestinationAvatar()) {
 				Label("Open sign-in (simulated)", systemImage: "person.badge.key")
 			}
 			#endif
+		} header: {
+			Text("Apple Account")
+		} footer: {
+			Text(signInLive
+				 ? "Signing in obtains and persists a developer session (x-apple-gs-token) in Zag Store's own Keychain. Passwords, two-factor codes and tokens are never logged."
+				 : "The developer-session token path is implemented (sign-in → token store → developer headers → inventory). It is not a platform limitation: enabling the on-device sign-in build plus a one-time account provisioning is what remains before a live session can be obtained here.")
+		}
+	}
+
+	private func gateRow(_ title: String, ok: Bool, detail: String) -> some View {
+		HStack(alignment: .firstTextBaseline, spacing: 12) {
+			Image(systemName: ok ? "checkmark.circle.fill" : "circle")
+				.foregroundStyle(ok ? .green : .secondary).frame(width: 24)
+			VStack(alignment: .leading, spacing: 2) {
+				Text(title).font(.subheadline.weight(.medium))
+				Text(detail).font(.caption).foregroundStyle(.secondary)
+			}
 		}
 	}
 
