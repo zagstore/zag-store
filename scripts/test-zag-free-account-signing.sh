@@ -36,6 +36,9 @@ key = (root / "ZagSigningKey.swift").read_text()
 adapter = (root / "ZagFreeAccountSigningAdapter.swift").read_text()
 portal = (root / "ZagDeveloperPortal.swift").read_text()
 provisioner = (root / "ZagFreeAccountProvisioner.swift").read_text()
+# ZagSigningIdentity (and its key-free description) live in ZagSigningModels.swift
+# since the ZagDeveloperPortal split (03293945); assert them at their real home.
+models = (root / "ZagSigningModels.swift").read_text()
 for name, text in [("key", key), ("adapter", adapter), ("provisioner", provisioner)]:
     for forbidden in ["print(", "Logger", "NSLog", "os_log", "debugPrint", "dump("]:
         assert forbidden not in text, (name, forbidden)
@@ -43,7 +46,7 @@ assert "kSecAttrIsPermanent: false" in key and "SecItemAdd" not in key
 print("PASS: the key factory keeps keys out of the Keychain itself and nothing near key material logs")
 assert not re.search(r"func\s+\w*[Rr]evoke", portal + provisioner)
 print("PASS: the portal interface has no revoke operation, so nothing can revoke a certificate automatically")
-assert "ZagSigningIdentity" in portal and '"[signing identity \\(serialNumber)]"' in portal
+assert "struct ZagSigningIdentity" in models and '"[signing identity \\(serialNumber)]"' in models
 print("PASS: a signing identity describes itself without its key")
 keychain_key = (root / "ZagKeychainSigningKey.swift").read_text()
 for forbidden in ["print(", "Logger", "NSLog", "os_log", "debugPrint", "dump(", "SecKeyCopyExternalRepresentation", "SecItemCopyMatching(query", "kSecReturnData"]:

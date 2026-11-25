@@ -112,7 +112,7 @@ enum ZagCertificateReplacementCoordinator {
 		case (.revoked(let t), .authorizeCSR):        return .csrAuthorized(target: t)
 		case (.csrAuthorized(let t), .csrStarted):    return .submitting(target: t)
 		case (.submitting(let t), .csrSucceeded):     return .completed(serial: t.serialNumber)
-		case (.submitting(let t), .csrRejected):      return .abandoned(reason: .csrRejected)
+		case (.submitting, .csrRejected):             return .abandoned(reason: .csrRejected)
 
 		// Cancellation is allowed from any non-terminal state.
 		case (.idle, .cancel), (.selected, .cancel), (.revokeConfirmed, .cancel),

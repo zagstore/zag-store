@@ -105,13 +105,13 @@ enum ZagSigningExperiment {
 		}
 		pass(.preflight, "ready (cert in profile, team, device[self-consistent], bundle, entitlements, validity)")
 
+		#if canImport(ZsignSwift)
 		// 5. Assemble a minimal single-binary app and sign it with Zsign using the
 		//    imported-identity signer callback (the private key stays in the key store).
 		let appURL: URL
 		do { appURL = try assembleMinimalApp(executable: sourceExecutable, in: workDir) }
 		catch { return fail(.sign, "could not assemble the test app bundle") }
 
-		#if canImport(ZsignSwift)
 		let components: [String: (provision: Data, entitlements: Data)] = ["": (profile, entitlementsData)]
 		if let signFailure = Zsign.signComponents(appPath: appURL.path, certificate: certDER, signer: signer,
 												   components: components, bundleIdentifier: expectedBundleID) {
@@ -124,9 +124,6 @@ enum ZagSigningExperiment {
 			return fail(.zsignReverify, "Zsign verify: \(sanitize(vFailure))")
 		}
 		pass(.zsignReverify, "Zsign re-verified every binary, team, identifiers, entitlements and embedded profile")
-		#else
-		return fail(.sign, "ZsignSwift is not linked into this build (needs the experiment app build)")
-		#endif
 
 		// 7. INDEPENDENT verification — our own code, not the signing library.
 		let independent = independentVerify(appURL: appURL, expectedCertDER: certDER, inputProfile: profile, now: now)
@@ -142,6 +139,13 @@ enum ZagSigningExperiment {
 		} catch { return fail(.package, "could not package the IPA") }
 
 		return report
+		#else
+		// ZsignSwift is linked only in the experiment app build; the signer and the
+		// profile entitlements are consumed only by that path, so discard them here
+		// to keep the no-Zsign compile free of unused-binding diagnostics.
+		_ = (signer, entitlementsData)
+		return fail(.sign, "ZsignSwift is not linked into this build (needs the experiment app build)")
+		#endif
 	}
 
 	// MARK: independent verification (no Zsign)
