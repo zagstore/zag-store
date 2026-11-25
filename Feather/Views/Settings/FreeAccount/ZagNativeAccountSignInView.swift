@@ -268,7 +268,17 @@ struct ZagNativeAccountSignInContent: View {
 		}
 		.sheet(isPresented: Binding(
 			get: { model.phase == .awaitingCode || model.phase == .awaitingConsent || model.phase == .selectingPhone },
-			set: { shown in if !shown { Task { model.cancel() } } }
+			set: { shown in
+				// Only a user dismissal (swipe/Cancel while still awaiting input)
+				// cancels. When the flow itself advances past the sheet (phase
+				// moves to .submitting/.signedIn/.failed), SwiftUI also calls this
+				// with shown=false; cancelling then would discard the code just
+				// submitted and abort a sign-in that is completing normally.
+				if !shown,
+				   model.phase == .awaitingCode || model.phase == .awaitingConsent || model.phase == .selectingPhone {
+					Task { model.cancel() }
+				}
+			}
 		)) { interactiveSheet }
 	}
 

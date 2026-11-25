@@ -22,6 +22,10 @@ struct ZagAppleSigningSettingsView: View {
 	/// never implies a session or profile exists before it does.
 	@State private var signedIn = false
 	@State private var provisioned = false
+	/// The Personal Team id, discovered from the same authenticated session the
+	/// sign-in screen uses. The certificate inventory lists against this team;
+	/// an empty team is rejected (401/403) by Apple's services.
+	@State private var teamID = ""
 
 	/// Whether this build links the native engine. Device builds do; the
 	/// simulator does not, in which case the whole feature is unavailable.
@@ -45,9 +49,18 @@ struct ZagAppleSigningSettingsView: View {
 	}
 
 	private func refresh() async {
-		guard engineLinked else { signedIn = false; provisioned = false; return }
+		guard engineLinked else { signedIn = false; provisioned = false; teamID = ""; return }
 		provisioned = await ZagAppleAuthMachine.nativeAccount().isProvisioned()
 		signedIn = ZagDeveloperTokenStore().hasToken(scope: "device")
+		guard signedIn else { teamID = ""; return }
+		// Same authenticated native machine + persisted developer session as the
+		// sign-in screen's Personal Team retrieval, so the certificate inventory
+		// lists against the real team rather than an empty (rejected) one.
+		#if canImport(ZagAppleAuth)
+		if let first = try? await ZagNativeDeveloperPortal.readOnlyInventory().teams().first {
+			teamID = first.teamID
+		}
+		#endif
 	}
 
 	// MARK: Overview
@@ -93,8 +106,17 @@ struct ZagAppleSigningSettingsView: View {
 
 	private var certificateSection: some View {
 		Section {
-			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
-				Label("Signing certificate", systemImage: "checkmark.seal")
+			if signedIn {
+				NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview(team: teamID)).zagSettingsDestinationAvatar()) {
+					Label("Signing certificate", systemImage: "checkmark.seal")
+				}
+			} else {
+				Label {
+					VStack(alignment: .leading, spacing: 2) {
+						Text("Signing certificate").foregroundStyle(.secondary)
+						Text("Sign in to view and manage your certificate.").font(.caption).foregroundStyle(.secondary)
+					}
+				} icon: { Image(systemName: "checkmark.seal").foregroundStyle(.secondary) }
 			}
 		} header: {
 			Text("Certificate")
