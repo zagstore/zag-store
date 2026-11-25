@@ -66,17 +66,28 @@ def authorised():
         refuse("the window is empty or longer than 7 days")
     if now >= end:
         refuse("the authorisation window has passed")
-    if not row["Provider"].startswith("https://"):
-        refuse("the provider is not an https URL")
-    if row["Serial policy"] not in ("g3Fixed", "g3PerAccount"):
-        refuse("the serial policy is not g3Fixed or g3PerAccount")
-    if row["Serial policy"] != "g3Fixed":
-        # The bridge's live backend requires one valid device serial
-        # (zag-apple-bridge live.rs, valid_serial); a per-account serial is
-        # not implemented, so such a build could never sign in.
-        refuse("the bridge supports only g3Fixed (a fixed device serial)")
-    if row["Serial policy"] == "g3Fixed" and not os.environ.get("ZAG_G5_DEVICE_SERIAL"):
-        refuse("g3Fixed needs ZAG_G5_DEVICE_SERIAL (never stored in the ledger)")
+    native = row["Provider"] == "native"
+    if native:
+        # Option B: a native, on-device campaign authenticates through
+        # ZagAppleAuthMachine's own ADI identity and GrandSlam. There is no
+        # remote anisette server and no externally supplied device serial (the
+        # on-device ADI identity is the device), so the bridge is not
+        # configured for such a campaign. The serial policy is correspondingly
+        # 'native'.
+        if row["Serial policy"] != "native":
+            refuse("a native campaign (Provider = native) must use serial policy 'native'")
+    else:
+        if not row["Provider"].startswith("https://"):
+            refuse("the provider is not 'native' or an https URL")
+        if row["Serial policy"] not in ("g3Fixed", "g3PerAccount"):
+            refuse("the serial policy is not g3Fixed or g3PerAccount")
+        if row["Serial policy"] != "g3Fixed":
+            # The bridge's live backend requires one valid device serial
+            # (zag-apple-bridge live.rs, valid_serial); a per-account serial is
+            # not implemented, so such a build could never sign in.
+            refuse("the bridge supports only g3Fixed (a fixed device serial)")
+        if not os.environ.get("ZAG_G5_DEVICE_SERIAL"):
+            refuse("g3Fixed needs ZAG_G5_DEVICE_SERIAL (never stored in the ledger)")
     if not re.fullmatch(r"[A-Z]", row["Account label"]):
         refuse("the account label must be a single letter, never an address")
     # An existing-account build only for a campaign authorised as one, and

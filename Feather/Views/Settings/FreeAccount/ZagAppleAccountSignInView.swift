@@ -19,37 +19,57 @@ import SwiftUI
 @MainActor
 final class ZagAppleAccountSignInController: ObservableObject {
 	@Published private(set) var model: ZagFreeAccountSignInModel?
+	@Published private(set) var nativeModel: ZagNativeSignInModel?
 	@Published private(set) var unavailableReason: String?
 
 	#if ZAG_APPLE_BRIDGE
-	private let directory: ZagAccountDirectory
+	private let directory: ZagAccountDirectory?
+	/// Option B: when the native engine (ZagAppleAuth xcframework) is linked,
+	/// Zag Store authenticates entirely on-device through ZagAppleAuthMachine —
+	/// no ZagAccountDirectory, no ZagIsideloadAuthenticationService, no remote
+	/// anisette. The bridge path is retained only for builds that do not link
+	/// the native engine (e.g. the simulator), where it reports unavailable.
+	private let useNative: Bool
 
 	init() {
-		var configuration = ZagAccountDirectory.Configuration()
-		configuration.namespace = "ZagStore.accounts"
-		configuration.makeService = { ZagIsideloadAuthenticationService() }
-		configuration.localState = ZagBridgeAnisetteLocalState()
-		directory = ZagAccountDirectory(
-			anisette: ZagBridgeAnisetteSource(),
-			secrets: ZagKeychainFreeAccountSecretStore(),
-			preferences: ZagUserDefaultsPreferences(),
-			configuration: configuration
-		)
+		if ZagAppleAuthMachine.isLinked {
+			useNative = true
+			directory = nil
+		} else {
+			useNative = false
+			var configuration = ZagAccountDirectory.Configuration()
+			configuration.namespace = "ZagStore.accounts"
+			configuration.makeService = { ZagIsideloadAuthenticationService() }
+			configuration.localState = ZagBridgeAnisetteLocalState()
+			directory = ZagAccountDirectory(
+				anisette: ZagBridgeAnisetteSource(),
+				secrets: ZagKeychainFreeAccountSecretStore(),
+				preferences: ZagUserDefaultsPreferences(),
+				configuration: configuration
+			)
+		}
 	}
 
 	func prepare() async {
-		guard model == nil else { return }
-		let m = ZagFreeAccountSignInModel(
-			authenticator: await directory.newSignIn(),
-			diagnostics: ZagFreeAccountDiagnostics()
-		)
-		model = m
-		await m.restore()   // restores a persisted session if one exists (no network when valid)
+		if useNative {
+			guard nativeModel == nil else { return }
+			let m = ZagNativeSignInModel()
+			nativeModel = m
+			await m.restore()   // on-device session check, no network
+		} else {
+			guard model == nil, let directory else { return }
+			let m = ZagFreeAccountSignInModel(
+				authenticator: await directory.newSignIn(),
+				diagnostics: ZagFreeAccountDiagnostics()
+			)
+			model = m
+			await m.restore()
+		}
 	}
 	#else
 	init() {}
 	func prepare() async {
-		unavailableReason = "Native sign-in needs a device build with the Apple bridge linked. This build does not link it."
+		unavailableReason = "Native sign-in needs a device build with the Apple engine linked. This build does not link it."
 	}
 	#endif
 }
@@ -59,7 +79,9 @@ struct ZagAppleAccountSignInView: View {
 
 	var body: some View {
 		Group {
-			if let model = controller.model {
+			if let native = controller.nativeModel {
+				ZagNativeAccountSignInContent(model: native)
+			} else if let model = controller.model {
 				ZagAppleAccountSignInContent(model: model)
 			} else {
 				List {
