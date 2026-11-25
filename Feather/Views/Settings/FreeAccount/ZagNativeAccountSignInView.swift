@@ -61,22 +61,14 @@ final class ZagNativeSignInModel: ObservableObject {
 		guard canSubmitCredentials else { return }
 		failure = nil
 		notice = nil
-		// Runtime authorization. Native live sign-in reaches Apple only in the
-		// supervised experiment build, and only when the owner has armed the
-		// campaign. This is the same gate the bridge uses
-		// (ZagLiveExperiment.campaign.authorize(.signIn)); it is provider-
-		// agnostic, so it arms the native path without configuring the bridge or
-		// any remote anisette.
-		#if ZAG_LIVE_EXPERIMENT
-		do { try ZagLiveExperiment.campaign.authorize(.signIn) }
-		catch {
-			finish(failure: ZagNativeSignInFailure(message: "This build is not armed for a live sign-in campaign.", recovery: .unsupportedBuild))
-			return
-		}
-		#else
-		finish(failure: ZagNativeSignInFailure(message: "Native live sign-in requires the supervised experiment build.", recovery: .unsupportedBuild))
-		return
-		#endif
+		// Native Apple Account sign-in is a standard Zag Store feature. Pressing
+		// Sign In is the owner's consent to authenticate and to the one-time
+		// on-device ADI provisioning it needs. No campaign arming, expiry, nonce
+		// or experiment build is involved. It stays standalone: on-device ADI
+		// only, never a remote anisette server, and it reaches Apple's GrandSlam
+		// and Developer Services read-only — it signs, installs, issues and
+		// revokes nothing (irreversible certificate operations keep their own
+		// separate consent elsewhere).
 		isBusy = true
 		phase = .authenticating
 		coordinator = ZagTwoFactorCoordinator()
@@ -84,11 +76,10 @@ final class ZagNativeSignInModel: ObservableObject {
 
 		#if canImport(ZagAppleAuth)
 		// On-device ADI provisioning. signInWith2FA requires a provisioned
-		// machine; provisioning happens here, once, if it has not already. The
-		// campaign authorises native on-device ADI provisioning explicitly, and
-		// the owner initiating sign-in is the consent. This contacts only
-		// Apple's ADI endpoint to identify this iPhone — it signs, installs,
-		// issues and revokes nothing — and it leaves all other app data intact.
+		// machine; provisioning happens here, once, if it has not already.
+		// Pressing Sign In is the consent. This contacts only Apple's ADI
+		// endpoint to identify this iPhone — it signs, installs, issues and
+		// revokes nothing — and it leaves all other app data intact.
 		let alreadyProvisioned = await machine.isProvisioned()
 		if !alreadyProvisioned {
 			notice = "Setting up this iPhone with Apple (one-time)…"
