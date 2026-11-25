@@ -1472,3 +1472,67 @@ preserved-CSR prototype and needs no action from me against Apple:
 The read-only inventory needs only that fresh session, not the preserved CSR/key,
 so it does not disturb the `ptteamprobe` experiment. The single remaining owner
 input is the spare-bundle-id free-team profile from step 1.
+
+---
+
+## Option B prepared: dev.zagstore.rocertinv signing config — stop at authorization (2026-11-25)
+
+Prepared the separate experimental identity up to the authorization boundary. No
+Apple contact, no provisioning, no install, no new certificate, no key export.
+`dev.zagstore.ptteamprobe` (key/CSR/journals) and the canonical `com.cwd43.gu29`
+are untouched.
+
+### Verified before any Apple operation (read-only)
+- **Team:** `V54K5JYGS4` (free Personal Team). The available Apple Development
+  cert's subject is `UID=5FYSXDURU2, CN=…(R3DNK3YV9S), OU=V54K5JYGS4` — its team
+  (OU) **is** V54K5JYGS4, and an existing V54K5JYGS4 profile's `TeamIdentifier`
+  agrees. The CN's `R3DNK3YV9S` is the account id, not the team.
+- **Certificate (reused, never recreated):** Apple Development, SHA-1
+  `5657782A6EADFFF608040D39186E6533557349FC`, present in the login keychain.
+- **Bundle id:** `dev.zagstore.rocertinv` (new, spare — coexists with the other two apps).
+- **Device UDID:** `00008130…001C` — the connected iPhone 15 Pro Max
+  (iPhone16,2), the same device in the one valid profile on disk.
+- **Keychain access:** the native stores set no explicit access group, so this
+  app's items (incl. the fresh read-only session) live in its DEFAULT group
+  `V54K5JYGS4.dev.zagstore.rocertinv` — isolated from the other two apps.
+- **Entitlements:** minimal free-team set (`scripts/zag-rocertinv.entitlements`:
+  application-identifier, team-identifier, get-task-allow, keychain-access-groups).
+  Confirmed viable: the repo's own `Feather.entitlements` is just
+  `{get-task-allow}`; the canonical binary's large entitlement set was grafted by
+  the 7S3MGZK59N distribution re-sign, not required by the source. Only
+  `OpenSSL.framework` is embedded (no app extensions needing separate provisioning).
+- **Native auth:** the real `ZagAppleAuth` module (no second implementation);
+  both flags `ZAG_CERT_REPLACEMENT_EXPERIMENT` + `ZAG_CERT_REPLACEMENT_READONLY_LIVE`.
+- **Read-only transport:** still blocks every mutating endpoint (18/18); the
+  compile-time `#error` guarantees the live path cannot silently degrade.
+
+### Prepared tooling (safe, committed; runs no Apple op)
+`scripts/zag-build-readonly-cert-inventory.sh` now has:
+- `preflight` — read-only checks (ran green: identity reused + present, device
+  connected; validates the owner's profile once it exists).
+- `sign` — builds + signs the IPA for `dev.zagstore.rocertinv` reusing the cert;
+  **requires `ZAG_RO_PROFILE` and is held at the authorization boundary** (it
+  neither provisions nor installs).
+
+### MINIMUM OWNER ACTION to generate the profile (the authorization boundary)
+This is the one step only the owner can take (their own Xcode/Apple interaction);
+Claude performs no Apple contact.
+
+1. Connect the iPhone 15 Pro Max; in **Xcode → Settings → Accounts**, ensure the
+   free Apple ID (team **V54K5JYGS4 — Personal Team**) is signed in, with the
+   existing **Apple Development** cert `5657782A…` already present (do not let
+   Xcode create a new certificate).
+2. Make a throwaway single-view iOS target (or reuse any) with **Bundle
+   Identifier `dev.zagstore.rocertinv`**, **Team = the V54K5JYGS4 Personal
+   Team**, Signing = **Automatic**, and select the connected iPhone as the run
+   destination. Xcode registers the App ID + this device and issues a **7-day
+   development provisioning profile** for `dev.zagstore.rocertinv` on that device.
+   (No new certificate is created if the existing one is already installed.)
+3. Export that profile: it appears at
+   `~/Library/MobileDevice/Provisioning Profiles/<uuid>.mobileprovision`.
+   Hand its path back as `ZAG_RO_PROFILE`.
+
+Then (next, separately authorized step): `ZAG_RO_PROFILE=<path>
+scripts/zag-build-readonly-cert-inventory.sh preflight` to validate, then `… sign`
+to produce the coexisting IPA — followed by a separately authorized install and
+the single read-only inventory GET. **Stopping here, at the authorization boundary.**
