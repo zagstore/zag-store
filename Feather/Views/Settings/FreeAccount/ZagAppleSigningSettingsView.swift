@@ -50,6 +50,7 @@ struct ZagAppleSigningSettingsView: View {
 			certificateSection
 			provisioningSection
 			signingSection
+			signingMethodSection
 			safetySection
 		}
 		.navigationTitle("Apple Account & Signing")
@@ -194,6 +195,39 @@ struct ZagAppleSigningSettingsView: View {
 			Text("Signing & installation")
 		} footer: {
 			Text("Your Apple Account credentials, signing keys and app contents never leave this iPhone. Live signing and installation require a native-bridge build and separate authorisation; until then these steps are experimental.")
+		}
+	}
+
+	// MARK: Signing method (explicit, user-selectable; existing methods preserved)
+
+	/// The current readiness of the native method, from the real availability
+	/// model. Conservative free-account state (signed-out) until a live session
+	/// exists, so it honestly reports the next required step rather than success.
+	private var nativeMethodStatus: String {
+		let none = ZagSigningMethodAvailability.ImportedCertificates(total: 0, usable: 0, nearestExpiry: nil)
+		switch ZagSigningMethodAvailability.status(of: .freeAppleAccount, imported: none, freeAccount: .signedOut) {
+		case .ready(let d):          return d
+		case .actionRequired(let m): return m
+		case .external(let m):       return m
+		}
+	}
+
+	private var signingMethodSection: some View {
+		Section {
+			HStack(alignment: .firstTextBaseline, spacing: 12) {
+				Image(systemName: "key.horizontal").foregroundStyle(tint).frame(width: 24)
+				VStack(alignment: .leading, spacing: 2) {
+					Text(ZagSigningMethod.freeAppleAccount.title).font(.subheadline.weight(.medium))
+					Text(ZagSigningMethod.freeAppleAccount.summary).font(.caption).foregroundStyle(.secondary)
+				}
+				Spacer(minLength: 8)
+				Text(nativeMethodStatus).font(.caption2).foregroundStyle(.orange)
+					.multilineTextAlignment(.trailing)
+			}
+		} header: {
+			Text("Signing method")
+		} footer: {
+			Text("Native Apple Account signing is an explicit choice, offered alongside — never instead of — AppTesters, Imported Certificate, BYOC and Developer Account. It routes an install through the on-device signer (ZagFreeAccountSigningAdapter) and the provisioning coordinator; it runs only after you sign in and a signing identity is provisioned, and it never redirects an install you did not choose.")
 		}
 	}
 
