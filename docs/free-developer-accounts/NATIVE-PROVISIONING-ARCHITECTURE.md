@@ -1216,3 +1216,55 @@ reuse that exact key/CSR for the post-revoke submission.
    preserved key/CSR. **Risks:** revocation is irreversible and may break an
    unknown dependent; the CSR may still 7460 if the team enforces a per-machine/
    account rule rather than a count — the flow halts, never retries.
+
+---
+
+## First-live-session preparation: read-only transport boundary (2026-11-25)
+
+Prepares the first live validation of the native standalone path as a READ-ONLY
+certificate-inventory session. No alternative signing workflow; the device key,
+CSR, stable machineId and journals are untouched. No Apple contact in this
+preparation.
+
+### The read-only boundary (below UI and consent)
+- **`ZagReadOnlyEndpointPolicy`** classifies a `ZagHTTPRequest` by URL path and
+  method override only (never body or token), fail-closed: a QH65B2 action is
+  allowed only if it is non-mutating; a `/services/v1/` request is allowed only
+  if `X-HTTP-Method-Override == GET`; anything else is blocked.
+- **`ZagReadOnlyTransport`** wraps the pinned developer-services transport and
+  enforces the policy: a blocked request throws `ZagTransportError.readOnlyBlocked`
+  and **never reaches the base transport** (test-proven with a recording base —
+  a revoke and a submitCSR both fail to arrive while inventory passes).
+- **`ZagNativeDeveloperPortal.readOnlyInventory(machine:)`** composes the portal
+  with that transport AND a denying consent (defence in depth). The transport is
+  the hard boundary: even if UI/consent allowed a mutation, the DELETE revoke and
+  the submitDevelopmentCSR are refused before any byte leaves the device.
+
+### What is enabled / disabled for the first live session
+- **Enabled:** read-only certificate inventory (`/services/v1/certificates` GET),
+  and by the same policy the other read-only discovery actions.
+- **Disabled at the transport:** certificate revocation (v1 DELETE) and CSR
+  submission (QH65B2 `submitDevelopmentCSR`), plus every other mutating action —
+  regardless of UI consent. Also disabled at the consent layer.
+
+### Flags / reachability
+- The screen is reachable in an experimental build that defines
+  `ZAG_CERT_REPLACEMENT_EXPERIMENT` (Settings › Experimental › "Replace a
+  Certificate"). Verified: a full `xcodebuild` of the Feather app with that
+  condition **BUILD SUCCEEDED** and compiled the cert-replacement + read-only
+  sources into `Feather.app` (arm64).
+- `ZAG_CERT_REPLACEMENT_READONLY_LIVE` (with the `ZagAppleAuth` bridge) selects
+  the read-only native portal for the live session and marks the screen
+  read-only (inventory only; no selection/revoke/CSR offered). Default OFF, so
+  the ordinary build ships the disabled portal and no live path.
+
+### Can the read-only test run without modifying Apple account state?
+Yes. A GET certificate listing is non-mutating; the transport refuses every
+mutating endpoint, so the session cannot create, revoke or change anything.
+
+### Minimum user action to execute the read-only test
+Produce the experimental build with `ZAG_CERT_REPLACEMENT_EXPERIMENT` +
+`ZAG_CERT_REPLACEMENT_READONLY_LIVE` and the Apple-auth bridge, installed by the
+owner; sign in to the free Apple Account; open Settings › Experimental ›
+"Replace a Certificate"; the inventory loads on appear (or via "Refresh list").
+That single read is the whole test. (This preparation did not run it.)

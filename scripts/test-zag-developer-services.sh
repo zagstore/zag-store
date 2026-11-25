@@ -17,10 +17,14 @@ struct ZagDevelopmentCertificate: Codable, Equatable, Sendable {
 struct ZagIssuedCertificate: Sendable, Equatable {
     let certificate: ZagDevelopmentCertificate; let data: Data
 }
+// ZagFreeAccountTransport references ZagASCClient.host in one extension.
+enum ZagASCClient { static let host = "api.appstoreconnect.apple.com" }
 SHIM
 swiftc -O -o "$OUT/dsvc" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagPortalError.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagDeveloperServicesProtocol.swift" \
+  "$ROOT/Feather/Utilities/FreeAccount/ZagFreeAccountTransport.swift" \
+  "$ROOT/Feather/Utilities/FreeAccount/ZagReadOnlyDeveloperTransport.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagDeveloperTokenStore.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagMutationConsent.swift" \
   "$ROOT/Feather/Utilities/FreeAccount/ZagProfileIdentityAudit.swift" \

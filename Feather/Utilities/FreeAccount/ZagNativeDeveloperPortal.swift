@@ -81,6 +81,19 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 								 headers: { await machine.developerHeaders() ?? [:] },
 								 consent: consent, maxRequests: maxRequests)
 	}
+
+	/// First-live-session construction: the pinned transport is wrapped in the
+	/// read-only boundary, so ONLY read-only endpoints (certificate inventory,
+	/// team/device discovery) can ever leave the device — a revoke or a CSR is
+	/// refused before transmission, independent of consent. Mutations are ALSO
+	/// denied at the consent layer (defence in depth), but the transport is the
+	/// hard boundary. A smaller request ceiling bounds the session.
+	static func readOnlyInventory(machine: ZagAppleAuthMachine = ZagAppleAuthMachine(),
+								  maxRequests: Int = 8) -> ZagNativeDeveloperPortal {
+		ZagNativeDeveloperPortal(transport: ZagReadOnlyTransport(base: transport()),
+								 headers: { await machine.developerHeaders() ?? [:] },
+								 consent: ZagDenyingMutationConsent(), maxRequests: maxRequests)
+	}
 	#endif
 
 	// MARK: - Core request

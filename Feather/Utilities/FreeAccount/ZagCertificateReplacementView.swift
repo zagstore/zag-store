@@ -34,6 +34,10 @@ final class ZagCertificateReplacementModel: ObservableObject {
 	@Published private(set) var banner: String?
 	@Published private(set) var busy = false
 
+	/// A read-only session surfaces the inventory only; selection, revocation and
+	/// CSR are not offered (and are blocked at the transport regardless).
+	let readOnly: Bool
+
 	private let driver: ZagCertificateReplacementDriver
 	private let activeGuard: ZagActiveCertificateGuard
 	/// The preserved device-generated CSR; supplied by the provisioner. The UI
@@ -41,9 +45,10 @@ final class ZagCertificateReplacementModel: ObservableObject {
 	private let preservedCSR: () -> ZagCertificateRequest?
 
 	init(driver: ZagCertificateReplacementDriver, activeGuard: ZagActiveCertificateGuard,
-		 preservedCSR: @escaping () -> ZagCertificateRequest?) {
+		 readOnly: Bool = false, preservedCSR: @escaping () -> ZagCertificateRequest?) {
 		self.driver = driver
 		self.activeGuard = activeGuard
+		self.readOnly = readOnly
 		self.preservedCSR = preservedCSR
 	}
 
@@ -91,16 +96,30 @@ final class ZagCertificateReplacementModel: ObservableObject {
 		state = await driver.currentState()
 	}
 
-	/// The gated Settings entry point: a driver backed by the DISABLED portal
-	/// (every operation throws until a live portal is explicitly enabled) and an
-	/// in-memory journal. No live Apple contact is possible from here.
-	static func gatedPreview() -> ZagCertificateReplacementModel {
+	/// The gated Settings entry point. In the default experimental build the
+	/// portal is the DISABLED portal (no live contact possible). When the
+	/// read-only live flag is set and the Apple-auth bridge is present, the
+	/// portal is the native read-only portal: inventory can run, but revoke and
+	/// CSR are blocked at the transport boundary. The screen is marked read-only
+	/// so it never offers a mutation.
+	static func gatedPreview(team: String = "") -> ZagCertificateReplacementModel {
+		let guard0 = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil)
+		let portal: ZagReplacementPortal
+		var readOnly = false
+		#if ZAG_CERT_REPLACEMENT_READONLY_LIVE && canImport(ZagAppleAuth)
+		if ZagCertReplacementExperiment.mode == .readOnlyInventory {
+			portal = ZagNativeDeveloperPortal.readOnlyInventory()
+			readOnly = true
+		} else {
+			portal = ZagDisabledReplacementPortal()
+		}
+		#else
+		portal = ZagDisabledReplacementPortal()
+		#endif
 		let driver = ZagCertificateReplacementDriver(
-			portal: ZagDisabledReplacementPortal(),
-			consent: ZagMutationConsentCoordinator(),
-			activeGuard: ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil),
-			journal: ZagInMemoryReplacementJournal(), team: "")
-		return ZagCertificateReplacementModel(driver: driver, activeGuard: ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil), preservedCSR: { nil })
+			portal: portal, consent: ZagMutationConsentCoordinator(),
+			activeGuard: guard0, journal: ZagInMemoryReplacementJournal(), team: team)
+		return ZagCertificateReplacementModel(driver: driver, activeGuard: guard0, readOnly: readOnly, preservedCSR: { nil })
 	}
 
 	static func describe(_ error: Error) -> String {
@@ -128,9 +147,19 @@ struct ZagCertificateReplacementView: View {
 	var body: some View {
 		List {
 			disclaimerSection
+			if model.readOnly {
+				Section {
+					Label("Read-only session", systemImage: "lock.shield")
+					Text("This session can only read the certificate list. Revoking a certificate and requesting a new one are disabled and cannot be sent — not just hidden here, but blocked before any request leaves this iPhone.")
+						.font(.footnote).foregroundStyle(.secondary)
+				}
+			}
 			if let banner = model.banner {
 				Section { Text(banner).font(.footnote).foregroundStyle(.orange) }
 			}
+			if model.readOnly {
+				inventorySection
+			} else {
 			switch model.state {
 			case .idle, .selected, .abandoned:
 				inventorySection
@@ -151,8 +180,9 @@ struct ZagCertificateReplacementView: View {
 					Text("Re-check the certificate list; do not submit again until it is reconciled.").font(.footnote).foregroundStyle(.secondary)
 				}
 			}
+			}
 		}
-		.navigationTitle("Replace a certificate")
+		.navigationTitle(model.readOnly ? "Certificate inventory" : "Replace a certificate")
 		.task { await model.onAppear() }
 	}
 
@@ -179,8 +209,10 @@ struct ZagCertificateReplacementView: View {
 					if !cert.isActiveProtected {
 						Text("This iPhone has no key for this certificate; its usage is unknown. Revoking it may break any app or workflow that relies on it.")
 							.font(.caption2).foregroundStyle(.orange)
-						Button("Select for replacement") { Task { await model.select(cert) } }
-							.buttonStyle(.bordered).controlSize(.small)
+						if !model.readOnly {
+							Button("Select for replacement") { Task { await model.select(cert) } }
+								.buttonStyle(.bordered).controlSize(.small)
+						}
 					}
 				}
 			}

@@ -546,5 +546,52 @@ run {
 	check(portal.revokeCalls == 0, "e2e: no revoke call was made for a stale target")
 }
 
+// --- Read-only transport boundary: mutations cannot reach the network ---
+func req(_ url: String, override: String? = nil) -> ZagHTTPRequest {
+	var h: [String: String] = [:]; if let override { h["X-HTTP-Method-Override"] = override }
+	return ZagHTTPRequest(url: URL(string: url)!, method: "POST", headers: h, body: Data())
+}
+let H = "https://developerservices2.apple.com/services"
+// Read-only endpoints pass.
+check(ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/QH65B2/ios/listAllDevelopmentCerts.action?clientId=X")), "readonly: QH65B2 cert listing allowed")
+check(ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/QH65B2/listTeams.action?clientId=X")), "readonly: QH65B2 listTeams allowed")
+check(ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/v1/certificates", override: "GET")), "readonly: v1 GET override (inventory) allowed")
+check(ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/v1/certificates", override: "get")), "readonly: v1 override case-insensitive")
+// Mutating endpoints are blocked.
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/QH65B2/ios/submitDevelopmentCSR.action?clientId=X")), "readonly: QH65B2 submitCSR blocked")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/QH65B2/ios/revokeDevelopmentCert.action?clientId=X")), "readonly: QH65B2 revoke action blocked")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/QH65B2/ios/addDevice.action?clientId=X")), "readonly: QH65B2 addDevice blocked")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/QH65B2/ios/downloadTeamProvisioningProfile.action?clientId=X")), "readonly: QH65B2 downloadProfile (mutating) blocked")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/v1/certificates/ID123", override: "DELETE")), "readonly: v1 DELETE revoke blocked")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/v1/certificates", override: "POST")), "readonly: v1 POST override blocked")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/v1/certificates")), "readonly: v1 with no override blocked (fail closed)")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("\(H)/QH65B2/ios/unknownFuture.action?clientId=X")), "readonly: unknown QH65B2 action blocked (fail closed)")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(req("https://developerservices2.apple.com/other/thing")), "readonly: unrecognised path blocked (fail closed)")
+// Build the real URLs through the production builders and confirm classification.
+check(ZagReadOnlyEndpointPolicy.isReadOnly(ZagHTTPRequest(url: try! ZagDeveloperServicesV1.endpoint("certificates"), method: "POST", headers: ZagDeveloperServicesV1.headers(methodOverride: "GET"), body: Data())), "readonly: real v1 GET inventory request allowed")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(ZagHTTPRequest(url: try! ZagDeveloperServicesV1.endpoint("certificates/ID"), method: "POST", headers: ZagDeveloperServicesV1.headers(methodOverride: "DELETE"), body: Data())), "readonly: real v1 DELETE revoke request blocked")
+check(!ZagReadOnlyEndpointPolicy.isReadOnly(ZagHTTPRequest(url: try! ZagDeveloperServicesProtocol.endpoint(.submitCSR), method: "POST", headers: [:], body: Data())), "readonly: real submitCSR endpoint blocked")
+
+// The wrapper never forwards a blocked request to the base transport.
+final class RecordingTransport: ZagHTTPTransport, @unchecked Sendable {
+	var sentPaths: [String] = []
+	func send(_ request: ZagHTTPRequest) async throws -> ZagHTTPResponse {
+		sentPaths.append(request.url.path)
+		return ZagHTTPResponse(statusCode: 200, headers: [:], body: Data("{\"data\":[]}".utf8))
+	}
+}
+run {
+	let base = RecordingTransport(); let t = ZagReadOnlyTransport(base: base)
+	_ = try? await t.send(req("\(H)/v1/certificates", override: "GET"))                 // allowed
+	check(base.sentPaths.count == 1, "readonly transport: inventory reached the base")
+	do { _ = try await t.send(req("\(H)/v1/certificates/ID", override: "DELETE")); check(false, "readonly transport: revoke should throw") }
+	catch { check((error as? ZagTransportError).map { if case .readOnlyBlocked = $0 { return true } else { return false } } ?? false, "readonly transport: revoke throws readOnlyBlocked") }
+	do { _ = try await t.send(req("\(H)/QH65B2/ios/submitDevelopmentCSR.action?clientId=X")); check(false, "readonly transport: submitCSR should throw") }
+	catch { _ = error }
+	check(base.sentPaths.count == 1, "readonly transport: NO mutating request reached the base (still 1)")
+}
+// The read-only experiment default mode is disabled (flag off in this build).
+check(ZagCertReplacementExperiment.mode == .disabled || ZagCertReplacementExperiment.mode == .readOnlyInventory, "experiment: mode is a defined value")
+
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

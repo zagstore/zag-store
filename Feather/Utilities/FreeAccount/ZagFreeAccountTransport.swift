@@ -26,6 +26,9 @@ enum ZagTransportError: Error, Equatable, Sendable {
 	case cancelled
 	case offline
 	case responseTooLarge
+	/// A request was refused by the read-only boundary before it was sent. The
+	/// string is a short, non-sensitive reason (endpoint kind), never request data.
+	case readOnlyBlocked(String)
 	/// Any other failure; the code is URLError's, never a message that could
 	/// contain request data.
 	case failed(code: Int)
