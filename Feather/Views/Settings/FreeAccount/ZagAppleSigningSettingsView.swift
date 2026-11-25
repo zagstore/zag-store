@@ -46,6 +46,7 @@ struct ZagAppleSigningSettingsView: View {
 	var body: some View {
 		List {
 			overviewSection
+			readinessSection
 			accountSection
 			certificateSection
 			provisioningSection
@@ -54,6 +55,7 @@ struct ZagAppleSigningSettingsView: View {
 			safetySection
 		}
 		.navigationTitle("Apple Account & Signing")
+		.task { await refreshReadiness() }
 	}
 
 	// MARK: Overview / honest status
@@ -77,6 +79,91 @@ struct ZagAppleSigningSettingsView: View {
 			}
 		} footer: {
 			Text("This feature is experimental. Nothing is sent to Apple, no certificate is created or revoked, and no app is signed or installed until you explicitly authorise each step. Steps that have not been verified against Apple are shown as experimental and never reported as complete.")
+		}
+	}
+
+	// MARK: Readiness (four distinct prerequisites + the single next action)
+
+	/// The live readiness, from locally-read facts only (no Apple contact). The
+	/// machine's provisioning state is actor-isolated, so it is refreshed in a
+	/// `.task` into this state rather than computed synchronously. Certificate
+	/// availability stays unverified until a real certificate is confirmed (it
+	/// cannot be asserted offline). Authentication alone never implies signing.
+	@State private var readiness = ZagNativeSigningReadiness(
+		authenticated: false, adiProvisioned: false,
+		certificateAvailable: false, signingGateOpen: false)
+
+	private func refreshReadiness() async {
+		let linked = ZagAppleAuthMachine.isLinked
+		let provisioned = linked ? await ZagAppleAuthMachine().isProvisioned() : false
+		let authed = linked && ZagDeveloperTokenStore().hasToken(scope: "device")
+		readiness = ZagNativeSigningReadiness(
+			authenticated: authed,
+			adiProvisioned: provisioned,
+			certificateAvailable: false,   // verified only against a real certificate; none issued yet
+			signingGateOpen: ZagFreeAccountSigning.isEnabled
+		)
+	}
+
+	private var readinessSection: some View {
+		let r = readiness
+		return Section {
+			ForEach(ZagNativeSigningStage.allCases, id: \.rawValue) { stage in
+				readinessRow(stage, status: r.status(of: stage))
+			}
+			recoveryRow(r.recovery)
+		} header: {
+			Text("Readiness")
+		} footer: {
+			Text("Authentication, device provisioning, certificate availability and signing readiness are checked independently. Native signing becomes available only when all four are verified — being signed in is never sufficient on its own. The next step is highlighted above.")
+		}
+	}
+
+	private func readinessRow(_ stage: ZagNativeSigningStage, status: ZagNativeSigningStageStatus) -> some View {
+		let icon: String
+		let color: Color
+		let label: String
+		switch status {
+		case .done:    icon = "checkmark.circle.fill"; color = .green;     label = "Ready"
+		case .blocked: icon = stage.systemImage;       color = .orange;    label = "Next step"
+		case .pending: icon = "circle";                color = .secondary; label = "Waiting"
+		}
+		return HStack(spacing: 12) {
+			Image(systemName: icon).foregroundStyle(color).frame(width: 24)
+			Text(stage.title).font(.subheadline)
+			Spacer(minLength: 8)
+			Text(label).font(.caption2.weight(status == .blocked ? .bold : .regular)).foregroundStyle(color)
+		}
+	}
+
+	@ViewBuilder
+	private func recoveryRow(_ recovery: ZagNativeSigningRecovery) -> some View {
+		switch recovery {
+		case .signIn:
+			NavigationLink(destination: ZagAppleAccountSignInView().zagSettingsDestinationAvatar()) {
+				recoveryLabel(recovery)
+			}
+		case .confirmADIProvisioning:
+			NavigationLink(destination: ZagADIProvisioningConfirmView().zagSettingsDestinationAvatar()) {
+				recoveryLabel(recovery)
+			}
+		case .provisionCertificate:
+			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
+				recoveryLabel(recovery)
+			}
+		case .enableSigningBuild, .ready:
+			recoveryLabel(recovery)
+		}
+	}
+
+	private func recoveryLabel(_ recovery: ZagNativeSigningRecovery) -> some View {
+		HStack(alignment: .firstTextBaseline, spacing: 12) {
+			Image(systemName: recovery == .ready ? "checkmark.seal.fill" : "arrow.forward.circle")
+				.foregroundStyle(recovery == .ready ? .green : tint).frame(width: 24)
+			VStack(alignment: .leading, spacing: 2) {
+				Text(recovery.actionTitle).font(.subheadline.weight(.medium))
+				Text(recovery.detail).font(.caption).foregroundStyle(.secondary)
+			}
 		}
 	}
 
