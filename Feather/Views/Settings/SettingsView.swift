@@ -239,6 +239,7 @@ struct SettingsView: View {
                         _settingsSearchResults
                     } else {
 					_supportSection
+					_appleSigningSection
 					ForEach(_settingsSectionOrder) { section in
 						_settingsSection(section)
 					}
@@ -593,6 +594,27 @@ extension SettingsView {
 		}
 
 		ZagStoreRouter.consume(route)
+	}
+
+	// First-class entry point for the native standalone-signing feature. Visible
+	// in every build; the screen itself declares its mode honestly (offline vs.
+	// read-only live) and performs no Apple contact without separate authorisation.
+	@ViewBuilder
+	private var _appleSigningSection: some View {
+		Section {
+			NavigationLink(destination: ZagAppleSigningSettingsView().zagSettingsDestinationAvatar()) {
+				Label {
+					VStack(alignment: .leading, spacing: 2) {
+						Text("Apple Account & Signing")
+						Text("Sign apps on-device with a free Apple Account · Experimental")
+							.font(.caption).foregroundStyle(.secondary)
+					}
+				} icon: {
+					Image(systemName: "key.horizontal.fill")
+				}
+			}
+			.accessibilityIdentifier("settings.appleSigning")
+		}
 	}
 
 	@ViewBuilder
