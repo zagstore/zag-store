@@ -384,10 +384,10 @@ check(step(step(csrAuth, .csrStarted), .csrSucceeded) == .completed(serial: "FOR
 
 // A failed OR ambiguous revoke is terminal and cannot advance to the CSR.
 let failed = step(revoking, .revokeFailed)
-check(failed == .revokeHalted(serial: "FOR123", reason: .revokeFailed), "replace: revoke failure halts")
+check(failed == .revokeHalted(target: ZagReplacementTarget(id: "v1-foreign", serialNumber: "FOR123", sha1: "BBBB"), reason: .revokeFailed), "replace: revoke failure halts")
 check(step(failed, .authorizeCSR) == failed && !RC2.maySubmitCSR(step(failed, .authorizeCSR)), "replace: a failed revoke cannot advance to CSR")
 let ambiguous = step(revoking, .revokeAmbiguous)
-check(ambiguous == .revokeHalted(serial: "FOR123", reason: .revokeAmbiguous), "replace: ambiguous revoke halts")
+check(ambiguous == .revokeHalted(target: ZagReplacementTarget(id: "v1-foreign", serialNumber: "FOR123", sha1: "BBBB"), reason: .revokeAmbiguous), "replace: ambiguous revoke halts")
 check(!RC2.maySubmitCSR(step(ambiguous, .authorizeCSR)), "replace: an ambiguous revoke cannot advance to CSR")
 
 // No chained mutations: you cannot jump selection straight to authorizeCSR.
@@ -398,12 +398,153 @@ check(step(.completed(serial: "FOR123"), .csrStarted) == .completed(serial: "FOR
 check(step(failed, .revokeStarted) == failed, "replace: halted ignores duplicate revoke")
 
 // Interruption recovery: in-flight mutations resolve to NON-advancing states.
-check(RC2.recoverAfterInterruption(revoking) == .revokeHalted(serial: "FOR123", reason: .interruptedDuringRevoke), "replace: interrupted revoke -> halt (needs re-check)")
+check(RC2.recoverAfterInterruption(revoking) == .revokeHalted(target: ZagReplacementTarget(id: "v1-foreign", serialNumber: "FOR123", sha1: "BBBB"), reason: .interruptedDuringRevoke), "replace: interrupted revoke -> halt (needs re-check)")
 check(RC2.recoverAfterInterruption(step(csrAuth, .csrStarted)) == .submissionUnconfirmed(serial: "FOR123"), "replace: interrupted CSR -> submissionUnconfirmed (reconcile, never completed)")
 check(RC2.recoverAfterInterruption(revoked) == revoked, "replace: a settled state recovers unchanged")
 // The journal round-trips through Codable (survives termination).
 let enc = try! JSONEncoder().encode(csrAuth)
 check((try? JSONDecoder().decode(ZagCertificateReplacementState.self, from: enc)) == csrAuth, "replace: journal state survives Codable round-trip")
+
+// --- Replacement helpers: pre-revoke verification + failure classification ---
+let selTarget = ZagReplacementTarget(id: "v1-foreign", serialNumber: "FOR123", sha1: "BBBB")
+let freshMatch = ZagRevocableCertificate(id: "v1-foreign", serialNumber: "FOR123", sha1: "BBBB", name: "iPhone Developer", machineName: nil, expiresAt: crSoon)
+typealias RS = ZagCertificateReplacementService
+// Happy verification.
+if case .success(let c) = RS.verifyTargetForRevoke(selected: selTarget, freshListing: [freshMatch], activeGuard: guardz) {
+	check(c.id == "v1-foreign", "verify: fresh listing match returns the exact candidate")
+} else { check(false, "verify: expected success for a matching candidate") }
+// Stale inventory — target gone.
+check(RS.verifyTargetForRevoke(selected: selTarget, freshListing: [], activeGuard: guardz) == .failure(.targetNoLongerPresent), "verify: stale inventory -> targetNoLongerPresent")
+// Fingerprint mismatch (same id, different sha1).
+let changed = ZagRevocableCertificate(id: "v1-foreign", serialNumber: "FOR123", sha1: "CCCC", name: "x", machineName: nil, expiresAt: crSoon)
+check(RS.verifyTargetForRevoke(selected: selTarget, freshListing: [changed], activeGuard: guardz) == .failure(.fingerprintMismatch), "verify: fingerprint mismatch -> refused")
+// The id now resolves to the protected active cert.
+let nowActive = ZagRevocableCertificate(id: "v1-foreign", serialNumber: "723BE3EC", sha1: "5657782a6eadfff608040d39186e6533557349fc", name: "Apple Development", machineName: nil, expiresAt: crSoon)
+let selActiveId = ZagReplacementTarget(id: "v1-foreign", serialNumber: "723BE3EC", sha1: "5657782a6eadfff608040d39186e6533557349fc")
+check(RS.verifyTargetForRevoke(selected: selActiveId, freshListing: [nowActive], activeGuard: guardz) == .failure(.targetNowActive), "verify: target now the active cert -> refused")
+// Listing unavailable decides nothing.
+check(RS.verifyTargetForRevoke(selected: selTarget, freshListing: nil, activeGuard: guardz) == .failure(.listingUnavailable), "verify: nil listing -> listingUnavailable")
+
+// Failure classification: repeated 7460 and limits are authoritative; the rest ambiguous.
+check(RS.classifySubmitFailure(ZagPortalError.existingCertificateOrPendingRequest) == .repeatedConflict, "classify: repeated 7460 -> repeatedConflict (not success)")
+check(RS.classifySubmitFailure(ZagPortalError.certificateLimitReached) == .certificateLimitReached, "classify: cert limit -> certificateLimitReached")
+check(RS.classifySubmitFailure(ZagPortalError.network) == .ambiguousSubmission, "classify: network CSR error -> ambiguousSubmission")
+check(RS.classifyRevokeFailure(ZagPortalError.network) == .ambiguousRevoke, "classify: network revoke error -> ambiguousRevoke")
+check(RS.classifyRevokeFailure(ZagPortalError.sessionRejected) == .sessionRejected, "classify: revoke session rejection surfaced")
+
+// Reconcile verdict from a fresh listing.
+check(RS.reconcileVerdict(target: selTarget, freshListing: []) == .targetGone, "reconcile: target absent -> targetGone")
+check(RS.reconcileVerdict(target: selTarget, freshListing: [freshMatch]) == .targetStillPresent, "reconcile: target present -> targetStillPresent")
+check(RS.reconcileVerdict(target: selTarget, freshListing: nil) == .listingUnavailable, "reconcile: nil listing -> listingUnavailable")
+
+// --- End-to-end driver workflow against a scripted mock portal ---
+final class MockPortal: ZagReplacementPortal, @unchecked Sendable {
+	var listings: [[ZagRevocableCertificate]]   // consumed FIFO per inventory call
+	var revokeError: Error?
+	var revokeCalls = 0
+	var submitError: Error?
+	var submitCalls = 0
+	let issued: ZagIssuedCertificate
+	init(listings: [[ZagRevocableCertificate]], issued: ZagIssuedCertificate) { self.listings = listings; self.issued = issued }
+	func revocableCertificates(team: String) async throws -> [ZagRevocableCertificate] {
+		listings.isEmpty ? [] : listings.removeFirst()
+	}
+	func revokeCertificate(_ c: ZagRevocableCertificate, guard g: ZagActiveCertificateGuard, override: Bool, team: String) async throws {
+		revokeCalls += 1; if let e = revokeError { throw e }
+	}
+	func submitCertificateRequest(_ r: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
+		submitCalls += 1; if let e = submitError { throw e }; return issued
+	}
+}
+final class MemJournal: ZagReplacementJournalStore, @unchecked Sendable {
+	var s: ZagCertificateReplacementState?
+	func loadReplacementState() -> ZagCertificateReplacementState? { s }
+	func saveReplacementState(_ v: ZagCertificateReplacementState) { s = v }
+}
+let issuedCert = ZagIssuedCertificate(certificate: ZagDevelopmentCertificate(serialNumber: "NEW9", name: "Apple Development", machineName: "Zag Store", expiresAt: crSoon, data: Data([1,2,3])), data: Data([1,2,3]))
+func makeDriver(_ portal: MockPortal, _ journal: MemJournal) -> ZagCertificateReplacementDriver {
+	ZagCertificateReplacementDriver(portal: portal, consent: ZagMutationConsentCoordinator(), activeGuard: guardz, journal: journal, team: "V54K5JYGS4")
+}
+func run(_ body: @escaping () async -> Void) { let g = DispatchGroup(); g.enter(); Task { await body(); g.leave() }; g.wait() }
+
+// 1. Full successful replacement: select -> revoke (stops) -> separately submit -> completed.
+run {
+	let portal = MockPortal(listings: [[freshMatch], [freshMatch]], issued: issuedCert)
+	let j = MemJournal(); let d = makeDriver(portal, j)
+	try? await d.select(freshMatch)
+	try? await d.confirmAndRevoke()
+	check(await d.currentState() == .revoked(target: selTarget), "e2e: a successful revoke STOPS at revoked (no auto CSR)")
+	check(portal.submitCalls == 0, "e2e: the CSR was NOT auto-submitted after revoke")
+	_ = try? await d.authorizeAndSubmitCSR(ZagCertificateRequest(data: Data([9])))
+	check(await d.currentState() == .completed(serial: "FOR123"), "e2e: a separate CSR authorization completes the flow")
+	check(portal.revokeCalls == 1 && portal.submitCalls == 1, "e2e: exactly one revoke and one submission")
+}
+// 2. Repeated 7460 after a successful revoke: not treated as success; flow abandons honestly.
+run {
+	let portal = MockPortal(listings: [[freshMatch], [freshMatch]], issued: issuedCert)
+	portal.submitError = ZagPortalError.existingCertificateOrPendingRequest
+	let j = MemJournal(); let d = makeDriver(portal, j)
+	try? await d.select(freshMatch); try? await d.confirmAndRevoke()
+	do { _ = try await d.authorizeAndSubmitCSR(ZagCertificateRequest(data: Data([9]))); check(false, "e2e: repeated 7460 should throw") }
+	catch { check((error as? ZagReplacementError) == .repeatedConflict, "e2e: repeated 7460 -> repeatedConflict") }
+	check(await d.currentState() == .abandoned(reason: .csrRejected), "e2e: repeated 7460 abandons, never completed")
+}
+// 3. Ambiguous revoke (network): halts, requires read-only reconcile; reconcile proves gone -> revoked.
+run {
+	let portal = MockPortal(listings: [[freshMatch], []], issued: issuedCert)  // 2nd listing (reconcile) shows it gone
+	portal.revokeError = ZagPortalError.network
+	let j = MemJournal(); let d = makeDriver(portal, j)
+	try? await d.select(freshMatch)
+	do { try await d.confirmAndRevoke(); check(false, "e2e: ambiguous revoke should throw") }
+	catch { check((error as? ZagReplacementError) == .ambiguousRevoke, "e2e: network revoke -> ambiguousRevoke") }
+	check(await d.currentState() == .revokeHalted(target: selTarget, reason: .revokeAmbiguous), "e2e: ambiguous revoke halts")
+	try? await d.reconcileAfterAmbiguousRevoke()
+	check(await d.currentState() == .revoked(target: selTarget), "e2e: reconcile proving the cert gone -> revoked")
+}
+// 4. Ambiguous revoke; reconcile shows it STILL present -> back to selected (not advanced).
+run {
+	let portal = MockPortal(listings: [[freshMatch], [freshMatch]], issued: issuedCert)
+	portal.revokeError = ZagPortalError.network
+	let j = MemJournal(); let d = makeDriver(portal, j)
+	try? await d.select(freshMatch); _ = try? await d.confirmAndRevoke()
+	try? await d.reconcileAfterAmbiguousRevoke()
+	check(await d.currentState() == .selected(target: selTarget), "e2e: reconcile showing the cert present -> selected (cannot reach CSR)")
+	check(!ZagCertificateReplacementCoordinator.maySubmitCSR(await d.currentState()), "e2e: still cannot submit the CSR")
+}
+// 5. App termination during revocation: journal left `revoking`; launch recovery -> halt (needs re-check).
+run {
+	let j = MemJournal(); j.saveReplacementState(.revoking(target: selTarget))
+	let portal = MockPortal(listings: [[freshMatch]], issued: issuedCert)
+	let d = makeDriver(portal, j)
+	await d.recoverOnLaunch()
+	check(await d.currentState() == .revokeHalted(target: selTarget, reason: .interruptedDuringRevoke), "e2e: interrupted revoke recovers to a halt")
+}
+// 6. Ambiguous CSR submission: journal left `submitting`; recovery -> submissionUnconfirmed.
+run {
+	let portal = MockPortal(listings: [[freshMatch], [freshMatch]], issued: issuedCert)
+	portal.submitError = ZagPortalError.network
+	let j = MemJournal(); let d = makeDriver(portal, j)
+	try? await d.select(freshMatch); try? await d.confirmAndRevoke()
+	do { _ = try await d.authorizeAndSubmitCSR(ZagCertificateRequest(data: Data([9]))); check(false, "e2e: ambiguous CSR should throw") }
+	catch { check((error as? ZagReplacementError) == .ambiguousSubmission, "e2e: network CSR -> ambiguousSubmission") }
+	check(await d.currentState() == .submissionUnconfirmed(serial: "FOR123"), "e2e: ambiguous CSR -> submissionUnconfirmed (reconcile)")
+}
+// 7. Protected active cert cannot be selected through the driver.
+run {
+	let portal = MockPortal(listings: [[nowActive]], issued: issuedCert)
+	let j = MemJournal(); let d = makeDriver(portal, j)
+	do { try await d.select(nowActive); check(false, "e2e: selecting the active cert should throw") }
+	catch { check((error as? ZagReplacementError) == .targetNowActive, "e2e: driver rejects selecting the protected active cert") }
+}
+// 8. Stale inventory at revoke time: the chosen cert vanished between select and revoke.
+run {
+	let portal = MockPortal(listings: [[]], issued: issuedCert)  // gone by the revoke-time refresh
+	let j = MemJournal(); let d = makeDriver(portal, j)
+	try? await d.select(freshMatch)
+	do { try await d.confirmAndRevoke(); check(false, "e2e: stale target should throw") }
+	catch { check((error as? ZagReplacementError) == .targetNoLongerPresent, "e2e: stale inventory refuses the revoke") }
+	check(portal.revokeCalls == 0, "e2e: no revoke call was made for a stale target")
+}
 
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

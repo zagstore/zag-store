@@ -33,6 +33,10 @@ struct ZagNativeDeveloperTeam: Codable, Equatable, Sendable {
 /// The live native portal. Disabled by default: the designated initializer is
 /// internal and the convenience factory returns the disabled stub unless an
 /// explicit enable is passed.
+// Conforms to ZagReplacementPortal (ZagCertificateReplacementService.swift): it
+// already implements all three operations that service needs.
+extension ZagNativeDeveloperPortal: ZagReplacementPortal {}
+
 struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// Supplies the current developer headers (token bag). Async so it can be
 	/// backed by the Keychain-held session; it performs NO network itself
@@ -153,6 +157,16 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 										body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
 		let rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
 		return rows.compactMap { ZagDeveloperServicesProtocol.parseCertificate($0).map(Self.certificate) }
+	}
+
+	/// Read-only revocation candidates: the same `/services/v1/certificates`
+	/// listing as `certificates(team:)`, but preserving the v1 `id` and a DER
+	/// SHA-1 so a later revoke can target the EXACT certificate. No new endpoint.
+	func revocableCertificates(team: String) async throws -> [ZagRevocableCertificate] {
+		let response = try await sendV1(path: "certificates", methodOverride: "GET",
+										body: try ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
+		let rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
+		return ZagCertificateRevocation.candidates(from: rows)
 	}
 
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {

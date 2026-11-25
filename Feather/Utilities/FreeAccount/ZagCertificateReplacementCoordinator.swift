@@ -31,9 +31,12 @@ enum ZagCertificateReplacementState: Codable, Equatable, Sendable {
 	case revoking(target: ZagReplacementTarget)
 	/// Revoke succeeded; the slot is free. CSR still needs its own authorization.
 	case revoked(target: ZagReplacementTarget)
-	/// Revoke failed or was ambiguous: a TERMINAL stop for this attempt. It can
-	/// never advance to CSR submission.
-	case revokeHalted(serial: String, reason: ZagReplacementHalt)
+	/// Revoke failed or was ambiguous: a stop for this attempt that can NEVER
+	/// advance to CSR submission. It carries the full target so that a later
+	/// READ-ONLY reconciliation (`reconcileHaltedRevoke`) can re-enter safely —
+	/// forward to `.revoked` only if the listing PROVES the certificate is gone,
+	/// otherwise back to `.selected`. Until then it is terminal.
+	case revokeHalted(target: ZagReplacementTarget, reason: ZagReplacementHalt)
 	/// A SECOND, separate authorization to submit the CSR has been given.
 	case csrAuthorized(target: ZagReplacementTarget)
 	/// CSR submission is in flight (written ahead).
@@ -102,8 +105,8 @@ enum ZagCertificateReplacementCoordinator {
 		case (.selected(let t), .confirmRevoke):      return .revokeConfirmed(target: t)
 		case (.revokeConfirmed(let t), .revokeStarted): return .revoking(target: t)
 		case (.revoking(let t), .revokeSucceeded):    return .revoked(target: t)
-		case (.revoking(let t), .revokeFailed):       return .revokeHalted(serial: t.serialNumber, reason: .revokeFailed)
-		case (.revoking(let t), .revokeAmbiguous):    return .revokeHalted(serial: t.serialNumber, reason: .revokeAmbiguous)
+		case (.revoking(let t), .revokeFailed):       return .revokeHalted(target: t, reason: .revokeFailed)
+		case (.revoking(let t), .revokeAmbiguous):    return .revokeHalted(target: t, reason: .revokeAmbiguous)
 
 		// CSR — a SECOND authorization, only reachable from a succeeded revoke.
 		case (.revoked(let t), .authorizeCSR):        return .csrAuthorized(target: t)
@@ -130,9 +133,34 @@ enum ZagCertificateReplacementCoordinator {
 	/// re-check; a CSR in flight becomes `submissionUnconfirmed` for reconciliation.
 	static func recoverAfterInterruption(_ state: ZagCertificateReplacementState) -> ZagCertificateReplacementState {
 		switch state {
-		case .revoking(let t):   return .revokeHalted(serial: t.serialNumber, reason: .interruptedDuringRevoke)
+		case .revoking(let t):   return .revokeHalted(target: t, reason: .interruptedDuringRevoke)
 		case .submitting(let t): return .submissionUnconfirmed(serial: t.serialNumber)
 		default:                 return state
+		}
+	}
+
+	/// The verdict of a READ-ONLY re-listing after an ambiguous or interrupted
+	/// revoke — the only thing allowed to move a halted flow.
+	enum ReconcileVerdict: Equatable, Sendable {
+		case targetGone           // the certificate is no longer listed — revoke took effect
+		case targetStillPresent   // the certificate is still listed — revoke did NOT take effect
+		case listingUnavailable   // could not read the listing — decide nothing
+	}
+
+	/// Re-enters a halted flow from a read-only reconciliation. An authoritative
+	/// `revokeFailed` is NOT reconcilable (the server told us it did not happen);
+	/// only an ambiguous or interrupted halt may move, and only as the listing
+	/// proves: gone -> `.revoked` (CSR still needs its own authorization),
+	/// still-present -> `.selected` (the user may retry or cancel). A missing
+	/// listing leaves it halted. Nothing here submits or revokes.
+	static func reconcileHaltedRevoke(_ state: ZagCertificateReplacementState,
+									  verdict: ReconcileVerdict) -> ZagCertificateReplacementState {
+		guard case .revokeHalted(let target, let reason) = state,
+			  reason == .revokeAmbiguous || reason == .interruptedDuringRevoke else { return state }
+		switch verdict {
+		case .targetGone:         return .revoked(target: target)
+		case .targetStillPresent: return .selected(target: target)
+		case .listingUnavailable: return state
 		}
 	}
 

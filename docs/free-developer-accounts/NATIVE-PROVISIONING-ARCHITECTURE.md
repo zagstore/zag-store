@@ -1128,3 +1128,91 @@ path not involved.
    new CSR (another 7460); the coordinator halts rather than retrying.
 
 Stop before any account mutation.
+
+---
+
+## Certificate-replacement integration: driver, consent, journal, UI (2026-11-25)
+
+Connects the pure `ZagCertificateReplacementCoordinator` to the native portal
+client, the mutation-consent coordinator and a durable journal, plus a native
+SwiftUI workflow. Offline only — no Apple requests, revocations, CSRs, new keys,
+imports or installs; the entry point is behind the DISABLED portal and a gate
+(`ZAG_CERT_REPLACEMENT_EXPERIMENT`).
+
+### Integrated components
+- **`ZagReplacementPortal`** — a narrow seam over the already-existing portal ops
+  (read-only `revocableCertificates`, `revokeCertificate`, `submitCertificateRequest`).
+  `ZagNativeDeveloperPortal` conforms directly; **no new Apple endpoint** (the new
+  `revocableCertificates` reuses the established `/services/v1/certificates` GET,
+  preserving the v1 `id` + DER SHA-1 so a revoke targets the exact certificate).
+- **`ZagCertificateReplacementService`** — stateless, fully-tested helpers:
+  `verifyTargetForRevoke` (fresh-listing re-verification), `classifyRevokeFailure`
+  / `classifySubmitFailure`, `reconcileVerdict`.
+- **`ZagCertificateReplacementDriver`** (`actor`) — owns the journal, consent and
+  portal; drives the coordinator; persists the journal before every network step.
+- **Coordinator evolution** — `revokeHalted` now carries the full target, and
+  `reconcileHaltedRevoke(verdict:)` re-enters a halted flow only from a read-only
+  re-listing (gone → `revoked`; present → `selected`; unavailable → stays halted).
+- **UI** — `ZagCertificateReplacementView` + `ZagCertificateReplacementModel`
+  (@MainActor): inventory & status, the protected active cert flagged IN USE,
+  per-candidate unknown-usage warnings, exact selection, a separate destructive
+  revoke confirmation, a separate CSR authorization screen, and recovery /
+  reconciliation screens. A standing disclaimer states replacement is **not
+  guaranteed** to resolve 7460.
+
+### Independent authorization & interruption safeguards
+- Revoke and CSR are **two separate driver calls**, each taking its own consent
+  (`.revokeCertificate`, then `.submitCSR`); the revoke's consent is cancelled on
+  success so it cannot carry into the CSR.
+- **Before revoke:** refresh the listing; confirm the exact cert still exists,
+  its SHA-1 still matches, and it is not the protected active cert; else fail
+  closed (`targetNoLongerPresent` / `fingerprintMismatch` / `targetNowActive` /
+  `listingUnavailable`) with no mutation.
+- **After a successful revoke:** persist `revoked` and **STOP** — the CSR is never
+  auto-submitted (test-proven: `submitCalls == 0` at that point).
+- **Before CSR:** a second consent, reachable only from `revoked`; it is consumed
+  and the `submitting` write-ahead persisted **before** transmission; submitted
+  **exactly once**, no retry.
+- **Write-ahead + recovery:** `revoking`/`submitting` are persisted before the
+  call, so launch recovery turns an interrupted revoke into
+  `revokeHalted(.interruptedDuringRevoke)` and an interrupted CSR into
+  `submissionUnconfirmed` — never `completed`.
+- **Ambiguity:** any revoke failure is treated as ambiguous and halts; it cannot
+  advance to the CSR until a **read-only reconciliation** proves the cert gone.
+  A **repeated 7460** after a successful revoke is surfaced as `repeatedConflict`
+  (the flow abandons; it is never mistaken for success) — i.e. a freed slot is
+  never assumed to create an available issuance slot.
+
+### Is the whole workflow executable on a stock iPhone?
+No — by design and by authorization. All logic, gating, consent, journalling,
+recovery and UI are implemented and tested offline, but the three live steps
+(list / revoke / submit) run only against the DISABLED portal here. Executing
+them needs a live portal (currently behind `ZagLivePortal.isEnabled == false`)
+and the owner's separate, explicit authorization. The original device-generated
+signing path is untouched.
+
+### Validation
+213-check dev-services suite (full replacement, repeated 7460, ambiguous revoke
+→ reconcile both ways, interrupted revoke, interrupted CSR, protected-cert
+rejection, stale inventory, fingerprint mismatch) + CMS 11/11 + imported-identity
+green. Whole-directory arm64-iOS typecheck clean; arm64-iOS whole-module codegen
+of the new files (incl. the SwiftUI view) produced a Mach-O object. (The lone
+intermittent "coarse days" check is the pre-existing day-boundary flake.)
+
+### Current native CSR & Keychain state
+Unchanged: the preserved device-generated non-extractable RSA-2048 key and its
+original CSR remain pending and are NOT regenerated. `machineId` remains the
+stable per-install Keychain value. The replacement flow, when authorized, would
+reuse that exact key/CSR for the post-revoke submission.
+
+### Minimum separately-authorized live sequence to test replacement
+1. Enable the live portal for one bounded session (owner action).
+2. Read-only `revocableCertificates` to populate and verify the inventory.
+3. Owner selects the exact legacy candidate (…5EBF18); confirm it is not the
+   active cert and its fingerprint matches.
+4. Explicit revoke confirmation → ONE `revokeCertificate`. Then STOP and persist.
+5. Read-only re-list to confirm the revoke landed (reconcile if ambiguous).
+6. Separate CSR authorization → ONE `submitCertificateRequest` reusing the
+   preserved key/CSR. **Risks:** revocation is irreversible and may break an
+   unknown dependent; the CSR may still 7460 if the team enforces a per-machine/
+   account rule rather than a count — the flow halts, never retries.

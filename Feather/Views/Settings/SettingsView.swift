@@ -648,6 +648,14 @@ extension SettingsView {
 				Label("First Signing Experiment", systemImage: "signature")
 			}
 			#endif
+			#if ZAG_CERT_REPLACEMENT_EXPERIMENT
+			// Native certificate-replacement workflow (7460 recovery). Backed by the
+			// disabled portal unless a live portal is explicitly enabled; every
+			// mutation is separately confirmed and nothing is guaranteed.
+			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.gatedPreview()).zagSettingsDestinationAvatar()) {
+				Label("Replace a Certificate", systemImage: "arrow.triangle.2.circlepath")
+			}
+			#endif
 		} header: {
 			Text("Experimental Features")
 		}
