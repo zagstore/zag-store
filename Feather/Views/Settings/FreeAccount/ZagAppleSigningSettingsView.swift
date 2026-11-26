@@ -40,6 +40,10 @@ struct ZagAppleSigningSettingsView: View {
 				Section("Zag Store Installation") {
 					LabeledContent("Signing Method", value: runningInstallation.method == .imported ? "Certificate" : runningInstallation.method.rawValue)
 					LabeledContent("Expiration", value: runningInstallation.expiry?.formatted(date: .abbreviated, time: .omitted) ?? "Unknown")
+					if let pair = runningInstallation.importedCertificate,
+					   let name = pair.nickname ?? Storage.shared.getProvisionFileDecoded(for: pair)?.Name {
+						LabeledContent("Certificate", value: name)
+					}
 					if let expiry = runningInstallation.expiry {
 						LabeledContent("Validity") {
 							Text(expiry.expirationInfo(from: Date()).formatted).foregroundStyle(expiry.expirationInfo(from: Date()).color)
@@ -99,6 +103,7 @@ struct ZagAppleSigningSettingsView: View {
 		.onReceive(ZagNativeAppInventory.changes) { _ in
 			ZagAppleIDCapacity.invalidateDevice()
 			deviceCheckFailed = true
+			Task { await refreshDevice(force: false) }
 		}
 		#endif
 		.alert("Apple ID", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
