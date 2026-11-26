@@ -1096,7 +1096,11 @@ private struct ZagRunningDetailsSheet: View {
 							Text("\(installation.runningApp.version ?? "Unknown") (\(installation.runningApp.build ?? "Unknown"))").foregroundStyle(.secondary)
 						}
 					}
-					LabeledContent("Signing Method", value: installation.method == .imported ? "Certificate" : installation.method == .personal ? "Apple ID" : installation.method == .certificate ? "Certificate" : "Unknown")
+					LabeledContent("Signing Method", value: installation.method == .imported ? "Certificate" : installation.method.rawValue)
+					if let pair = installation.importedCertificate,
+					   let name = pair.nickname ?? Storage.shared.getProvisionFileDecoded(for: pair)?.Name {
+						LabeledContent("Certificate", value: name)
+					}
 					if let expiry = installation.expiry {
 						LabeledContent("Expiration", value: expiry.formatted(date: .abbreviated, time: .omitted))
 						LabeledContent("Validity") { Text(expiry.expirationInfo(from: Date()).formatted).foregroundStyle(expiry.expirationInfo(from: Date()).color) }
