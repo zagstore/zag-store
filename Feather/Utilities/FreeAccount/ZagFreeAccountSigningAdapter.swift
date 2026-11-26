@@ -560,15 +560,20 @@ enum ZagProfileOnlyRenewal {
 		authenticate: (Data) throws -> Data = { try ZagCMSVerifier.verify($0).get() }) throws -> ZagIssuedProfile {
 		let authenticated = try authenticate(bytes)
 		let profile = try ZagIssuedProfile(profileData: authenticated)
-		guard let contents = ZagMobileProvision.parseUnverified(authenticated),
-			  contents.teamIdentifier == team, profile.bundleIdentifier == component.bundleIdentifier,
-			  contents.applicationIdentifier == "\(team).\(component.bundleIdentifier)",
-			  contents.developerCertificates.contains(certificate),
-			  contents.provisionedDevices.contains(where: { $0.caseInsensitiveCompare(udid) == .orderedSame }),
-			  let evidence = component.signedEntitlements,
-			  let signed = try? PropertyListSerialization.propertyList(from: evidence, format: nil) as? [String: Any],
-			  ZagEntitlementAudit.disallowed(requested: signed.mapValues(ZagEntitlementValue.init),
-				granted: contents.entitlements).isEmpty else { throw Failure.needsResign }
+		func incompatible(_ reason: String) -> Failure {
+			ZagSigningDiagnostics.record("Profile compatibility rejected: \(reason)")
+			return .needsResign
+		}
+		guard let contents = ZagMobileProvision.parseUnverified(authenticated) else { throw incompatible("profile payload unreadable") }
+		guard contents.teamIdentifier == team else { throw incompatible("team mismatch") }
+		guard profile.bundleIdentifier == component.bundleIdentifier else { throw incompatible("bundle mismatch") }
+		guard contents.applicationIdentifier == "\(team).\(component.bundleIdentifier)" else { throw incompatible("application identifier mismatch") }
+		guard contents.developerCertificates.contains(certificate) else { throw incompatible("original certificate not granted") }
+		guard contents.provisionedDevices.contains(where: { $0.caseInsensitiveCompare(udid) == .orderedSame }) else { throw incompatible("device not covered") }
+		guard let evidence = component.signedEntitlements,
+			  let signed = try? PropertyListSerialization.propertyList(from: evidence, format: nil) as? [String: Any] else { throw incompatible("signed entitlement evidence unreadable") }
+		guard ZagEntitlementAudit.disallowed(requested: signed.mapValues(ZagEntitlementValue.init),
+			granted: contents.entitlements).isEmpty else { throw incompatible("signed entitlements not granted") }
 		guard profile.expiresAt > now else { throw Failure.noExtension }
 		return .init(uuid: profile.uuid, teamIdentifier: profile.teamIdentifier, bundleIdentifier: profile.bundleIdentifier,
 			certificateSerials: profile.certificateSerials, deviceUDIDs: profile.deviceUDIDs, entitlements: profile.entitlements,
