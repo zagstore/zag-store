@@ -415,6 +415,9 @@ extension LibraryCellView {
 			} else if _hasPendingNativeInstall, _signedAction(update: nil) == .install {
 				Button("Install", systemImage: "square.and.arrow.down") { _startNative(installSaved: true) }
 			}
+			if _hasPendingNativeInstall {
+				Button("Export IPA", systemImage: "square.and.arrow.up") { _exportNativeIPA() }
+			}
 			Button("Sign Separate Copy", systemImage: "person.crop.circle.badge.plus") { confirmSeparateSigning = true }
 		} else if app.isSigned {
 			if isManagedInstalled, let id = app.identifier, _signedAction(update: nil) == .open {
@@ -592,6 +595,31 @@ extension LibraryCellView {
 		.offset(y: 26)
 		.accessibilityElement(children: .ignore)
 		.accessibilityLabel(Text(showIdentity ? "\(appleID ? "Apple ID" : "Certificate"), \(info.formatted)" : info.formatted))
+	}
+
+	private func _exportNativeIPA() {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		Task { @MainActor in
+			do {
+				let url = try await ZagNativeAppInventory.prepareIPAExport(app)
+				let directory = url.deletingLastPathComponent()
+				guard let presenter = UIApplication.topViewController() else {
+					try? FileManager.default.removeItem(at: directory)
+					return
+				}
+				let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+				controller.completionWithItemsHandler = { _, _, _, _ in
+					try? FileManager.default.removeItem(at: directory)
+				}
+				controller.popoverPresentationController?.sourceView = presenter.view
+				controller.popoverPresentationController?.sourceRect = CGRect(
+					x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+				presenter.present(controller, animated: true)
+			} catch {
+				UIAlertController.showAlertWithOk(title: "Export Failed", message: error.localizedDescription)
+			}
+		}
+		#endif
 	}
 
 	private func _signSeparateCopy() {

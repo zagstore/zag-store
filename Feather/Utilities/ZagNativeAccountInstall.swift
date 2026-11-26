@@ -542,7 +542,7 @@ enum ZagNativeAccountInstall {
 		}
 		try checkpoint()
 		let retainSigned: @Sendable (ZagNativeInstalledProfiles, ZagInstallExpectation, URL) async throws -> Void = { metadata, expectation, signedApp in
-			try await ZagNativeAppInventory.save(metadata, source: source, name: name, renewing: nil, signedOnly: (expectation, signedApp))
+			try await ZagNativeAppInventory.save(metadata, source: source, name: name, renewing: nil, signedOnly: (expectation, signedApp), artifactDeviceUDID: device.udid)
 		}
 		do {
 			return try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: app,
