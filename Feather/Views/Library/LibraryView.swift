@@ -354,7 +354,7 @@ struct LibraryView: View {
 					_ = try await ZagNativeAccountInstall.runInline(app, job: job, options: OptionsManager.shared.appleIDOptions, renew: true)
 					renewed += 1
 				} catch {
-					if !ZagNativeAccountInstall.currentAccountMatches(scope) { unavailableAccounts.insert(scope.accountID) }
+					if !ZagNativeAccountInstall.hasConnectedAccount(scope.accountID) { unavailableAccounts.insert(scope.accountID) }
 					lines.append("\(entry.name). \(error.localizedDescription)")
 					let report = ZagSigningDiagnostics.latest
 					if report != previous { reports.append("App \(index + 1)\n\(report)") }

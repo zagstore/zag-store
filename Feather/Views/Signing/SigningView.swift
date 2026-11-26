@@ -101,7 +101,7 @@ struct SigningView: View {
 						Text("Zag Store will identify this iPhone using its saved pairing when you start.").foregroundStyle(.secondary)
 					}
 					if let entry = _renewing {
-						if let scope = entry.installation.record.owner?.scope, !ZagNativeAccountInstall.currentAccountMatches(scope) {
+						if let scope = entry.installation.record.owner?.scope, !ZagNativeAccountInstall.hasConnectedAccount(scope.accountID) {
 							NavigationLink("Connect the Apple Account that signed this app") { ZagAppleSigningSettingsView() }
 						}
 						if !ZagNativeAppInventory.hasSource(entry) {
@@ -135,7 +135,7 @@ struct SigningView: View {
 						.accessibilityElement(children: .combine)
 						.accessibilityValue(progress.title)
 					}
-					if let issue = _certificateIssue, ZagNativeAccountInstall.currentAccountMatches(issue.scope) {
+					if let issue = _certificateIssue, ZagNativeAccountInstall.hasConnectedAccount(issue.scope.accountID) {
 						Section("Development Certificate") {
 							Text(issue.failure.message).font(.footnote)
 							Button("Copy Diagnostics") { UIPasteboard.general.string = ZagSigningDiagnostics.latest }
@@ -945,7 +945,7 @@ extension SigningView {
 		if _signingMethod == .freeAppleAccount {
 			if _isSigning { return _nativeProgress?.title ?? "Preparing App" }
 			if _renewing != nil { return "Resign and Install" }
-			if let issue = _certificateIssue, ZagNativeAccountInstall.currentAccountMatches(issue.scope) {
+			if let issue = _certificateIssue, ZagNativeAccountInstall.hasConnectedAccount(issue.scope.accountID) {
 				return "Resume Sign and Install"
 			}
 			return _appleIDOptions.installAfterSigning ? "Sign and Install" : "Sign"
@@ -979,7 +979,7 @@ extension SigningView {
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 	private func _startAccountInstall(resuming scope: ZagSigningScope? = nil) {
 		guard !_isSigning else { return }
-		if let issue = _certificateIssue, !ZagNativeAccountInstall.currentAccountMatches(issue.scope) { _certificateIssue = nil }
+		if let issue = _certificateIssue, !ZagNativeAccountInstall.hasConnectedAccount(issue.scope.accountID) { _certificateIssue = nil }
 		let expectedScope = scope ?? _certificateIssue?.scope
 		_isSigning = true
 		_accountDiagnostics = ""

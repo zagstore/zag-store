@@ -38,15 +38,18 @@ struct ZagDeveloperTokenStore {
 	}
 
 	/// The persisted token for `scope`, decoded, or nil. Never logged.
-	func load(scope: String) -> ZagPersistedDeveloperToken? {
+	func load(scope: String) -> ZagPersistedDeveloperToken? { try? read(scope: scope) }
+
+	func read(scope: String) throws -> ZagPersistedDeveloperToken? {
 		var q = query(scope)
 		q[kSecReturnData as String] = true
 		q[kSecMatchLimit as String] = kSecMatchLimitOne
 		var item: CFTypeRef?
-		guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
-			  let data = item as? Data,
-			  let token = try? JSONDecoder().decode(ZagPersistedDeveloperToken.self, from: data) else { return nil }
-		return token
+		let status = SecItemCopyMatching(q as CFDictionary, &item)
+		if status == errSecItemNotFound { return nil }
+		guard status == errSecSuccess else { throw ZagAppleAuthError.keychain(status) }
+		guard let data = item as? Data else { throw ZagAppleAuthError.keychain(errSecDecode) }
+		return try JSONDecoder().decode(ZagPersistedDeveloperToken.self, from: data)
 	}
 
 	/// Store the token (overwrites). The bytes are opaque and never logged.

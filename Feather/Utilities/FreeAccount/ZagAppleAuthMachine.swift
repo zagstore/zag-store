@@ -867,12 +867,14 @@ actor ZagAppleAuthMachine {
 										   email: String, password: String, platform: ZagAppleAuthPlatform,
 										   scope: String, coordinator: ZagTwoFactorCoordinator,
 										   includeDeveloperSession: Bool = false) -> ZagAppleAuthSignInReport {
+		guard !coordinator.didCancel else { return ZagAppleAuthSignInReport(outcome: .twoFactorRequired) }
 		coordinator.begin()
 		let result: Result<RawSignIn, ZagAppleAuthError> = withClient(persisted: persisted, transport: transport, platform: platform) { client in
 			let p = aauth_client_provision(client)
 			guard p == AAUTH_OK else {
 				return .success(RawSignIn(outcome: transport.reachedApple ? .rejected(code: Int(p.rawValue)) : .transportFailed))
 			}
+			guard !coordinator.didCancel else { return .success(RawSignIn(outcome: .twoFactorRequired)) }
 			let ctx = Unmanaged.passUnretained(coordinator).toOpaque()
 			// AUTOMATIC: follow the account's real 2FA configuration; do not force a
 			// method. phone_number_id 0 discovers the trusted numbers to present.
@@ -887,7 +889,7 @@ actor ZagAppleAuthMachine {
 			var dev: ZagDeveloperSessionReport? = nil
 			// Persist ONLY on a positive AAUTH_OK with valid (non-empty) session
 			// material. The bytes are opaque and never logged.
-			if rc == AAUTH_OK, let session {
+			if rc == AAUTH_OK, let session, !coordinator.didCancel {
 				var buf = aauth_client_buffer()
 				if aauth_account_session_plist(session, &buf) == AAUTH_OK, let d = buf.data, buf.size > 0 {
 					let bytes = Data(bytes: d, count: buf.size)
@@ -896,11 +898,12 @@ actor ZagAppleAuthMachine {
 				aauth_client_buffer_free(&buf)
 				// Developer-session from the FRESH in-memory session (not the stored,
 				// possibly-aged one), immediately after authentication.
-				if includeDeveloperSession {
+				if includeDeveloperSession, sessionStored, !coordinator.didCancel {
 					dev = Self.exchangeDeveloper(client: client, account: session, transport: transport, stageFor: Self.signInStage, persistScope: scope)
 				}
 			}
 			if let session { aauth_account_session_free(session) }
+			if coordinator.didCancel { return .success(RawSignIn(outcome: .twoFactorRequired)) }
 			if rc == AAUTH_OK { return .success(RawSignIn(outcome: .authenticated, sessionStored: sessionStored, dev: dev)) }
 			let error = String(cString: aauth_client_last_error())
 			let ec = grandSlamCode(error), http = grandSlamHTTPStatus(error), message = grandSlamMessage(error)

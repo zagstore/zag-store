@@ -79,6 +79,7 @@ final class ZagCertificateReplacementModel: ObservableObject {
 			#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 			if let scope = nativeScope {
 				try await ZagNativeAccountInstall.withExclusiveOperation {
+					try await ZagNativeAccountInstall.validateSigningScope(scope)
 					if case .selected(let target) = await driver.currentState(),
 					   let identity = try Self.nativeIdentity(scope),
 					   ZagActiveCertificateGuard.sameSerial(target.serialNumber, identity.serialNumber) {

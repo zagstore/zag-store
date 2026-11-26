@@ -45,6 +45,7 @@ final class ZagNativeSignInModel: ObservableObject {
 	@Published private(set) var accountID: UUID?
 	private let requestedAccount: ZagNativeAppleID?
 	private static var authenticating = false
+	private var attempt: ZagNativeAuthenticationAttempt?
 	var emailLocked: Bool { requestedAccount?.email != nil }
 	private var coordinator = ZagTwoFactorCoordinator()
 	private var stageObservation: Task<Void, Never>?
@@ -71,52 +72,68 @@ final class ZagNativeSignInModel: ObservableObject {
 	func restore() async {
 		guard let accountID else { return }
 		if ZagNativeAppleIDs.shared.connectedToken(accountID) == nil {
-			await restoreDeveloperSession(accountID)
+			guard await restoreDeveloperSession(accountID) else { return }
 		}
 		if ZagNativeAppleIDs.shared.connectedToken(accountID) != nil {
 			await refreshInventory()
-			finishSignedIn()
+			if !Task.isCancelled { finishSignedIn() }
 		}
 	}
 
-	private func restoreDeveloperSession(_ id: UUID) async {
+	private func restoreDeveloperSession(_ id: UUID) async -> Bool {
 		let vault = ZagNativeAppleIDKeychain()
 		let accountScope = ZagNativeAppleIDs.scope(id)
-		guard !Self.authenticating, let session = vault.session(accountScope) else { return }
+		guard !Self.authenticating, !Task.isCancelled,
+			  let session = try? vault.session(accountScope) else { return false }
+		let attempt = ZagNativeAuthenticationAttempt()
+		self.attempt = attempt
 		Self.authenticating = true
 		isBusy = true
 		phase = .authenticating
 		let staging = "native-login-staging"
 		defer {
+			try? vault.deleteCredentials(staging)
+			self.attempt = nil
 			Self.authenticating = false
 			isBusy = false
 			phase = .signedOut
-			try? vault.deleteCredentials(staging)
 		}
 		do {
 			try vault.deleteCredentials(staging)
 			try vault.saveSession(session, scope: staging)
 			let report = try await ZagAppleAuthMachine.nativeLogin(temporaryScope: staging).developerSession()
-			guard !Task.isCancelled, report.outcome == .ok, vault.session(accountScope) == session,
-				  vault.token(staging)?.nativeAccountID == id else { return }
+			try attempt.checkpoint()
+			guard report.outcome == .ok, try vault.session(accountScope) == session,
+				  try vault.token(staging)?.nativeAccountID == id else { return false }
 			_ = try ZagNativeAppleIDs.shared.completeAuthentication(
-				temporaryScope: staging, email: requestedAccount?.email ?? "", expected: id)
+				temporaryScope: staging, email: requestedAccount?.email ?? "", expected: id, attempt: attempt)
+			return true
+		} catch is CancellationError {
+			return false
 		} catch {
 			failure = .init(message: "The saved session could not be renewed. Sign in again.", recovery: .retry)
+			return false
 		}
 	}
 
 	func signIn() async {
-		guard canSubmitCredentials else { return }
+		guard canSubmitCredentials, !Task.isCancelled else { return }
 		guard !Self.authenticating else {
 			finish(failure: .init(message: "Another Apple ID is signing in. Try again when it finishes.", recovery: .retry))
 			return
 		}
 		Self.authenticating = true
+		let attempt = ZagNativeAuthenticationAttempt()
+		self.attempt = attempt
 		let temporaryScope = "native-login-staging"
-		do { try ZagNativeAppleIDKeychain().deleteCredentials(temporaryScope) }
-		catch {
+		let vault = ZagNativeAppleIDKeychain()
+		defer {
+			try? vault.deleteCredentials(temporaryScope)
+			self.attempt = nil
 			Self.authenticating = false
+		}
+		do { try vault.deleteCredentials(temporaryScope) }
+		catch {
 			finish(failure: .init(message: error.localizedDescription, recovery: .retry))
 			return
 		}
@@ -125,10 +142,6 @@ final class ZagNativeSignInModel: ObservableObject {
 		let expectedAccount = accountID
 		password = ""
 		let machine = ZagAppleAuthMachine.nativeLogin(temporaryScope: temporaryScope)
-		defer {
-			Self.authenticating = false
-			try? ZagNativeAppleIDKeychain().deleteCredentials(temporaryScope)
-		}
 		failure = nil
 		notice = nil
 		// Native Apple Account sign-in is a standard Zag Store feature. Pressing
@@ -178,13 +191,16 @@ final class ZagNativeSignInModel: ObservableObject {
 		}
 		#endif
 
-		guard !coordinator.didCancel else { finish(failure: nil); return }
+		guard (try? attempt.checkpoint()) != nil, !coordinator.didCancel else { finish(failure: nil); return }
 		let report: ZagAppleAuthSignInReport
 		do {
-			report = try await machine.signInWith2FA(email: email, password: secret,
-													 coordinator: coordinator,
-													 allowNetwork: true,
-													 includeDeveloperSession: true)
+			let challenge = coordinator
+			report = try await withTaskCancellationHandler {
+				try await machine.signInWith2FA(email: email, password: secret, coordinator: challenge,
+												allowNetwork: true, includeDeveloperSession: true)
+			} onCancel: {
+				challenge.cancel()
+			}
 		} catch let error as ZagAppleAuthError {
 			finish(failure: ZagNativeSignInClassifier.failure(error: error))
 			return
@@ -193,7 +209,7 @@ final class ZagNativeSignInModel: ObservableObject {
 			return
 		}
 
-		if coordinator.didCancel {
+		if coordinator.didCancel || (try? attempt.checkpoint()) == nil {
 			finish(failure: nil)   // user cancelled; quietly return to signed-out
 			return
 		}
@@ -204,7 +220,7 @@ final class ZagNativeSignInModel: ObservableObject {
 		}
 		do {
 			accountID = try ZagNativeAppleIDs.shared.completeAuthentication(
-				temporaryScope: temporaryScope, email: email, expected: expectedAccount)
+				temporaryScope: temporaryScope, email: email, expected: expectedAccount, attempt: attempt)
 		} catch {
 			finish(failure: .init(message: error.localizedDescription, recovery: .retry))
 			return
@@ -230,6 +246,9 @@ final class ZagNativeSignInModel: ObservableObject {
 	}
 
 	func cancel() {
+		attempt?.cancel()
+		password = ""
+		code = ""
 		coordinator.cancel()
 		finish(failure: nil)
 	}
