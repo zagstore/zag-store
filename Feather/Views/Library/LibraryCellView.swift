@@ -463,7 +463,7 @@ extension LibraryCellView {
 			let certificate = _isNativeAccountApp ? nil : Storage.shared.getCertificate(from: app)
 			let update = isManagedInstalled ? availableUpdate : nil
 			let certRevoked = certificate?.revoked == true
-			let expiry = _isNativeAccountApp ? _nativeProfileExpiry : certificate?.expiration
+			let expiry = _isNativeAccountApp ? _nativeProfileExpiry : (ZagCertificateProfileReceipt.load(for: app)?.effectiveExpiration ?? certificate?.expiration)
 			ZStack {
 				// One control: Install contracts into the progress circle and
 				// expands back into Install, Update or Open.
@@ -606,7 +606,7 @@ extension LibraryCellView {
 
 	private func _signedAction(update: UpdateManager.AvailableUpdate?) -> ZagAppRowAction {
 		let certificate = Storage.shared.getCertificate(from: app)
-		let expiry = _isNativeAccountApp ? _nativeProfileExpiry : certificate?.expiration
+		let expiry = _isNativeAccountApp ? _nativeProfileExpiry : (ZagCertificateProfileReceipt.load(for: app)?.effectiveExpiration ?? certificate?.expiration)
 		// An imported signed archive may predate certificate metadata; preserve
 		// the existing explicit Install path when its validity is unknown.
 		let launchable = certificate?.revoked != true && expiry.map { $0 > Date() } != false

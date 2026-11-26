@@ -1707,6 +1707,29 @@ pub unsafe extern "C" fn zag_installed_profiles(
     output_dir: *const c_char,
     callback: Option<ZagRPPairingCallback>,
 ) -> bool {
+    start_profile_operation(device_ip, pairing_path, output_dir, None, callback)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn zag_install_profiles(
+    device_ip: *const c_char,
+    pairing_path: *const c_char,
+    output_dir: *const c_char,
+    input_dir: *const c_char,
+    callback: Option<ZagRPPairingCallback>,
+) -> bool {
+    if input_dir.is_null() { return false; }
+    let Ok(input) = CStr::from_ptr(input_dir).to_str().map(PathBuf::from) else { return false; };
+    start_profile_operation(device_ip, pairing_path, output_dir, Some(input), callback)
+}
+
+unsafe fn start_profile_operation(
+    device_ip: *const c_char,
+    pairing_path: *const c_char,
+    output_dir: *const c_char,
+    input: Option<PathBuf>,
+    callback: Option<ZagRPPairingCallback>,
+) -> bool {
     let Some(callback) = callback else { return false; };
     if device_ip.is_null() || pairing_path.is_null() || output_dir.is_null() {
         return false;
@@ -1725,7 +1748,7 @@ pub unsafe extern "C" fn zag_installed_profiles(
             }
         };
         runtime.block_on(async move {
-            match timeout(Duration::from_secs(45), run_installed_profiles(device_ip, pairing_path, output_dir, callback)).await {
+            match timeout(Duration::from_secs(45), run_installed_profiles(device_ip, pairing_path, output_dir, input, callback)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => emit(callback, -8, error),
                 Err(_) => emit(callback, -8, "Timed out reading provisioning profiles over RPPairing".to_string()),
@@ -1739,6 +1762,7 @@ async fn run_installed_profiles(
     device_ip: String,
     pairing_path: PathBuf,
     output_dir: PathBuf,
+    input: Option<PathBuf>,
     callback: ZagRPPairingCallback,
 ) -> Result<(), String> {
     std::fs::create_dir_all(&output_dir)
@@ -1752,6 +1776,20 @@ async fn run_installed_profiles(
             let mut misagent = MisagentClient::connect_rsd(&mut adapter, &mut handshake)
                 .await
                 .map_err(|error| format!("misagent over RSD failed: {error}"))?;
+            if let Some(input) = input {
+                let mut paths = std::fs::read_dir(input)
+                    .map_err(|error| format!("Unable to read profile staging: {error}"))?
+                    .map(|entry| entry.map(|item| item.path()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("Unable to read staged profile: {error}"))?;
+                paths.sort();
+                for path in paths {
+                    let bytes = std::fs::read(path)
+                        .map_err(|error| format!("Unable to read staged profile: {error}"))?;
+                    misagent.install(bytes).await
+                        .map_err(|error| format!("misagent profile installation failed: {error}"))?;
+                }
+            }
             let profiles = misagent
                 .copy_all()
                 .await

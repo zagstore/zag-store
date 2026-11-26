@@ -124,10 +124,169 @@ enum ZagNativeAccountInstall {
 		ZagNativeAppleIDs.shared.connectedToken(accountID) != nil
 	}
 
+	/// A batch owns its inventory snapshot and read-only developer discovery.
+	/// The device queue is shared with individual refreshes and full fallback.
+	@MainActor
+	final class RefreshCoordinator {
+		private struct Discovery: Sendable {
+			let portal: ZagNativeDeveloperPortal
+			let appIDs: [ZagRegisteredAppID]
+			let certificates: [ZagDevelopmentCertificate]
+			let token: ZagPersistedDeveloperToken
+		}
+		private let discovery = ZagProfileOnlyRenewal.ReadCache<ZagSigningScope, Discovery>()
+		private let inventory = ZagProfileOnlyRenewal.ReadCache<Bool, (ZagPairedDeviceIdentity, [String: ZagRPPairingCore.InstalledAppInfo])>()
+		private static let deviceQueue = ZagProfileOnlyRenewal.DeviceQueue()
+		private static var refreshingApps: Set<String> = []
+		private static var batchRunning = false
+
+		static func beginBatch() -> Bool {
+			guard !batchRunning else { return false }
+			batchRunning = true
+			return true
+		}
+
+		static func endBatch() { batchRunning = false }
+
+		static func onDevice<T: Sendable>(_ operation: @escaping @MainActor () async throws -> T) async throws -> T {
+			try await deviceQueue.run(operation)
+		}
+
+		static func reserve(_ uuid: String) throws {
+			guard refreshingApps.insert(uuid).inserted else { throw Failure.busy }
+		}
+
+		static func release(_ uuid: String) { refreshingApps.remove(uuid) }
+
+		static func installAndReadBack(_ profiles: [Data]) async throws -> [Data] {
+			let pairing = ZagRPPairingCore.shared
+			do { return try await pairing.installProfiles(profiles) }
+			catch {
+				let reason = error.localizedDescription.lowercased()
+				guard ["broken pipe", "channel closed", "connection reset", "timed out", "already running", "socket io failed"]
+					.contains(where: { reason.contains($0) }) else { throw error }
+				ZagSigningDiagnostics.record("Retrying profile management once after a transport failure")
+				try await Task.sleep(for: .milliseconds(250))
+				if let observed = try? await ZagRPPairingFreeAccountInstaller.readProfiles().get(),
+				   profiles.allSatisfy({ observed.contains($0) }) { return observed }
+				return try await pairing.installProfiles(profiles)
+			}
+		}
+
+		private func discover(_ scope: ZagSigningScope) async throws -> Discovery {
+			try await discovery.value(for: scope) {
+				guard let token = ZagNativeAppleIDs.shared.connectedToken(scope.accountID) else { throw Failure.signIn }
+				let consent = ZagMutationConsentCoordinator()
+				consent.authorize([.downloadProfile])
+				let portal = ZagNativeAccountInstall.portal(token: token, consent: consent)
+				do {
+					async let apps = portal.appIDs(team: scope.teamID)
+					async let certificates = portal.certificates(team: scope.teamID)
+					return try await Discovery(portal: portal, appIDs: apps, certificates: certificates, token: token)
+				} catch let error as ZagPortalOperationFailure where error.underlying == .sessionRejected {
+					try? ZagNativeAppleIDs.shared.invalidate(token)
+					throw error
+				}
+			}
+		}
+
+		private func readDevice() async throws -> (ZagPairedDeviceIdentity, [String: ZagRPPairingCore.InstalledAppInfo]) {
+			try await inventory.value(for: true) {
+				try await Self.onDevice { try await ZagRPPairingCore.shared.signingDeviceInventory() }
+			}
+		}
+
+		func renew(_ entry: ZagNativeAppInventory.Entry, job: String) async throws -> ZagInstallVerification {
+			let receipt = entry.installation
+			guard let owner = receipt.record.owner, let identity = receipt.executableIdentity,
+				  let certificate = ZagCertificateInspection(der: identity.certificate),
+				  certificate.serialNumber == owner.certificateSerial,
+				  certificate.organizationalUnit == owner.scope.teamID,
+				  certificate.expiresAt > Date(),
+				  receipt.profiles.allSatisfy({ $0.signedEntitlements != nil }) else {
+				throw ZagProfileOnlyRenewal.Failure.needsResign
+			}
+			let start = ContinuousClock.now
+			defer { ZagSigningDiagnostics.elapsed("Profile-only total", since: start) }
+			let jobs = ZagInstallJobs.shared
+			try jobs.checkpoint(job)
+			jobs.reportNative(job, .provisioning)
+			let pairing = ZagRPPairingCore.shared
+			async let developer = discover(owner.scope)
+			let (device, installed) = try await readDevice()
+			ZagSigningDiagnostics.elapsed("Installed app inventory", since: start)
+			guard let installedApp = installed[receipt.record.bundleIdentifier],
+				  let version = identity.version, installedApp.version == version,
+				  let build = identity.build, installedApp.build == build,
+				  let name = certificate.commonName, !name.isEmpty, installedApp.signerIdentity == name else {
+				throw ZagProfileOnlyRenewal.Failure.appUnavailable
+			}
+			let discovered = try await developer
+			ZagSigningDiagnostics.elapsed("Scoped developer discovery", since: start)
+			guard discovered.certificates.contains(where: {
+				$0.serialNumber == owner.certificateSerial && $0.expiresAt > Date()
+					&& ($0.data == nil || $0.data == identity.certificate)
+			}) else { throw ZagProfileOnlyRenewal.Failure.needsResign }
+
+			let requestStart = ContinuousClock.now
+			var requested: [ZagIssuedProfile] = []
+			// One app requests its extensions in order. Independent apps share
+			// discovery but perform these developer calls concurrently.
+			for component in receipt.profiles {
+				try Task.checkCancellation()
+				try jobs.checkpoint(job)
+				guard let appID = discovered.appIDs.first(where: { $0.bundleIdentifier == component.bundleIdentifier }) else {
+					throw ZagProfileOnlyRenewal.Failure.needsResign
+				}
+				let profile: ZagIssuedProfile
+				do {
+					do { profile = try await discovered.portal.profile(for: appID, team: owner.scope.teamID) }
+					catch where (error as? ZagPortalOperationFailure)?.underlying == .network || (error as? ZagPortalError) == .network {
+						try await Task.sleep(for: .milliseconds(250))
+						try jobs.checkpoint(job)
+						profile = try await discovered.portal.profile(for: appID, team: owner.scope.teamID)
+					}
+				} catch let error as ZagPortalOperationFailure where error.underlying == .sessionRejected {
+					try? ZagNativeAppleIDs.shared.invalidate(discovered.token)
+					throw error
+				}
+				requested.append(try ZagProfileOnlyRenewal.validate(profile.data, component: component,
+					team: owner.scope.teamID, certificate: identity.certificate, udid: device.udid))
+			}
+			ZagSigningDiagnostics.elapsed("Renew and validate profiles", since: requestStart)
+			_ = try ZagProfileOnlyRenewal.effectiveExpiry(requested, certificateExpires: certificate.expiresAt,
+				previous: receipt.record.expiresAt, now: Date())
+
+			let queued = ContinuousClock.now
+			return try await Self.onDevice {
+				try jobs.checkpoint(job)
+				guard pairing.pairedIdentity == device,
+					  ZagNativeAppleIDs.shared.connectedToken(owner.scope.accountID) == discovered.token else { throw Failure.signIn }
+				ZagSigningDiagnostics.elapsed("Device queue wait", since: queued)
+				try jobs.beginInstalling(job)
+				jobs.setNativeProgress(job, caption: "Installing", fraction: ZagNativeSigningProgress.installing.fraction)
+				let handoff = ContinuousClock.now
+				let readback = try await Self.installAndReadBack(requested.map(\.data))
+				ZagSigningDiagnostics.elapsed("Misagent install and readback", since: handoff)
+				jobs.reportNative(job, .verifying)
+				guard requested.allSatisfy({ readback.contains($0.data) }), pairing.pairedIdentity == device else {
+					throw ZagProfileOnlyRenewal.Failure.readback
+				}
+				let expiry = try ZagProfileOnlyRenewal.effectiveExpiry(requested, certificateExpires: certificate.expiresAt,
+					previous: receipt.record.expiresAt, now: Date())
+				let persistence = ContinuousClock.now
+				try ZagNativeAppInventory.confirmProfileRefresh(entry, profiles: requested)
+				ZagSigningDiagnostics.elapsed("Persist verified expiry", since: persistence)
+				return .verified(profileExpiresAt: expiry, certificateExpiresAt: certificate.expiresAt)
+			}
+		}
+	}
+
 	static func install(source: URL, name: String, accountID: UUID, expectedScope: ZagSigningScope? = nil,
 						requiredInstalledIdentifier: String? = nil,
 						forbiddenInstalledIdentifier: String? = nil,
 						installAfterSigning: Bool = true,
+						archiveTime: Duration? = nil,
 						checkpoint: @escaping @MainActor () throws -> Void = {},
 						beginInstalling: @escaping @MainActor @Sendable () throws -> Void = {},
 						onCertificateReady: (@Sendable () async -> Void)? = nil,
@@ -135,8 +294,11 @@ enum ZagNativeAccountInstall {
 						progress: @escaping @Sendable (ZagNativeSigningProgress) async -> Void = { _ in },
 						onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
 		try await withExclusiveOperation {
-			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics()) {
+			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics.current.get() ?? ZagSigningDiagnostics()) {
 				ZagSigningDiagnostics.record("Native signing attempt started")
+				if let archiveTime { ZagSigningDiagnostics.record("Original IPA lookup and extraction: \(archiveTime)") }
+				let started = ContinuousClock.now
+				defer { ZagSigningDiagnostics.elapsed("Full signing total", since: started) }
 				await progress(.preparing)
 				if let renewing {
 					guard let owner = renewing.installation.record.owner, owner.scope == expectedScope,
@@ -170,19 +332,23 @@ enum ZagNativeAccountInstall {
 		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
 		defer { try? FileManager.default.removeItem(at: directory) }
 		let app = directory.appendingPathComponent(source.lastPathComponent, isDirectory: true)
+		let copyStart = ContinuousClock.now
 		try await Task.detached(priority: .userInitiated) {
 			try FileManager.default.copyItem(at: source, to: app)
 		}.value
+		ZagSigningDiagnostics.elapsed("Copy app bundle", since: copyStart)
 		try Task.checkCancellation()
 		let main = try component(at: app, name: name)
 		let extensions = try ZagFreeAccountSigningAdapter.extensionPaths(in: app).values.sorted().map {
 			try component(at: app.appendingPathComponent($0), name: appendingName(name, path: $0))
 		}
 
+		let inventoryStart = ContinuousClock.now
 		ZagSigningDiagnostics.record("Reading paired device and installed apps")
 		let (device, installed) = try await pairing.signingDeviceInventory()
 		let installedProfiles = (try? await ZagRPPairingFreeAccountInstaller.readProfiles().get()) ?? []
 		let profiles = installedProfiles.compactMap { try? ZagIssuedProfile(profileData: $0) }
+		ZagSigningDiagnostics.elapsed("Full signing device inventory and profile readback", since: inventoryStart)
 
 
 		if let renewing {
@@ -330,7 +496,7 @@ enum ZagNativeAccountInstall {
 
 	static func installSaved(entry: ZagNativeAppInventory.Entry, job: String) async throws {
 		try await withExclusiveOperation {
-			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics()) {
+			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics.current.get() ?? ZagSigningDiagnostics()) {
 				guard let expectation = entry.pendingInstall, let source = ZagNativeAppInventory.signedApp(entry) else {
 					throw Failure.invalidApp
 				}
@@ -468,7 +634,8 @@ extension ZagInstallJobs {
 extension ZagNativeAccountInstall {
 	static func runInline(_ app: AppInfoPresentable, job: String, options: ZagAppleIDSigningOptions, renew: Bool = false,
 		requiredInstalledIdentifier: String? = nil, requiredScope: ZagSigningScope? = nil,
-		interactive: Bool = true, onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
+		interactive: Bool = true, refreshCoordinator: RefreshCoordinator? = nil,
+		onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
 		let entry = ZagNativeAppInventory.entry(app)
 		if renew {
 			guard let entry, let scope = entry.installation.record.owner?.scope else {
@@ -476,8 +643,26 @@ extension ZagNativeAccountInstall {
 			}
 			ZagInstallJobs.shared.setNativeProgress(job, caption: hasConnectedAccount(scope.accountID) ? "Refreshing" : "Authenticating", fraction: 0)
 			let id = try await ZagAppleIDSigningSelection.resolve(required: scope.accountID, interactive: interactive)
-			return try await ZagNativeAppInventory.withSource(entry) { source in
-				try await runInlineSource(source, name: entry.name, accountID: id, job: job, installAfterSigning: true, renewing: entry, interactive: interactive)
+			let coordinator = refreshCoordinator ?? RefreshCoordinator()
+			try RefreshCoordinator.reserve(entry.uuid)
+			defer { RefreshCoordinator.release(entry.uuid) }
+			do {
+				return try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics.current.get() ?? ZagSigningDiagnostics()) {
+					try await coordinator.renew(entry, job: job)
+				}
+			} catch where (error as? ZagProfileOnlyRenewal.Failure) == .needsResign
+				|| error.localizedDescription.localizedCaseInsensitiveContains("misagent over RSD failed: service not found") {
+				ZagInstallJobs.shared.advance(job, to: .signing)
+				guard ZagNativeAppInventory.hasSource(entry) else { throw ZagNativeAppInventory.Failure.missingSource }
+				return try await RefreshCoordinator.onDevice {
+					let started = ContinuousClock.now
+					return try await ZagNativeAppInventory.withSource(entry) { source in
+						let unpacked = started.duration(to: .now)
+						return try await runInlineSource(source, name: entry.name, accountID: id, job: job,
+							installAfterSigning: true, renewing: entry, interactive: interactive,
+							archiveTime: unpacked)
+					}
+				}
 			}
 		}
 		guard let source = Storage.shared.getAppDirectory(for: app) else { throw Failure.invalidApp }
@@ -501,12 +686,12 @@ extension ZagNativeAccountInstall {
 
 	private static func runInlineSource(_ source: URL, name: String, accountID: UUID, job: String, installAfterSigning: Bool,
 		renewing: ZagNativeAppInventory.Entry? = nil, requiredInstalledIdentifier: String? = nil, forbiddenInstalledIdentifier: String? = nil,
-		requiredScope: ZagSigningScope? = nil, interactive: Bool = true, onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
+		requiredScope: ZagSigningScope? = nil, interactive: Bool = true, archiveTime: Duration? = nil, onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
 		let jobs = ZagInstallJobs.shared
 		func attempt() async throws -> ZagInstallVerification {
 			try await install(source: source, name: name, accountID: accountID, expectedScope: renewing?.installation.record.owner?.scope ?? requiredScope,
 				requiredInstalledIdentifier: requiredInstalledIdentifier, forbiddenInstalledIdentifier: forbiddenInstalledIdentifier,
-				installAfterSigning: installAfterSigning, checkpoint: { try jobs.checkpoint(job) },
+				installAfterSigning: installAfterSigning, archiveTime: archiveTime, checkpoint: { try jobs.checkpoint(job) },
 				beginInstalling: {
 					try jobs.beginInstalling(job)
 					jobs.setNativeProgress(job, caption: ZagNativeSigningProgress.installing.title, fraction: ZagNativeSigningProgress.installing.fraction)

@@ -166,6 +166,31 @@ enum ZagNativeAppInventory {
 		changes.send(id)
 	}
 
+	static func confirmProfileRefresh(_ original: Entry, profiles: [ZagIssuedProfile]) throws {
+		guard var current = entry(original.uuid), current.pendingInstall == nil,
+			  current.installation == original.installation,
+			  let main = profiles.first(where: { $0.bundleIdentifier == current.installation.record.bundleIdentifier }),
+			  profiles.count == current.installation.profiles.count,
+			  let earliest = profiles.map(\.expiresAt).min() else { throw Failure.unverified }
+		let updated = current.installation.profiles.compactMap { component -> ZagNativeInstalledProfiles.Component? in
+			guard let profile = profiles.first(where: { $0.bundleIdentifier == component.bundleIdentifier }) else { return nil }
+			var next = component
+			next.uuid = profile.uuid
+			next.expiresAt = profile.expiresAt
+			return next
+		}
+		guard updated.count == profiles.count else { throw Failure.unverified }
+		current.installation.record.owner?.profileUUID = main.uuid
+		current.installation.record.profileExpiresAt = earliest
+		current.installation.record.lastSuccessfulRefresh = Date()
+		current.installation.record.expiryVerified = true
+		current.installation = .init(record: current.installation.record, profiles: updated,
+			executableIdentity: current.installation.executableIdentity)
+		try JSONEncoder().encode(current).write(to: folder(current.uuid).appendingPathComponent("installation.json"),
+			options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		changes.send(current.uuid)
+	}
+
 	static func signedApp(_ entry: Entry) -> URL? {
 		let url = folder(entry.uuid).appendingPathComponent("Signed.app")
 		return FileManager.default.fileExists(atPath: url.path) ? url : nil

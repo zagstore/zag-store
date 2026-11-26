@@ -135,7 +135,7 @@ final class ZagRPPairingCore: ObservableObject {
 		case failed(String)
 	}
 
-	struct InstalledAppInfo: Equatable {
+	struct InstalledAppInfo: Equatable, Sendable {
 		let bundleID: String
 		let version: String
 		let build: String
@@ -832,6 +832,22 @@ final class ZagRPPairingCore: ObservableObject {
 		deviceIP: String = "10.7.0.1",
 		completion: @escaping (Result<[Data], Error>) -> Void
 	) {
+		manageProfiles(deviceIP: deviceIP, installing: nil, completion: completion)
+	}
+
+	func installProfiles(_ profiles: [Data], deviceIP: String = ZagDeviceLink.peerAddress) async throws -> [Data] {
+		let input = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+		try FileManager.default.createDirectory(at: input, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+		defer { try? FileManager.default.removeItem(at: input) }
+		for (index, profile) in profiles.enumerated() {
+			try profile.write(to: input.appendingPathComponent("\(index).mobileprovision"), options: .atomic)
+		}
+		return try await withCheckedThrowingContinuation { continuation in
+			manageProfiles(deviceIP: deviceIP, installing: input) { continuation.resume(with: $0) }
+		}
+	}
+
+	private func manageProfiles(deviceIP: String, installing input: URL?, completion: @escaping (Result<[Data], Error>) -> Void) {
 		guard installedProfilesCompletion == nil else { return completion(.failure(InstalledAppsError.alreadyRunning)) }
 		guard pairingFileExists else { return completion(.failure(InstalledAppsError.notPaired)) }
 		guard acquireTransport("Installed profiles") else { return completion(.failure(InstalledAppsError.alreadyRunning)) }
@@ -843,7 +859,12 @@ final class ZagRPPairingCore: ObservableObject {
 		let started = deviceIP.withCString { ip in
 			Self.pairingFileURL.path.withCString { pairingPath in
 				directory.path.withCString { outputDirectory in
-					zag_installed_profiles(ip, pairingPath, outputDirectory, zagInstalledProfilesCallback)
+					if let input {
+						return input.path.withCString {
+							zag_install_profiles(ip, pairingPath, outputDirectory, $0, zagInstalledProfilesCallback)
+						}
+					}
+					return zag_installed_profiles(ip, pairingPath, outputDirectory, zagInstalledProfilesCallback)
 				}
 			}
 		}

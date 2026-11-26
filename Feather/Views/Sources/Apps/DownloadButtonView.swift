@@ -248,7 +248,7 @@ struct DownloadButtonView: View {
 		}
 
 		if let certificate = Storage.shared.getCertificate(from: signed) {
-			return certificate.expiration
+			return ZagCertificateProfileReceipt.load(for: signed)?.effectiveExpiration ?? certificate.expiration
 		}
 
 		return nil

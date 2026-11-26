@@ -56,7 +56,11 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 	private func installThroughRPPairing(_ signedApp: URL) async throws {
 		let staging = workRoot.appendingPathComponent("zag-free-account-install-\(UUID().uuidString)", isDirectory: true)
 		defer { try? FileManager.default.removeItem(at: staging) }
+		let packageStart = ContinuousClock.now
 		let ipa = try Self.package(signedApp, in: staging)
+		ZagSigningDiagnostics.elapsed("Rebuild IPA", since: packageStart)
+		let installStart = ContinuousClock.now
+		defer { ZagSigningDiagnostics.elapsed("Transfer IPA and reinstall", since: installStart) }
 		try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
 			Task { @MainActor in
 				do {

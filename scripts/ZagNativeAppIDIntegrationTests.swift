@@ -5,6 +5,7 @@ extension Tests {
 	static func nativeAppIDsAcrossAccounts() async {
 		await testNativeAccountLibrary()
 		await testMixedRefreshBatch()
+		await testProfileOnlyRenewal()
 		testSigningPresentation()
 		let clock = TestClock()
 		let secrets = MemorySecrets()
@@ -313,6 +314,92 @@ private final class HostedAppleIDVault: ZagNativeAppleIDVault {
 }
 
 extension Tests {
+	@MainActor
+	static func testProfileOnlyRenewal() async {
+		let now = Date(timeIntervalSince1970: 1_000)
+		let certificate = try! Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+		let team = "FIXTURE001"
+		let udid = "fixture-device"
+		func fixture(_ id: String, expiry: Date, grants: Bool, signer: Data) throws -> (ZagNativeInstalledProfiles.Component, Data) {
+			let entitlements: [String: Any] = ["application-identifier": "\(team).\(id)", "get-task-allow": true]
+			let signed = try ZagEntitlementSet(entitlements)
+			let component = ZagNativeInstalledProfiles.Component(originalBundleIdentifier: id,
+				bundleIdentifier: id, uuid: "embedded-\(id)", expiresAt: now + 50, signedEntitlements: signed.data)
+			let payload = try PropertyListSerialization.data(fromPropertyList: [
+				"CreationDate": now, "ExpirationDate": expiry, "DeveloperCertificates": [signer], "TeamIdentifier": [team],
+				"ProvisionedDevices": [udid], "UUID": "renewed-\(id)",
+				"Entitlements": ["application-identifier": "\(team).\(id)", "get-task-allow": grants]
+			], format: .xml, options: 0)
+			return (component, payload)
+		}
+		do {
+			let main = try fixture("app.fixture", expiry: now + 200, grants: true, signer: certificate)
+			let widget = try fixture("app.fixture.widget", expiry: now + 140, grants: true, signer: certificate)
+			let renewed = try [main, widget].map {
+				try ZagProfileOnlyRenewal.validate($0.1, component: $0.0, team: team, certificate: certificate,
+					udid: udid, now: now, authenticate: { $0 })
+			}
+			let expiry = try ZagProfileOnlyRenewal.effectiveExpiry(renewed, certificateExpires: now + 120,
+				previous: now + 50, now: now)
+			check(expiry == now + 120 && main.0.expiresAt == now + 50,
+				"profile-only renewal verifies components without an IPA and caps expiry at the certificate")
+			let extensionCapped = try ZagProfileOnlyRenewal.effectiveExpiry(renewed, certificateExpires: now + 300,
+				previous: now + 50, now: now)
+			check(extensionCapped == now + 140, "the earliest compatible extension limits effective renewal")
+			for bad in [try fixture("app.fixture", expiry: now + 200, grants: false, signer: certificate),
+						try fixture("app.fixture", expiry: now + 200, grants: true, signer: Data([0]))] {
+				check((try? ZagProfileOnlyRenewal.validate(bad.1, component: bad.0, team: team, certificate: certificate,
+					udid: udid, now: now, authenticate: { $0 })) == nil, "incompatible installed entitlements or signer reject profile-only renewal")
+			}
+		} catch { check(false, "profile-only fixture: \(error)") }
+
+		let cache = ZagProfileOnlyRenewal.ReadCache<String, String>()
+		let device = ZagProfileOnlyRenewal.DeviceQueue()
+		var loads: [String: Int] = [:]
+		var deviceOpen = 0
+		var devicePeak = 0
+		let isolated = await ZagNativeSigningPipeline.concurrentRefresh(count: 3, isCancelled: { false }) { index in
+			let key = index == 2 ? "account-b/team-b" : "account-a/team-a"
+			do {
+				let loaded = try await cache.value(for: key) {
+					loads[key, default: 0] += 1
+					try await Task.sleep(for: .milliseconds(30))
+					return key
+				}
+				guard loaded == key else { return .failed("Account scope mixed") }
+				return try await device.run {
+					deviceOpen += 1
+					devicePeak = max(devicePeak, deviceOpen)
+					defer { deviceOpen -= 1 }
+					try await Task.sleep(for: .milliseconds(10))
+					return .refreshed
+				}
+			} catch { return .failed("Unexpected fixture failure") }
+		}
+		check(loads == ["account-a/team-a": 1, "account-b/team-b": 1] && devicePeak == 1
+			&& isolated == [.refreshed, .refreshed, .refreshed],
+			"refresh coalesces same-scope discovery, isolates different scopes and serializes device mutation")
+
+		var open = 0
+		var peak = 0
+		let start = ContinuousClock.now
+		let outcomes = await ZagNativeSigningPipeline.concurrentRefresh(count: 5, limit: 3, isCancelled: { false }) { index in
+			open += 1
+			peak = max(peak, open)
+			defer { open -= 1 }
+			try? await Task.sleep(for: .milliseconds(100))
+			return index == 1 ? .failed("fixture") : .refreshed
+		}
+		check(peak == 3 && outcomes == [.refreshed, .failed("fixture"), .refreshed, .refreshed, .refreshed],
+			"bounded refresh operations genuinely overlap and preserve independent results")
+		let parallelTime = start.duration(to: .now)
+		let serialStart = ContinuousClock.now
+		for _ in 0..<5 { try? await Task.sleep(for: .milliseconds(100)) }
+		let serialTime = serialStart.duration(to: .now)
+
+		print("PROFILE TEST: simulated batch of five 100 ms jobs, peak \(peak), parallel \(parallelTime), sequential \(serialTime)")
+	}
+
 	static func testSigningPresentation() {
 		check(ZagNativeSigningProgress.allCases.map(\.title) == ["Preparing", "Provisioning", "Signing", "Installing", "Verifying", "Verifying"],
 			"compact native progress stages use a single word")

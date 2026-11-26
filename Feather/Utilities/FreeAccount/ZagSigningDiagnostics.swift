@@ -12,6 +12,12 @@ final class ZagSigningDiagnostics: @unchecked Sendable {
 
 	static var latest: String { UserDefaults.standard.string(forKey: key) ?? "" }
 
+	var report: String {
+		lock.lock()
+		defer { lock.unlock() }
+		return lines.joined(separator: "\n")
+	}
+
 	func record(_ event: String) {
 		lock.lock()
 		defer { lock.unlock() }

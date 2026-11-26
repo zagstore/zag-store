@@ -45,6 +45,22 @@ extension Storage {
 	}
 }
 
+/// Durable receipt for an imported profile installed independently of its app.
+struct ZagCertificateProfileReceipt: Codable {
+	let profile: Data
+	let effectiveExpiration: Date
+
+	static func location(in signedDirectory: URL) -> URL {
+		signedDirectory.appendingPathComponent("verified-renewal.json")
+	}
+
+	static func load(for app: AppInfoPresentable) -> Self? {
+		guard app.isSigned, let uuid = app.uuid, UUID(uuidString: uuid) != nil,
+			  let data = try? Data(contentsOf: location(in: FileManager.default.signed(uuid))) else { return nil }
+		return try? JSONDecoder().decode(Self.self, from: data)
+	}
+}
+
 // MARK: - Helpers
 struct AnyApp: Identifiable {
 	let base: AppInfoPresentable
