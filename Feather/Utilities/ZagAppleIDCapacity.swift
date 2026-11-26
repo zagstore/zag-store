@@ -42,7 +42,27 @@ enum ZagAppleIDCapacity {
 		}
 	}
 
-	static func synchronizeDevice() async throws -> Int {
+	struct DeviceSnapshot {
+		let count: Int
+		let checkedAt: Date
+	}
+	private static var deviceSnapshot: DeviceSnapshot?
+	private static var deviceTask: Task<Int, Error>?
+	static var cachedDevice: DeviceSnapshot? { deviceSnapshot }
+	static func invalidateDevice() {
+		if let old = deviceSnapshot { deviceSnapshot = .init(count: old.count, checkedAt: .distantPast) }
+	}
+	static func synchronizeDevice(force: Bool = true) async throws -> Int {
+		if let task = deviceTask { return try await task.value }
+		if !force, let cached = deviceSnapshot, Date().timeIntervalSince(cached.checkedAt) < 300 { return cached.count }
+		let task = Task { try await readDeviceCount() }
+		deviceTask = task
+		defer { deviceTask = nil }
+		let count = try await task.value
+		deviceSnapshot = .init(count: count, checkedAt: .now)
+		return count
+	}
+	private static func readDeviceCount() async throws -> Int {
 		await ZagRunningInstallation.shared.inspect()
 		let pairing = ZagRPPairingCore.shared
 		let (device, installed) = try await pairing.signingDeviceInventory()
