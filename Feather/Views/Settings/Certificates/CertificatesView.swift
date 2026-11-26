@@ -109,7 +109,7 @@ struct CertificatesView: View {
     #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
     private func _nativeCard(_ cert: ZagNativeAccountInstall.LocalCertificate) -> some View {
         let active = _signingPreference == .appleAccount && cert.hasPrivateKey && cert.expires > Date()
-            && (try? ZagNativeAppleIDs.shared.catalog().defaultID) == cert.scope.accountID
+            && (try? ZagNativeAppleIDs.shared.catalog().activeID) == cert.scope.accountID
             && ZagNativeAccountInstall.hasConnectedAccount(cert.scope.accountID)
         let keyStatus = cert.hasPrivateKey ? "Private key available" : "Private key unavailable"
         let detail = [active ? "Active Apple ID" : nil, keyStatus, "Certificate expiry"]

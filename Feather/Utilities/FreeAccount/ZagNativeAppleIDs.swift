@@ -4,12 +4,16 @@ struct ZagNativeAppleID: Identifiable, Codable, Equatable, Sendable {
 	let id: UUID
 	var email: String?
 	var teams: [ZagDeveloperTeam] = []
-	var label: String { email ?? "Existing Apple ID" }
+	var label: String { email ?? "Apple ID" }
 }
 
 struct ZagNativeAppleIDCatalog: Codable, Equatable, Sendable {
 	var accounts: [ZagNativeAppleID] = []
+	var activeID: UUID?
+	// Read the previous persisted field once, then store only activeID.
 	var defaultID: UUID?
+	var signedOutAccounts: [ZagNativeAppleID]?
+	var pendingSignOuts: Set<UUID>?
 	var migratedLegacy = false
 	var verifiedLegacyCredentials: Bool?
 
@@ -19,12 +23,16 @@ struct ZagNativeAppleIDCatalog: Codable, Equatable, Sendable {
 		} else {
 			accounts.append(.init(id: id, email: email))
 		}
-		if defaultID == nil { defaultID = id }
+		signedOutAccounts?.removeAll { $0.id == id }
 	}
 
-	mutating func remove(_ id: UUID) {
-		accounts.removeAll { $0.id == id }
-		if defaultID == id { defaultID = accounts.first?.id }
+	mutating func forget(_ account: ZagNativeAppleID) {
+		accounts.removeAll { $0.id == account.id }
+		var recovery = signedOutAccounts ?? []
+		recovery.removeAll { $0.id == account.id }
+		recovery.append(.init(id: account.id, email: account.email))
+		signedOutAccounts = recovery
+		if activeID == account.id { activeID = nil }
 	}
 }
 
@@ -96,14 +104,35 @@ struct ZagNativeAppleIDs {
 
 	func catalog() throws -> ZagNativeAppleIDCatalog {
 		var catalog = try vault.catalog()
-		guard catalog.verifiedLegacyCredentials != true, let legacy = try vault.token("device") else { return catalog }
+		let original = catalog
+		for id in catalog.pendingSignOuts ?? [] {
+			if (try? clearCredentials(id)) != nil { catalog.pendingSignOuts?.remove(id) }
+		}
+		if catalog.pendingSignOuts?.isEmpty == true { catalog.pendingSignOuts = nil }
+		try migrateLegacy(&catalog)
+		catalog.activeID = catalog.activeID ?? catalog.defaultID
+		catalog.defaultID = nil
+		for account in catalog.accounts {
+			let scope = Self.scope(account.id)
+			if try vault.token(scope) == nil, try vault.session(scope) == nil {
+				catalog.forget(account)
+			}
+		}
+		try updateActiveSelection(&catalog)
+		if catalog != original { try vault.saveCatalog(catalog) }
+		return catalog
+	}
+
+	private func migrateLegacy(_ catalog: inout ZagNativeAppleIDCatalog) throws {
+		guard catalog.verifiedLegacyCredentials != true, let legacy = try vault.token("device") else { return }
 		let id = legacy.nativeAccountID
+		guard catalog.signedOutAccounts?.contains(where: { $0.id == id }) != true else { return }
 		let destination = Self.scope(id)
 		let currentToken = try vault.token(destination)
 		// A catalog from the previous build may have been committed before
 		// the session copy. Repair only a still-listed account with credentials.
 		if catalog.migratedLegacy {
-			guard catalog.accounts.contains(where: { $0.id == id }), currentToken != nil else { return catalog }
+			guard catalog.accounts.contains(where: { $0.id == id }), currentToken != nil else { return }
 		}
 		guard currentToken == nil || currentToken?.nativeAccountID == id else { throw Failure.storage }
 		let legacySession = try vault.session("device")
@@ -115,13 +144,31 @@ struct ZagNativeAppleIDs {
 			catalog.verifiedLegacyCredentials = true
 			try vault.saveCatalog(catalog)
 		}
-		return catalog
+	}
+
+	private func usableToken(_ id: UUID, now: Date = Date()) throws -> ZagPersistedDeveloperToken? {
+		guard let token = try vault.token(Self.scope(id)), token.nativeAccountID == id,
+			  token.isUsable(at: now) else { return nil }
+		return token
+	}
+
+	private func updateActiveSelection(_ catalog: inout ZagNativeAppleIDCatalog) throws {
+		let authenticated = try catalog.accounts.filter { try usableToken($0.id) != nil }
+		if !authenticated.contains(where: { $0.id == catalog.activeID }) {
+			catalog.activeID = authenticated.count == 1 ? authenticated.first?.id : nil
+		}
+	}
+
+	func accountForAuthentication(_ id: UUID) throws -> ZagNativeAppleID {
+		let catalog = try catalog()
+		return catalog.accounts.first { $0.id == id }
+			?? catalog.signedOutAccounts?.first { $0.id == id }
+			?? .init(id: id, email: nil)
 	}
 
 	func connectedToken(_ id: UUID, now: Date = Date()) -> ZagPersistedDeveloperToken? {
-		guard (try? catalog().accounts.contains { $0.id == id }) == true,
-			  let token = try? vault.token(Self.scope(id)), token.nativeAccountID == id, token.isUsable(at: now) else { return nil }
-		return token
+		guard (try? catalog().accounts.contains { $0.id == id }) == true else { return nil }
+		return try? usableToken(id, now: now)
 	}
 
 	func completeAuthentication(temporaryScope: String, email: String, expected: UUID?, attempt: ZagNativeAuthenticationAttempt) throws -> UUID {
@@ -130,12 +177,14 @@ struct ZagNativeAppleIDs {
 		guard let token = try vault.token(temporaryScope), token.isUsable(at: Date()),
 			  let session = try vault.session(temporaryScope), !session.isEmpty else { throw Failure.storage }
 		let id = token.nativeAccountID
-		if let expected, expected != id || !catalog.accounts.contains(where: { $0.id == expected }) { throw Failure.wrongAccount }
+		guard catalog.pendingSignOuts?.contains(id) != true else { throw Failure.storage }
+		if let expected, expected != id { throw Failure.wrongAccount }
 		let destination = Self.scope(id)
 		let previous = (try vault.token(destination), try vault.session(destination))
 		try copyCredentials(to: destination, token: token, session: session, previous: previous) {
 			try attempt.checkpoint()
 			catalog.register(id: id, email: email.isEmpty ? nil : email)
+			try updateActiveSelection(&catalog)
 			catalog.migratedLegacy = true
 			try vault.saveCatalog(catalog)
 		}
@@ -176,10 +225,10 @@ struct ZagNativeAppleIDs {
 		try vault.saveToken(.init(accountID: token.accountID, token: token.token, expiresAtMs: -1), scope: scope)
 	}
 
-	func setDefault(_ id: UUID) throws {
+	func activate(_ id: UUID) throws {
 		var catalog = try catalog()
-		guard catalog.accounts.contains(where: { $0.id == id }) else { throw Failure.unavailable }
-		catalog.defaultID = id
+		guard catalog.accounts.contains(where: { $0.id == id }), try usableToken(id) != nil else { throw Failure.unavailable }
+		catalog.activeID = id
 		try vault.saveCatalog(catalog)
 	}
 
@@ -190,16 +239,27 @@ struct ZagNativeAppleIDs {
 		try vault.saveCatalog(catalog)
 	}
 
-	func signOut(_ id: UUID) throws {
-		_ = try catalog()
+	private func clearCredentials(_ id: UUID) throws {
 		try vault.deleteCredentials(Self.scope(id))
-		if try vault.token("device")?.nativeAccountID == id { try vault.deleteCredentials("device") }
+		if try vault.token("device")?.nativeAccountID == id {
+			// Keep the token as attribution if the session deletion needs retrying.
+			try vault.deleteSession("device")
+			try vault.deleteToken("device")
+		}
 	}
 
-	func remove(_ id: UUID) throws {
+	func signOut(_ id: UUID) throws {
 		var catalog = try catalog()
-		try signOut(id)
-		catalog.remove(id)
+		guard let account = catalog.accounts.first(where: { $0.id == id }) else { return }
+		catalog.forget(account)
+		catalog.pendingSignOuts = (catalog.pendingSignOuts ?? []).union([id])
+		try updateActiveSelection(&catalog)
+		// Persist the removal before touching credentials so an interrupted
+		// sign-out cannot resurrect the account or activate it on relaunch.
+		try vault.saveCatalog(catalog)
+		try clearCredentials(id)
+		catalog.pendingSignOuts?.remove(id)
+		if catalog.pendingSignOuts?.isEmpty == true { catalog.pendingSignOuts = nil }
 		try vault.saveCatalog(catalog)
 	}
 }

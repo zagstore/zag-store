@@ -93,16 +93,20 @@ struct SigningView: View {
 					}
 				}
 				if _signingMethod == .freeAppleAccount {
-					if !ZagNativeAccountInstall.hasSession {
-						NavigationLink("Connect Apple Account") { ZagAppleSigningSettingsView() }
+					if _renewing == nil, !ZagNativeAccountInstall.hasSession {
+						NavigationLink("Add Apple ID") { ZagAppleSigningSettingsView() }
 					} else if !_accountPairing.hasSavedPairing {
 						Text("Pair this iPhone in Settings to install apps.").foregroundStyle(.secondary)
 					} else if _accountPairing.pairedIdentity == nil {
 						Text("Zag Store will identify this iPhone using its saved pairing when you start.").foregroundStyle(.secondary)
 					}
 					if let entry = _renewing {
-						if let scope = entry.installation.record.owner?.scope, !ZagNativeAccountInstall.hasConnectedAccount(scope.accountID) {
-							NavigationLink("Connect the Apple Account that signed this app") { ZagAppleSigningSettingsView() }
+						if let scope = entry.installation.record.owner?.scope,
+						   !ZagNativeAccountInstall.hasConnectedAccount(scope.accountID),
+						   let owner = try? ZagNativeAppleIDs.shared.accountForAuthentication(scope.accountID) {
+							NavigationLink("Sign in with the Apple ID that signed this app") {
+								ZagAppleIDAuthenticationView(account: owner, requiresOriginalAccount: true)
+							}
 						}
 						if !ZagNativeAppInventory.hasSource(entry) {
 							Text(ZagNativeAppInventory.Failure.missingSource.localizedDescription)

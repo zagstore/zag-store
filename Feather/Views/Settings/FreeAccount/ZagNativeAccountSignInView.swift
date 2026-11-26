@@ -260,10 +260,7 @@ final class ZagNativeSignInModel: ObservableObject {
 	}
 
 	func signOut() async {
-		// Leaves the machine profile intact (that is the ADI provisioning, not
-		// the session). Only the developer token is forgotten, which is what
-		// developerHeaders() checks — so the model reads as signed out. The
-		// model always uses the default "device" scope machine.
+		// The shared device ADI profile and installed-app ownership remain intact.
 		do {
 			if let accountID { try ZagNativeAppleIDs.shared.signOut(accountID) }
 		} catch {
@@ -336,6 +333,8 @@ final class ZagNativeSignInModel: ObservableObject {
 
 struct ZagNativeAccountSignInContent: View {
 	@ObservedObject var model: ZagNativeSignInModel
+	var showsSignOut = true
+	var requiresOriginalAccount = false
 	@FocusState private var focus: Field?
 	private enum Field { case appleID, password }
 
@@ -382,7 +381,7 @@ struct ZagNativeAccountSignInContent: View {
 	}
 
 	private var credentialsSection: some View {
-		Section("Sign in with your Apple Account") {
+		Section(requiresOriginalAccount ? "Sign in with the Apple ID that signed this app" : "Sign in with your Apple ID") {
 			TextField("Apple Account", text: $model.appleID)
 				.keyboardType(.emailAddress).textContentType(.username)
 				.textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -430,8 +429,10 @@ struct ZagNativeAccountSignInContent: View {
 				}
 			}
 			Button("Reauthenticate") { model.reauthenticate() }
-			Button(role: .destructive) { Task { await model.signOut() } } label: { Text("Sign Out") }
-				.disabled(model.isBusy)
+			if showsSignOut {
+				Button("Sign Out", role: .destructive) { Task { await model.signOut() } }
+					.disabled(model.isBusy)
+			}
 		}
 	}
 

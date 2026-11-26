@@ -6,7 +6,6 @@ struct ZagAppleSigningSettingsView: View {
 	@AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
 	@ObservedObject private var pairing = ZagRPPairingCore.shared
 	@State private var catalog = ZagNativeAppleIDCatalog()
-	@State private var removing: ZagNativeAppleID?
 	@State private var failure: String?
 
 	var body: some View {
@@ -18,14 +17,7 @@ struct ZagAppleSigningSettingsView: View {
 							ZagAppleIDAccountDetail(account: account)
 								.onDisappear { reload() }
 						} label: {
-							ZagAppleIDAccountLabel(account: account, isDefault: account.id == catalog.defaultID)
-						}
-						.contextMenu {
-							Button("Set as Default") { perform { try ZagNativeAppleIDs.shared.setDefault(account.id) } }
-							if ZagNativeAppleIDs.shared.connectedToken(account.id) != nil {
-								Button("Sign Out") { perform { try ZagNativeAppleIDs.shared.signOut(account.id) } }
-							}
-							Button("Remove Apple ID", role: .destructive) { removing = account }
+							ZagAppleIDAccountLabel(account: account, isActive: account.id == catalog.activeID)
 						}
 					}
 					NavigationLink {
@@ -44,35 +36,33 @@ struct ZagAppleSigningSettingsView: View {
 		.navigationTitle("Apple IDs & Signing")
 		.tint(Color(hex: themeColorHex))
 		.onAppear { reload() }
-		.alert("Remove Apple ID?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), presenting: removing) { account in
-			Button("Remove", role: .destructive) { perform { try ZagNativeAppleIDs.shared.remove(account.id) } }
-			Button("Cancel", role: .cancel) {}
-		} message: { account in
-			Text("Apps signed by \(account.label) stay installed. Add this Apple ID again to renew them. If it was the default, the first remaining Apple ID becomes the default.")
-		}
 		.alert("Apple ID", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
 			Button("OK", role: .cancel) {}
 		} message: { Text(failure ?? "") }
 	}
 
-	private func reload() { perform {} }
-	private func perform(_ action: () throws -> Void) {
-		do { try action(); catalog = try ZagNativeAppleIDs.shared.catalog() }
+	private func reload() {
+		do { catalog = try ZagNativeAppleIDs.shared.catalog() }
 		catch { failure = error.localizedDescription }
 	}
 }
 
 private struct ZagAppleIDAccountLabel: View {
 	let account: ZagNativeAppleID
-	let isDefault: Bool
+	let isActive: Bool
 	var body: some View {
 		let connected = ZagNativeAppleIDs.shared.connectedToken(account.id) != nil
 		Label {
 			VStack(alignment: .leading, spacing: 3) {
 				Text(account.label)
-				Text([connected ? "Signed in" : "Sign-in required", isDefault ? "Default" : nil,
-					  account.teams.first?.name].compactMap { $0 }.joined(separator: " · "))
-					.font(.caption).foregroundStyle(.secondary)
+				HStack(spacing: 0) {
+					Text(connected ? (isActive ? "Active" : "Signed in") : "Sign-in required")
+						.foregroundStyle(connected && isActive ? Color.green : Color.secondary)
+					if let team = account.teams.first?.name {
+						Text(" · " + team).foregroundStyle(.secondary)
+					}
+				}
+				.font(.caption)
 			}
 		} icon: {
 			Image(systemName: connected ? "person.crop.circle.badge.checkmark" : "person.crop.circle")
@@ -83,6 +73,8 @@ private struct ZagAppleIDAccountLabel: View {
 
 private struct ZagAppleIDAccountDetail: View {
 	let account: ZagNativeAppleID
+	@Environment(\.dismiss) private var dismiss
+	@State private var confirmingSignOut = false
 	@State private var failure: String?
 	@State private var catalog = ZagNativeAppleIDCatalog()
 
@@ -90,12 +82,13 @@ private struct ZagAppleIDAccountDetail: View {
 		List {
 			Section {
 				ZagAppleIDAccountLabel(account: catalog.accounts.first(where: { $0.id == account.id }) ?? account,
-					isDefault: catalog.defaultID == account.id)
-				Button("Set as Default") {
-					do { try ZagNativeAppleIDs.shared.setDefault(account.id); reload() }
-					catch { failure = error.localizedDescription }
+					isActive: catalog.activeID == account.id)
+				if catalog.activeID != account.id, ZagNativeAppleIDs.shared.connectedToken(account.id) != nil {
+					Button("Activate") {
+						do { try ZagNativeAppleIDs.shared.activate(account.id); reload() }
+						catch { failure = error.localizedDescription }
+					}
 				}
-				.disabled(catalog.defaultID == account.id)
 				NavigationLink("Authentication") {
 					ZagAppleIDAuthenticationView(account: catalog.accounts.first(where: { $0.id == account.id }) ?? account)
 						.onDisappear { reload() }
@@ -116,10 +109,22 @@ private struct ZagAppleIDAccountDetail: View {
 				}
 			}
 			#endif
+			Section {
+				Button("Sign Out", role: .destructive) { confirmingSignOut = true }
+			}
 			if let failure { Text(failure).font(.footnote).foregroundStyle(.secondary) }
 		}
 		.navigationTitle("Apple ID")
 		.onAppear { reload() }
+		.alert("Sign Out?", isPresented: $confirmingSignOut) {
+			Button("Sign Out", role: .destructive) {
+				do { try ZagNativeAppleIDs.shared.signOut(account.id); dismiss() }
+				catch { failure = error.localizedDescription }
+			}
+			Button("Cancel", role: .cancel) {}
+		} message: {
+			Text("Apps signed by this Apple ID stay installed. To renew them, sign back in with the same Apple ID.")
+		}
 	}
 	private func reload() {
 		do { catalog = try ZagNativeAppleIDs.shared.catalog() }
@@ -130,13 +135,15 @@ private struct ZagAppleIDAccountDetail: View {
 struct ZagAppleIDAuthenticationView: View {
 	@StateObject private var model: ZagNativeSignInModel
 	var onAuthenticated: (@MainActor (UUID) -> Void)?
-	init(account: ZagNativeAppleID?, onAuthenticated: (@MainActor (UUID) -> Void)? = nil) {
+	private let requiresOriginalAccount: Bool
+	init(account: ZagNativeAppleID?, requiresOriginalAccount: Bool = false, onAuthenticated: (@MainActor (UUID) -> Void)? = nil) {
 		_model = StateObject(wrappedValue: ZagNativeSignInModel(account: account))
 		self.onAuthenticated = onAuthenticated
+		self.requiresOriginalAccount = requiresOriginalAccount
 	}
 
 	var body: some View {
-		ZagNativeAccountSignInContent(model: model)
+		ZagNativeAccountSignInContent(model: model, showsSignOut: false, requiresOriginalAccount: requiresOriginalAccount)
 			.navigationTitle("Apple ID")
 			.task { await model.restore() }
 			.onChange(of: model.phase) { phase in
@@ -192,32 +199,31 @@ enum ZagAppleIDSigningSelection {
 		let directory = ZagNativeAppleIDs.shared
 		let catalog = try directory.catalog()
 		if let required, directory.connectedToken(required) != nil { return required }
-		let available = catalog.accounts.filter { $0.id != exclude }
-		if required == nil, available.count == 1, exclude == nil,
-		   let only = available.first, directory.connectedToken(only.id) != nil { return only.id }
-		if !interactive {
-			guard let selected = required ?? catalog.defaultID, directory.connectedToken(selected) != nil else {
-				throw ZagNativeAppleIDs.Failure.unavailable
-			}
-			return selected
-		}
-		guard let presenter = await availablePresenter() else {
+		if required == nil, exclude == nil, let active = catalog.activeID,
+		   directory.connectedToken(active) != nil { return active }
+		guard interactive, let presenter = await availablePresenter() else {
 			throw ZagNativeAppleIDs.Failure.unavailable
 		}
-		let account = required.flatMap { required in catalog.accounts.first { $0.id == required } }
-		if required != nil && account == nil { throw ZagNativeAppleIDs.Failure.unavailable }
+		let available = catalog.accounts.filter { $0.id != exclude }
+		let account = try required.map { try directory.accountForAuthentication($0) }
 		return try await withCheckedThrowingContinuation { continuation in
 			var finished = false
 			@MainActor func finish(_ id: UUID?) {
 				guard !finished else { return }
 				finished = true
-				presenter.dismiss(animated: true) {
-					if let id { continuation.resume(returning: id) }
-					else { continuation.resume(throwing: ZagInstallCancelled()) }
+				let result = Result<UUID, Error> {
+					guard let id else { throw ZagInstallCancelled() }
+					guard id != exclude, required == nil || required == id,
+						  directory.connectedToken(id) != nil else { throw ZagNativeAppleIDs.Failure.wrongAccount }
+					if required == nil, exclude == nil, try directory.catalog().activeID == nil {
+						try directory.activate(id)
+					}
+					return id
 				}
+				presenter.dismiss(animated: true) { continuation.resume(with: result) }
 			}
 			let host = UIHostingController(rootView: ZagAppleIDSelectionView(accounts: available,
-				defaultID: catalog.defaultID, required: account, forceChoice: exclude != nil, finish: finish))
+				activeID: catalog.activeID, required: account, forceChoice: exclude != nil, finish: finish))
 			host.isModalInPresentation = true
 			presenter.present(host, animated: true)
 		}
@@ -226,7 +232,7 @@ enum ZagAppleIDSigningSelection {
 
 private struct ZagAppleIDSelectionView: View {
 	let accounts: [ZagNativeAppleID]
-	let defaultID: UUID?
+	let activeID: UUID?
 	let required: ZagNativeAppleID?
 	let forceChoice: Bool
 	let finish: @MainActor (UUID?) -> Void
@@ -237,7 +243,7 @@ private struct ZagAppleIDSelectionView: View {
 		NavigationStack {
 			Group {
 				if let required {
-					ZagAppleIDAuthenticationView(account: required, onAuthenticated: finish)
+					ZagAppleIDAuthenticationView(account: required, requiresOriginalAccount: true, onAuthenticated: finish)
 				} else if accounts.isEmpty {
 					ZagAppleIDAuthenticationView(account: nil, onAuthenticated: finish)
 				} else if accounts.count == 1 && !forceChoice, let account = accounts.first {
@@ -249,16 +255,16 @@ private struct ZagAppleIDSelectionView: View {
 								selected = account.id
 							} label: {
 								HStack {
-									ZagAppleIDAccountLabel(account: account, isDefault: account.id == defaultID)
+									ZagAppleIDAccountLabel(account: account, isActive: account.id == activeID)
 									Spacer()
-									if (selected ?? defaultID) == account.id { Image(systemName: "checkmark") }
+									if (selected ?? activeID) == account.id { Image(systemName: "checkmark") }
 								}
 							}
 							.buttonStyle(.plain)
 						}
-						if let account = accounts.first(where: { $0.id == (selected ?? defaultID) }) {
+						if let account = accounts.first(where: { $0.id == (selected ?? activeID) }) {
 							if ZagNativeAppleIDs.shared.connectedToken(account.id) != nil {
-								Button("Continue") { finish(account.id) }
+								Button(activeID == nil && !forceChoice ? "Activate and Continue" : "Continue") { finish(account.id) }
 							} else {
 								NavigationLink("Authenticate Selected Apple ID") {
 									ZagAppleIDAuthenticationView(account: account, onAuthenticated: finish)

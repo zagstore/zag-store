@@ -277,6 +277,7 @@ private final class HostedAppleIDVault: ZagNativeAppleIDVault {
 	var sessions: [String: Data] = [:]
 	var failCatalogWrite = false
 	var failSessionRead: String?
+	var failSessionDelete: String?
 
 	func catalog() throws -> ZagNativeAppleIDCatalog { index }
 	func saveCatalog(_ value: ZagNativeAppleIDCatalog) throws {
@@ -291,7 +292,10 @@ private final class HostedAppleIDVault: ZagNativeAppleIDVault {
 	}
 	func saveSession(_ value: Data, scope: String) throws { sessions[scope] = value }
 	func deleteToken(_ scope: String) throws { tokens[scope] = nil }
-	func deleteSession(_ scope: String) throws { sessions[scope] = nil }
+	func deleteSession(_ scope: String) throws {
+		if failSessionDelete == scope { throw ZagNativeAppleIDs.Failure.storage }
+		sessions[scope] = nil
+	}
 }
 
 extension Tests {
@@ -313,6 +317,7 @@ extension Tests {
 			vault.tokens[aScope] = first
 			vault.index.register(id: a, email: nil)
 			vault.index.migratedLegacy = true
+			vault.index.defaultID = a
 			vault.failCatalogWrite = false
 			vault.failSessionRead = "device"
 			check((try? directory.catalog()) == nil && vault.index.verifiedLegacyCredentials != true
@@ -321,8 +326,8 @@ extension Tests {
 			vault.failSessionRead = nil
 			let migrated = try directory.catalog()
 			let again = try directory.catalog()
-			check(migrated == again && again.defaultID == a && again.accounts.map(\.id) == [a]
-				&& again.verifiedLegacyCredentials == true && vault.sessions[aScope] == Data([1]),
+			check(migrated == again && again.activeID == a && again.accounts.map(\.id) == [a]
+				&& again.defaultID == nil && again.verifiedLegacyCredentials == true && vault.sessions[aScope] == Data([1]),
 				"legacy migration is idempotent and retains the stable installed-app owner")
 			vault.tokens["staging-b"] = second
 			vault.sessions["staging-b"] = Data([2])
@@ -347,10 +352,10 @@ extension Tests {
 			check(registered == b && directory.connectedToken(a) == first && directory.connectedToken(b) == second
 				&& vault.sessions[aScope] == Data([1]) && vault.sessions[bScope] == Data([2]),
 				"adding a second account keeps tokens and GrandSlam sessions separately scoped")
-			try directory.setDefault(b)
-			let changed = try directory.catalog()
-			check(changed.defaultID == b && directory.connectedToken(a) == first,
-				"changing default leaves a non-default account usable for its installed apps")
+			try directory.activate(b)
+			let changed = try ZagNativeAppleIDs(vault: vault).catalog()
+			check(changed.activeID == b && directory.connectedToken(a) == first,
+				"activation persists across relaunch and leaves the previous session usable")
 			do {
 				_ = try directory.completeAuthentication(temporaryScope: "staging-b", email: "two@example.test", expected: a, attempt: .init())
 				check(false, "wrong account must not be adopted after reauthentication")
@@ -361,13 +366,21 @@ extension Tests {
 			try directory.invalidate(first)
 			check(directory.connectedToken(a) == nil && vault.sessions[aScope] == Data([1])
 				&& directory.connectedToken(b) == second, "a rejected token is invalidated only for its account")
-			try directory.remove(b)
+			let afterExpiry = try directory.catalog()
+			check(afterExpiry.accounts.contains { $0.id == a } && afterExpiry.activeID == b,
+				"session expiry preserves the account for reauthentication")
+			try directory.signOut(b)
 			let remaining = try directory.catalog()
-			check(remaining.defaultID == a && vault.sessions[bScope] == nil && vault.sessions[aScope] == Data([1]),
-				"removal clears only the selected credentials and deterministically changes the default")
-			let readded = try directory.completeAuthentication(temporaryScope: "staging-b", email: "two@example.test", expected: nil, attempt: .init())
-			check(readded == b && directory.connectedToken(b) == second,
-				"re-adding the account restores the stable ID used by existing app ownership")
+			check(remaining.activeID == nil && remaining.accounts.map(\.id) == [a]
+				&& vault.tokens[bScope] == nil && vault.sessions[bScope] == nil && vault.sessions[aScope] == Data([1]),
+				"signing out leaves no active account when the only remaining session has expired")
+			let owner = ZagSigningScope(accountID: b, teamID: "FREETEAM02")
+			let original = try directory.accountForAuthentication(owner.accountID)
+			check(original.id == b && original.email == "two@example.test",
+				"a signed-out owner retains its original email and account identifier for renewal")
+			let readded = try directory.completeAuthentication(temporaryScope: "staging-b", email: "two@example.test", expected: owner.accountID, attempt: .init())
+			check(readded == owner.accountID && directory.connectedToken(b) == second,
+				"renewal authentication restores the app’s original owner")
 			let replacement = ZagPersistedDeveloperToken(accountID: first.accountID, token: "fixture-renewed", expiresAtMs: 0)
 			vault.tokens["reauth-a"] = replacement
 			vault.sessions["reauth-a"] = Data([3])
@@ -383,11 +396,44 @@ extension Tests {
 			_ = try directory.completeAuthentication(temporaryScope: "reauth-a", email: "one@example.test", expected: a, attempt: .init())
 			check(directory.connectedToken(a) == replacement && directory.connectedToken(b) == second
 				&& vault.sessions[aScope] == Data([3]), "reauthentication replaces only the selected account’s session")
-			try directory.signOut(a)
-			let afterSignOut = try directory.catalog()
-			check(afterSignOut.defaultID == a && directory.connectedToken(a) == nil
-				&& vault.sessions[aScope] == nil && directory.connectedToken(b) == second,
-				"signing out preserves the listed default account and the other session")
+			let third = ZagPersistedDeveloperToken(accountID: "303", token: "fixture-three", expiresAtMs: 0)
+			vault.tokens["staging-c"] = third
+			vault.sessions["staging-c"] = Data([4])
+			let c = try directory.completeAuthentication(temporaryScope: "staging-c", email: "three@example.test", expected: nil, attempt: .init())
+			try directory.activate(a)
+			vault.failSessionDelete = aScope
+			do {
+				try directory.signOut(a)
+				check(false, "sign-out must report a Keychain deletion failure")
+			} catch ZagNativeAppleIDs.Failure.storage {
+				let interrupted = try ZagNativeAppleIDs(vault: vault).catalog()
+				check(interrupted.activeID == nil && interrupted.accounts.map(\.id) == [b, c]
+					&& directory.connectedToken(a) == nil && directory.connectedToken(b) == second,
+					"an interrupted sign-out hides the account and leaves independent sessions available")
+			}
+			vault.failSessionDelete = nil
+			let afterSignOut = try ZagNativeAppleIDs(vault: vault).catalog()
+			check(afterSignOut.activeID == nil && afterSignOut.accounts.map(\.id) == [b, c]
+				&& vault.sessions[aScope] == nil && vault.sessions["device"] == nil,
+				"relaunch retries credential removal and requires explicit selection among multiple accounts")
+			try directory.activate(b)
+			try directory.signOut(b)
+			let sole = try directory.catalog()
+			check(sole.activeID == c && sole.accounts.map(\.id) == [c],
+				"the sole authenticated account becomes active after sign-out")
+			try directory.signOut(c)
+			let empty = try directory.catalog()
+			check(empty.activeID == nil && empty.accounts.isEmpty, "signing out the last account leaves an empty library")
+
+			let ghostVault = HostedAppleIDVault()
+			ghostVault.index.migratedLegacy = true
+			ghostVault.index.register(id: a, email: nil)
+			ghostVault.index.defaultID = a
+			ghostVault.tokens["device"] = first
+			let ghosts = try ZagNativeAppleIDs(vault: ghostVault).catalog()
+			let relaunched = try ZagNativeAppleIDs(vault: ghostVault).catalog()
+			check(ghosts.accounts.isEmpty && ghosts.activeID == nil && ghosts == relaunched,
+				"a credentialless legacy ghost cannot reappear from stale device-scoped credentials")
 
 			let absentVault = HostedAppleIDVault()
 			absentVault.tokens["device"] = first
