@@ -165,6 +165,17 @@ enum ZagCMSVerifier {
 		return nil
 	}
 
+	/// Identifies the signer recorded in a detached code-signature CMS.
+	static func embeddedSigner(_ cms: Data) -> Data? {
+		guard let parts = try? ZagDER.single(cms).children(), parts.count == 2,
+			  ZagDER.decodeObjectIdentifier(parts[0]) == oidSignedData,
+			  let signed = try? parts[1].children().first?.children(),
+			  let certificates = try? signed.first(where: { $0.tag == 0xA0 })?.children(),
+			  let signer = try? signed.last(where: { $0.tag == 0x31 })?.children().first?.children(),
+			  signer.count >= 2 else { return nil }
+		return signerCertificate(matching: signer[1], in: certificates.map(\.encoded))
+	}
+
 	/// Finds the embedded certificate whose issuer+serial match the SignerInfo
 	/// `sid` (issuerAndSerialNumber ::= SEQUENCE { issuer Name, serial INTEGER }).
 	private static func signerCertificate(matching sid: ZagDER.Node, in certDERs: [Data]) -> Data? {

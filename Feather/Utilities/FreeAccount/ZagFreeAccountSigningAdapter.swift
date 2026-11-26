@@ -268,6 +268,14 @@ enum ZagCodeSignatureInspection {
 	static let codeDirectorySlot = 0
 	static let cmsSlot = 0x10000
 
+	static func matchesSigner(_ certificate: Data, in executable: Data) -> Bool {
+		guard let slices = signatureBlobs(executable), !slices.isEmpty else { return false }
+		return slices.allSatisfy { slice in
+			guard let cms = slice[cmsSlot], cms.count > 8 else { return false }
+			return ZagCMSVerifier.embeddedSigner(Data(cms.dropFirst(8))) == certificate
+		}
+	}
+
 	/// Whether every slice holds a non-empty CMS signature.
 	static func hasCMSSignature(_ data: Data) -> Bool {
 		guard let slices = signatureBlobs(data), !slices.isEmpty else { return false }
@@ -339,6 +347,7 @@ struct ZagInstallExpectation: Codable, Equatable, Sendable {
 	var certificateSerial: String?
 	var extensionIdentifiers: [String: String] = [:]
 	var extensionProfileExpirations: [String: Date] = [:]
+	var allowsWildcardProfile: Bool?
 }
 
 /// Compares the provisioning profiles the device reports as installed
@@ -358,9 +367,11 @@ enum ZagInstalledProfileCheck {
 		}
 		let team = expectation.teamIdentifier ?? app.teamIdentifier
 		guard app.teamIdentifier == team else { return .mismatch("profile team") }
-		guard app.entitlements.dictionary["application-identifier"] as? String == "\(team).\(expectation.bundleIdentifier)" else {
-			return .mismatch("profile App ID")
-		}
+		let appID = app.entitlements.dictionary["application-identifier"] as? String
+		let matchesBundle = expectation.allowsWildcardProfile == true
+			? ZagImportedIdentityProfileMatch.bundleMatches(target: expectation.bundleIdentifier, applicationIdentifier: appID ?? "", team: team)
+			: appID == "\(team).\(expectation.bundleIdentifier)"
+		guard matchesBundle else { return .mismatch("profile App ID") }
 		guard abs(app.expiresAt.timeIntervalSince(expectation.profileExpiresAt)) < 1 else { return .mismatch("profile expiry") }
 		if let serial = expectation.certificateSerial, !app.certificateSerials.contains(serial) { return .mismatch("profile certificate") }
 		var earliest = app.expiresAt
@@ -447,17 +458,30 @@ enum ZagNativeSigningPipeline {
 		}
 	}
 
+	static func extendsValidity(previousProfile: Date, newProfile: Date, certificate: Date, now: Date) -> Bool {
+		let renewed = min(newProfile, certificate)
+		return renewed > now && renewed > min(previousProfile, certificate)
+	}
+
+	enum RefreshOutcome: Equatable {
+		case refreshed
+		case skipped(String)
+		case failed(String)
+	}
+
 	@MainActor
-	static func refreshSequentially<App>(_ apps: [App],
-		refresh: (App, Int) async throws -> Void) async -> [Result<Void, Error>] {
-		var results: [Result<Void, Error>] = []
+	static func refreshBatch<App>(_ apps: [App], eligibility: (App) -> String?,
+		isCancelled: () -> Bool, renew: (App, Int) async throws -> RefreshOutcome) async -> [RefreshOutcome] {
+		var results: [RefreshOutcome] = []
 		for (index, app) in apps.enumerated() {
-			guard !Task.isCancelled else { break }
-			do {
-				try await refresh(app, index)
-				results.append(.success(()))
-			} catch {
-				results.append(.failure(error))
+			if isCancelled() || Task.isCancelled {
+				results.append(.skipped("Cancelled."))
+			} else if let reason = eligibility(app) {
+				results.append(.skipped(reason))
+			} else {
+				do { results.append(try await renew(app, index)) }
+				catch is CancellationError { results.append(.skipped("Cancelled.")) }
+				catch { results.append(.failed(error.localizedDescription)) }
 			}
 		}
 		return results

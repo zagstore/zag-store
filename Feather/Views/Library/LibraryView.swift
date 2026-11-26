@@ -32,6 +32,7 @@ import Combine
 
 
 import CoreData
+import Security
 
 
 
@@ -165,6 +166,8 @@ struct LibraryView: View {
     @AppStorage("zagStore.apps.sortOrder") private var _sortOrder = 0
 	@AppStorage("zagStore.apps.signingMethodFilter") private var _signingFilter = 0
 	@State private var _refreshingNativeApps = false
+	@State private var _refreshAllCancelled = false
+	@State private var _refreshAllJob: String?
 	@State private var _checkedNativeReconciliation = false
     @State private var _showAppDiagnostics = false
 
@@ -293,84 +296,328 @@ struct LibraryView: View {
 		#endif
 	}
 
-	private var _refreshAllAction: (() -> Void)? {
-		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-		if _signedApps.contains(where: { app in
-			guard let id = app.identifier, _managedInstalledBundleIDs.contains(id),
-				  let entry = ZagNativeAppInventory.entry(app) else { return false }
-			return entry.pendingInstall == nil
-		}) { return _refreshAllNative }
-		#endif
-		return nil
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private struct CertificateRefresh {
+		let certificate: CertificatePair
+		let record: Signed
+		let source: URL
+		let current: ZagInstallExpectation
+		let replacement: ZagInstallExpectation
+		let replacementProfile: ZagIssuedProfile
+		let replacementBytes: Data
+		let signer: Data
+		let entitlementsByComponent: [String: ZagEntitlementSet]
+
+		private static func entitlements(in bundle: Bundle, signedBy signer: Data) -> ZagEntitlementSet? {
+			guard let executable = bundle.executableURL,
+				  let binary = try? Data(contentsOf: executable, options: .mappedIfSafe),
+				  ZagCodeSignatureInspection.matchesSigner(signer, in: binary),
+				  let entitlements = try? ZagMachOSignatureInspector.entitlements(at: executable) else { return nil }
+			return try? ZagEntitlementSet(entitlements)
+		}
+
+		@MainActor
+		init(_ app: Signed) throws(RefreshSkip) {
+			let storage = Storage.shared
+			guard let recorded = app.certificate, !recorded.revoked, storage.getFile(.certificate, from: recorded) != nil else {
+				throw RefreshSkip("Its recorded certificate is unavailable.")
+			}
+			guard let source = storage.getAppDirectory(for: app),
+				  let bundle = Bundle(url: source), let id = app.identifier, bundle.bundleIdentifier == id,
+				  let currentBytes = try? Data(contentsOf: source.appendingPathComponent("embedded.mobileprovision")),
+				  let currentProfile = try? ZagIssuedProfile(profileData: currentBytes) else {
+				throw RefreshSkip("The signed archive or its original profile is unavailable.")
+			}
+			func signingCertificate(_ pair: CertificatePair) -> Data? {
+				guard let p12 = storage.getFile(.certificate, from: pair),
+					  let bytes = try? Data(contentsOf: p12),
+					  let identity = try? ZagImportedSigningIdentity.importIdentity(pkcs12: bytes, password: pair.password ?? "").get() else { return nil }
+				var certificate: SecCertificate?
+				guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess, let certificate else { return nil }
+				return SecCertificateCopyData(certificate) as Data
+			}
+			let newerProfiles = storage.getAllCertificates().compactMap { pair -> (CertificatePair, Data, Date)? in
+				guard !pair.revoked, let url = storage.getFile(.provision, from: pair),
+					  let bytes = try? Data(contentsOf: url), let preview = try? ZagIssuedProfile(profileData: bytes),
+					  preview.teamIdentifier == currentProfile.teamIdentifier, preview.uuid != currentProfile.uuid,
+					  preview.expiresAt > max(Date(), currentProfile.expiresAt) else { return nil }
+				return (pair, bytes, preview.expiresAt)
+			}.sorted { $0.2 > $1.2 }
+			guard !newerProfiles.isEmpty else { throw RefreshSkip("No newer provisioning profile is available for the recorded team.") }
+			guard let signer = signingCertificate(recorded), let inspection = ZagCertificateInspection(der: signer),
+				  let team = inspection.organizationalUnit, team == currentProfile.teamIdentifier,
+				  currentProfile.certificateSerials.contains(inspection.serialNumber),
+				  let entitlements = Self.entitlements(in: bundle, signedBy: signer) else {
+				throw RefreshSkip("The recorded certificate does not match the archived signer.")
+			}
+			guard let currentAppID = currentProfile.entitlements.dictionary["application-identifier"] as? String,
+				  ZagImportedIdentityProfileMatch.bundleMatches(target: id, applicationIdentifier: currentAppID, team: team) else {
+				throw RefreshSkip("The original profile does not cover this app’s bundle identifier.")
+			}
+			var componentIDs = [id]
+			var entitlementsByComponent = ["": entitlements]
+			for path in ZagFreeAccountSigningAdapter.nestedBundles(in: source) {
+				let component = source.appendingPathComponent(path)
+				guard component.pathExtension == "appex",
+					  let bundle = Bundle(url: component), let id = bundle.bundleIdentifier,
+					  let embedded = try? Data(contentsOf: component.appendingPathComponent("embedded.mobileprovision")),
+					  embedded == currentBytes,
+					  ZagImportedIdentityProfileMatch.bundleMatches(target: id, applicationIdentifier: currentAppID, team: team),
+					  let entitlements = Self.entitlements(in: bundle, signedBy: signer) else {
+					throw RefreshSkip("A nested component needs independent provisioning; its current signing identity cannot be preserved by this profile.")
+				}
+				componentIDs.append(id)
+				entitlementsByComponent[path] = entitlements
+			}
+			let pairedUDID = ZagRPPairingCore.shared.pairedIdentity?.udid
+			func replacement(for candidate: (CertificatePair, Data, Date)) -> ZagIssuedProfile? {
+				let (pair, bytes, _) = candidate
+				guard signingCertificate(pair) == signer,
+					  let authenticated = try? ZagCMSVerifier.verify(bytes).get(),
+					  let profile = try? ZagIssuedProfile(profileData: authenticated),
+					  let contents = ZagMobileProvision.parseUnverified(authenticated),
+					  contents.developerCertificates.contains(signer),
+					  profile.teamIdentifier == team, profile.uuid != currentProfile.uuid,
+					  ZagNativeSigningPipeline.extendsValidity(previousProfile: currentProfile.expiresAt,
+						newProfile: profile.expiresAt, certificate: inspection.expiresAt, now: Date()),
+					  Self.coversDevice(profile, udid: pairedUDID),
+					  componentIDs.allSatisfy({ ZagImportedIdentityProfileMatch.bundleMatches(target: $0, applicationIdentifier: contents.applicationIdentifier, team: team) }),
+					  entitlementsByComponent.values.allSatisfy({
+						  ZagEntitlementAudit.disallowed(requested: $0.dictionary.mapValues(ZagEntitlementValue.init),
+							granted: contents.entitlements).isEmpty
+					  }) else { return nil }
+				return profile
+			}
+			// A separately imported newer profile is usable only with byte-for-byte
+			// the same signing certificate as the recorded pair and archive.
+			guard let candidate = newerProfiles.lazy.compactMap({ candidate in
+				replacement(for: candidate).map { (candidate.0, candidate.1, $0) }
+			}).first else {
+				throw RefreshSkip("No compatible profile extends validity with the original certificate and entitlements.")
+			}
+			func expectation(_ profile: ZagIssuedProfile) -> ZagInstallExpectation {
+				ZagInstallExpectation(bundleIdentifier: id, profileUUID: profile.uuid, profileExpiresAt: profile.expiresAt,
+					certificateExpiresAt: inspection.expiresAt, signerCommonName: inspection.commonName, teamIdentifier: team,
+					version: bundle.infoDictionary?["CFBundleShortVersionString"] as? String,
+					build: bundle.infoDictionary?["CFBundleVersion"] as? String, certificateSerial: inspection.serialNumber,
+					allowsWildcardProfile: true)
+			}
+			self.certificate = candidate.0
+			self.record = app
+			self.source = source
+			self.current = expectation(currentProfile)
+			self.replacement = expectation(candidate.2)
+			self.replacementProfile = candidate.2
+			self.replacementBytes = candidate.1
+			self.signer = signer
+			self.entitlementsByComponent = entitlementsByComponent
+		}
+
+		private static func coversDevice(_ profile: ZagIssuedProfile, udid: String?) -> Bool {
+			if profile.deviceUDIDs.isEmpty {
+				return ZagMobileProvision.extractUnverifiedPlist(from: profile.data)?["ProvisionsAllDevices"] as? Bool == true
+			}
+			guard let udid else { return true }
+			return profile.deviceUDIDs.contains { $0.caseInsensitiveCompare(udid) == .orderedSame }
+		}
+
+		@MainActor
+		func renew(job: String) async throws {
+			try await ZagNativeAccountInstall.withExclusiveOperation {
+				let pairing = ZagRPPairingCore.shared
+				let (device, _) = try await pairing.signingDeviceInventory()
+				guard Self.coversDevice(replacementProfile, udid: device.udid) else {
+					throw RefreshSkip("The replacement profile does not include this iPhone.")
+				}
+				let verifier = ZagRPPairingFreeAccountInstaller()
+				guard case .verified(let oldExpiry, let oldCertExpiry) = await verifier.verify(current),
+					  ZagNativeSigningPipeline.extendsValidity(previousProfile: oldExpiry,
+						newProfile: replacement.profileExpiresAt, certificate: oldCertExpiry, now: Date()) else {
+					throw RefreshSkip("The installed profile could not be matched to an extendable archive.")
+				}
+				let jobs = ZagInstallJobs.shared
+				try jobs.checkpoint(job)
+				guard !record.isDeleted, !certificate.isDeleted, !certificate.revoked else { throw RefreshSkip("The signing record or its certificate is unavailable.") }
+				let staging = source.deletingLastPathComponent().appendingPathComponent(UUID().uuidString, isDirectory: true)
+				try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+				defer { try? FileManager.default.removeItem(at: staging) }
+				let stagedApp = staging.appendingPathComponent(source.lastPathComponent)
+				try FileManager.default.copyItem(at: source, to: stagedApp)
+				let entitlementFile = staging.appendingPathComponent("entitlements.plist")
+				try PropertyListSerialization.data(fromPropertyList: entitlementsByComponent[""]?.dictionary ?? [:], format: .xml, options: 0)
+					.write(to: entitlementFile, options: .atomic)
+				var options = Options.defaultOptions
+				options.appEntitlementsFile = entitlementFile
+				let signing = ZsignHandler(appUrl: stagedApp, options: options, cert: certificate)
+				try await signing.sign()
+				if let error = signing.hadError { throw error }
+				for (path, entitlements) in entitlementsByComponent {
+					let component = path.isEmpty ? stagedApp : stagedApp.appendingPathComponent(path)
+					guard let bundle = Bundle(url: component),
+						  let embedded = try? Data(contentsOf: component.appendingPathComponent("embedded.mobileprovision")),
+						  embedded == replacementBytes,
+						  Self.entitlements(in: bundle, signedBy: signer) == entitlements,
+						  pairing.pairedIdentity == device else {
+						throw ZagFreeAccountSigningError.verification("The renewed archive did not preserve its original signing identity.")
+					}
+				}
+				try jobs.checkpoint(job)
+				jobs.advance(job, to: .packaging)
+				let ipa = try await Task.detached(priority: .utility) {
+					try ZagRPPairingFreeAccountInstaller.package(stagedApp, in: staging)
+				}.value
+				try jobs.checkpoint(job)
+				jobs.advance(job, to: .preparingMobileDataFix)
+				let coordinator = ZagMobileDataInstallCoordinator.shared
+				try await coordinator.install(jobID: job, bundleID: replacement.bundleIdentifier,
+					cancelRequested: { jobs.isCancelRequested(job) }) {
+					try jobs.beginInstalling(job)
+					defer { if coordinator.usingMobileDataFix { jobs.advance(job, to: .restoringMobileData) } }
+					try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+						do {
+							try pairing.installGate4IPA(at: ipa, retryTransientFailures: true) {
+								continuation.resume(with: $0)
+							}
+						} catch { continuation.resume(throwing: error) }
+					}
+				}
+				guard case .verified(let expiry, let certExpiry) = await verifier.verify(replacement),
+					  pairing.pairedIdentity == device,
+					  ZagNativeSigningPipeline.extendsValidity(previousProfile: oldExpiry, newProfile: expiry,
+						certificate: certExpiry, now: Date()) else {
+					throw ZagFreeAccountSigningError.verification("The device did not verify an extended installed profile.")
+				}
+				_ = try FileManager.default.replaceItemAt(source, withItemAt: stagedApp)
+				if !record.isDeleted, !certificate.isDeleted, record.certificate != certificate {
+					record.certificate = certificate
+					Storage.shared.saveContext()
+				}
+			}
+		}
+	}
+	#else
+	private struct CertificateRefresh {}
+	#endif
+
+	private enum RefreshMethod {
+		case appleID(ZagSigningScope)
+		case certificate(CertificateRefresh)
 	}
 
-	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-	private func _refreshAllNative() {
-		guard !_refreshingNativeApps else { return }
+	private struct RefreshItem {
+		let app: Signed
+		let eligibility: Result<RefreshMethod, RefreshSkip>
+		var name: String { app.name ?? "App" }
+	}
+
+	private struct RefreshSkip: LocalizedError {
+		let reason: String
+		init(_ reason: String) { self.reason = reason }
+		var errorDescription: String? { reason }
+	}
+
+	private var _refreshItems: [RefreshItem] {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		let installed = _managedInstalledBundleIDs
-		let items = _signedApps.compactMap { row -> (Signed, ZagNativeAppInventory.Entry)? in
-			guard let id = row.identifier, installed.contains(id), let entry = ZagNativeAppInventory.entry(row),
-				  entry.pendingInstall == nil else { return nil }
-			return (row, entry)
-		}.sorted {
-			let lhs = $0.1.installation.record, rhs = $1.1.installation.record
-			if lhs.owner?.scope.accountID != rhs.owner?.scope.accountID {
-				return (lhs.owner?.scope.accountID.uuidString ?? "") < (rhs.owner?.scope.accountID.uuidString ?? "")
+		var seen: Set<String> = []
+		return _signedApps.compactMap { row in
+			guard let id = row.identifier, id != Bundle.main.bundleIdentifier, installed.contains(id),
+				  !ZagUpdateTransactionManager.shared.isPendingInstallationSigned(uuid: row.uuid),
+				  !_isNativePending(row), seen.insert(id).inserted else { return nil }
+			let eligibility = Result<RefreshMethod, RefreshSkip> { () throws(RefreshSkip) -> RefreshMethod in
+				guard ZagRPPairingCore.shared.hasSavedPairing else { throw RefreshSkip("Installation pairing is unavailable.") }
+				if let entry = ZagNativeAppInventory.entry(row) {
+					guard let scope = entry.installation.record.owner?.scope else { throw RefreshSkip("Signing ownership is unavailable.") }
+					guard ZagNativeAppInventory.hasSource(entry) else { throw RefreshSkip("Import its original IPA.") }
+					return .appleID(scope)
+				}
+				return .certificate(try CertificateRefresh(row))
 			}
-			return lhs.profileExpiresAt < rhs.profileExpiresAt
+			return RefreshItem(app: row, eligibility: eligibility)
 		}
+		#else
+		return []
+		#endif
+	}
+
+	private func _refreshAll(_ items: [RefreshItem]) {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		guard !_refreshingNativeApps else {
+			_refreshAllCancelled = true
+			if let job = _refreshAllJob { _ = ZagInstallJobs.shared.requestCancel(job) }
+			return
+		}
+		_refreshAllCancelled = false
 		_refreshingNativeApps = true
 		Task { @MainActor in
-			defer { _refreshingNativeApps = false }
-			var lines: [String] = []
-			var reports: [String] = []
-			var renewed = 0
+			defer { _refreshingNativeApps = false; _refreshAllJob = nil }
 			var unavailableAccounts: Set<UUID> = []
-			_ = await ZagNativeSigningPipeline.refreshSequentially(items) { item, index in
-				let (app, entry) = item
-				guard let scope = entry.installation.record.owner?.scope,
-					  !unavailableAccounts.contains(scope.accountID) else {
-					lines.append("\(entry.name) skipped. Its Apple ID is unavailable.")
-					return
+			var diagnostics: [String] = []
+			let results = await ZagNativeAppleIDs.shared.withStableActiveSelection {
+				await ZagNativeSigningPipeline.refreshBatch(items, eligibility: { item in
+					guard case .failure(let reason) = item.eligibility else { return nil }
+					return reason.reason
+				}, isCancelled: { _refreshAllCancelled }) { item, _ in
+					let method = try item.eligibility.get()
+					let job = "library:\(item.app.uuid ?? UUID().uuidString)"
+					let jobs = ZagInstallJobs.shared
+					guard jobs.begin(job, stage: .signing) else { return .skipped("A job is already running.") }
+					_refreshAllJob = job
+					defer { jobs.finish(job); _refreshAllJob = nil }
+					switch method {
+					case .appleID(let scope):
+						guard !unavailableAccounts.contains(scope.accountID) else { return .skipped("Its Apple ID needs authentication.") }
+						do { _ = try await ZagAppleIDSigningSelection.resolve(required: scope.accountID) }
+						catch is ZagInstallCancelled {
+							unavailableAccounts.insert(scope.accountID)
+							return .skipped("Apple ID authentication was cancelled.")
+						} catch {
+							unavailableAccounts.insert(scope.accountID)
+							return .skipped("Its Apple ID needs authentication.")
+						}
+						let previous = ZagSigningDiagnostics.latest
+						do {
+							try jobs.checkpoint(job)
+							guard case .verified = try await ZagNativeAccountInstall.runInline(item.app, job: job,
+								options: OptionsManager.shared.appleIDOptions, renew: true) else {
+								throw ZagNativeAppInventory.Failure.unverified
+							}
+						} catch is ZagInstallCancelled {
+							return .skipped("Cancelled.")
+						} catch {
+							if !ZagNativeAccountInstall.hasConnectedAccount(scope.accountID) { unavailableAccounts.insert(scope.accountID) }
+							let report = ZagSigningDiagnostics.latest
+							if report != previous { diagnostics.append(report) }
+							throw error
+						}
+					case .certificate(let plan):
+						do { try await plan.renew(job: job) }
+						catch let skip as RefreshSkip { return .skipped(skip.reason) }
+						catch is ZagInstallCancelled { return .skipped("Cancelled.") }
+					}
+					return .refreshed
 				}
-				guard ZagNativeAppInventory.hasSource(entry) else {
-					lines.append("\(entry.name) skipped. Import its original IPA.")
-					return
-				}
-				do { _ = try await ZagAppleIDSigningSelection.resolve(required: scope.accountID) }
-				catch {
-					unavailableAccounts.insert(scope.accountID)
-					lines.append("\(entry.name) skipped. Its Apple ID needs authentication.")
-					return
-				}
-				let job = "library:\(entry.uuid)"
-				guard ZagInstallJobs.shared.begin(job, stage: .signing) else {
-					lines.append("\(entry.name) skipped. A job is already running.")
-					return
-				}
-				defer { ZagInstallJobs.shared.finish(job) }
-				let previous = ZagSigningDiagnostics.latest
-				do {
-					_ = try await ZagNativeAccountInstall.runInline(app, job: job, options: OptionsManager.shared.appleIDOptions, renew: true)
-					renewed += 1
-				} catch {
-					if !ZagNativeAccountInstall.hasConnectedAccount(scope.accountID) { unavailableAccounts.insert(scope.accountID) }
-					lines.append("\(entry.name). \(error.localizedDescription)")
-					let report = ZagSigningDiagnostics.latest
-					if report != previous { reports.append("App \(index + 1)\n\(report)") }
+			}
+			var refreshed = 0, skipped = 0, failed = 0
+			var lines: [String] = []
+			for (item, result) in zip(items, results) {
+				switch result {
+				case .refreshed: refreshed += 1
+				case .skipped(let reason): skipped += 1; lines.append("\(item.name) — skipped. \(reason)")
+				case .failed(let reason): failed += 1; lines.append("\(item.name) — failed. \(reason)")
 				}
 			}
 			var actions = [UIAlertAction(title: "OK", style: .cancel)]
-			if !reports.isEmpty {
+			if !diagnostics.isEmpty {
 				actions.append(UIAlertAction(title: "Copy Diagnostics", style: .default) { _ in
-					UIPasteboard.general.string = reports.joined(separator: "\n\n")
+					UIPasteboard.general.string = diagnostics.joined(separator: "\n\n")
 				})
 			}
 			UIAlertController.showAlert(title: "Refresh All",
-				message: (["Renewed \(renewed) of \(items.count) apps."] + lines).joined(separator: "\n"), actions: actions)
+				message: (["Refreshed \(refreshed) · Skipped \(skipped) · Failed \(failed)"] + lines).joined(separator: "\n"), actions: actions)
 		}
+		#endif
 	}
-	#endif
 
 	private func _matchesSigningFilter(_ app: Signed) -> Bool {
 		guard _signingFilter != 0 else { return true }
@@ -761,14 +1008,18 @@ struct LibraryView: View {
 		Group {
 			zagUpdatesContent
 
-			if !snapshot.installed.isEmpty || _refreshAllAction != nil,
+			let refreshItems = !_refreshingNativeApps && (_selectedScope == .all || _selectedScope == .installed)
+				? _refreshItems : []
+			let eligibleCount = refreshItems.filter { if case .success = $0.eligibility { return true }; return false }.count
+			if !snapshot.installed.isEmpty || !refreshItems.isEmpty,
 			   _selectedScope == .all || _selectedScope == .installed {
 				Section {
 					ZagLibraryHeader(
 						title: .localized("Installed"),
 						count: snapshot.installed.count,
 						isCollapsed: _installedCollapsed,
-						trailingAction: _refreshAllAction
+						trailingTitle: _refreshingNativeApps ? "Cancel" : "Refresh All · \(eligibleCount)",
+						trailingAction: refreshItems.isEmpty && !_refreshingNativeApps ? nil : { _refreshAll(refreshItems) }
 					) {
 						withAnimation(.easeInOut(duration: 0.28)) {
 							_installedCollapsed.toggle()
@@ -3248,6 +3499,7 @@ private struct ZagLibraryHeader: View {
 	let title: String
 	let count: Int
 	let isCollapsed: Bool
+	var trailingTitle: String = "Refresh All"
 	var trailingAction: (() -> Void)? = nil
 	let onToggle: () -> Void
 
@@ -3264,7 +3516,7 @@ private struct ZagLibraryHeader: View {
 			.accessibilityHint(Text(isCollapsed ? "Expand section" : "Collapse section"))
 
 			if let trailingAction {
-				Button(action: trailingAction) { ZagCountBadge(title: "Refresh All", tracking: 0.4) }
+				Button(action: trailingAction) { ZagCountBadge(title: trailingTitle, tracking: 0.4) }
 					.buttonStyle(.plain)
 			}
 

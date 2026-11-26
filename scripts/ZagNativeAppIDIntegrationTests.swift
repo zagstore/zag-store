@@ -4,6 +4,7 @@ extension Tests {
 	@MainActor
 	static func nativeAppIDsAcrossAccounts() async {
 		await testNativeAccountLibrary()
+		await testMixedRefreshBatch()
 		let clock = TestClock()
 		let secrets = MemorySecrets()
 		let original = "com.example.integration"
@@ -77,6 +78,19 @@ extension Tests {
 			check(ZagInstalledProfileCheck.verify(expectation, installedProfiles: [mainProfile, olderProfile])
 				== .mismatch("extension profile expiry"), "renewal refuses a mismatched installed extension expiration")
 
+			let wildcard = try installedProfile(id: "com.example.*", uuid: "WILDCARD", expiry: expiration)
+			var wildcardExpectation = ZagInstallExpectation(bundleIdentifier: mainID, profileUUID: "WILDCARD",
+				profileExpiresAt: expiration, certificateExpiresAt: certificate.expiresAt, signerCommonName: nil,
+				teamIdentifier: teams[0], certificateSerial: certificate.serialNumber)
+			check(ZagInstalledProfileCheck.verify(wildcardExpectation, installedProfiles: [wildcard]) == .mismatch("profile App ID"),
+				"native renewal still requires an exact installed App ID")
+			wildcardExpectation.allowsWildcardProfile = true
+			let staleWildcard = try installedProfile(id: "com.example.*", uuid: "WILDCARD", expiry: expiration - 60)
+			check(ZagInstalledProfileCheck.verify(wildcardExpectation, installedProfiles: [wildcard])
+				== .verified(profileExpiresAt: expiration, certificateExpiresAt: certificate.expiresAt)
+				&& ZagInstalledProfileCheck.verify(wildcardExpectation, installedProfiles: [staleWildcard]) == .mismatch("profile expiry"),
+				"certificate renewal verifies wildcard coverage and exact installed expiration")
+
 			var scopes: Set<ZagSigningScope> = []
 			check(ZagSigningPreference.resolve(saved: nil, legacyAsk: true) == .askEveryTime
 				&& ZagSigningPreference.resolve(saved: nil, legacyAsk: false) == .importedCertificate
@@ -121,14 +135,6 @@ extension Tests {
 			check(validityBoundaries.allSatisfy { remaining, expected in
 				ZagAppleIDProfileValidity(expiresAt: clock.now + remaining, now: clock.now) == expected
 			}, "Apple ID expiry changes at the exact two-day, four-day and expiry boundaries")
-
-			var refreshAttempts: [String] = []
-			let batch = await ZagNativeSigningPipeline.refreshSequentially(accounts) { account, index in
-				refreshAttempts.append(account)
-				if index == 1 { throw ZagPortalError.network }
-			}
-			let batchFailures = batch.filter { if case .failure = $0 { return true }; return false }.count
-			check(refreshAttempts == accounts && batchFailures == 1, "bulk renewal visits each app in order and isolates an individual failure")
 
 			for index in accounts.indices {
 				await transport.select(accounts[index])
@@ -299,6 +305,66 @@ private final class HostedAppleIDVault: ZagNativeAppleIDVault {
 }
 
 extension Tests {
+	@MainActor
+	static func testMixedRefreshBatch() async {
+		let vault = HostedAppleIDVault()
+		let directory = ZagNativeAppleIDs(vault: vault)
+		let active = ZagPersistedDeveloperToken(accountID: "401", token: "active-fixture", expiresAtMs: 0)
+		let second = ZagPersistedDeveloperToken(accountID: "402", token: "second-fixture", expiresAtMs: 0)
+		let expired = ZagPersistedDeveloperToken(accountID: "403", token: "expired-fixture", expiresAtMs: -1)
+		for token in [active, second, expired] {
+			vault.index.register(id: token.nativeAccountID, email: nil)
+			vault.tokens[ZagNativeAppleIDs.scope(token.nativeAccountID)] = token
+		}
+		vault.index.activeID = active.nativeAccountID
+		enum Job: CaseIterable { case expired, activeFailure, nonActive, missingCertificate, certificate, cancelBatch, cancelled }
+		enum TestFailure: LocalizedError {
+			case unverified
+			var errorDescription: String? { "Installation was not verified." }
+		}
+		let now = Date(timeIntervalSince1970: 1_000)
+		let previous = now + 100, extended = now + 200, cert = now + 300
+		check(ZagNativeSigningPipeline.extendsValidity(previousProfile: previous, newProfile: extended, certificate: cert, now: now)
+			&& !ZagNativeSigningPipeline.extendsValidity(previousProfile: previous, newProfile: previous, certificate: cert, now: now)
+			&& !ZagNativeSigningPipeline.extendsValidity(previousProfile: previous, newProfile: extended, certificate: previous, now: now),
+			"certificate renewal requires longer effective validity, including the certificate expiry")
+		var cancelled = false
+		let results = await directory.withStableActiveSelection {
+			await ZagNativeSigningPipeline.refreshBatch(Job.allCases, eligibility: {
+				$0 == .missingCertificate ? "Recorded certificate unavailable." : nil
+			}, isCancelled: { cancelled }) { job, _ in
+				switch job {
+				case .expired:
+					check(directory.connectedToken(expired.nativeAccountID) == nil, "the batch refuses an expired owner session")
+					return .skipped("Authentication needed.")
+				case .nonActive:
+					check(directory.connectedToken(second.nativeAccountID) == second, "a non-active owner keeps its own batch credentials")
+					return .refreshed
+				case .certificate:
+					guard ZagNativeSigningPipeline.extendsValidity(previousProfile: previous, newProfile: extended, certificate: cert, now: now) else {
+						throw TestFailure.unverified
+					}
+					return .refreshed
+				case .activeFailure:
+					try directory.invalidate(active)
+					check((try? directory.catalog().activeID) == active.nativeAccountID, "the batch holds Active even when its token is rejected")
+					throw TestFailure.unverified
+				case .cancelBatch:
+					cancelled = true
+					throw CancellationError()
+				case .cancelled, .missingCertificate:
+					check(false, "cancelled and ineligible apps never run")
+					return .refreshed
+				}
+			}
+		}
+		check(results == [.skipped("Authentication needed."), .failed("Installation was not verified."), .refreshed,
+						  .skipped("Recorded certificate unavailable."), .refreshed, .skipped("Cancelled."), .skipped("Cancelled.")],
+			"mixed refresh reports successful, skipped, unverified and cancelled work independently")
+		check((try? directory.catalog().activeID) == second.nativeAccountID,
+			"Active reconciles only after batch completion")
+	}
+
 	@MainActor
 	static func testNativeAccountLibrary() async {
 		let vault = HostedAppleIDVault()

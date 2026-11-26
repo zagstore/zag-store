@@ -98,6 +98,16 @@ struct ZagNativeAppleIDs {
 	}
 
 	static let shared = Self(vault: ZagNativeAppleIDKeychain())
+	private static var activeReconciliationHolds = 0
+
+	func withStableActiveSelection<T>(_ operation: @MainActor () async -> T) async -> T {
+		Self.activeReconciliationHolds += 1
+		defer {
+			Self.activeReconciliationHolds -= 1
+			if Self.activeReconciliationHolds == 0 { _ = try? catalog() }
+		}
+		return await operation()
+	}
 	let vault: ZagNativeAppleIDVault
 
 	nonisolated static func scope(_ id: UUID) -> String { ZagAppleAuthMachine.nativeCredentialScope(id) }
@@ -153,6 +163,7 @@ struct ZagNativeAppleIDs {
 	}
 
 	private func updateActiveSelection(_ catalog: inout ZagNativeAppleIDCatalog) throws {
+		guard Self.activeReconciliationHolds == 0 else { return }
 		let authenticated = try catalog.accounts.filter { try usableToken($0.id) != nil }
 		if !authenticated.contains(where: { $0.id == catalog.activeID }) {
 			catalog.activeID = authenticated.count == 1 ? authenticated.first?.id : nil
