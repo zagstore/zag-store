@@ -173,6 +173,75 @@ enum ZagNativeAccountInstall {
 			}
 		}
 
+		// Coalesce ready requests only; a slow developer request must not hold
+		// up the entire batch. Each participant retains its own verification.
+		private struct ProfileHandoff {
+			let profiles: [Data]
+			let prepare: @MainActor () throws -> Void
+			let continuation: CheckedContinuation<[Data], Error>
+		}
+		private var pendingHandoffs: [ProfileHandoff] = []
+		private var handoffScheduled = false
+
+		private func handoff(_ profiles: [Data], prepare: @escaping @MainActor () throws -> Void) async throws -> [Data] {
+			try Task.checkCancellation()
+			return try await withCheckedThrowingContinuation { continuation in
+				pendingHandoffs.append(.init(profiles: profiles, prepare: prepare, continuation: continuation))
+				guard !handoffScheduled else { return }
+				handoffScheduled = true
+				Task { @MainActor in
+					// A bounded collection window, not a barrier across all apps.
+					try? await Task.sleep(for: .milliseconds(150))
+					await self.flushHandoffs()
+				}
+			}
+		}
+
+		private func flushHandoffs() async {
+			let pending = pendingHandoffs
+			pendingHandoffs.removeAll()
+			handoffScheduled = false
+			do {
+				_ = try await Self.onDevice {
+					var ready: [ProfileHandoff] = []
+					for item in pending {
+						do {
+							try item.prepare()
+							ready.append(item)
+						} catch {
+							item.continuation.resume(throwing: error)
+						}
+					}
+					guard !ready.isEmpty else { return true }
+					var unique: [Data] = []
+					for item in ready {
+						for profile in item.profiles where !unique.contains(profile) {
+							unique.append(profile)
+						}
+					}
+					do {
+						let observed = try await Self.installAndReadBack(unique)
+						for item in ready { item.continuation.resume(returning: observed) }
+					} catch {
+						// A failed batch may have installed a subset. Read back
+						// before deciding which individual requests failed.
+						let observed = try? await ZagRPPairingFreeAccountInstaller.readProfiles().get()
+						for item in ready {
+							if let observed, item.profiles.allSatisfy({ observed.contains($0) }) {
+								item.continuation.resume(returning: observed)
+							} else {
+								item.continuation.resume(throwing: error)
+							}
+						}
+					}
+					return true
+				}
+			} catch {
+				// The queue can reject before the operation starts.
+				for item in pending { item.continuation.resume(throwing: error) }
+			}
+		}
+
 		private func discover(_ scope: ZagSigningScope) async throws -> Discovery {
 			try await discovery.value(for: scope) {
 				guard let token = ZagNativeAppleIDs.shared.connectedToken(scope.accountID) else { throw Failure.signIn }
@@ -267,16 +336,15 @@ enum ZagNativeAccountInstall {
 				previous: receipt.record.expiresAt, now: Date())
 
 			let queued = ContinuousClock.now
-			return try await Self.onDevice {
+			let readback = try await handoff(requested.map(\.data)) {
 				try jobs.checkpoint(job)
 				guard pairing.pairedIdentity == device,
 					  ZagNativeAppleIDs.shared.connectedToken(owner.scope.accountID) == discovered.token else { throw Failure.signIn }
-				ZagSigningDiagnostics.elapsed("Device queue wait", since: queued)
 				try jobs.beginInstalling(job)
 				jobs.setNativeProgress(job, caption: "Installing", fraction: ZagNativeSigningProgress.installing.fraction)
-				let handoff = ContinuousClock.now
-				let readback = try await Self.installAndReadBack(requested.map(\.data))
-				ZagSigningDiagnostics.elapsed("Misagent install and readback", since: handoff)
+			}
+			ZagSigningDiagnostics.elapsed("Shared device queue, profile install and readback", since: queued)
+			return try await Self.onDevice {
 				jobs.reportNative(job, .verifying)
 				guard requested.allSatisfy({ readback.contains($0.data) }), pairing.pairedIdentity == device else {
 					throw ZagProfileOnlyRenewal.Failure.readback
