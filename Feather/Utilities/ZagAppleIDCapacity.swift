@@ -43,6 +43,7 @@ enum ZagAppleIDCapacity {
 	}
 
 	static func synchronizeDevice() async throws -> Int {
+		await ZagRunningInstallation.shared.inspect()
 		let pairing = ZagRPPairingCore.shared
 		let (device, installed) = try await pairing.signingDeviceInventory()
 		let profiles = try await ZagRPPairingFreeAccountInstaller.readProfiles().get()

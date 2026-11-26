@@ -39,6 +39,8 @@ final class ZagAppleIDExpirationNotifications: NSObject, UNUserNotificationCente
 			var currentWarnings: Set<String> = []
 			#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 			if enabled, [.authorized, .provisional, .ephemeral].contains(settings.authorizationStatus) {
+				await ZagRunningInstallation.shared.inspect()
+				guard !Task.isCancelled else { return }
 				let dates = ZagNativeAppInventory.verifiedInstalledEntries().compactMap { entry -> Date? in
 					let record = entry.installation.record
 					return record.owner?.teamKind == .personalFree ? record.expiresAt : nil

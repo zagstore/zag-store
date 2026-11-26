@@ -85,6 +85,7 @@ private struct ZagLibraryListSnapshot {
 struct LibraryView: View {
 	private static var didPerformInitialDeviceInventory = false
 	private static var didMeasureFirstListPreparation = false
+	@ObservedObject private var runningInstallation = ZagRunningInstallation.shared
 
 	@Environment(\.scenePhase) private var scenePhase
 
@@ -236,7 +237,7 @@ struct LibraryView: View {
         let startedAt = shouldMeasure ? ZagPerformanceMonitor.now() : 0
         let managed = _managedInstalledBundleIDs
         let signed = filteredAndSortedApps(from: _signedApps).filter {
-            $0.identifier != Bundle.main.bundleIdentifier && _matchesSigningFilter($0)
+            !ZagRunningAppPolicy.isRunning($0.identifier, bundle: Bundle.main.bundleIdentifier) && _matchesSigningFilter($0)
         }
         let installed = signed.filter { app in
             guard let id = app.identifier, !id.isEmpty else { return false }
@@ -310,7 +311,7 @@ struct LibraryView: View {
     // Keep device inventory intact; hide the store's own signed archive from Library.
     private var _filteredSignedApps: [Signed] {
 		filteredAndSortedApps(from: _signedApps).filter {
-			$0.identifier != Bundle.main.bundleIdentifier && _matchesSigningFilter($0)
+			!ZagRunningAppPolicy.isRunning($0.identifier, bundle: Bundle.main.bundleIdentifier) && _matchesSigningFilter($0)
 		}
 	}
 
@@ -689,12 +690,11 @@ struct LibraryView: View {
 
 			let eligibleCount = batch.operation == nil && (_selectedScope == .all || _selectedScope == .installed)
 				? batch.refreshEligibleCount(Array(_signedApps)) : 0
-			if !snapshot.installed.isEmpty || eligibleCount > 0,
-			   _selectedScope == .all || _selectedScope == .installed {
+			if _selectedScope == .all || _selectedScope == .installed {
 				Section {
 					ZagLibraryHeader(
 						title: .localized("Installed"),
-						count: snapshot.installed.count,
+						count: snapshot.installed.count + 1,
 						isCollapsed: _installedCollapsed,
 						trailingTitle: _refreshingNativeApps ? "Cancel" : "Refresh All · \(eligibleCount)",
 						trailingAction: eligibleCount == 0 && !_refreshingNativeApps ? nil : {
@@ -709,6 +709,20 @@ struct LibraryView: View {
 						.listRowBackground(Color.clear)
 
 					if !_installedCollapsed {
+						LibraryCellView(
+							app: runningInstallation.runningApp,
+							isManagedInstalled: true,
+							showsSeparator: !snapshot.installed.isEmpty,
+							runningInstallation: runningInstallation,
+							runningHasUpdate: selfUpdateCoordinator.availableRelease != nil,
+							onRunningUpdate: { _isSelfUpdatePresenting = true },
+							selectedInfoAppPresenting: $_selectedInfoAppPresenting,
+							selectedSigningAppPresenting: $_selectedSigningAppPresenting,
+							selectedInstallAppPresenting: $_selectedInstallAppPresenting,
+							selectedAppUUIDs: $_selectedAppUUIDs
+						)
+						.listRowSeparator(.hidden)
+						.task { await runningInstallation.inspect() }
 					ForEach(Array(snapshot.installed.enumerated()), id: \.element.uuid) { index, app in
 						LibraryCellView(
 							app: app,
@@ -1415,6 +1429,7 @@ extension LibraryView {
 	}
 
 	private func _deleteStoredApp(_ app: AppInfoPresentable) {
+		guard !(app is ZagRunningApp), app.identifier != Bundle.main.bundleIdentifier else { return }
 		if let identifier = app.identifier, !identifier.isEmpty {
 			_clearManagedInstalledMarker(identifier)
 		}
@@ -1422,11 +1437,12 @@ extension LibraryView {
 	}
 
 	private func _requestRemoveManagedApp(_ app: AppInfoPresentable) {
+		guard !(app is ZagRunningApp), app.identifier != Bundle.main.bundleIdentifier else { return }
 		_pendingRemoveApp = AnyApp(base: app)
 	}
 
 	private func _removeManagedApp(_ app: AppInfoPresentable) {
-		guard let identifier = app.identifier, !identifier.isEmpty else {
+		guard let identifier = app.identifier, !identifier.isEmpty, identifier != Bundle.main.bundleIdentifier else {
 			return
 		}
 		guard !_removingBundleIDs.contains(identifier) else {

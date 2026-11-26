@@ -312,12 +312,9 @@ enum ZagNativeAccountInstall {
 				let components = try await Task.detached(priority: .utility) {
 					try runningComponents(certificate: identity.certificate)
 				}.value
-				guard components.count == receipt.profiles.count, components.allSatisfy({ id, evidence in
-					guard let bytes = receipt.profiles.first(where: { $0.bundleIdentifier == id })?.signedEntitlements,
-						  let signed = try? PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any],
-						  let observed = try? PropertyListSerialization.propertyList(from: evidence, format: nil) as? [String: Any] else { return false }
-					return NSDictionary(dictionary: signed).isEqual(to: observed)
-				}) else { throw requiresResign("running app does not match the signing receipt") }
+				guard matchesRunningComponents(components, receipt: receipt) else {
+					throw requiresResign("running app does not match the signing receipt")
+				}
 			}
 			guard receipt.profiles.allSatisfy({ $0.signedEntitlements != nil }) else { throw requiresResign("missing signed component entitlements") }
 			let jobs = ZagInstallJobs.shared
@@ -697,13 +694,16 @@ enum ZagNativeAccountInstall {
 	}
 
 	enum SelfRenewalFailure: LocalizedError {
-		case ownership
+		case ownership, profiles
 		var errorDescription: String? {
-			"Zag Store could not verify a Personal Team signing identity for this installation."
+			switch self {
+			case .ownership: "Zag Store could not match the running code to the original signing identity."
+			case .profiles: "No compatible installed profile covers all components. Recover the original profiles before retrying."
+			}
 		}
 	}
 
-	nonisolated private static func runningComponents(certificate: Data) throws -> [String: Data] {
+	nonisolated static func runningComponents(certificate: Data) throws -> [String: Data] {
 		let root = Bundle.main.bundleURL
 		let components = [root] + ZagFreeAccountSigningAdapter.nestedBundles(in: root).map { root.appendingPathComponent($0) }
 		var evidence: [String: Data] = [:]
@@ -717,6 +717,27 @@ enum ZagNativeAccountInstall {
 			evidence[id] = try ZagEntitlementSet(ZagMachOSignatureInspector.entitlements(at: executable)).data
 		}
 		return evidence
+	}
+
+	nonisolated static func matchesRunningComponents(_ components: [String: Data], receipt: ZagNativeInstalledProfiles) -> Bool {
+		components.count == receipt.profiles.count && components.allSatisfy { id, evidence in
+			guard let bytes = receipt.profiles.first(where: { $0.bundleIdentifier == id })?.signedEntitlements,
+				  let signed = try? PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any],
+				  let observed = try? PropertyListSerialization.propertyList(from: evidence, format: nil) as? [String: Any] else { return false }
+			return NSDictionary(dictionary: signed).isEqual(to: observed)
+		}
+	}
+
+	static func runningSigningScope(signer: Data, team: String) -> ZagSigningScope? {
+		let accounts = (try? ZagNativeAppleIDs.shared.catalog().accounts) ?? []
+		let candidates = accounts.compactMap { account -> ZagSigningScope? in
+			guard account.teams.contains(where: { $0.identifier == team && $0.kind == .personalFree }),
+				  let data = try? secrets.load(.signingPrivateKey, account: account.id, team: team),
+				  let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: data),
+				  identity.certificate == signer else { return nil }
+			return .init(accountID: account.id, teamID: team)
+		}
+		return candidates.count == 1 ? candidates[0] : nil
 	}
 
 	static func verifyRunningInstallation() async throws {
@@ -736,16 +757,8 @@ enum ZagNativeAccountInstall {
 			}.value
 			guard let cert = ZagCertificateInspection(der: signer), let teamID = cert.organizationalUnit,
 				  cert.expiresAt > .now else { throw SelfRenewalFailure.ownership }
-			let accounts = try ZagNativeAppleIDs.shared.catalog().accounts
-			let candidates = accounts.compactMap { account -> ZagSigningScope? in
-				guard account.teams.contains(where: { $0.identifier == teamID && $0.kind == .personalFree }),
-					  hasConnectedAccount(account.id),
-					  let data = try? secrets.load(.signingPrivateKey, account: account.id, team: teamID),
-					  let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: data),
-					  identity.certificate == signer else { return nil }
-				return .init(accountID: account.id, teamID: teamID)
-			}
-			guard candidates.count == 1, let scope = candidates.first else { throw SelfRenewalFailure.ownership }
+			guard let scope = runningSigningScope(signer: signer, team: teamID),
+				  hasConnectedAccount(scope.accountID) else { throw SelfRenewalFailure.ownership }
 			let pairing = ZagRPPairingCore.shared
 			let (device, installed) = try await pairing.signingDeviceInventory()
 			guard let app = installed[identifier], app.version == Bundle.main.version,
@@ -768,7 +781,7 @@ enum ZagNativeAccountInstall {
 						try? ZagProfileOnlyRenewal.validate($0.1, component: component, team: teamID,
 							certificate: signer, udid: device.udid)
 					}
-					guard let profile = matches.max(by: { $0.expiresAt < $1.expiresAt }) else { throw SelfRenewalFailure.ownership }
+					guard let profile = matches.max(by: { $0.expiresAt < $1.expiresAt }) else { throw SelfRenewalFailure.profiles }
 					if id == identifier { main = profile }
 					component.uuid = profile.uuid
 					component.expiresAt = profile.expiresAt

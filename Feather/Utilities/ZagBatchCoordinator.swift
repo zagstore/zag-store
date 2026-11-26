@@ -40,14 +40,14 @@ final class ZagBatchCoordinator: ObservableObject {
 		Task { _ = await run(operation, origin: origin) }
 	}
 
-	func run(_ operation: ZagBatchOperation, origin: ZagBatchOrigin) async -> Report {
+	func run(_ operation: ZagBatchOperation, origin: ZagBatchOrigin, only identifier: String? = nil) async -> Report {
 		guard reservation.begin(operation) else { return .busy(operation) }
 		completed = 0
 		total = 0
 		defer { reservation.finish() }
 
 		let report = await Self.$allowsForegroundInteraction.withValue(origin != .shortcut && origin != .automatic) {
-			await execute(operation, origin: origin)
+			await execute(operation, origin: origin, only: identifier)
 		}
 		if !report.diagnostics.isEmpty {
 			UserDefaults.standard.set(report.diagnostics, forKey: "ZagNativeSigningDiagnostics")
@@ -66,7 +66,7 @@ final class ZagBatchCoordinator: ObservableObject {
 		return report
 	}
 
-	private func execute(_ operation: ZagBatchOperation, origin: ZagBatchOrigin) async -> Report {
+	private func execute(_ operation: ZagBatchOperation, origin: ZagBatchOrigin, only identifier: String?) async -> Report {
 		if origin == .automatic, ZagNetworkPath.shared.summary == "Offline" {
 			return .attention(operation, "The network is unavailable.")
 		}
@@ -82,13 +82,15 @@ final class ZagBatchCoordinator: ObservableObject {
 		do {
 			switch operation {
 			case .refresh:
+				await ZagRunningInstallation.shared.inspect()
 				let request = Signed.fetchRequest()
 				request.sortDescriptors = [NSSortDescriptor(keyPath: \Signed.date, ascending: false)]
 				let items = refreshItems(try Storage.shared.context.fetch(request), automatic: origin == .automatic)
+					.filter { identifier == nil || $0.app.identifier == identifier }
 				guard !items.isEmpty else {
 					return .init(title: operation.title, message: "No eligible apps to refresh.", needsAttention: false)
 				}
-				return await refresh(items, automatic: origin == .automatic)
+				return await refresh(items, automatic: origin == .automatic, interactive: identifier != nil && origin == .inApp)
 			case .update:
 				return try await update(origin: origin)
 			}
@@ -119,7 +121,8 @@ final class ZagBatchCoordinator: ObservableObject {
 
 		let manager = ZagUpdateTransactionManager.shared
 		let pending = updates.visibleUpdates.filter {
-			manager.stage(for: $0) == nil || manager.isRetryable($0)
+			$0.installedBundleID != Bundle.main.bundleIdentifier &&
+				(manager.stage(for: $0) == nil || manager.isRetryable($0))
 		}
 		total = pending.count
 		guard !pending.isEmpty else {
@@ -220,7 +223,7 @@ final class ZagBatchCoordinator: ObservableObject {
 
 	private struct CertificateRefresh {
 		let certificate: CertificatePair
-		let record: Signed
+		let record: Signed?
 		let source: URL
 		let current: ZagInstallExpectation
 		let replacement: ZagInstallExpectation
@@ -229,7 +232,8 @@ final class ZagBatchCoordinator: ObservableObject {
 		let signer: Data
 		let entitlementsByComponent: [String: ZagEntitlementSet]
 		private var refreshedProfile: URL {
-			ZagCertificateProfileReceipt.location(in: source.deletingLastPathComponent())
+			record == nil ? ZagCertificateProfileReceipt.runningLocation :
+				ZagCertificateProfileReceipt.location(in: source.deletingLastPathComponent())
 		}
 
 		private static func entitlements(in bundle: Bundle, signedBy signer: Data) -> ZagEntitlementSet? {
@@ -243,16 +247,33 @@ final class ZagBatchCoordinator: ObservableObject {
 		@MainActor
 		init(_ app: Signed) throws(RefreshSkip) {
 			let storage = Storage.shared
-			guard let recorded = app.certificate, !recorded.revoked, storage.getFile(.certificate, from: recorded) != nil else {
-				throw RefreshSkip("Its recorded certificate is unavailable.")
+			guard let recorded = app.certificate, let source = storage.getAppDirectory(for: app) else {
+				throw RefreshSkip("The signed archive or recorded certificate is unavailable.")
 			}
-			guard let source = storage.getAppDirectory(for: app),
+			try self.init(app: app, record: app, source: source, recorded: recorded)
+		}
+
+		@MainActor
+		init(running app: ZagRunningApp, recorded: CertificatePair) throws(RefreshSkip) {
+			try self.init(app: app, record: nil, source: Bundle.main.bundleURL, recorded: recorded)
+		}
+
+		@MainActor
+		private init(app: AppInfoPresentable, record: Signed?, source: URL, recorded: CertificatePair) throws(RefreshSkip) {
+			let storage = Storage.shared
+			guard !recorded.revoked, storage.getFile(.certificate, from: recorded) != nil,
 				  let bundle = Bundle(url: source), let id = app.identifier, bundle.bundleIdentifier == id,
 				  let currentBytes = try? Data(contentsOf: source.appendingPathComponent("embedded.mobileprovision")),
 				  let embeddedProfile = try? ZagIssuedProfile(profileData: currentBytes) else {
-				throw RefreshSkip("The signed archive or its original profile is unavailable.")
+				throw RefreshSkip("The original certificate or profile is unavailable.")
 			}
-			let renewed = ZagCertificateProfileReceipt.load(for: app).flatMap { try? ZagCMSVerifier.verify($0.profile).get() }
+			let renewed = ZagCertificateProfileReceipt.load(for: app).flatMap { receipt -> ZagCertificateProfileReceipt? in
+				guard let running = app as? ZagRunningApp else { return receipt }
+				guard receipt.runningBundleIdentifier == running.identifier, receipt.runningVersion == running.version,
+					  receipt.runningBuild == running.build,
+					  receipt.effectiveExpiration == ZagRunningInstallation.shared.expiry else { return nil }
+				return receipt
+			}.flatMap { try? ZagCMSVerifier.verify($0.profile).get() }
 				.flatMap { try? ZagIssuedProfile(profileData: $0) }
 			let currentProfile = renewed ?? embeddedProfile
 
@@ -331,7 +352,7 @@ final class ZagBatchCoordinator: ObservableObject {
 					allowsWildcardProfile: true)
 			}
 			self.certificate = candidate.0
-			self.record = app
+			self.record = record
 			self.source = source
 			self.current = expectation(currentProfile)
 			self.replacement = expectation(candidate.2)
@@ -367,13 +388,14 @@ final class ZagBatchCoordinator: ObservableObject {
 				}
 				let jobs = ZagInstallJobs.shared
 				try jobs.checkpoint(job)
-				guard !record.isDeleted, !certificate.isDeleted, !certificate.revoked else {
+				guard record?.isDeleted != true, !certificate.isDeleted, !certificate.revoked else {
 					throw RefreshSkip("The signing certificate is unavailable.")
 				}
 				try jobs.beginInstalling(job)
 				let readback: [Data]
 				do { readback = try await ZagNativeAccountInstall.RefreshCoordinator.installAndReadBack([replacementBytes]) }
 				catch where error.localizedDescription.localizedCaseInsensitiveContains("misagent over RSD failed: service not found") {
+					guard record != nil else { throw RefreshSkip("This iPhone cannot update the running app’s profile in place. Use the original signing identity to recover.") }
 					// An explicitly unsupported service can use the established full-signing path.
 					jobs.advance(job, to: .signing)
 					try await renewBySigning(job: job)
@@ -384,10 +406,21 @@ final class ZagBatchCoordinator: ObservableObject {
 					  case .verified(let expiry, let certExpiry) = ZagInstalledProfileCheck.verify(replacement, installedProfiles: readback),
 					  ZagNativeSigningPipeline.extendsValidity(previousProfile: oldExpiry, newProfile: expiry,
 						certificate: certExpiry, now: Date()) else { throw ZagProfileOnlyRenewal.Failure.readback }
-				let receipt = ZagCertificateProfileReceipt(profile: replacementBytes, effectiveExpiration: min(expiry, certExpiry))
+				var receipt = ZagCertificateProfileReceipt(profile: replacementBytes, effectiveExpiration: min(expiry, certExpiry))
+				if record == nil {
+					let running = ZagRunningInstallation.shared.runningApp
+					receipt.runningBundleIdentifier = running.identifier
+					receipt.runningVersion = running.version
+					receipt.runningBuild = running.build
+				}
+				try FileManager.default.createDirectory(at: refreshedProfile.deletingLastPathComponent(), withIntermediateDirectories: true)
 				try JSONEncoder().encode(receipt).write(to: refreshedProfile, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-				record.certificate = certificate
-				try Storage.shared.context.save()
+				if let record {
+					record.certificate = certificate
+					try Storage.shared.context.save()
+				} else {
+					ZagRunningInstallation.shared.certificateDidRenew(to: receipt.effectiveExpiration)
+				}
 			}
 		}
 
@@ -407,7 +440,8 @@ final class ZagBatchCoordinator: ObservableObject {
 				}
 				let jobs = ZagInstallJobs.shared
 				try jobs.checkpoint(job)
-				guard !record.isDeleted, !certificate.isDeleted, !certificate.revoked else { throw RefreshSkip("The signing record or its certificate is unavailable.") }
+				guard let record, !record.isDeleted, record.identifier != Bundle.main.bundleIdentifier,
+					  !certificate.isDeleted, !certificate.revoked else { throw RefreshSkip("The signing record or its certificate is unavailable.") }
 				let staging = source.deletingLastPathComponent().appendingPathComponent(UUID().uuidString, isDirectory: true)
 				try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
 				defer { try? FileManager.default.removeItem(at: staging) }
@@ -476,7 +510,7 @@ final class ZagBatchCoordinator: ObservableObject {
 	}
 
 	private struct RefreshItem {
-		let app: Signed
+		let app: AppInfoPresentable
 		let eligibility: Result<RefreshMethod, RefreshSkip>
 		var name: String { app.name ?? "App" }
 	}
@@ -494,11 +528,12 @@ final class ZagBatchCoordinator: ObservableObject {
 		var seen: Set<String> = []
 		if !automatic { _certificateRefreshCache.update(records: Storage.shared.getAllCertificates()) }
 		let now = Date()
-		return rows.compactMap { row in
+		var items: [RefreshItem] = rows.compactMap { row in
 			guard let id = row.identifier, !ZagUpdateTransactionManager.shared.isPendingInstallationSigned(uuid: row.uuid)
 			else { return nil }
-			let selfApp = id == Bundle.main.bundleIdentifier
+			let selfApp = ZagRunningAppPolicy.isRunning(id, bundle: Bundle.main.bundleIdentifier)
 			guard selfApp || installed.contains(id) else { return nil }
+			if selfApp, row.uuid != ZagRunningInstallation.shared.nativeUUID { return nil }
 			let entry = ZagNativeAppInventory.entry(row)
 			guard entry?.pendingInstall == nil, seen.insert(id).inserted else { return nil }
 			let eligibility = Result<RefreshMethod, RefreshSkip> { () throws(RefreshSkip) -> RefreshMethod in
@@ -527,14 +562,52 @@ final class ZagBatchCoordinator: ObservableObject {
 			if case .failure = eligibility { return nil }
 			return RefreshItem(app: row, eligibility: eligibility)
 		}
+		if !automatic, let plan = runningCertificatePlan() {
+			items.insert(.init(app: ZagRunningInstallation.shared.runningApp, eligibility: .success(.certificate(plan))), at: 0)
+		}
+		return items
 		#else
 		return []
 		#endif
 	}
 
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private var runningPlanCache: (key: String, plan: CertificateRefresh?)?
+
+	private func runningCertificatePlan() -> CertificateRefresh? {
+		let status = ZagRunningInstallation.shared
+		guard status.method == .imported, let cert = status.importedCertificate,
+			  ZagRPPairingCore.shared.hasSavedPairing else { return nil }
+		let catalog = Storage.shared.getAllCertificates().map {
+			let path = Storage.shared.getFile(.provision, from: $0)
+			let modified = try? path?.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+			return "\($0.objectID.uriRepresentation())|\($0.revoked)|\(String(describing: modified))"
+		}.joined(separator: ";")
+		let key = "\(catalog)|\(String(describing: status.expiry))|\(String(describing: ZagRPPairingCore.shared.pairedIdentity?.udid))"
+		if let cached = runningPlanCache, cached.key == key { return cached.plan }
+		let plan = try? CertificateRefresh(running: status.runningApp, recorded: cert)
+		runningPlanCache = (key, plan)
+		return plan
+	}
+	#endif
+
+	func canRefreshRunning() -> Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return ZagRPPairingCore.shared.hasSavedPairing &&
+			(ZagRunningInstallation.shared.nativeUUID != nil || runningCertificatePlan() != nil)
+		#else
+		return false
+		#endif
+	}
+
+	func refreshRunning() async {
+		guard let identifier = Bundle.main.bundleIdentifier else { return }
+		_ = await run(.refresh, origin: .inApp, only: identifier)
+	}
+
 	func refreshEligibleCount(_ rows: [Signed]) -> Int { refreshItems(rows).count }
 
-	private func refresh(_ items: [RefreshItem], automatic: Bool) async -> Report {
+	private func refresh(_ items: [RefreshItem], automatic: Bool, interactive: Bool) async -> Report {
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		guard ZagNativeAccountInstall.RefreshCoordinator.beginBatch() else { return .busy(.refresh) }
 		total = items.count
@@ -572,12 +645,12 @@ final class ZagBatchCoordinator: ObservableObject {
 							try jobs.checkpoint(job)
 							switch try item.eligibility.get() {
 							case .appleID(let scope):
-								guard ZagNativeAccountInstall.hasConnectedAccount(scope.accountID) else {
+								guard interactive || ZagNativeAccountInstall.hasConnectedAccount(scope.accountID) else {
 									return .skipped("Sign in to this app’s Apple ID, then try Refresh.")
 								}
 								guard case .verified = try await ZagNativeAccountInstall.runInline(item.app, job: job,
 									options: OptionsManager.shared.appleIDSigningDefaults, renew: true,
-									interactive: false, refreshCoordinator: coordinator, profileOnly: automatic) else {
+									interactive: interactive, refreshCoordinator: coordinator, profileOnly: automatic) else {
 									throw ZagNativeAppInventory.Failure.unverified
 								}
 							case .certificate(let plan): try await plan.renew(job: job)

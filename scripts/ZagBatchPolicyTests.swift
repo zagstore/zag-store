@@ -69,6 +69,22 @@ struct ZagBatchPolicyTests {
 		let near = ZagAppleIDMaintenancePolicy.reminders(expiring: [now + 8 * 3600], now: now)
 		precondition(Set(near.keys.map(\.threshold)) == [6, 0])
 		precondition(ZagAppleIDMaintenancePolicy.reminders(expiring: [now - 1], now: now).isEmpty)
+		precondition(ZagRunningSigningMethod.identify(imported: true, personal: false, paid: true) == .imported)
+		precondition(ZagRunningSigningMethod.identify(imported: false, personal: true, paid: false) == .personal)
+		precondition(ZagRunningSigningMethod.identify(imported: false, personal: false, paid: true) == .paid)
+		precondition(ZagRunningSigningMethod.identify(imported: false, personal: false, paid: false, distribution: true) == .certificate)
+		precondition(ZagRunningSigningMethod.identify(imported: false, personal: true, paid: true) == .unknown)
+		precondition(ZagRunningSigningMethod.identify(imported: false, personal: false, paid: false) == .unknown)
+		let running = "com.cwd43.gu29.TEAM123456"
+		let stored = ["com.example.one", running, "com.example.two", "com.cwd43.gu29", running]
+		for sorted in [stored, stored.sorted(), stored.sorted(by: >), Array(stored.reversed())] {
+			let installed = [running] + sorted.filter { !ZagRunningAppPolicy.isRunning($0, bundle: running) }
+			precondition(installed.first == running && installed.filter { $0 == running }.count == 1)
+			precondition(installed.contains("com.cwd43.gu29"))
+		}
+		precondition(!ZagRunningAppPolicy.isRunning(nil, bundle: nil))
+		print("PASS: running signing classification and mapped pin deduplication")
+
 		print("PASS: automatic renewal window, retry limits, silent results and expiration reminder reconciliation")
 
 		print("PASS: shared reservation, cancellation, cold/warm request consumption, and completion policies")

@@ -85,11 +85,7 @@ enum ZagNativeAppInventory {
 				  value.installation.record.owner != nil else { return nil }
 			let id = value.installation.record.bundleIdentifier
 			let isSelf = id == Bundle.main.bundleIdentifier
-			if isSelf {
-				let identity = value.installation.executableIdentity
-				guard identity?.version == Bundle.main.version,
-					  identity?.build == Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else { return nil }
-			}
+			if isSelf, value.uuid != ZagRunningInstallation.shared.nativeUUID { return nil }
 			guard id == row.identifier, installed.contains(id) || isSelf,
 				  seen.insert(id).inserted else { return nil }
 			return value

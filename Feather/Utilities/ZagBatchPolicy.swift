@@ -78,3 +78,26 @@ struct ZagBatchLaunchRequest {
 		return pending
 	}
 }
+
+enum ZagRunningSigningMethod: String {
+	case personal = "Free Apple ID"
+	case paid = "Apple Developer"
+	case imported = "Imported Certificate"
+	case certificate = "Certificate"
+	case unknown = "Unknown"
+
+	static func identify(imported: Bool, personal: Bool, paid: Bool, distribution: Bool = false) -> Self {
+		if imported { return .imported }
+		if personal != paid { return personal ? .personal : .paid }
+		return distribution && !personal && !paid ? .certificate : .unknown
+	}
+}
+
+/// The pin represents the current Bundle, independent of the order and
+/// provenance of stored signing archives.
+enum ZagRunningAppPolicy {
+	static func isRunning(_ identifier: String?, bundle: String?) -> Bool {
+		guard let identifier, let bundle else { return false }
+		return identifier == bundle
+	}
+}

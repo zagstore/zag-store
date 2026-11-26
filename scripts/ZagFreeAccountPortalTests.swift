@@ -113,6 +113,7 @@ extension Result where Failure == ZagProvisioningFailure {
 	}
 
 	static func main() async {
+		distributionSignerLookup()
 		await nativeCertificateInventory()
 		await nativeInstallAndRestart()
 		await nativeAppIDsAcrossAccounts()
@@ -124,6 +125,22 @@ extension Result where Failure == ZagProvisioningFailure {
 		await failures()
 		await liveDisabled()
 		print("SUCCESS: \(passed) free-account provisioning checks passed")
+	}
+
+	static func distributionSignerLookup() {
+		let certificate = try! Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+		let cert = try! ZagDER.single(certificate)
+		var tbs = try! cert.children()[0].children()
+		if tbs.first?.tag == 0xa0 { tbs.removeFirst() }
+		let signer = ZagDER.sequence([ZagDER.integer(Data([1])), ZagDER.sequence([tbs[2].encoded, tbs[0].encoded])])
+		let oid = ZagDER.objectIdentifier("1.2.840.113549.1.7.2")
+		let parts = ZagDER.integer(Data([1])) + ZagDER.set([]) + ZagDER.sequence([]) +
+			ZagDER.element(0xa0, certificate) + ZagDER.set([signer])
+		func indefinite(_ tag: UInt8, _ body: Data) -> Data { Data([tag, 0x80]) + body + Data([0, 0]) }
+		let ber = indefinite(0x30, oid + indefinite(0xa0, indefinite(0x30, parts)))
+		check(ZagCMSVerifier.embeddedSigner(ber) == certificate, "BER code-signature wrappers preserve exact signer DER")
+		check(ZagCMSVerifier.embeddedSigner(Data(ber.dropLast())) == nil, "truncated BER signer data is refused")
+		check(ZagCMSVerifier.embeddedSigner(ber + Data([0])) == nil, "trailing BER signer data is refused")
 	}
 
 	static func nativeCertificateInventory() async {

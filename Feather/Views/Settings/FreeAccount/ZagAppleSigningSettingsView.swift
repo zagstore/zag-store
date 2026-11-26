@@ -10,8 +10,7 @@ struct ZagAppleSigningSettingsView: View {
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 	@State private var deviceCount: Int?
 	@State private var checkingDevice = false
-	@State private var checkingSelf = false
-	@State private var selfInventoryRevision = 0
+	@ObservedObject private var runningInstallation = ZagRunningInstallation.shared
 	#endif
 
 	var body: some View {
@@ -36,31 +35,19 @@ struct ZagAppleSigningSettingsView: View {
 						  systemImage: pairing.hasSavedPairing ? "checkmark.circle.fill" : "iphone")
 				}
 				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-				Section {
-					let _ = selfInventoryRevision
-					let receipt = Bundle.main.bundleIdentifier.flatMap { ZagNativeAppInventory.entry(bundleIdentifier: $0) }
-					let expiry = receipt.flatMap { entry -> Date? in
-						let identity = entry.installation.executableIdentity
-						guard entry.pendingInstall == nil, entry.installation.record.expiryVerified == true,
-							  identity?.version == Bundle.main.version,
-							  identity?.build == Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else { return nil }
-						return entry.installation.record.expiresAt
-					}
-					LabeledContent("Verified expiration", value: expiry?.formatted() ?? "Unknown")
-					Button(checkingSelf ? "Verifying" : "Verify This Installation") {
-						checkingSelf = true
-						Task {
-							defer { checkingSelf = false; selfInventoryRevision += 1 }
-							do { try await ZagNativeAccountInstall.verifyRunningInstallation() }
-							catch { failure = "Zag Store could not verify this installation. Check pairing and sign in with the original Apple ID." }
+				Section("Zag Store Installation") {
+					LabeledContent("Signing Method", value: runningInstallation.method.rawValue)
+					LabeledContent("Verified expiration", value: runningInstallation.expiry?.formatted() ?? "Unknown")
+					LabeledContent("Profile renewal", value: ZagBatchCoordinator.shared.canRefreshRunning() ? "Available" : "Unavailable")
+					if let recovery = runningInstallation.recovery {
+						Text(recovery).font(.footnote).foregroundStyle(.secondary)
+						Button("Retry Verification") {
+							Task { await runningInstallation.inspect(verifyPersonal: true, retry: true) }
 						}
+						.disabled(runningInstallation.inspecting)
 					}
-					.disabled(checkingSelf || !pairing.hasSavedPairing)
-				} header: {
-					Text("Zag Store Renewal")
-				} footer: {
-					Text("Verified Personal Team installations can renew through Refresh All. If Zag Store has expired, use the original signer and bundle identifier to recover access. A different signing identity may affect local data and Keychain access.")
 				}
+				.task { await runningInstallation.inspect(verifyPersonal: true) }
 				Section {
 					LabeledContent("Verified free-profile apps", value: deviceCount.map(String.init) ?? "Unknown")
 					LabeledContent("Installation capacity", value: "Unknown")
@@ -73,7 +60,7 @@ struct ZagAppleSigningSettingsView: View {
 							catch { deviceCount = nil; failure = "Check installation pairing and the device connection, then try again." }
 						}
 					}
-					.disabled(checkingDevice || !pairing.hasSavedPairing)
+					.disabled(checkingDevice || runningInstallation.inspecting || !pairing.hasSavedPairing)
 				} header: {
 					Text("Device Capacity")
 				} footer: {
@@ -88,7 +75,7 @@ struct ZagAppleSigningSettingsView: View {
 		.tint(Color(hex: themeColorHex))
 		.onAppear { reload() }
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-		.onReceive(ZagNativeAppInventory.changes) { _ in selfInventoryRevision += 1; deviceCount = nil }
+		.onReceive(ZagNativeAppInventory.changes) { _ in deviceCount = nil }
 		#endif
 		.alert("Apple ID", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
 			Button("OK", role: .cancel) {}

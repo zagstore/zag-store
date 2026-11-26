@@ -167,6 +167,11 @@ enum ZagCMSVerifier {
 
 	/// Identifies the signer recorded in a detached code-signature CMS.
 	static func embeddedSigner(_ cms: Data) -> Data? {
+		if let signer = strictEmbeddedSigner(cms) { return signer }
+		return normalizeSignerContainer(cms).flatMap(strictEmbeddedSigner)
+	}
+
+	private static func strictEmbeddedSigner(_ cms: Data) -> Data? {
 		guard let parts = try? ZagDER.single(cms).children(), parts.count == 2,
 			  ZagDER.decodeObjectIdentifier(parts[0]) == oidSignedData,
 			  let signed = try? parts[1].children().first?.children(),
@@ -174,6 +179,62 @@ enum ZagCMSVerifier {
 			  let signer = try? signed.last(where: { $0.tag == 0x31 })?.children().first?.children(),
 			  signer.count >= 2 else { return nil }
 		return signerCertificate(matching: signer[1], in: certificates.map(\.encoded))
+	}
+
+	/// Distribution signatures can use indefinite BER wrappers. Normalize
+	/// structure only for signer lookup in code signatures. Profile signature
+	/// verification continues to use the original bytes and strict DER.
+	private static func normalizeSignerContainer(_ data: Data) -> Data? {
+		guard data.count <= 2 * 1024 * 1024 else { return nil }
+		let bytes = [UInt8](data)
+		var cursor = 0
+		var budget = 16_384
+
+		func element(limit: Int, depth: Int) throws -> Data {
+			guard depth < 32, budget > 0, cursor + 2 <= limit else { throw ZagDER.ParseError.truncated }
+			budget -= 1
+			let start = cursor
+			let tag = bytes[cursor]
+			let firstLength = Int(bytes[cursor + 1])
+			cursor += 2
+			guard tag != 0, tag & 0x1f != 0x1f else { throw ZagDER.ParseError.unsupportedLength }
+			let constructed = tag & 0x20 != 0
+
+			if firstLength == 0x80 {
+				guard constructed else { throw ZagDER.ParseError.unsupportedLength }
+				var body = Data()
+				while cursor + 2 <= limit {
+					if bytes[cursor] == 0, bytes[cursor + 1] == 0 {
+						cursor += 2
+						return ZagDER.element(tag, body)
+					}
+					body.append(try element(limit: limit, depth: depth + 1))
+				}
+				throw ZagDER.ParseError.truncated
+			}
+			var length = firstLength
+			if firstLength > 0x80 {
+				let count = firstLength & 0x7f
+				guard count <= 4, cursor + count <= limit else { throw ZagDER.ParseError.unsupportedLength }
+				length = bytes[cursor ..< cursor + count].reduce(0) { ($0 << 8) | Int($1) }
+				cursor += count
+			}
+			guard length <= limit - cursor else { throw ZagDER.ParseError.truncated }
+			let end = cursor + length
+			if !constructed {
+				cursor = end
+				return Data(bytes[start ..< end])
+			}
+			let bodyStart = cursor
+			var body = Data()
+			while cursor < end { body.append(try element(limit: end, depth: depth + 1)) }
+			// Preserve byte-for-byte DER certificates and issuer names.
+			if body.elementsEqual(bytes[bodyStart ..< end]) { return Data(bytes[start ..< end]) }
+			return ZagDER.element(tag, body)
+		}
+
+		guard let normalized = try? element(limit: bytes.count, depth: 0), cursor == bytes.count else { return nil }
+		return normalized
 	}
 
 	/// Finds the embedded certificate whose issuer+serial match the SignerInfo

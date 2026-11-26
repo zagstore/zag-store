@@ -36,6 +36,9 @@ struct LibraryCellView: View {
 	var onSignedForInstall: ((String) -> Void)? = nil
 	var onInstallCompleted: ((AppInfoPresentable) async -> Bool)? = nil
 	var onInstallFailedAfterSigning: ((String) -> Void)? = nil
+	var runningInstallation: ZagRunningInstallation? = nil
+	var runningHasUpdate = false
+	var onRunningUpdate: (() -> Void)? = nil
 
 	@State private var isDeleteConfirmationPresented = false
 	@State private var confirmSeparateSigning = false
@@ -138,7 +141,7 @@ struct LibraryCellView: View {
 		let isEditing = editMode?.wrappedValue == .active
 
 		HStack(spacing: 18) {
-			if isEditing {
+			if isEditing, runningInstallation == nil {
 				Button {
 					_toggleSelection()
 				} label: {
@@ -161,14 +164,13 @@ struct LibraryCellView: View {
 			HStack(spacing: 10) {
 				ZStack(alignment: .bottomLeading) {
 					FRAppIconView(
-						app: app,
+						app: runningInstallation == nil ? app : nil,
 						size: 62
 					)
 
-					ZagLibraryRepositoryBadge(
-						bundleID: app.identifier,
-						onTap: onRepositoryBadgeTap
-					)
+					if runningInstallation == nil {
+						ZagLibraryRepositoryBadge(bundleID: app.identifier, onTap: onRepositoryBadgeTap)
+					}
 				}
 
 				NBTitleWithSubtitleView(
@@ -227,13 +229,13 @@ struct LibraryCellView: View {
 		.contentShape(Rectangle())
 		.onTapGesture {
 			if isEditing {
-				_toggleSelection()
+				if runningInstallation == nil { _toggleSelection() }
 			} else {
 				selectedInfoAppPresenting = AnyApp(base: app)
 			}
 		}
 		.swipeActions {
-			if !isEditing {
+			if !isEditing, runningInstallation == nil {
 				_swipeActions(for: app)
 			}
 		}
@@ -241,15 +243,20 @@ struct LibraryCellView: View {
 			if !isEditing {
 				_contextActions(for: app)
 
-				ZagLibraryRepositorySourceLabel(bundleID: app.identifier)
-
-				Divider()
-
-				_contextActionsExtra(for: app)
-
-				Divider()
-
-				_actions(for: app)
+				if runningInstallation != nil {
+					if ZagBatchCoordinator.shared.canRefreshRunning() {
+						Button("Refresh", systemImage: "arrow.clockwise") {
+							Task { await ZagBatchCoordinator.shared.refreshRunning() }
+						}
+					}
+					if runningHasUpdate { Button("Update", systemImage: "arrow.down.circle") { onRunningUpdate?() } }
+				} else {
+					ZagLibraryRepositorySourceLabel(bundleID: app.identifier)
+					Divider()
+					_contextActionsExtra(for: app)
+					Divider()
+					_actions(for: app)
+				}
 			}
 		}
 		.alert("Sign With a Different Apple ID?", isPresented: $confirmSeparateSigning) {
@@ -278,6 +285,9 @@ struct LibraryCellView: View {
 
 	private var _desc: String {
 		let version = app.version
+		if let running = app as? ZagRunningApp, let version, let build = running.build {
+			return "\(version) (\(build))"
+		}
 
 		let storedDate: Date?
 		if let signed = app as? Signed {
@@ -460,20 +470,28 @@ extension LibraryCellView {
 		for app: AppInfoPresentable
 	) -> some View {
 		if app.isSigned {
-			let certificate = _isNativeAccountApp ? nil : Storage.shared.getCertificate(from: app)
+			let status = runningInstallation
+			let certificate = status == nil && !_isNativeAccountApp ? Storage.shared.getCertificate(from: app) : nil
 			let update = isManagedInstalled ? availableUpdate : nil
 			let certRevoked = certificate?.revoked == true
-			let expiry = _isNativeAccountApp ? _nativeProfileExpiry : (ZagCertificateProfileReceipt.load(for: app)?.effectiveExpiration ?? certificate?.expiration)
+			let expiry = status != nil ? status?.expiry :
+				(_isNativeAccountApp ? _nativeProfileExpiry : (ZagCertificateProfileReceipt.load(for: app)?.effectiveExpiration ?? certificate?.expiration))
 			ZStack {
 				// One control: Install contracts into the progress circle and
 				// expands back into Install, Update or Open.
 				ZagInstallControl(
-					mode: _signedControlMode(update: update),
-					action: { _signedControlTap(update: update) },
+					mode: status == nil ? _signedControlMode(update: update) : _runningControlMode,
+					action: {
+						if status == nil { _signedControlTap(update: update) }
+						else if jobs.job(_jobKey) == nil {
+							if runningHasUpdate { onRunningUpdate?() }
+							else if let id = app.identifier { UIApplication.openApp(with: id) }
+						}
+					},
 					cancelAction: _canCancelFromControl ? _requestCancel : nil
 				)
 
-				if let caption = _signedCaption(update: update) {
+				if let caption = status == nil ? _signedCaption(update: update) : _jobCaption {
 					_progressCaption(caption)
 				} else if certRevoked {
 					Text(.localized("Revoked"))
@@ -487,7 +505,8 @@ extension LibraryCellView {
 						.lineLimit(1)
 						.offset(y: 24)
 				} else if let expiry {
-					_expiryCaption(expiry, appleID: _isNativeAccountApp)
+					_expiryCaption(expiry, appleID: status.map { $0.method == .personal } ?? _isNativeAccountApp,
+						showIdentity: status?.method != .unknown)
 				}
 			}
 			.frame(width: ZagListLayout.actionWidth, height: ZagListLayout.compactRowHeight, alignment: .center)
@@ -523,6 +542,11 @@ extension LibraryCellView {
 		#endif
 	}
 
+	private var _runningControlMode: ZagInstallControlMode {
+		_runningMode ?? .pill(.init(title: runningHasUpdate ? "Update" : "Open",
+			accessibilityLabel: runningHasUpdate ? "Update Zag Store" : "Open Zag Store"))
+	}
+
 	private var _runningMode: ZagInstallControlMode? {
 		guard let job = jobs.job(_jobKey) else { return nil }
 		return job.nativeCaption != nil && job.progress > 0 ? .progress(job.progress, .none) : .spinner(.none)
@@ -533,7 +557,7 @@ extension LibraryCellView {
 			.foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.82).frame(width: ZagListLayout.actionWidth, height: 11).offset(y: 26)
 	}
 
-	private func _expiryCaption(_ expiry: Date, appleID: Bool) -> some View {
+	private func _expiryCaption(_ expiry: Date, appleID: Bool, showIdentity: Bool = true) -> some View {
 		let now = Date()
 		let info = expiry.expirationInfo(from: now)
 		let color: Color
@@ -546,8 +570,10 @@ extension LibraryCellView {
 		} else { color = info.color }
 		return HStack(alignment: .firstTextBaseline, spacing: 2) {
 			Group {
-				if appleID { ZagAppleIDMark() }
-				else { Image(systemName: "shield").accessibilityHidden(true) }
+				if showIdentity {
+					if appleID { ZagAppleIDMark() }
+					else { Image(systemName: "shield").accessibilityHidden(true) }
+				}
 			}
 			.alignmentGuide(.firstTextBaseline) { $0[.firstTextBaseline] + 0.75 }
 			Text(info.formatted)
@@ -557,7 +583,7 @@ extension LibraryCellView {
 		.lineLimit(1)
 		.offset(y: 26)
 		.accessibilityElement(children: .ignore)
-		.accessibilityLabel(Text("\(appleID ? "Apple ID" : "Certificate"), \(info.formatted)"))
+		.accessibilityLabel(Text(showIdentity ? "\(appleID ? "Apple ID" : "Certificate"), \(info.formatted)" : info.formatted))
 	}
 
 	private func _signSeparateCopy() {
