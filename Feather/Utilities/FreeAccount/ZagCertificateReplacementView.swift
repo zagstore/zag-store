@@ -121,7 +121,8 @@ final class ZagCertificateReplacementModel: ObservableObject {
 	static func inventory(team: String, expectedScope: ZagSigningScope? = nil) -> ZagCertificateReplacementModel {
 		let consent = ZagMutationConsentCoordinator()
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-		if let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()),
+		if let id = expectedScope?.accountID ?? (try? ZagNativeAppleIDs.shared.catalog().defaultID),
+		   let token = ZagNativeAppleIDs.shared.connectedToken(id),
 		   case let scope = ZagSigningAuthorization.nativeAccount(token: token, teamID: team).scope,
 		   expectedScope == nil || expectedScope == scope {
 			let activeGuard = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: (try? nativeIdentity(scope))?.serialNumber)
@@ -135,7 +136,7 @@ final class ZagCertificateReplacementModel: ObservableObject {
 		#endif
 		let activeGuard = ZagActiveCertificateGuard(activeSHA1: nil, activeSerial: nil)
 		#if canImport(ZagAppleAuth)
-		let portal: ZagReplacementPortal = expectedScope == nil ? ZagNativeDeveloperPortal.readOnlyInventory() : ZagDisabledReplacementPortal()
+		let portal: ZagReplacementPortal = ZagDisabledReplacementPortal()
 		#else
 		let portal: ZagReplacementPortal = ZagDisabledReplacementPortal()
 		#endif

@@ -38,6 +38,7 @@ struct LibraryCellView: View {
 	var onInstallFailedAfterSigning: ((String) -> Void)? = nil
 
 	@State private var isDeleteConfirmationPresented = false
+	@State private var confirmSeparateSigning = false
 	@State private var choosingSigningMethod = false
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 	private var _nativeEntry: ZagNativeAppInventory.Entry? { ZagNativeAppInventory.entry(app) }
@@ -235,6 +236,12 @@ struct LibraryCellView: View {
 				_actions(for: app)
 			}
 		}
+		.alert("Sign With a Different Apple ID?", isPresented: $confirmSeparateSigning) {
+			Button("Choose Apple ID") { _signSeparateCopy() }
+			Button("Cancel", role: .cancel) {}
+		} message: {
+			Text("The new Apple ID signs a separate copy with different identifiers. The current app stays installed. Its app data and App Group access will stay with the original copy.")
+		}
 		.alert(.localized("Delete Stored Copy?"), isPresented: $isDeleteConfirmationPresented) {
 			Button(.localized("Delete"), role: .destructive) {
 				onDeleteApp?(app)
@@ -374,6 +381,7 @@ extension LibraryCellView {
 			if _hasPendingNativeInstall {
 				Button("Resign", systemImage: "signature") { _startNative() }
 			}
+			Button("Sign Separate Copy", systemImage: "person.crop.circle.badge.plus") { confirmSeparateSigning = true }
 		} else if app.isSigned {
 			if isManagedInstalled, let id = app.identifier {
 				Button(
@@ -534,8 +542,11 @@ extension LibraryCellView {
 			}
 		} else { color = info.color }
 		return HStack(alignment: .firstTextBaseline, spacing: 2) {
-			if appleID { ZagAppleIDMark() }
-			else { Image(systemName: "shield").accessibilityHidden(true) }
+			Group {
+				if appleID { ZagAppleIDMark() }
+				else { Image(systemName: "shield").accessibilityHidden(true) }
+			}
+			.alignmentGuide(.firstTextBaseline) { $0[.firstTextBaseline] + 0.75 }
 			Text(info.formatted)
 		}
 		.font(.system(size: 8, weight: .regular))
@@ -544,6 +555,22 @@ extension LibraryCellView {
 		.offset(y: 26)
 		.accessibilityElement(children: .ignore)
 		.accessibilityLabel(Text("\(appleID ? "Apple ID" : "Certificate"), \(info.formatted)"))
+	}
+
+	private func _signSeparateCopy() {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		guard let entry = _nativeEntry, let owner = entry.installation.record.owner,
+			  jobs.begin(_jobKey, stage: .signing) else { return }
+		Task { @MainActor in
+			defer { jobs.finish(_jobKey) }
+			do {
+				let account = try await ZagAppleIDSigningSelection.resolve(exclude: owner.scope.accountID)
+				_ = try await ZagNativeAccountInstall.signSeparateCopy(entry, using: account, job: _jobKey,
+					options: OptionsManager.shared.appleIDOptions)
+			} catch is ZagInstallCancelled {
+			} catch { ZagNativeAccountInstall.showInlineFailure(error) }
+		}
+		#endif
 	}
 
 	private func _startNative(installSaved: Bool = false) {

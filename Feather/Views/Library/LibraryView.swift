@@ -252,7 +252,7 @@ struct LibraryView: View {
         var uniqueUpdates: [String: UpdateManager.AvailableUpdate] = [:]
         var ambiguous = Set<String>()
         for update in updateManager.updates {
-            guard let id = update.app.id else { continue }
+            guard let id = update.installedBundleID else { continue }
             if uniqueUpdates[id] == nil {
                 uniqueUpdates[id] = update
             } else {
@@ -312,21 +312,35 @@ struct LibraryView: View {
 			guard let id = row.identifier, installed.contains(id), let entry = ZagNativeAppInventory.entry(row),
 				  entry.pendingInstall == nil else { return nil }
 			return (row, entry)
-		}.sorted { $0.1.installation.record.profileExpiresAt < $1.1.installation.record.profileExpiresAt }
+		}.sorted {
+			let lhs = $0.1.installation.record, rhs = $1.1.installation.record
+			if lhs.owner?.scope.accountID != rhs.owner?.scope.accountID {
+				return (lhs.owner?.scope.accountID.uuidString ?? "") < (rhs.owner?.scope.accountID.uuidString ?? "")
+			}
+			return lhs.profileExpiresAt < rhs.profileExpiresAt
+		}
 		_refreshingNativeApps = true
 		Task { @MainActor in
 			defer { _refreshingNativeApps = false }
 			var lines: [String] = []
 			var reports: [String] = []
 			var renewed = 0
+			var unavailableAccounts: Set<UUID> = []
 			_ = await ZagNativeSigningPipeline.refreshSequentially(items) { item, index in
 				let (app, entry) = item
-				guard let scope = entry.installation.record.owner?.scope, ZagNativeAccountInstall.currentAccountMatches(scope) else {
-					lines.append("\(entry.name) skipped. Its Apple Account is unavailable.")
+				guard let scope = entry.installation.record.owner?.scope,
+					  !unavailableAccounts.contains(scope.accountID) else {
+					lines.append("\(entry.name) skipped. Its Apple ID is unavailable.")
 					return
 				}
 				guard ZagNativeAppInventory.hasSource(entry) else {
 					lines.append("\(entry.name) skipped. Import its original IPA.")
+					return
+				}
+				do { _ = try await ZagAppleIDSigningSelection.resolve(required: scope.accountID) }
+				catch {
+					unavailableAccounts.insert(scope.accountID)
+					lines.append("\(entry.name) skipped. Its Apple ID needs authentication.")
 					return
 				}
 				let job = "library:\(entry.uuid)"
@@ -340,6 +354,7 @@ struct LibraryView: View {
 					_ = try await ZagNativeAccountInstall.runInline(app, job: job, options: OptionsManager.shared.appleIDOptions, renew: true)
 					renewed += 1
 				} catch {
+					if !ZagNativeAccountInstall.currentAccountMatches(scope) { unavailableAccounts.insert(scope.accountID) }
 					lines.append("\(entry.name). \(error.localizedDescription)")
 					let report = ZagSigningDiagnostics.latest
 					if report != previous { reports.append("App \(index + 1)\n\(report)") }
@@ -387,7 +402,7 @@ struct LibraryView: View {
 	// Only offer a row-level update when exactly one repository candidate matches.
 	private func _installedRowUpdate(for app: Signed) -> UpdateManager.AvailableUpdate? {
 		guard let identifier = app.identifier, !identifier.isEmpty else { return nil }
-		let matches = updateManager.updates.filter { $0.app.id == identifier }
+		let matches = updateManager.updates.filter { $0.installedBundleID == identifier }
 		return matches.count == 1 ? matches.first : nil
 	}
 
@@ -2471,7 +2486,7 @@ private struct ZagUpdateRow: View {
 	var snapshot: ZagUpdateRowSnapshot {
 		ZagUpdateRowSnapshot(
 			id: update.id,
-			bundleID: update.app.id ?? update.id,
+			bundleID: update.installedBundleID ?? update.id,
 			name: update.app.currentName,
 			iconURL: update.app.iconURL?.absoluteString,
 			sourceIconURL: update.source.currentIconURL?.absoluteString,
@@ -2582,7 +2597,7 @@ private struct ZagUpdateRow: View {
 				fill: zagUpdatePillBackground,
 				action: {
 					if showsOpen {
-						if let bundleID = update.app.id {
+						if let bundleID = update.installedBundleID {
 							UIApplication.openApp(with: bundleID)
 						}
 					} else if stage == nil || isFailed(stage) {
@@ -3030,7 +3045,7 @@ private extension ZagUpdatesPopup {
 
 		return ZagUpdateRowSnapshot(
 			id: update.id,
-			bundleID: update.app.id ?? update.id,
+			bundleID: update.installedBundleID ?? update.id,
 			name: update.app.currentName,
 			iconURL: update.app.iconURL?.absoluteString,
 			sourceIconURL: update.source.currentIconURL?.absoluteString,
@@ -3229,6 +3244,7 @@ private struct ZagCachedUpdateRow: View {
 
 
 private struct ZagLibraryHeader: View {
+	@AppStorage("zagStore.designer.header.gap") private var headerGap: Double = 8
 	let title: String
 	let count: Int
 	let isCollapsed: Bool
@@ -3236,7 +3252,7 @@ private struct ZagLibraryHeader: View {
 	let onToggle: () -> Void
 
 	var body: some View {
-		HStack(spacing: 8) {
+		HStack(spacing: headerGap) {
 			Button(action: onToggle) {
 				ZagSectionHeader(title: title, count: count)
 					.frame(maxWidth: .infinity, alignment: .leading)
@@ -3248,7 +3264,7 @@ private struct ZagLibraryHeader: View {
 			.accessibilityHint(Text(isCollapsed ? "Expand section" : "Collapse section"))
 
 			if let trailingAction {
-				Button(action: trailingAction) { ZagCountBadge(title: "Refresh All") }
+				Button(action: trailingAction) { ZagCountBadge(title: "Refresh All", tracking: 0.4) }
 					.buttonStyle(.plain)
 			}
 
@@ -3543,7 +3559,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 		_ update: UpdateManager.AvailableUpdate,
 		signedUUID: String
 	) {
-		guard let bundleID = update.app.id, !bundleID.isEmpty else { return }
+		guard let bundleID = update.installedBundleID, !bundleID.isEmpty else { return }
 		var stored = baselines()
 		// Preserve the first known installed release through multiple retries,
 		// while tracking every prepared IPA that has never been installed.
@@ -3660,19 +3676,32 @@ final class ZagUpdateTransactionManager: ObservableObject {
 
 				stages[update.id] = .signing
 
-				let preference = ZagCertificateSelection.preference
-				let method: ZagSigningMethod?
-				if interactive { method = await ZagCertificateSelection.chooseMethod() }
-				else {
-					method = preference == .askEveryTime ? nil
-						: preference == .appleAccount ? .freeAppleAccount : .importedCertificate
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				let native = update.installedBundleID.flatMap { ZagNativeAppInventory.entry(bundleIdentifier: $0) }
+					.flatMap { $0.pendingInstall == nil && $0.installation.record.expiryVerified == true ? $0 : nil }
+				if native != nil && native?.installation.record.owner == nil { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+				#endif
+				let existingCertificate: CertificatePair? = update.installedBundleID.flatMap { identifier in
+					let request = Signed.fetchRequest()
+					request.predicate = NSPredicate(format: "identifier == %@ AND version == %@", identifier, update.installedVersion)
+					let matches = (try? Storage.shared.context.fetch(request))?.compactMap(\.certificate) ?? []
+					let ids = Set(matches.map(\.objectID))
+					return ids.count == 1 ? matches.first : nil
 				}
-				guard let method else { throw CancellationError() }
+				let method: ZagSigningMethod
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				if native != nil { method = .freeAppleAccount }
+				else if existingCertificate != nil { method = .importedCertificate }
+				else { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+				#else
+				guard existingCertificate != nil else { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+				method = .importedCertificate
+				#endif
 				let selectedOptions = OptionsManager.shared.options
 				if method == .freeAppleAccount {
 					#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-					guard let original = update.app.id else { throw ZagUpdateTransactionError.importedRecordNotFound }
-					let target = ZagNativeAppInventory.entry(originalIdentifier: original)?.installation.record.bundleIdentifier ?? original
+					guard let native, let scope = native.installation.record.owner?.scope else { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+					let target = native.installation.record.bundleIdentifier
 					let job = Self.jobID(update)
 					guard ZagInstallJobs.shared.begin(job, stage: .signing) else { throw ZagNativeAccountInstall.Failure.busy }
 					var keepJob = false
@@ -3681,7 +3710,8 @@ final class ZagUpdateTransactionManager: ObservableObject {
 					var options = preferredOptions
 					options.installAfterSigning = false
 					do {
-						_ = try await ZagNativeAccountInstall.runInline(imported, job: job, options: options, requiredInstalledIdentifier: target)
+						_ = try await ZagNativeAccountInstall.runInline(imported, job: job, options: options, requiredInstalledIdentifier: target,
+							requiredScope: scope, interactive: interactive)
 					} catch {
 						if interactive, !(error is ZagInstallCancelled) { ZagNativeAccountInstall.showInlineFailure(error) }
 						throw error
@@ -3705,27 +3735,13 @@ final class ZagUpdateTransactionManager: ObservableObject {
 					throw ZagUpdateTransactionError.missingCertificate
 					#endif
 				}
-				guard let certificate = ZagCertificateSelection.activeCertificate() else {
+				guard let certificate = existingCertificate else {
 					throw ZagUpdateTransactionError.missingCertificate
 				}
 
 				var options = selectedOptions
 
-				if
-					options.ppqProtection,
-					let identifier = imported.identifier,
-					certificate.ppQCheck
-				{
-					options.appIdentifier =
-						"\(identifier).\(OptionsManager.shared.options.ppqString)"
-				}
-
-				if
-					let identifier = imported.identifier,
-					let mappedIdentifier = options.identifiers[identifier]
-				{
-					options.appIdentifier = mappedIdentifier
-				}
+				options.appIdentifier = update.installedBundleID
 
 				if
 					let name = imported.name,
@@ -3978,6 +3994,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 }
 
 private enum ZagUpdateTransactionError: LocalizedError {
+	case signingIdentityUnavailable
 	case missingDownloadURL
 	case missingCertificate
 	case importedRecordNotFound
@@ -3985,6 +4002,7 @@ private enum ZagUpdateTransactionError: LocalizedError {
 
 	var errorDescription: String? {
 		switch self {
+		case .signingIdentityUnavailable: return "The installed app’s signing identity could not be confirmed. Use Customise to sign a separate copy."
 		case .missingDownloadURL:
 			return "The repository did not provide a download URL."
 		case .missingCertificate:

@@ -89,8 +89,7 @@ struct SigningView: View {
 				if _renewing == nil {
 					Picker("Signing Method", selection: $_signingMethod) {
 						Text(ZagSigningMethod.importedCertificate.title).tag(ZagSigningMethod.importedCertificate)
-						ZagSigningMethodLabel(title: ZagSigningMethod.freeAppleAccount.title, appleID: true)
-							.tag(ZagSigningMethod.freeAppleAccount)
+						Text(ZagSigningMethod.freeAppleAccount.title).tag(ZagSigningMethod.freeAppleAccount)
 					}
 				}
 				if _signingMethod == .freeAppleAccount {
@@ -958,9 +957,9 @@ extension SigningView {
 	private var _canStartSigning: Bool {
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		if _signingMethod == .freeAppleAccount {
-			guard _accountPairing.hasSavedPairing && ZagNativeAccountInstall.hasSession && !_isSigning else { return false }
+			guard _accountPairing.hasSavedPairing && !_isSigning else { return false }
 			if let entry = _renewing {
-				guard let scope = entry.installation.record.owner?.scope, ZagNativeAccountInstall.currentAccountMatches(scope) else { return false }
+				guard entry.installation.record.owner != nil else { return false }
 				return ZagNativeAppInventory.hasSource(entry) || _sourceImportID != nil
 			}
 			return _useOnlyAppleIDOptions || _certificateChanges.isEmpty
@@ -993,8 +992,9 @@ extension SigningView {
 				} else {
 					try ZagNativeAccountInstall.validateOptions(explicitCertificateChanges: _useOnlyAppleIDOptions ? [] : _certificateChanges)
 					guard let source = Storage.shared.getAppDirectory(for: app) else { throw ZagNativeAccountInstall.Failure.invalidApp }
+					let accountID = try await ZagAppleIDSigningSelection.resolve(required: expectedScope?.accountID)
 					let result = try await ZagNativeAccountInstall.install(
-						source: source, name: app.name ?? "App", expectedScope: expectedScope,
+						source: source, name: app.name ?? "App", accountID: accountID, expectedScope: expectedScope,
 						installAfterSigning: _appleIDOptions.installAfterSigning,
 						onCertificateReady: { @MainActor in _certificateIssue = nil }, progress: _reportNativeProgress
 					)
@@ -1012,6 +1012,8 @@ extension SigningView {
 				}
 				_certificateIssue = nil
 				_accountInstallMessage = "Installed and verified on this iPhone. Open the app from the Home Screen."
+			} catch is ZagInstallCancelled {
+				_nativeProgress = nil
 			} catch let issue as ZagNativeAccountInstall.CertificateIssue {
 				_nativeProgress = nil
 				_certificateIssue = issue
@@ -1024,11 +1026,12 @@ extension SigningView {
 	}
 
 	private func _renew(_ entry: ZagNativeAppInventory.Entry) async throws {
-		guard let scope = entry.installation.record.owner?.scope, ZagNativeAccountInstall.currentAccountMatches(scope) else {
+		guard let scope = entry.installation.record.owner?.scope else {
 			throw ZagNativeAppInventory.Failure.wrongAccount
 		}
+		let accountID = try await ZagAppleIDSigningSelection.resolve(required: scope.accountID)
 		func renew(_ source: URL) async throws {
-			let result = try await ZagNativeAccountInstall.install(source: source, name: entry.name, expectedScope: scope,
+			let result = try await ZagNativeAccountInstall.install(source: source, name: entry.name, accountID: accountID, expectedScope: scope,
 				onCertificateReady: { @MainActor in _certificateIssue = nil }, renewing: entry, progress: _reportNativeProgress)
 			guard case .verified = result else { throw ZagNativeAppInventory.Failure.unverified }
 		}

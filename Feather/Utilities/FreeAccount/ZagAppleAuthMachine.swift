@@ -307,6 +307,7 @@ enum ZagAppleAuthPlatform: String, Sendable, Equatable {
 actor ZagAppleAuthMachine {
 	let scope: String
 	let platform: ZagAppleAuthPlatform
+	private let credentialScope: String
 	private let store: ZagAppleAuthMachineStore
 	private let now: @Sendable () -> Date
 
@@ -334,9 +335,10 @@ actor ZagAppleAuthMachine {
 		}
 	}
 
-	init(scope: String = "device", platform: ZagAppleAuthPlatform = .iphone,
+	init(scope: String = "device", credentialScope: String? = nil, platform: ZagAppleAuthPlatform = .iphone,
 		 store: ZagAppleAuthMachineStore = ZagAppleAuthMachineStore(), now: @escaping @Sendable () -> Date = { Date() }) {
 		self.scope = scope
+		self.credentialScope = credentialScope ?? scope
 		self.platform = platform
 		self.store = store
 		self.now = now
@@ -360,8 +362,14 @@ actor ZagAppleAuthMachine {
 	/// existing `device`-scope profile is reused; only the on-the-wire client-info
 	/// changes. One factory keeps provisioning, sign-in and inventory on the same
 	/// platform and scope, with no cross-phase drift.
-	static func nativeAccount() -> ZagAppleAuthMachine {
-		ZagAppleAuthMachine(scope: "device", platform: .macLegacy)
+	static func nativeAccount(accountID: UUID? = nil) -> ZagAppleAuthMachine {
+		ZagAppleAuthMachine(scope: "device", credentialScope: accountID.map(Self.nativeCredentialScope), platform: .macLegacy)
+	}
+
+	static func nativeCredentialScope(_ id: UUID) -> String { "native-account-\(id.uuidString)" }
+
+	static func nativeLogin(temporaryScope: String) -> ZagAppleAuthMachine {
+		ZagAppleAuthMachine(scope: "device", credentialScope: temporaryScope, platform: .macLegacy)
 	}
 
 	/// Whether a provisioned machine profile is already stored (no network).
@@ -650,7 +658,7 @@ actor ZagAppleAuthMachine {
 											  twoFactorPolicy: policy,
 											  consentGate: { coordinator.requestConsent() })
 		let platform = self.platform
-		let scope = self.scope
+		let scope = self.credentialScope
 		return await withCheckedContinuation { continuation in
 			DispatchQueue.global(qos: .userInitiated).async {
 				continuation.resume(returning: Self.driveSignInWith2FA(persisted: persisted, transport: transport,
@@ -675,10 +683,10 @@ actor ZagAppleAuthMachine {
 	func developerSession(allowNetwork: Bool = true) async throws -> ZagDeveloperSessionReport {
 		#if canImport(ZagAppleAuth)
 		guard let persisted = try store.load(scope: scope) else { return ZagDeveloperSessionReport(outcome: .notProvisioned) }
-		guard let sessionBytes = ZagAppleAuthSessionStore().load(scope: scope) else { return ZagDeveloperSessionReport(outcome: .noSession) }
+		guard let sessionBytes = ZagAppleAuthSessionStore().load(scope: credentialScope) else { return ZagDeveloperSessionReport(outcome: .noSession) }
 		let transport = ZagAppleAuthTransport(allowNetwork: allowNetwork, maxRequests: 1)  // one apptokens request, no retry
 		let platform = self.platform
-		let scope = self.scope
+		let scope = self.credentialScope
 		return await withCheckedContinuation { continuation in
 			DispatchQueue.global(qos: .userInitiated).async {
 				continuation.resume(returning: Self.driveDeveloperSession(persisted: persisted, sessionBytes: sessionBytes, transport: transport, platform: platform, scope: scope))
@@ -782,7 +790,7 @@ actor ZagAppleAuthMachine {
 	/// token and the returned headers are never logged.
 	func developerHeaders(now: Date = Date(), expectedAccountID: String? = nil) -> [String: String]? {
 		guard let persisted = try? store.load(scope: scope),
-			  let token = ZagDeveloperTokenStore().load(scope: scope), token.isUsable(at: now),
+			  let token = ZagDeveloperTokenStore().load(scope: credentialScope), token.isUsable(at: now),
 			  expectedAccountID == nil || token.accountID == expectedAccountID else { return nil }
 		let platform = self.platform
 		// A refused transport: developer_headers is local, so no request is made;
@@ -801,7 +809,7 @@ actor ZagAppleAuthMachine {
 			return .success(obj)
 		}
 		if case .success(let headers) = result, !headers.isEmpty,
-		   ZagDeveloperTokenStore().load(scope: scope) == token,
+		   ZagDeveloperTokenStore().load(scope: credentialScope) == token,
 		   headers.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) { return headers }
 		return nil
 	}

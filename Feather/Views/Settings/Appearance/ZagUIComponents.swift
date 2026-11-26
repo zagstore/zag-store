@@ -17,9 +17,10 @@ struct ZagCountBadge: View {
 	private var themeColorHex: String = "#3F8EF7"
 
 	private let title: String
+	private let tracking: CGFloat
 
-	init(count: Int) { title = count.description }
-	init(title: String) { self.title = title }
+	init(count: Int) { title = count.description; tracking = 0 }
+	init(title: String, tracking: CGFloat = 0) { self.title = title; self.tracking = tracking }
 
 	@Environment(\.colorScheme)
 	private var colorScheme
@@ -30,6 +31,7 @@ struct ZagCountBadge: View {
 
 	var body: some View {
 		Text(title)
+			.tracking(tracking)
 			.font(.system(size: badgeFontSize, weight: .medium, design: .rounded))
 			.monospacedDigit()
 			.foregroundStyle(tint)

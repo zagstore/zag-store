@@ -52,7 +52,8 @@ enum ZagNativeAppInventory {
 	static func entry(bundleIdentifier: String) -> Entry? {
 		let request = Signed.fetchRequest()
 		request.predicate = NSPredicate(format: "identifier == %@", bundleIdentifier)
-		return (try? Storage.shared.context.fetch(request))?.lazy.compactMap { Self.entry($0) }.first
+		let entries = (try? Storage.shared.context.fetch(request))?.compactMap { Self.entry($0) } ?? []
+		return entries.first(where: { $0.pendingInstall == nil }) ?? entries.first
 	}
 
 	static func pendingEntry(bundleIdentifier: String) -> Entry? {
@@ -66,7 +67,7 @@ enum ZagNativeAppInventory {
 		guard let rows = try? Storage.shared.context.fetch(Signed.fetchRequest()) else { return nil }
 		let matches = rows.compactMap { Self.entry($0) }.filter {
 			($0.pendingInstall != nil) == pending && $0.installation.record.originalBundleIdentifier == originalIdentifier
-				&& $0.installation.record.owner.map { ZagNativeAccountInstall.currentAccountMatches($0.scope) } == true
+
 		}
 		return matches.count == 1 ? matches.first : nil
 	}

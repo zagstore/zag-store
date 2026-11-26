@@ -181,6 +181,17 @@ extension LibraryInfoView {
 
 	@ViewBuilder
 	private func _certSection(for app: AppInfoPresentable) -> some View {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let entry = ZagNativeAppInventory.entry(app), let scope = entry.installation.record.owner?.scope {
+			let account = (try? ZagNativeAppleIDs.shared.catalog().accounts)?.first { $0.id == scope.accountID }
+			NBSection("Signing Identity") {
+				LabeledContent("Apple ID", value: account?.label ?? "Account unavailable")
+				LabeledContent("Team", value: scope.teamID)
+			}
+		} else if app.isSigned, Storage.shared.getCertificate(from: app) == nil {
+			NBSection("Signing Identity") { Text("Signing identity unavailable").foregroundStyle(.secondary) }
+		}
+		#endif
 		if let cert = Storage.shared.getCertificate(from: app) {
 			NBSection(.localized("Certificate")) {
 				CertificatesCellView(

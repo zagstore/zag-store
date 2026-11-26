@@ -623,10 +623,10 @@ final class UpdateManager: ObservableObject {
 		let availableVersion: String
 		let installedBuild: String?
 		let availableBuild: String?
+		var installedIdentifier: String? = nil
 
-		var id: String {
-			app.id ?? app.currentUniqueId
-		}
+		var id: String { installedIdentifier ?? app.id ?? app.currentUniqueId }
+		var installedBundleID: String? { installedIdentifier ?? app.id }
 	}
 
 	private struct LocalApp {
@@ -634,6 +634,7 @@ final class UpdateManager: ObservableObject {
 		let identifier: String
 		let version: String
 		let build: String?
+		var installedIdentifier: String? = nil
 	}
 
 	@Published private(set) var updates: [AvailableUpdate] = []
@@ -659,7 +660,7 @@ final class UpdateManager: ObservableObject {
 		let recent = _recentUpdateRows()
 			.filter { ($0.completedAt ?? .distantPast) >= cutoff }
 		return updates.filter { update in
-			let bundleID = update.app.id ?? update.id
+			let bundleID = update.installedBundleID ?? update.id
 			return !recent.contains { row in
 				row.id == update.id && row.bundleID == bundleID &&
 				ZagVariantLineageResolver.matchesCompletedRelease(
@@ -1009,6 +1010,15 @@ final class UpdateManager: ObservableObject {
 					repositoryName ??
 					installed.bundleID
 
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				if let entry = ZagNativeAppInventory.entry(bundleIdentifier: installed.bundleID),
+				   entry.pendingInstall == nil, entry.installation.record.expiryVerified == true {
+					_addLocalApp(name: entry.name, identifier: entry.installation.record.originalBundleIdentifier,
+						version: installed.version, build: installed.build.isEmpty ? nil : installed.build,
+						installedIdentifier: installed.bundleID, to: &localApps)
+					continue
+				}
+				#endif
 				_addLocalApp(
 					name: installedName,
 					identifier: installed.bundleID,
@@ -1267,7 +1277,7 @@ final class UpdateManager: ObservableObject {
 					}
 
 					let localKey =
-						identifier.lowercased() + "|" +
+						(localApp.installedIdentifier ?? identifier).lowercased() + "|" +
 						_normalizedAppName(localApp.name)
 
 					let suggestedUpdate = AvailableUpdate(
@@ -1276,7 +1286,8 @@ final class UpdateManager: ObservableObject {
 						installedVersion: localApp.version,
 						availableVersion: availableVersion,
 						installedBuild: localApp.build,
-						availableBuild: availableBuild
+						availableBuild: availableBuild,
+						installedIdentifier: localApp.installedIdentifier
 					)
 					if let existing = selectedUpdates[localKey] {
 						let comparison = ZagVariantLineageResolver.compareRelease(
@@ -1536,7 +1547,7 @@ final class UpdateManager: ObservableObject {
 		}
 
 		return updates.first {
-			$0.app.id == identifier
+			$0.installedBundleID == identifier
 		}
 	}
 
@@ -1554,6 +1565,7 @@ final class UpdateManager: ObservableObject {
 		identifier: String?,
 		version: String?,
 		build: String? = nil,
+		installedIdentifier: String? = nil,
 		to apps: inout [LocalApp]
 	) {
 		guard
@@ -1570,7 +1582,7 @@ final class UpdateManager: ObservableObject {
 		let normalizedName = _normalizedAppName(name)
 
 		if let index = apps.firstIndex(where: {
-			$0.identifier == identifier &&
+			$0.identifier == identifier && $0.installedIdentifier == installedIdentifier &&
 				_normalizedAppName($0.name) == normalizedName
 		}) {
 			if _compareVersions(
@@ -1581,7 +1593,8 @@ final class UpdateManager: ObservableObject {
 					name: name,
 					identifier: identifier,
 					version: version,
-					build: build
+					build: build,
+					installedIdentifier: installedIdentifier
 				)
 			}
 		} else {
@@ -1590,7 +1603,8 @@ final class UpdateManager: ObservableObject {
 					name: name,
 					identifier: identifier,
 					version: version,
-					build: build
+					build: build,
+					installedIdentifier: installedIdentifier
 				)
 			)
 		}

@@ -139,7 +139,7 @@ enum ZagCertificateSelection {
 		return await withCheckedContinuation { continuation in
 			let alert = UIAlertController(title: "Signing Method", message: nil, preferredStyle: .actionSheet)
 			if ZagSigningMethodAvailability.freeAccountEnabled {
-				alert.addAction(UIAlertAction(title: UIImage(systemName: "apple.logo") == nil ? "Apple ID" : " Apple ID", style: .default) { _ in continuation.resume(returning: .freeAppleAccount) })
+				alert.addAction(UIAlertAction(title: "Apple ID", style: .default) { _ in continuation.resume(returning: .freeAppleAccount) })
 			}
 			alert.addAction(UIAlertAction(title: ZagSigningMethod.importedCertificate.title, style: .default) { _ in continuation.resume(returning: .importedCertificate) })
 			alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in continuation.resume(returning: nil) })

@@ -42,13 +42,18 @@ final class ZagNativeSignInModel: ObservableObject {
 	@Published private(set) var teams: [ZagDeveloperTeam] = []
 	@Published private(set) var notice: String?
 
-	private let machine: ZagAppleAuthMachine
+	@Published private(set) var accountID: UUID?
+	private let requestedAccount: ZagNativeAppleID?
+	private static var authenticating = false
+	var emailLocked: Bool { requestedAccount?.email != nil }
 	private var coordinator = ZagTwoFactorCoordinator()
 	private var stageObservation: Task<Void, Never>?
-	private var runTask: Task<Void, Never>?
 
-	init(machine: ZagAppleAuthMachine = ZagAppleAuthMachine.nativeAccount()) {
-		self.machine = machine
+
+	init(account: ZagNativeAppleID? = nil) {
+		requestedAccount = account
+		accountID = account?.id
+		appleID = account?.email ?? ""
 	}
 
 	var canSubmitCredentials: Bool {
@@ -64,14 +69,66 @@ final class ZagNativeSignInModel: ObservableObject {
 	/// holds a usable developer session, we are signed in. The token itself is
 	/// never read into this model — only its validity.
 	func restore() async {
-		if await machine.developerHeaders() != nil {
-			phase = .signedIn
+		guard let accountID else { return }
+		if ZagNativeAppleIDs.shared.connectedToken(accountID) == nil {
+			await restoreDeveloperSession(accountID)
+		}
+		if ZagNativeAppleIDs.shared.connectedToken(accountID) != nil {
 			await refreshInventory()
+			finishSignedIn()
+		}
+	}
+
+	private func restoreDeveloperSession(_ id: UUID) async {
+		let vault = ZagNativeAppleIDKeychain()
+		let accountScope = ZagNativeAppleIDs.scope(id)
+		guard !Self.authenticating, let session = vault.session(accountScope) else { return }
+		Self.authenticating = true
+		isBusy = true
+		phase = .authenticating
+		let staging = "native-login-staging"
+		defer {
+			Self.authenticating = false
+			isBusy = false
+			phase = .signedOut
+			try? vault.deleteCredentials(staging)
+		}
+		do {
+			try vault.deleteCredentials(staging)
+			try vault.saveSession(session, scope: staging)
+			let report = try await ZagAppleAuthMachine.nativeLogin(temporaryScope: staging).developerSession()
+			guard !Task.isCancelled, report.outcome == .ok, vault.session(accountScope) == session,
+				  vault.token(staging)?.nativeAccountID == id else { return }
+			_ = try ZagNativeAppleIDs.shared.completeAuthentication(
+				temporaryScope: staging, email: requestedAccount?.email ?? "", expected: id)
+		} catch {
+			failure = .init(message: "The saved session could not be renewed. Sign in again.", recovery: .retry)
 		}
 	}
 
 	func signIn() async {
 		guard canSubmitCredentials else { return }
+		guard !Self.authenticating else {
+			finish(failure: .init(message: "Another Apple ID is signing in. Try again when it finishes.", recovery: .retry))
+			return
+		}
+		Self.authenticating = true
+		let temporaryScope = "native-login-staging"
+		do { try ZagNativeAppleIDKeychain().deleteCredentials(temporaryScope) }
+		catch {
+			Self.authenticating = false
+			finish(failure: .init(message: error.localizedDescription, recovery: .retry))
+			return
+		}
+		let email = appleID
+		let secret = password
+		let expectedAccount = accountID
+		password = ""
+		let machine = ZagAppleAuthMachine.nativeLogin(temporaryScope: temporaryScope)
+		defer {
+			Self.authenticating = false
+			try? ZagNativeAppleIDKeychain().deleteCredentials(temporaryScope)
+		}
 		failure = nil
 		notice = nil
 		// Native Apple Account sign-in is a standard Zag Store feature. Pressing
@@ -121,10 +178,7 @@ final class ZagNativeSignInModel: ObservableObject {
 		}
 		#endif
 
-		let email = appleID
-		let secret = password
-		password = ""   // do not retain the plaintext past hand-off
-
+		guard !coordinator.didCancel else { finish(failure: nil); return }
 		let report: ZagAppleAuthSignInReport
 		do {
 			report = try await machine.signInWith2FA(email: email, password: secret,
@@ -148,8 +202,13 @@ final class ZagNativeSignInModel: ObservableObject {
 			finish(failure: f)
 			return
 		}
-		// Success: the session lives in the machine's Keychain. Read the
-		// read-only inventory; absence of teams is not a sign-in failure.
+		do {
+			accountID = try ZagNativeAppleIDs.shared.completeAuthentication(
+				temporaryScope: temporaryScope, email: email, expected: expectedAccount)
+		} catch {
+			finish(failure: .init(message: error.localizedDescription, recovery: .retry))
+			return
+		}
 		await refreshInventory()
 		finishSignedIn()
 	}
@@ -172,8 +231,13 @@ final class ZagNativeSignInModel: ObservableObject {
 
 	func cancel() {
 		coordinator.cancel()
-		runTask?.cancel()
 		finish(failure: nil)
+	}
+
+	func reauthenticate() {
+		guard !isBusy else { return }
+		failure = nil
+		phase = .signedOut
 	}
 
 	func signOut() async {
@@ -182,7 +246,7 @@ final class ZagNativeSignInModel: ObservableObject {
 		// developerHeaders() checks — so the model reads as signed out. The
 		// model always uses the default "device" scope machine.
 		do {
-			try ZagDeveloperTokenStore().delete(scope: "device")
+			if let accountID { try ZagNativeAppleIDs.shared.signOut(accountID) }
 		} catch {
 			notice = "Zag Store could not remove the current Apple Account session. Try signing out again before switching accounts."
 			return
@@ -224,13 +288,11 @@ final class ZagNativeSignInModel: ObservableObject {
 		// The read-only Developer Services inventory exists only in the native
 		// (xcframework) build; off-device there is nothing to read.
 		#if canImport(ZagAppleAuth)
-		guard let token = ZagDeveloperTokenStore().load(scope: "device") else { teams = []; return }
-		let native = ZagNativeDeveloperPortal.readOnlyInventory(machine: machine, expectedAccountID: token.accountID)
-		let discovered = (try? await native.teams()) ?? []
-		guard ZagDeveloperTokenStore().load(scope: "device")?.accountID == token.accountID else { return }
-		teams = discovered.map {
-			ZagDeveloperTeam(identifier: $0.teamID, name: $0.name, kind: $0.isPersonalTeam ? .personalFree : .individualPaid)
-		}
+		guard let accountID, let token = ZagNativeAppleIDs.shared.connectedToken(accountID) else { teams = []; return }
+		let native = ZagNativeDeveloperPortal.readOnlyInventory(machine: .nativeAccount(accountID: accountID), expectedAccountID: token.accountID)
+		guard let discovered = try? await native.teams(), ZagNativeAppleIDs.shared.connectedToken(accountID) == token else { return }
+		teams = discovered.map(\.signingTeam)
+		try? ZagNativeAppleIDs.shared.storeTeams(teams, for: accountID)
 		#endif
 	}
 
@@ -306,9 +368,11 @@ struct ZagNativeAccountSignInContent: View {
 				.keyboardType(.emailAddress).textContentType(.username)
 				.textInputAutocapitalization(.never).autocorrectionDisabled()
 				.focused($focus, equals: .appleID).submitLabel(.next)
+				.disabled(model.emailLocked || model.isBusy)
 				.onSubmit { focus = .password }
 			SecureField("Password", text: $model.password)
 				.textContentType(.password)
+				.disabled(model.isBusy)
 				.focused($focus, equals: .password).submitLabel(.go)
 				.onSubmit { if model.canSubmitCredentials { Task { await model.signIn() } } }
 			Button {
@@ -346,6 +410,7 @@ struct ZagNativeAccountSignInContent: View {
 					LabeledContent(team.name, value: team.identifier).font(.footnote)
 				}
 			}
+			Button("Reauthenticate") { model.reauthenticate() }
 			Button(role: .destructive) { Task { await model.signOut() } } label: { Text("Sign Out") }
 				.disabled(model.isBusy)
 		}

@@ -18,6 +18,16 @@ struct ZagNativeDeveloperTeam: Codable, Equatable, Sendable {
 				|| name.lowercased().hasSuffix("(personal team)"))
 	}
 
+	var signingTeam: ZagDeveloperTeam {
+		let membership = type?.lowercased() ?? ""
+		let kind: ZagDeveloperTeam.Kind
+		if isPersonalTeam { kind = .personalFree }
+		else if membership.contains("individual") { kind = .individualPaid }
+		else if membership.contains("company") || membership.contains("organization") { kind = .organization }
+		else { kind = .unknown }
+		return .init(identifier: teamID, name: name, kind: kind)
+	}
+
 	static func personalTeam(in teams: [Self], expectedID: String? = nil) -> Self? {
 		let matching = teams.filter { $0.isPersonalTeam && (expectedID == nil || $0.teamID == expectedID) }
 		guard Set(matching.map(\.teamID)).count == 1 else { return nil }
@@ -98,7 +108,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// refused before transmission, independent of consent. Mutations are ALSO
 	/// denied at the consent layer (defence in depth), but the transport is the
 	/// hard boundary. A smaller request ceiling bounds the session.
-	static func readOnlyInventory(machine: ZagAppleAuthMachine = ZagAppleAuthMachine.nativeAccount(),
+	static func readOnlyInventory(machine: ZagAppleAuthMachine,
 								  expectedAccountID: String? = nil,
 								  maxRequests: Int? = nil) -> ZagNativeDeveloperPortal {
 		ZagNativeDeveloperPortal(transport: ZagReadOnlyTransport(base: transport()),

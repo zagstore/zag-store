@@ -812,12 +812,12 @@ extension SettingsView {
 					Menu {
 						Picker("Signing Method", selection: $_signingPreference) {
 							ForEach(ZagSigningPreference.allCases, id: \.self) { method in
-								ZagSigningMethodLabel(title: method.title, appleID: method == .appleAccount).tag(method)
+								Text(method.title).tag(method)
 							}
 						}
 					} label: {
 						HStack(spacing: 6) {
-							ZagSigningMethodLabel(title: _signingPreference.title, appleID: _signingPreference == .appleAccount)
+							Text(_signingPreference.title)
 							Image(systemName: "chevron.up.chevron.down").font(.caption).accessibilityHidden(true)
 						}
 						.foregroundStyle(.secondary)
