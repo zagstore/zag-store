@@ -159,11 +159,14 @@ struct ZagProvisioningFailure: LocalizedError, Equatable, Sendable {
 
 	let kind: Kind
 	let step: Step
+	var portalFailure: ZagPortalOperationFailure? = nil
+	var invalidField: String? = nil
 	var appleAppIDRejection: ZagAppIDServerRejection? = nil
 
 	var errorDescription: String? { message }
 
 	var message: String {
+		if let portalFailure { return "\(summary) \(portalFailure.localizedDescription)" }
 		guard let rejection = appleAppIDRejection else { return summary }
 		let operation = rejection.action == .addAppID ? "App ID registration" : "App ID inventory"
 		var result = "Apple rejected \(operation) (HTTP \(rejection.fault.httpStatus)"
@@ -192,7 +195,9 @@ struct ZagProvisioningFailure: LocalizedError, Equatable, Sendable {
 		case .sessionRejected: return "Your Apple Account session has expired. Sign in again."
 		case .network: return "Apple's developer services could not be reached."
 		case .rateLimited: return "Apple is limiting requests for now. Try again later."
-		case .unexpectedResponse: return "Apple returned a response Zag Store does not recognise."
+		case .unexpectedResponse:
+			let stage = "Signing could not complete the \(step.rawValue) stage."
+			return invalidField.map { "\(stage) Missing or invalid: \($0)." } ?? stage
 		case .timedOut: return "Apple's developer services did not respond in time."
 		case .cancelled: return "Provisioning was cancelled."
 		case .unavailable: return "Free Apple Account signing is not available in this version of Zag Store."
@@ -436,7 +441,7 @@ actor ZagFreeAccountProvisioner {
 				changes.registeredAppGroups.append(group)
 			}
 			for (bundle, groups) in groupsByBundle.sorted(by: { $0.key < $1.key }) {
-				guard let appID = appIDs[bundle] else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .appGroups) }
+				guard let appID = appIDs[bundle] else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .appGroups, invalidField: "resolved App ID") }
 				try await call { try await portal.assignAppGroups(groups, to: appID, team: team) }
 			}
 		}
@@ -445,7 +450,7 @@ actor ZagFreeAccountProvisioner {
 		currentStep = .profiles
 		var results: [ZagProvisioningResult.Component] = []
 		for component in components {
-			guard let appID = appIDs[component.bundle] else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .profiles) }
+			guard let appID = appIDs[component.bundle] else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .profiles, invalidField: "resolved App ID") }
 			let cached = request.reusableProfiles
 				.filter { profile in
 					let groups = profile.entitlements.dictionary[ZagFreeAccountEntitlements.appGroupsKey] as? [String] ?? []
@@ -471,7 +476,7 @@ actor ZagFreeAccountProvisioner {
 				bundleIdentifier: component.bundle
 			)
 			guard let entitlements = try? ZagEntitlementSet(resolved.entitlements) else {
-				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .profiles)
+				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .profiles, invalidField: "reconciled entitlements")
 			}
 			results.append(.init(
 				originalBundleIdentifier: component.request.originalBundleIdentifier,
@@ -532,7 +537,7 @@ actor ZagFreeAccountProvisioner {
 		)
 		switch plan {
 		case .reuse(let serial):
-			guard let stored = usable, stored.serialNumber == serial else { throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate) }
+			guard let stored = usable, stored.serialNumber == serial else { throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate) }
 			return stored
 		case .userMustRevoke(let candidates):
 			experimentEvent("cert.limit", outcome: "blocked", failure: "portal.certificateLimit", count: candidates.count)
@@ -576,7 +581,8 @@ actor ZagFreeAccountProvisioner {
 				let valid = remote.filter { $0.expiresAt == .distantPast || $0.expiresAt > now() }.sorted { $0.expiresAt < $1.expiresAt }
 				experimentEvent("cert.limit", outcome: "blocked", failure: "portal.certificateLimit", count: valid.count)
 				throw ZagProvisioningFailure(kind: .certificateMustBeRevoked(candidates: valid), step: .certificate)
-			} catch let failure as ZagProvisioningFailure where failure.kind == .rateLimited || failure.kind == .sessionRejected {
+			} catch let failure as ZagProvisioningFailure where failure.portalFailure?.resultCode == 3250
+				|| failure.kind == .rateLimited || failure.kind == .sessionRejected {
 				// Apple refused the request: nothing was issued.
 				try markNotIssued(pending, account: request.accountID, team: team)
 				throw failure
@@ -626,7 +632,7 @@ actor ZagFreeAccountProvisioner {
 				  let identity = (try? secrets.load(.signingPrivateKey, account: request.accountID, team: team))
 					.flatMap({ $0 })
 					.flatMap({ try? JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }) else {
-				throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
+				throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
 			}
 			experimentEvent("cert.swap")
 			changes.createdCertificate = true
@@ -685,7 +691,7 @@ actor ZagFreeAccountProvisioner {
 			throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
 		}
 		guard try finishPendingIdentity(account: account, team: team), let identity = storedIdentity(account: account, team: team) else {
-			throw ZagProvisioningFailure(kind: .unexpectedResponse, step: .certificate)
+			throw ZagProvisioningFailure(kind: .keyStorage, step: .certificate)
 		}
 		return identity
 	}
@@ -945,9 +951,12 @@ actor ZagFreeAccountProvisioner {
 	/// Runs one portal call under the operation deadline; maps its errors.
 	private func call<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
 		let step = currentStep ?? .request
+		ZagSigningDiagnostics.record("Provisioning stage: \(step.rawValue)")
 		if Task.isCancelled { throw ZagProvisioningFailure(kind: .cancelled, step: step) }
 		do {
 			return try await ZagDeadline.run(seconds: operationTimeout, operation)
+		} catch let detail as ZagPortalOperationFailure {
+			throw ZagProvisioningFailure(kind: Self.kind(for: detail.underlying), step: step, portalFailure: detail)
 		} catch let rejection as ZagAppIDServerRejection {
 			throw ZagProvisioningFailure(kind: Self.kind(for: rejection.error), step: step, appleAppIDRejection: rejection)
 		} catch let error as ZagPortalError {

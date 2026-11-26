@@ -348,35 +348,32 @@ struct ZagInstallExpectation: Equatable, Sendable {
 /// success.
 enum ZagInstalledProfileCheck {
 	static func verify(_ expectation: ZagInstallExpectation, installedProfiles: [Data]) -> ZagInstallVerification {
-		var byUUID: [String: Certificate] = [:]
+		var byUUID: [String: ZagIssuedProfile] = [:]
 		for data in installedProfiles {
-			if let profile = try? Certificate.decode(profileData: data) { byUUID[profile.UUID] = profile }
+			if let profile = try? ZagIssuedProfile(profileData: data) { byUUID[profile.uuid] = profile }
 		}
 		guard let app = byUUID[expectation.profileUUID] else {
 			return .unverifiable("the app's profile is not among the device's installed profiles")
 		}
-		let team = expectation.teamIdentifier ?? app.TeamIdentifier.first ?? ""
-		guard app.TeamIdentifier.first == team else { return .mismatch("profile team") }
-		guard app.Entitlements?["application-identifier"]?.value as? String == "\(team).\(expectation.bundleIdentifier)" else {
+		let team = expectation.teamIdentifier ?? app.teamIdentifier
+		guard app.teamIdentifier == team else { return .mismatch("profile team") }
+		guard app.entitlements.dictionary["application-identifier"] as? String == "\(team).\(expectation.bundleIdentifier)" else {
 			return .mismatch("profile App ID")
 		}
-		guard abs(app.ExpirationDate.timeIntervalSince(expectation.profileExpiresAt)) < 1 else { return .mismatch("profile expiry") }
-		if let serial = expectation.certificateSerial, !containsCertificate(app, serial: serial) { return .mismatch("profile certificate") }
-		var earliest = app.ExpirationDate
+		guard abs(app.expiresAt.timeIntervalSince(expectation.profileExpiresAt)) < 1 else { return .mismatch("profile expiry") }
+		if let serial = expectation.certificateSerial, !app.certificateSerials.contains(serial) { return .mismatch("profile certificate") }
+		var earliest = app.expiresAt
 		for uuid in expectation.extensionProfileUUIDs {
 			guard let profile = byUUID[uuid] else { return .unverifiable("an extension's profile is not among the device's installed profiles") }
-			guard profile.TeamIdentifier.first == team else { return .mismatch("extension profile team") }
+			guard profile.teamIdentifier == team else { return .mismatch("extension profile team") }
 			if let bundle = expectation.extensionIdentifiers[uuid],
-			   profile.Entitlements?["application-identifier"]?.value as? String != "\(team).\(bundle)" { return .mismatch("extension profile App ID") }
-			if let serial = expectation.certificateSerial, !containsCertificate(profile, serial: serial) { return .mismatch("extension profile certificate") }
-			earliest = min(earliest, profile.ExpirationDate)
+			   profile.entitlements.dictionary["application-identifier"] as? String != "\(team).\(bundle)" { return .mismatch("extension profile App ID") }
+			if let serial = expectation.certificateSerial, !profile.certificateSerials.contains(serial) { return .mismatch("extension profile certificate") }
+			earliest = min(earliest, profile.expiresAt)
 		}
 		return .verified(profileExpiresAt: earliest, certificateExpiresAt: expectation.certificateExpiresAt)
 	}
 
-	private static func containsCertificate(_ profile: Certificate, serial: String) -> Bool {
-		profile.DeveloperCertificates?.contains { ZagCertificateInspection(der: $0)?.serialNumber == serial } == true
-	}
 }
 
 /// What the device reported after an installation.
@@ -414,12 +411,28 @@ enum ZagNativeSigningPipeline {
 		signer: ZagAppSigning, installer: ZagFreeAccountInstaller,
 		verifyTarget: @MainActor () throws -> Void, now: @Sendable () -> Date = { Date() }
 	) async throws -> ZagInstallVerification {
-		let result = try await provisioner.provision(request, authorization: authorization).get()
+		let provisioned = await provisioner.provision(request, authorization: authorization)
+		if case .failure(let failure) = provisioned {
+			var event = "Provisioning failed at \(failure.step.rawValue)"
+			if let field = failure.invalidField { event += " — Missing or invalid: \(field)" }
+			if case .invalidProfile(let problem) = failure.kind { event += " — \(problem.rawValue)" }
+			ZagSigningDiagnostics.record(event)
+		}
+		let result = try provisioned.get()
+		ZagSigningDiagnostics.record("Provisioning succeeded; reading Keychain identity")
 		guard let data = try secrets.load(.signingPrivateKey, account: request.accountID, team: request.team) else {
 			throw Failure.missingIdentity
 		}
 		let identity = try JSONDecoder().decode(ZagSigningIdentity.self, from: data)
-		let record = try signer.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: now())
+		ZagSigningDiagnostics.record("Signing and verifying app signature")
+		let record: ZagSignedAppRecord
+		do {
+			record = try signer.sign(appAt: app, with: result, identity: identity, authorization: authorization, now: now())
+			ZagSigningDiagnostics.record("App signature verification succeeded")
+		} catch {
+			ZagSigningDiagnostics.record("Signing or signature verification failed")
+			throw error
+		}
 		let info = (try? Data(contentsOf: app.appendingPathComponent("Info.plist")))
 			.flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) } as? [String: Any]
 		let expectation = ZagInstallExpectation(
@@ -436,9 +449,22 @@ enum ZagNativeSigningPipeline {
 			throw ZagFreeAccountSigningError.verification("The signing certificate or provisioning profile expired before installation.")
 		}
 		try await verifyTarget()
-		try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier)
+		ZagSigningDiagnostics.record("Installing via RPPairing")
+		do { try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier) }
+		catch {
+			ZagSigningDiagnostics.record("RPPairing installation failed")
+			throw error
+		}
+		ZagSigningDiagnostics.record("Installer returned success; verifying installed app")
 		try await verifyTarget()
-		return await installer.verify(expectation)
+		let installed = await installer.verify(expectation)
+		switch installed {
+		case .verified: ZagSigningDiagnostics.record("Installed app and profile verified")
+		case .unverifiable: ZagSigningDiagnostics.record("Installed app could not be verified")
+		case .mismatch: ZagSigningDiagnostics.record("Installed app or profile did not match")
+		case .notInstalled: ZagSigningDiagnostics.record("App missing from installed-app list")
+		}
+		return installed
 	}
 }
 

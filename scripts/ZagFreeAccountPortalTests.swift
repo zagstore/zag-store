@@ -200,8 +200,9 @@ extension Result where Failure == ZagProvisioningFailure {
 			do {
 				_ = try await portal.submitCertificateRequest(csr, team: team)
 				check(false, "failed read-back should surface an unconfirmed CSR")
-			} catch ZagPortalError.malformedResponse {
-				check(true, "a read-back 429 after CSR success does not classify the CSR as refused")
+			} catch let failure as ZagPortalOperationFailure {
+				check(failure.underlying == .malformedResponse && failure.reason.contains("HTTP 429"),
+					"a read-back 429 after CSR success retains the read-back status without classifying the CSR as refused")
 			}
 		} catch {
 			check(false, "native inventory and CSR flow: \(error)")

@@ -94,6 +94,14 @@ struct ZagRegisteredAppID: Codable, Equatable, Sendable {
 	let bundleIdentifier: String
 	/// From Apple when it reports one; otherwise nil.
 	let expiresAt: Date?
+	let appGroupsEnabled: Bool?
+
+	init(identifier: String, bundleIdentifier: String, expiresAt: Date?, appGroupsEnabled: Bool? = nil) {
+		self.identifier = identifier
+		self.bundleIdentifier = bundleIdentifier
+		self.expiresAt = expiresAt
+		self.appGroupsEnabled = appGroupsEnabled
+	}
 
 	func isActive(at now: Date) -> Bool {
 		guard let expiresAt else { return true }

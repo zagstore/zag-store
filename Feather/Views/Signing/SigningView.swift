@@ -74,6 +74,7 @@ struct SigningView: View {
 					if let issue = _certificateIssue, ZagNativeAccountInstall.currentAccountMatches(issue.scope) {
 						Section("Development Certificate") {
 							Text(issue.failure.message).font(.footnote)
+							Button("Copy Diagnostics") { UIPasteboard.general.string = ZagSigningDiagnostics.latest }
 							if let recovery = issue.recovery {
 								NavigationLink("Recover Certificate Request") {
 									ZagCertificateRecoveryView(model: recovery, teamName: issue.teamName, onResolved: { _startAccountInstall(resuming: issue.scope) })
@@ -164,6 +165,9 @@ struct SigningView: View {
 			get: { _accountInstallMessage != nil },
 			set: { if !$0 { _accountInstallMessage = nil } }
 		)) {
+			if !ZagSigningDiagnostics.latest.isEmpty {
+				Button("Copy Diagnostics") { UIPasteboard.general.string = ZagSigningDiagnostics.latest }
+			}
 			Button("OK", role: .cancel) { _accountInstallMessage = nil }
 		} message: {
 			Text(_accountInstallMessage ?? "")

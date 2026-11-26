@@ -25,6 +25,8 @@ enum ZagMutationConsequence {
 					"Generates a 7-day provisioning profile for this app on this device.")
 		case .addAppGroup:
 			return ("Create an app group", "Registers an application group with your team.")
+		case .updateAppID:
+			return ("Enable App Groups", "Enables the App Groups capability on the App ID.")
 		case .assignAppGroups:
 			return ("Assign app groups", "Associates app groups with the App ID.")
 		case .revokeCertificate:

@@ -60,27 +60,43 @@ struct ZagIssuedProfile: Sendable, Equatable {
 }
 
 extension ZagIssuedProfile {
-	/// Reads a signed .mobileprovision with Zag Store's profile parser
-	/// (`Certificate.decode`). Certificate serials come from the profile's own
-	/// developer certificates, in `ZagCertificateInspection`'s format.
+	enum DecodeFailure: Error {
+		case missing(String)
+	}
+
+	/// Read the signing metadata from the profile plist. Display metadata and
+	/// DER-Encoded-Profile are optional in profiles issued by developer services.
+	/// Cryptographic checks are performed separately on the original CMS bytes.
 	init(profileData: Data) throws {
-		guard let profile = try? Certificate.decode(profileData: profileData),
-			  let team = profile.TeamIdentifier.first,
-			  let entitlements = profile.Entitlements?.mapValues(\.value),
-			  let applicationIdentifier = entitlements[ZagFreeAccountEntitlements.applicationIdentifierKey] as? String,
-			  let dot = applicationIdentifier.firstIndex(of: "."),
-			  let entitlementSet = try? ZagEntitlementSet(entitlements) else {
-			throw ZagPortalError.malformedResponse
+		let payload: Data
+		if let start = profileData.range(of: Data("<?xml".utf8)),
+		   let end = profileData.range(of: Data("</plist>".utf8), options: [], in: start.lowerBound..<profileData.endIndex) {
+			payload = profileData.subdata(in: start.lowerBound..<end.upperBound)
+		} else { payload = profileData }
+		guard let plist = (try? PropertyListSerialization.propertyList(from: payload, format: nil)) as? [String: Any] else {
+			throw DecodeFailure.missing("mobileprovision plist")
 		}
+		func required<T>(_ name: String) throws -> T {
+			guard let value = plist[name] as? T else { throw DecodeFailure.missing(name) }
+			return value
+		}
+		let teams: [String] = try required("TeamIdentifier")
+		guard let team = teams.first, !team.isEmpty else { throw DecodeFailure.missing("TeamIdentifier[0]") }
+		let entitlements: [String: Any] = try required("Entitlements")
+		guard let appID = entitlements[ZagFreeAccountEntitlements.applicationIdentifierKey] as? String,
+			  let dot = appID.firstIndex(of: "."), appID.index(after: dot) < appID.endIndex else {
+			throw DecodeFailure.missing("Entitlements.application-identifier")
+		}
+		let certificates: [Data] = try required("DeveloperCertificates")
 		self.init(
-			uuid: profile.UUID,
+			uuid: try required("UUID"),
 			teamIdentifier: team,
-			bundleIdentifier: String(applicationIdentifier[applicationIdentifier.index(after: dot)...]),
-			certificateSerials: (profile.DeveloperCertificates ?? []).compactMap { ZagCertificateInspection(der: $0)?.serialNumber },
-			deviceUDIDs: profile.ProvisionedDevices ?? [],
-			entitlements: entitlementSet,
-			createdAt: profile.CreationDate,
-			expiresAt: profile.ExpirationDate,
+			bundleIdentifier: String(appID[appID.index(after: dot)...]),
+			certificateSerials: certificates.compactMap { ZagCertificateInspection(der: $0)?.serialNumber },
+			deviceUDIDs: plist["ProvisionedDevices"] as? [String] ?? [],
+			entitlements: try ZagEntitlementSet(entitlements),
+			createdAt: try required("CreationDate"),
+			expiresAt: try required("ExpirationDate"),
 			data: profileData
 		)
 	}

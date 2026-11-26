@@ -17,7 +17,7 @@ func throws_(_ expected: ZagPortalError, _ body: () throws -> Void, _ what: Stri
 
 // MARK: Action classification (read-only vs mutating) — audit item 5.
 let readOnly: [ZagDeveloperServicesAction] = [.listTeams, .listDevices, .listCertificates, .listAppIDs, .listAppGroups, .listProfiles]
-let mutating: [ZagDeveloperServicesAction] = [.addDevice, .submitCSR, .revokeCertificate, .addAppID, .addAppGroup, .assignAppGroups, .downloadProfile]
+let mutating: [ZagDeveloperServicesAction] = [.addDevice, .submitCSR, .revokeCertificate, .addAppID, .updateAppID, .addAppGroup, .assignAppGroups, .downloadProfile]
 check(readOnly.allSatisfy { !$0.isMutating }, "all discovery actions are read-only")
 check(mutating.allSatisfy { $0.isMutating }, "all create/register/revoke actions are mutating")
 check(Set(readOnly + mutating).count == ZagDeveloperServicesAction.allCases.count, "every action is classified exactly once")
@@ -64,7 +64,7 @@ let appIDFault = ZagDeveloperServicesProtocol.fault(body: plist(["resultCode": 3
 check(appIDFault?.resultCode == 35 && appIDFault?.message == "Invalid name [redacted] for [redacted] and [redacted]",
 	  "App ID diagnostics preserve the code and redact the bundle ID, email and account number")
 throws_(.certificateLimitReached, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 3540]), httpStatus: 200) }, "resultCode 3540 -> certificateLimitReached")
-throws_(.identifierUnavailable("Identifier is not available"), { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9999, "userString": "Identifier is not available"]), httpStatus: 200) }, "identifier message -> identifierUnavailable")
+throws_(.identifierUnavailable("Identifier is not available"), { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 9999, "userString": "Identifier is not available"]), httpStatus: 200, action: .addAppID) }, "identifier message -> identifierUnavailable")
 throws_(.malformedResponse, { _ = try ZagDeveloperServicesProtocol.parse(plist(["resultCode": 55555, "userString": "???"]), httpStatus: 200) }, "unknown non-zero code -> malformedResponse")
 throws_(.malformedResponse, { _ = try ZagDeveloperServicesProtocol.parse(Data("not a plist".utf8), httpStatus: 200) }, "non-plist body -> malformedResponse")
 throws_(.sessionRejected, { _ = try ZagDeveloperServicesProtocol.parse(Data(), httpStatus: 401) }, "HTTP 401 -> sessionRejected")
@@ -204,7 +204,7 @@ check(amb?.classification == .ambiguousRejection, "resultCode 4 is AMBIGUOUS, no
 check(amb?.resultCode == 4 && amb?.httpStatus == 200, "fault preserves the raw resultCode + http status")
 check(amb?.message.contains("@example.com") == false && amb?.message.contains("[redacted]") == true, "fault message is redacted (no email)")
 check(ZagDeveloperServicesProtocol.fault(body: faultPlist(3540), httpStatus: 200)?.classification == .certificateLimitReached, "3540 -> certificate limit")
-check(ZagDeveloperServicesProtocol.fault(body: faultPlist(9999, "Identifier is not available"), httpStatus: 200)?.classification == .identifierUnavailable, "identifier message -> identifierUnavailable")
+check(ZagDeveloperServicesProtocol.fault(body: faultPlist(9999, "Identifier is not available"), httpStatus: 200, action: .addAppID)?.classification == .identifierUnavailable, "identifier message -> identifierUnavailable")
 check(ZagDeveloperServicesProtocol.fault(body: Data("x".utf8), httpStatus: 200)?.classification == .malformed, "non-plist 2xx -> malformed")
 check(ZagDeveloperServicesProtocol.fault(body: Data(), httpStatus: 500)?.classification == .network, "HTTP 500 -> network")
 check(ZagDeveloperServicesProtocol.sanitizeMessage(String(repeating: "a", count: 300)).count <= 161, "message is length-bounded")

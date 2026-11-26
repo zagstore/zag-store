@@ -110,8 +110,14 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	// MARK: - Core request
 
 	private func send(_ action: ZagDeveloperServicesAction, teamID: String?, parameters: [String: Any] = [:]) async throws -> [String: Any] {
+		let url = try ZagDeveloperServicesProtocol.endpoint(action)
+		let endpoint = url.path
+		ZagSigningDiagnostics.record("POST \(endpoint)")
 		if action.isMutating && !consent.mayPerform(action) { throw ZagNativePortalError.consentRequired(action) }
-		guard budget?.take() != false else { throw ZagNativePortalError.requestCeilingReached }
+		guard budget?.take() != false else {
+			ZagSigningDiagnostics.record("Developer services request budget exhausted")
+			throw ZagNativePortalError.requestCeilingReached
+		}
 		var requestHeaders = try await headers()
 		guard !requestHeaders.isEmpty, requestHeaders.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) else {
 			throw ZagPortalError.sessionRejected
@@ -120,36 +126,67 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		requestHeaders["Accept"] = "text/x-xml-plist"
 		requestHeaders["Accept-Language"] = "en-us"
 		let request = ZagHTTPRequest(
-			url: try ZagDeveloperServicesProtocol.endpoint(action),
+			url: url,
 			method: "POST",
 			headers: requestHeaders,
 			body: try ZagDeveloperServicesProtocol.requestBody(teamID: teamID, parameters: parameters))
-		fault.set(nil)
 		let response: ZagHTTPResponse
 		do {
 			response = try await transport.send(request)
 		} catch let error as ZagTransportError {
 			fault.set(Self.transportReason(error))
+			ZagSigningDiagnostics.record("\(endpoint) — \(Self.transportReason(error))")
 			throw error
 		}
-		// A non-2xx that parse collapses to `.network` (not 401/403/429) keeps its
-		// status, so the banner shows e.g. "HTTP 404" instead of a bare "network".
-		if !(200..<300).contains(response.statusCode),
-		   ![401, 403, 429].contains(response.statusCode) {
-			fault.set("HTTP \(response.statusCode)")
+		let identifiers = [teamID] + ["identifier", "name", "deviceNumber", "appIdId", "machineId", "csrContent"].map { parameters[$0] as? String }
+		let groupIDs = parameters["applicationGroups"] as? [String] ?? []
+		let details = ZagDeveloperServicesProtocol.fault(body: response.body, httpStatus: response.statusCode,
+			action: action, redacting: identifiers.compactMap { $0 } + groupIDs + Array(requestHeaders.values), includeSuccess: true)
+		var status = Self.responseStatus(response.statusCode, details: details)
+		if details?.classification == .malformed,
+		   (try? PropertyListSerialization.propertyList(from: response.body, format: nil)) as? [String: Any] == nil {
+			status += " — Missing or invalid: response property list"
 		}
+		fault.set(status)
+		ZagSigningDiagnostics.record("\(endpoint) — \(status)")
 		do {
 			return try ZagDeveloperServicesProtocol.parse(response.body, httpStatus: response.statusCode, action: action)
-		} catch let error as ZagPortalError where action == .listAppIDs || action == .addAppID {
-			let sensitiveHeaders = requestHeaders.filter {
-				["x-apple-gs-token", "x-apple-i-identity-id", "x-apple-i-md", "x-apple-i-md-m", "x-apple-i-md-lu", "x-mme-device-id"]
-					.contains($0.key.lowercased())
+		} catch let error as ZagPortalError {
+			if action == .submitCSR,
+			   [.certificateLimitReached, .existingCertificateOrPendingRequest, .sessionRejected, .rateLimited].contains(error) {
+				throw error
 			}
-			let identifiers = [teamID, parameters["identifier"] as? String, parameters["name"] as? String].compactMap { $0 }
-			guard let details = ZagDeveloperServicesProtocol.fault(body: response.body, httpStatus: response.statusCode,
-				action: action, redacting: identifiers + Array(sensitiveHeaders.values)) else { throw error }
-			throw ZagAppIDServerRejection(action: action, error: error, fault: details)
+			if action == .listAppIDs || action == .addAppID, let details {
+				throw ZagAppIDServerRejection(action: action, error: error, fault: details)
+			}
+			let guidance: String
+			switch (action, details?.resultCode) {
+			case (.submitCSR, 3250): guidance = "Apple rejected the signing request."
+			case (.addAppID, 9412): guidance = "Apple rejected the bundle identifier."
+			case (.updateAppID, 9100), (.assignAppGroups, 9115), (.downloadProfile, 8201):
+				guidance = "Apple could not find the App ID."
+			case (.downloadProfile, 8220): guidance = "Apple reports that the team has no device eligible for this profile."
+			case (.assignAppGroups, 35): guidance = "Apple rejected the App Group assignment."
+			default: guidance = ""
+			}
+			throw ZagPortalOperationFailure(operation: endpoint,
+				reason: guidance.isEmpty ? status : "\(status) — \(guidance)", underlying: error, resultCode: details?.resultCode)
 		}
+	}
+
+	private static func responseStatus(_ http: Int, details: ZagDeveloperServicesFault?) -> String {
+		var status = "HTTP \(http)"
+		if let code = details?.resultCode { status += ", Apple code \(code)" }
+		if let message = details?.message, !message.isEmpty { status += " — \(message)" }
+		return status
+	}
+
+	private func malformed(_ action: ZagDeveloperServicesAction, fields: String) -> ZagPortalOperationFailure {
+		let operation = "/services/\(ZagDeveloperServicesProtocol.protocolVersion)/\(action.rawValue)"
+		let reason = [fault.reason, "Missing or invalid: \(fields)"].compactMap { $0 }.joined(separator: " — ")
+		let error = ZagPortalOperationFailure(operation: operation, reason: reason, underlying: .malformedResponse)
+		ZagSigningDiagnostics.record(error.localizedDescription)
+		return error
 	}
 
 	/// A short, secret-free reason for a transport refusal.
@@ -167,7 +204,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	/// Team discovery — the smallest safe first live experiment. Read-only.
 	func teams() async throws -> [ZagNativeDeveloperTeam] {
 		let dict = try await send(.listTeams, teamID: nil)
-		let rows = (dict["teams"] as? [[String: Any]]) ?? []
+		guard let rows = dict["teams"] as? [[String: Any]] else { throw malformed(.listTeams, fields: "teams") }
 		return rows.compactMap { row in
 			guard let id = row["teamId"] as? String else { return nil }
 			let memberships = (row["memberships"] as? [[String: Any]])?.first
@@ -181,9 +218,13 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	func devices(team: String) async throws -> [ZagRegisteredDevice] {
 		let dict = try await send(.listDevices, teamID: team)
-		guard let rows = dict["devices"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
-		return rows.compactMap { row in
-			guard let udid = (row["deviceNumber"] as? String) ?? (row["udid"] as? String) else { return nil }
+		guard let rows = dict["devices"] as? [[String: Any]] else { throw malformed(.listDevices, fields: "devices") }
+		return try rows.compactMap { row in
+			guard let udid = (row["deviceNumber"] as? String) ?? (row["udid"] as? String), !udid.isEmpty else {
+				throw malformed(.listDevices, fields: "devices[].deviceNumber")
+			}
+			let status = (row["status"] as? String)?.lowercased()
+			if status == "disabled" || status == "inactive" { return nil }
 			return ZagRegisteredDevice(udid: udid, name: (row["name"] as? String) ?? "device")
 		}
 	}
@@ -191,22 +232,27 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	func appIDs(team: String) async throws -> [ZagRegisteredAppID] {
 		let dict = try await send(.listAppIDs, teamID: team)
 		if dict["appIds"] == nil, ZagDeveloperServicesProtocol.resultCode(dict) == 0 { return [] }
-		guard let rows = dict["appIds"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
-		return try rows.map(Self.appID)
+		guard let rows = dict["appIds"] as? [[String: Any]] else { throw malformed(.listAppIDs, fields: "appIds") }
+		return try rows.map { row in
+			guard let appID = Self.appID(row) else { throw malformed(.listAppIDs, fields: "appIds[].appIdId or appIds[].identifier") }
+			return appID
+		}
 	}
 
-	private static func appID(_ row: [String: Any]) throws -> ZagRegisteredAppID {
+	private static func appID(_ row: [String: Any]) -> ZagRegisteredAppID? {
 		guard let identifier = (row["appIdId"] as? String) ?? (row["appIdentifierId"] as? String),
 			  !identifier.isEmpty, let bundle = row["identifier"] as? String, !bundle.isEmpty else {
-			throw ZagPortalError.malformedResponse
+			return nil
 		}
 		return ZagRegisteredAppID(identifier: identifier, bundleIdentifier: bundle,
-			expiresAt: ZagDeveloperServicesProtocol.date(row["expirationDate"]))
+			expiresAt: ZagDeveloperServicesProtocol.date(row["expirationDate"]),
+			appGroupsEnabled: (row["features"] as? [String: Any])?["APG3427HIY"] as? Bool)
 	}
 
 	private func appGroupRows(team: String) async throws -> [[String: Any]] {
 		let dict = try await send(.listAppGroups, teamID: team)
-		guard let rows = dict["applicationGroupList"] as? [[String: Any]] else { throw ZagPortalError.malformedResponse }
+		if dict["applicationGroupList"] == nil, ZagDeveloperServicesProtocol.resultCode(dict) == 0 { return [] }
+		guard let rows = dict["applicationGroupList"] as? [[String: Any]] else { throw malformed(.listAppGroups, fields: "applicationGroupList") }
 		return rows
 	}
 
@@ -247,10 +293,19 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	private func listCertificateRows(team: String) async throws -> [[String: Any]] {
 		let response = try await sendV1(path: "certificates", methodOverride: "GET",
 									   body: ZagDeveloperServicesV1.listCertificatesBody(teamID: team))
-		if !(200..<300).contains(response.statusCode) { fault.set("HTTP \(response.statusCode)") }
-		let rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
+		let rows: [[String: Any]]
+		do {
+			rows = try ZagDeveloperServicesV1.parseList(response.body, httpStatus: response.statusCode)
+		} catch let error as ZagPortalError {
+			let reason = (fault.reason ?? "No response status") + (error == .malformedResponse ? " — Missing or invalid: data" : "")
+			let failure = ZagPortalOperationFailure(operation: "/services/v1/certificates", reason: reason, underlying: error)
+			ZagSigningDiagnostics.record(failure.localizedDescription)
+			throw failure
+		}
 		guard rows.allSatisfy({ ZagDeveloperServicesProtocol.parseCertificate($0) != nil }) else {
-			throw ZagPortalError.malformedResponse
+			let failure = ZagPortalOperationFailure(operation: "/services/v1/certificates", reason: "Missing or invalid: data[].attributes certificate metadata", underlying: .malformedResponse)
+			ZagSigningDiagnostics.record(failure.localizedDescription)
+			throw failure
 		}
 		return rows
 	}
@@ -284,44 +339,83 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 	func profile(for appID: ZagRegisteredAppID, team: String) async throws -> ZagIssuedProfile {
 		let dict = try await send(.downloadProfile, teamID: team, parameters: ["appIdId": appID.identifier])
 		guard let profile = dict["provisioningProfile"] as? [String: Any],
-			  let encoded = (profile["encodedProfile"] as? Data) ?? (profile["encodedProfile"] as? String).flatMap({ Data(base64Encoded: $0) }) else { throw ZagPortalError.malformedResponse }
-		return try ZagIssuedProfile(profileData: encoded)
+			  let encoded = (profile["encodedProfile"] as? Data) ?? (profile["encodedProfile"] as? String).flatMap({ Data(base64Encoded: $0) }) else { throw malformed(.downloadProfile, fields: "provisioningProfile.encodedProfile") }
+		do { return try ZagIssuedProfile(profileData: encoded) }
+		catch ZagIssuedProfile.DecodeFailure.missing(let field) {
+			throw malformed(.downloadProfile, fields: "encodedProfile.\(field)")
+		} catch { throw malformed(.downloadProfile, fields: "encodedProfile.Entitlements") }
 	}
 
 	// MARK: - Mutations (consent-gated)
 
 	func registerDevice(udid: String, name: String, team: String) async throws -> ZagRegisteredDevice {
-		let dict = try await send(.addDevice, teamID: team, parameters: ["deviceNumber": udid, "name": name])
-		let row = (dict["device"] as? [String: Any]) ?? [:]
-		return ZagRegisteredDevice(udid: (row["deviceNumber"] as? String) ?? udid, name: (row["name"] as? String) ?? name)
+		let dict: [String: Any]
+		do {
+			dict = try await send(.addDevice, teamID: team, parameters: ["deviceNumber": udid, "name": name])
+		} catch let failure as ZagPortalOperationFailure where failure.resultCode == 35 {
+			// Apple also uses 35 for an invalid UDID. Only exact read-back proves
+			// that a concurrently registered device can be reused.
+			if let existing = try? await devices(team: team).first(where: { $0.udid.caseInsensitiveCompare(udid) == .orderedSame }) {
+				return existing
+			}
+			throw failure
+		}
+		guard let row = dict["device"] as? [String: Any],
+			  let returned = (row["deviceNumber"] as? String) ?? (row["udid"] as? String),
+			  returned.caseInsensitiveCompare(udid) == .orderedSame else {
+			throw malformed(.addDevice, fields: "device.deviceNumber matching the requested device")
+		}
+		return ZagRegisteredDevice(udid: returned, name: (row["name"] as? String) ?? name)
 	}
 
 	func registerAppID(bundleIdentifier: String, name: String, team: String) async throws -> ZagRegisteredAppID {
 		let allowed = CharacterSet.alphanumerics.union(.whitespaces)
 		let cleanName = name.folding(options: .diacriticInsensitive, locale: nil)
 			.components(separatedBy: allowed.inverted).joined().trimmingCharacters(in: .whitespaces)
-		let dict = try await send(.addAppID, teamID: team, parameters: ["identifier": bundleIdentifier, "name": cleanName.isEmpty ? "Zag Store App" : cleanName])
-		guard let row = dict["appId"] as? [String: Any] else { throw ZagPortalError.malformedResponse }
-		let appID = try Self.appID(row)
-		guard appID.bundleIdentifier == bundleIdentifier else { throw ZagPortalError.malformedResponse }
+		let dict: [String: Any]
+		do {
+			dict = try await send(.addAppID, teamID: team,
+				parameters: ["identifier": bundleIdentifier, "name": cleanName.isEmpty ? "Zag Store App" : cleanName])
+		} catch let rejection as ZagAppIDServerRejection where [35, 9401].contains(rejection.fault.resultCode ?? 0) {
+			if let existing = try? await appIDs(team: team).first(where: {
+				$0.bundleIdentifier == bundleIdentifier && $0.isActive(at: now())
+			}) { return existing }
+			throw rejection
+		}
+		guard let row = dict["appId"] as? [String: Any], let appID = Self.appID(row),
+			  appID.bundleIdentifier == bundleIdentifier else {
+			throw malformed(.addAppID, fields: "appId.appIdId or matching appId.identifier")
+		}
 		return appID
 	}
 
 	func registerAppGroup(_ identifier: String, team: String) async throws -> ZagRegisteredAppGroup {
-		let dict = try await send(.addAppGroup, teamID: team, parameters: ["identifier": identifier, "name": identifier])
-		let row = (dict["applicationGroup"] as? [String: Any]) ?? [:]
-		return ZagRegisteredAppGroup(identifier: (row["identifier"] as? String) ?? identifier)
+		let dict = try await send(.addAppGroup, teamID: team, parameters: ["identifier": identifier, "name": "Zag Store " + identifier.replacingOccurrences(of: ".", with: " ").replacingOccurrences(of: "-", with: " ")])
+		guard let row = dict["applicationGroup"] as? [String: Any], row["identifier"] as? String == identifier else {
+			throw malformed(.addAppGroup, fields: "matching applicationGroup.identifier")
+		}
+		return ZagRegisteredAppGroup(identifier: identifier)
 	}
 
 	func assignAppGroups(_ groups: [String], to appID: ZagRegisteredAppID, team: String) async throws {
 		let rows = try await appGroupRows(team: team)
 		let groupIDs = try groups.map { group in
 			guard let row = rows.first(where: { $0["identifier"] as? String == group }),
-				  let id = row["applicationGroup"] as? String else { throw ZagPortalError.malformedResponse }
+				  let id = row["applicationGroup"] as? String else { throw malformed(.listAppGroups, fields: "applicationGroupList[].applicationGroup") }
 			return id
 		}
-		_ = try await send(.assignAppGroups, teamID: team,
-						   parameters: ["appIdId": appID.identifier, "applicationGroups": groupIDs])
+		if appID.appGroupsEnabled != true {
+			let updated = try await send(.updateAppID, teamID: team,
+				parameters: ["appIdId": appID.identifier, "APG3427HIY": true])
+			guard let row = updated["appId"] as? [String: Any], Self.appID(row)?.identifier == appID.identifier else {
+				throw malformed(.updateAppID, fields: "matching appId.appIdId")
+			}
+		}
+		let assigned = try await send(.assignAppGroups, teamID: team,
+			parameters: ["appIdId": appID.identifier, "applicationGroups": groupIDs])
+		guard ZagDeveloperServicesProtocol.resultCode(assigned) == 0 else {
+			throw malformed(.assignAppGroups, fields: "resultCode")
+		}
 	}
 
 	func submitCertificateRequest(_ request: ZagCertificateRequest, team: String) async throws -> ZagIssuedCertificate {
@@ -335,7 +429,7 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		// that look like they came from many machines.
 		let dict = try await send(.submitCSR, teamID: team, parameters: ["csrContent": pem, "machineName": "Zag Store", "machineId": ZagMachineIdentifier.current()])
 		guard let row = (dict["certRequest"] as? [String: Any]) ?? (dict["certificate"] as? [String: Any]) else {
-			throw ZagPortalError.malformedResponse
+			throw malformed(.submitCSR, fields: "certRequest or certificate")
 		}
 		if let parsed = ZagDeveloperServicesProtocol.parseCertificate(row), let der = parsed.der, !der.isEmpty {
 			return ZagIssuedCertificate(certificate: Self.certificate(parsed), data: der)
@@ -345,15 +439,15 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		// Apple accepted the CSR response. A later inventory error cannot prove
 		// that the CSR was refused, even if that read returns 401 or 429.
 		guard id != nil || serial?.isEmpty == false,
-			  let listed = try? await listCertificateRows(team: team) else { throw ZagPortalError.malformedResponse }
+			  let listed = try? await listCertificateRows(team: team) else { throw malformed(.submitCSR, fields: "certificate reference or read-back inventory") }
 		guard let match = listed.first(where: { candidate in
 			if let id, candidate["id"] as? String == id { return true }
 			guard let serial, !serial.isEmpty else { return false }
 			guard let candidateSerial = ZagDeveloperServicesProtocol.parseCertificate(candidate)?.serialNumber else { return false }
 			return Self.normalizedSerial(candidateSerial) == Self.normalizedSerial(serial)
-		}), let parsed = ZagDeveloperServicesProtocol.parseCertificate(match) else { throw ZagPortalError.malformedResponse }
+		}), let parsed = ZagDeveloperServicesProtocol.parseCertificate(match) else { throw malformed(.submitCSR, fields: "issued certificate in inventory") }
 		let complete = await certificateDetail(for: match, parsed: parsed, team: team)
-		guard let der = complete.der, !der.isEmpty else { throw ZagPortalError.malformedResponse }
+		guard let der = complete.der, !der.isEmpty else { throw malformed(.submitCSR, fields: "issued certificate DER") }
 		return ZagIssuedCertificate(certificate: Self.certificate(complete), data: der)
 	}
 
@@ -378,7 +472,12 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 
 	/// One request to the `/services/v1/` JSON API over the pinned transport.
 	private func sendV1(path: String, methodOverride: String, body: Data) async throws -> ZagHTTPResponse {
-		guard budget?.take() != false else { throw ZagNativePortalError.requestCeilingReached }
+		let endpoint = "/services/v1/certificates" + (path == "certificates" ? "" : "/{id}")
+		ZagSigningDiagnostics.record("\(methodOverride) \(endpoint)")
+		guard budget?.take() != false else {
+			ZagSigningDiagnostics.record("Developer services request budget exhausted")
+			throw ZagNativePortalError.requestCeilingReached
+		}
 		var requestHeaders = try await headers()
 		guard !requestHeaders.isEmpty, requestHeaders.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) else {
 			throw ZagPortalError.sessionRejected
@@ -386,9 +485,20 @@ struct ZagNativeDeveloperPortal: ZagDeveloperPortalService {
 		requestHeaders["Accept-Language"] = "en-us"
 		for (k, v) in ZagDeveloperServicesV1.headers(methodOverride: methodOverride) { requestHeaders[k] = v }
 		let request = ZagHTTPRequest(url: try ZagDeveloperServicesV1.endpoint(path), method: "POST", headers: requestHeaders, body: body)
-		fault.set(nil)
-		do { return try await transport.send(request) }
-		catch let error as ZagTransportError { fault.set(Self.transportReason(error)); throw error }
+		do {
+			let response = try await transport.send(request)
+			let query = ((try? JSONSerialization.jsonObject(with: body)) as? [String: String])?["urlEncodedQueryParams"]
+			let details = ZagDeveloperServicesProtocol.fault(body: response.body, httpStatus: response.statusCode,
+				redacting: Array(requestHeaders.values) + [query, path.split(separator: "/").last.map(String.init)].compactMap { $0 })
+			let status = Self.responseStatus(response.statusCode, details: details)
+			fault.set(status)
+			ZagSigningDiagnostics.record("\(endpoint) — \(status)")
+			return response
+		} catch let error as ZagTransportError {
+			fault.set(Self.transportReason(error))
+			ZagSigningDiagnostics.record("\(endpoint) — \(Self.transportReason(error))")
+			throw error
+		}
 	}
 
 	/// Maps a parsed certificate (transport-independent) to the app model.

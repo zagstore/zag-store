@@ -18,7 +18,7 @@ extension Tests {
 		do {
 			try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 			let consent = ZagMutationConsentCoordinator()
-			consent.authorize([.addDevice, .submitCSR, .addAppID, .downloadProfile])
+			consent.authorize([.addDevice, .submitCSR, .addAppID, .downloadProfile, .addAppGroup, .assignAppGroups, .updateAppID])
 			let tokens = accounts.map { ZagPersistedDeveloperToken(accountID: $0, token: "mock-token-\($0)", expiresAtMs: 0) }
 			let portals = tokens.map { token in
 				ZagNativeDeveloperPortal(transport: transport, headers: { try await transport.headers(for: token) }, consent: consent, maxRequests: nil)
@@ -52,8 +52,11 @@ extension Tests {
 				scopes.insert(authorization.scope)
 				let provisioner = ZagFreeAccountProvisioner(portal: portals[index], keys: ZagSimulatedSigningKeyFactory(), secrets: secrets,
 					account: authorization.scope.accountID, now: { clock.now })
+				let appEntitlements = index == 0
+					? try ZagEntitlementSet([ZagFreeAccountEntitlements.appGroupsKey: ["group.com.example.integration"]])
+					: entitlements()
 				let request = ZagProvisioningRequest(accountID: authorization.scope.accountID, team: team.teamID, deviceUDID: udid,
-					deviceName: "Test Device", app: .init(originalBundleIdentifier: original, name: "Integration Test", entitlements: entitlements()),
+					deviceName: "Test Device", app: .init(originalBundleIdentifier: original, name: "Integration Test", entitlements: appEntitlements),
 					extensions: [], installedFreeAccountApps: [])
 				let actual = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
 					provisioner: provisioner, secrets: secrets, signer: AppIDTestSigner(), installer: AppIDTestInstaller(),
@@ -66,6 +69,27 @@ extension Tests {
 				"fresh and undated inventories allow registration, team scopes stay distinct, and an existing ID is reused")
 
 			await transport.select(accounts[0])
+			let group = ZagBundleIdentifierMapping.mappedAppGroup("group.com.example.integration", team: teams[0])!
+			let groupAssigned = await transport.assigned[teams[0]] == [group]
+			check(groupAssigned, "native App Group assignment follows capability enablement and carries the mapped group into the profile")
+			let suiteName = "ZagSigningDiagnosticsTests." + UUID().uuidString
+			let defaults = UserDefaults(suiteName: suiteName)!
+			defer { defaults.removePersistentDomain(forName: suiteName) }
+			await transport.setProfileFailure(true)
+			do {
+				_ = try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics(defaults: defaults)) {
+					try await portals[0].profile(for: .init(identifier: "NEW0",
+						bundleIdentifier: ZagBundleIdentifierMapping.mapped(original, team: teams[0])!, expiresAt: expiration), team: teams[0])
+				}
+				check(false, "incomplete profile reply should be rejected")
+			} catch let failure as ZagPortalOperationFailure {
+				let report = UserDefaults(suiteName: suiteName)?.string(forKey: "ZagNativeSigningDiagnostics") ?? ""
+				check(failure.operation.hasSuffix("downloadTeamProvisioningProfile.action")
+					&& report.contains("HTTP 200, Apple code 0") && report.contains("encodedProfile")
+					&& !report.contains(teams[0]) && !report.contains(accounts[0]),
+					"incomplete profile preserves endpoint, status, Apple code and missing field in the local report")
+			}
+			await transport.setProfileFailure(false)
 			await transport.rejectRegistration(code: 37)
 			let auth = ZagSigningAuthorization.nativeAccount(token: tokens[0], teamID: teams[0])
 			let provisioner = ZagFreeAccountProvisioner(portal: portals[0], keys: ZagSimulatedSigningKeyFactory(), secrets: secrets,
@@ -97,6 +121,10 @@ private actor NativeAppIDTransport: ZagHTTPTransport {
 	var registrations: [String: Int] = [:]
 	var registrationRejection: Int?
 	var certificatesReady = 0
+	var groups: [String: String] = [:]
+	var capabilityEnabled = Set<String>()
+	var assigned: [String: [String]] = [:]
+	var profileFailure = false
 
 	init(teams: [String: String], certDER: Data, certificateSerial: String, now: Date) {
 		self.teams = teams
@@ -109,6 +137,7 @@ private actor NativeAppIDTransport: ZagHTTPTransport {
 	func seed(_ ids: [ZagRegisteredAppID], team: String) { rows[team] = ids }
 	func rejectRegistration(code: Int) { registrationRejection = code }
 	func certificateReady() { certificatesReady += 1 }
+	func setProfileFailure(_ value: Bool) { profileFailure = value }
 
 	func headers(for token: ZagPersistedDeveloperToken) throws -> [String: String] {
 		guard selected == token.accountID else { throw ZagPortalError.sessionRejected }
@@ -177,15 +206,35 @@ private actor NativeAppIDTransport: ZagHTTPTransport {
 				rows[team, default: []].append(.init(identifier: id, bundleIdentifier: bundle, expiresAt: expiry))
 				reply["appId"] = ["appIdId": id, "identifier": bundle, "expirationDate": expiry]
 			}
+		case "listApplicationGroups.action":
+			if let group = groups[team] {
+				reply["applicationGroupList"] = [["identifier": group, "name": "Integration", "applicationGroup": "GROUP1"]]
+			}
+		case "addApplicationGroup.action":
+			guard let identifier = params?["identifier"] as? String, let name = params?["name"] as? String,
+				  !name.contains(".") else { throw ZagPortalError.malformedResponse }
+			groups[team] = identifier
+			reply["applicationGroup"] = ["identifier": identifier, "applicationGroup": "GROUP1"]
+		case "updateAppId.action":
+			guard let id = params?["appIdId"] as? String, let app = rows[team]?.first(where: { $0.identifier == id }),
+				  params?["APG3427HIY"] as? Bool == true else { throw ZagPortalError.malformedResponse }
+			capabilityEnabled.insert(team)
+			reply["appId"] = ["appIdId": id, "identifier": app.bundleIdentifier, "features": ["APG3427HIY": true]]
+		case "assignApplicationGroupToAppId.action":
+			guard capabilityEnabled.contains(team), params?["applicationGroups"] as? [String] == ["GROUP1"],
+				  let group = groups[team] else { throw ZagPortalError.malformedResponse }
+			assigned[team] = [group]
 		case "downloadTeamProvisioningProfile.action":
+			if profileFailure { break }
 			guard let id = params?["appIdId"] as? String, let app = rows[team]?.first(where: { $0.identifier == id }) else {
 				throw ZagPortalError.malformedResponse
 			}
 			let profile = try PropertyListSerialization.data(fromPropertyList: [
-				"AppIDName": "Test", "CreationDate": now, "ExpirationDate": now + 7 * 86_400,
-				"Platform": ["iOS"], "DeveloperCertificates": [certDER], "DER-Encoded-Profile": Data([1]),
-				"Entitlements": ["application-identifier": "\(team).\(app.bundleIdentifier)"], "Name": "Test",
-				"ProvisionedDevices": [udid], "TeamIdentifier": [team], "TeamName": "Test", "TimeToLive": 7, "UUID": "TESTPROFILE", "Version": 1
+				"CreationDate": now, "ExpirationDate": now + 7 * 86_400,
+				"DeveloperCertificates": [certDER],
+				"Entitlements": ["application-identifier": "\(team).\(app.bundleIdentifier)",
+				                 ZagFreeAccountEntitlements.appGroupsKey: assigned[team] ?? []],
+				"ProvisionedDevices": [udid], "TeamIdentifier": [team], "UUID": "TESTPROFILE"
 			], format: .xml, options: 0)
 			reply["provisioningProfile"] = ["encodedProfile": profile]
 		default: throw ZagPortalError.malformedResponse
@@ -202,6 +251,7 @@ private struct AppIDTestSigner: ZagAppSigning {
 			throw ZagFreeAccountSigningError.identityMismatch
 		}
 		try Data(result.app.bundleIdentifier.utf8).write(to: app.appendingPathComponent("signature"))
+		try result.app.profile.data.write(to: app.appendingPathComponent("embedded.mobileprovision"))
 		return .init(bundleIdentifier: result.app.bundleIdentifier, originalBundleIdentifier: result.app.originalBundleIdentifier,
 			signedAt: now, profileExpiresAt: result.expiresAt, certificateExpiresAt: identity.expiresAt)
 	}
@@ -209,14 +259,16 @@ private struct AppIDTestSigner: ZagAppSigning {
 
 private actor AppIDTestInstaller: ZagFreeAccountInstaller {
 	var installed: String?
+	var installedProfiles: [Data] = []
 	func install(signedApp: URL, bundleIdentifier: String) async throws {
 		guard try String(contentsOf: signedApp.appendingPathComponent("signature"), encoding: .utf8) == bundleIdentifier else {
 			throw ZagFreeAccountSigningError.verification("test signature")
 		}
 		installed = bundleIdentifier
+		installedProfiles = [try Data(contentsOf: signedApp.appendingPathComponent("embedded.mobileprovision"))]
 	}
 	func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification {
 		guard installed == expectation.bundleIdentifier, expectation.profileUUID == "TESTPROFILE" else { return .notInstalled }
-		return .verified(profileExpiresAt: expectation.profileExpiresAt, certificateExpiresAt: expectation.certificateExpiresAt)
+		return ZagInstalledProfileCheck.verify(expectation, installedProfiles: installedProfiles)
 	}
 }

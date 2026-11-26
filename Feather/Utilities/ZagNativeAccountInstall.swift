@@ -115,7 +115,10 @@ enum ZagNativeAccountInstall {
 	static func install(source: URL, name: String, expectedScope: ZagSigningScope? = nil,
 						onCertificateReady: (@Sendable () async -> Void)? = nil) async throws -> ZagInstallVerification {
 		try await withExclusiveOperation {
-			try await performInstall(source: source, name: name, expectedScope: expectedScope, onCertificateReady: onCertificateReady)
+			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics()) {
+				ZagSigningDiagnostics.record("Native signing attempt started")
+				return try await performInstall(source: source, name: name, expectedScope: expectedScope, onCertificateReady: onCertificateReady)
+			}
 		}
 	}
 
@@ -138,6 +141,7 @@ enum ZagNativeAccountInstall {
 			try component(at: app.appendingPathComponent($0), name: appendingName(name, path: $0))
 		}
 
+		ZagSigningDiagnostics.record("Reading paired device and installed apps")
 		let (device, installed) = try await pairing.signingDeviceInventory()
 		let installedProfiles = (try? await ZagRPPairingFreeAccountInstaller.readProfiles().get()) ?? []
 		let profiles = installedProfiles.compactMap { try? ZagIssuedProfile(profileData: $0) }
@@ -147,13 +151,14 @@ enum ZagNativeAccountInstall {
 		}.map(\.bundleIdentifier))
 
 		let consent = ZagMutationConsentCoordinator()
-		consent.authorize([.addDevice, .addAppID, .submitCSR, .downloadProfile, .addAppGroup, .assignAppGroups])
+		consent.authorize([.addDevice, .addAppID, .submitCSR, .downloadProfile, .addAppGroup, .assignAppGroups, .updateAppID])
 		defer { consent.cancel() }
 		let components = [main] + extensions
 		let groupCount = components.reduce(0) {
 			$0 + (($1.entitlements.dictionary[ZagFreeAccountEntitlements.appGroupsKey] as? [String])?.count ?? 0)
 		}
 		let portal = portal(token: token, consent: consent, maxRequests: 24 + 8 * components.count + groupCount)
+		ZagSigningDiagnostics.record("Selecting Personal Team")
 		guard let team = ZagNativeDeveloperTeam.personalTeam(in: try await portal.teams(), expectedID: expectedScope?.teamID) else { throw Failure.personalTeam }
 		let authorization = ZagSigningAuthorization.nativeAccount(token: token, teamID: team.teamID)
 		let scope = authorization.scope

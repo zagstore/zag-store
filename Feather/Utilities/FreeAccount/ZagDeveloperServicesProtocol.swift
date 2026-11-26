@@ -35,6 +35,7 @@ enum ZagDeveloperServicesAction: String, Sendable, Equatable, CaseIterable {
 	case submitCSR           = "ios/submitDevelopmentCSR.action"
 	case revokeCertificate   = "ios/revokeDevelopmentCert.action"   // superseded by v1 DELETE
 	case addAppID            = "ios/addAppId.action"
+	case updateAppID         = "ios/updateAppId.action"
 	case addAppGroup         = "ios/addApplicationGroup.action"
 	case assignAppGroups     = "ios/assignApplicationGroupToAppId.action"
 	case downloadProfile     = "ios/downloadTeamProvisioningProfile.action"
@@ -46,7 +47,7 @@ enum ZagDeveloperServicesAction: String, Sendable, Equatable, CaseIterable {
 		switch self {
 		case .listTeams, .listDevices, .listCertificates, .listAppIDs, .listAppGroups, .listProfiles:
 			return false
-		case .addDevice, .submitCSR, .revokeCertificate, .addAppID, .addAppGroup, .assignAppGroups, .downloadProfile:
+		case .addDevice, .submitCSR, .revokeCertificate, .addAppID, .updateAppID, .addAppGroup, .assignAppGroups, .downloadProfile:
 			// downloadTeamProvisioningProfile creates the team profile on demand,
 			// so it is treated as a mutation out of caution.
 			return true
@@ -110,14 +111,9 @@ enum ZagDeveloperServicesProtocol {
 	/// error code, so callers only ever see a success dictionary.
 	static func parse(_ body: Data, httpStatus: Int, action: ZagDeveloperServicesAction? = nil) throws -> [String: Any] {
 		guard (200..<300).contains(httpStatus) else {
-			if action == .addAppID, [400, 409, 422].contains(httpStatus),
+			if [400, 409, 422].contains(httpStatus),
 			   let payload = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any] {
 				try throwIfError(payload, action: action)
-			}
-			if action == .submitCSR, httpStatus == 409,
-			   let payload = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any],
-			   resultCode(payload) == 7460 {
-				throw ZagPortalError.existingCertificateOrPendingRequest
 			}
 			throw httpStatus == 401 || httpStatus == 403 ? ZagPortalError.sessionRejected
 				: httpStatus == 429 ? ZagPortalError.rateLimited
@@ -161,8 +157,8 @@ enum ZagDeveloperServicesProtocol {
 	private static func classification(for code: Int, action: ZagDeveloperServicesAction?, message: String) -> ZagDeveloperServicesFault.Classification {
 		switch (action, code) {
 		case (_, 1100), (_, 1): return .sessionRejected
-		case (_, 7460): return .existingCertificateOrPendingRequest
-		case (_, 3540), (_, 7458): return .certificateLimitReached
+		case (.submitCSR, 7460), (nil, 7460): return .existingCertificateOrPendingRequest
+		case (.submitCSR, 3540), (.submitCSR, 7458), (nil, 3540), (nil, 7458): return .certificateLimitReached
 		// AltSign's QH65B2 addAppId maps 9120 and SideSign maps 37.
 		// These codes have no App ID quota meaning outside registration.
 		case (.addAppID, 37), (.addAppID, 9120): return .appIDLimitReached
@@ -170,7 +166,11 @@ enum ZagDeveloperServicesProtocol {
 		case (.addAppID, 9412), (.addDevice, 35): return .ambiguousRejection
 		default:
 			let lower = message.lowercased()
-			if lower.contains("identifier") && (lower.contains("not available") || lower.contains("already in use")) {
+			if action == .submitCSR && code == 35 && lower.contains("certificate")
+				&& (lower.contains("limit") || lower.contains("maximum") || lower.contains("too many")) {
+				return .certificateLimitReached
+			}
+			if action == .addAppID && lower.contains("identifier") && (lower.contains("not available") || lower.contains("already in use")) {
 				return .identifierUnavailable
 			}
 			return .ambiguousRejection
@@ -188,10 +188,13 @@ enum ZagDeveloperServicesProtocol {
 	/// Classification is CONSERVATIVE: only HTTP 429 and the verified throttle
 	/// codes are a confirmed rate-limit — every other unknown non-zero code is
 	/// `ambiguousRejection`, never silently called a throttle.
-	static func fault(body: Data, httpStatus: Int, action: ZagDeveloperServicesAction? = nil, redacting: [String] = []) -> ZagDeveloperServicesFault? {
-		let dict = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any]
-		let code = dict.flatMap(resultCode)
-		let raw = dict.map(rawMessage) ?? ""
+	static func fault(body: Data, httpStatus: Int, action: ZagDeveloperServicesAction? = nil, redacting: [String] = [], includeSuccess: Bool = false) -> ZagDeveloperServicesFault? {
+		let plist = (try? PropertyListSerialization.propertyList(from: body, format: nil)) as? [String: Any]
+		let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+		let apiError = (json?["errors"] as? [[String: Any]])?.first
+		let dict = plist ?? json
+		let code = dict.flatMap(resultCode) ?? (apiError?["code"] as? String).flatMap(Int.init)
+		let raw = (apiError?["detail"] as? String) ?? (apiError?["title"] as? String) ?? dict.map(rawMessage) ?? ""
 		var message = raw
 		for value in redacting.filter({ !$0.isEmpty }).sorted(by: { $0.count > $1.count }) {
 			message = message.replacingOccurrences(of: value, with: "[redacted]", options: .caseInsensitive)
@@ -204,6 +207,8 @@ enum ZagDeveloperServicesProtocol {
 			if let code, code != 0 {
 				classification = Self.classification(for: code, action: action, message: raw)
 			} else if dict == nil || (dict?["resultCode"] != nil && code == nil) {
+				classification = .malformed
+			} else if includeSuccess || apiError != nil {
 				classification = .malformed
 			} else {
 				return nil
@@ -219,7 +224,9 @@ enum ZagDeveloperServicesProtocol {
 	/// email/token-like, strips control characters, collapses whitespace and caps
 	/// the length. Never returns credentials, identifiers or long opaque tokens.
 	static func sanitizeMessage(_ text: String, limit: Int = 160) -> String {
-		var s = text
+		var s = text.replacingOccurrences(of: #"(?is)-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----"#, with: "[redacted]", options: .regularExpression)
+		s = s.replacingOccurrences(of: #"(?i)\b(?:password|passcode|token|secret)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)"#,
+			with: "[redacted]", options: .regularExpression)
 		for pattern in ["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[A-Za-z0-9+/_-]{24,}={0,2}", "\\b[A-Z0-9]{10}\\b", "\\b(?:[A-Za-z0-9_-]+\\.){2,}[A-Za-z0-9_-]+\\b"] {
 			s = s.replacingOccurrences(of: pattern, with: "[redacted]", options: .regularExpression)
 		}

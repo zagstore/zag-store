@@ -134,8 +134,9 @@ func component(_ id: String, _ name: String, groups: [String] = []) -> ZagProvis
 			extensions: [component("com.example.notes.widget", "Widget", groups: [group])],
 			installedFreeAccountApps: []
 		)
-		guard case .success(let result) = await provisioner.provision(request, authorization: authorization),
-			  let identity = secrets.identity(account, team) else { return check(false, "provisioning") }
+		let provisioning = await provisioner.provision(request, authorization: authorization)
+		guard case .success(let result) = provisioning,
+			  let identity = secrets.identity(account, team) else { return check(false, "provisioning: \(provisioning)") }
 		check(result.extensions.count == 1, "the simulated portal provisions the app and its extension, each with its own profile")
 
 		// The key as a Security framework key, as the Keychain would hold it;
