@@ -12,8 +12,9 @@ enum ZagNativeAppInventory {
 		let uuid: String
 		let name: String
 		let version: String?
-		let installation: ZagNativeInstalledProfiles
+		var installation: ZagNativeInstalledProfiles
 		var signingMethod: ZagSigningMethod = .freeAppleAccount
+		var pendingInstall: ZagInstallExpectation? = nil
 	}
 
 	enum Failure: LocalizedError {
@@ -54,6 +55,22 @@ enum ZagNativeAppInventory {
 		return (try? Storage.shared.context.fetch(request))?.lazy.compactMap { Self.entry($0) }.first
 	}
 
+	static func pendingEntry(bundleIdentifier: String) -> Entry? {
+		let request = Signed.fetchRequest()
+		request.predicate = NSPredicate(format: "identifier == %@", bundleIdentifier)
+		return (try? Storage.shared.context.fetch(request))?.lazy.compactMap { Self.entry($0) }
+			.first { $0.pendingInstall != nil }
+	}
+
+	static func entry(originalIdentifier: String, pending: Bool = false) -> Entry? {
+		guard let rows = try? Storage.shared.context.fetch(Signed.fetchRequest()) else { return nil }
+		let matches = rows.compactMap { Self.entry($0) }.filter {
+			($0.pendingInstall != nil) == pending && $0.installation.record.originalBundleIdentifier == originalIdentifier
+				&& $0.installation.record.owner.map { ZagNativeAccountInstall.currentAccountMatches($0.scope) } == true
+		}
+		return matches.count == 1 ? matches.first : nil
+	}
+
 	static func iconURL(_ app: AppInfoPresentable) -> URL? {
 		guard app.isSigned, let id = app.uuid, UUID(uuidString: id) != nil else { return nil }
 		let url = folder(id).appendingPathComponent("icon.png")
@@ -66,12 +83,17 @@ enum ZagNativeAppInventory {
 	}
 
 	static func save(
-		_ verified: ZagNativeInstalledProfiles, source: URL, name: String, renewing: Entry?
+		_ verified: ZagNativeInstalledProfiles, source: URL, name: String, renewing: Entry?,
+		signedOnly: (ZagInstallExpectation, URL)? = nil
 	) async throws {
 		let storage = Storage.shared
 		let request = Signed.fetchRequest()
 		request.predicate = NSPredicate(format: "identifier == %@", verified.record.bundleIdentifier)
-		let existing = try storage.context.fetch(request).first { Self.entry($0) != nil }
+		let existing = try storage.context.fetch(request).first {
+			guard let entry = Self.entry($0) else { return false }
+			if let renewing { return entry.uuid == renewing.uuid }
+			return signedOnly == nil ? entry.pendingInstall == nil : entry.pendingInstall != nil
+		}
 		let id = renewing?.uuid ?? existing?.uuid ?? UUID().uuidString
 		let destination = folder(id)
 		let archive = destination.appendingPathComponent("Archive.ipa")
@@ -104,7 +126,17 @@ enum ZagNativeAppInventory {
 			try? image.write(to: icon, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
 		}
 		let version = Bundle(url: source)?.version ?? renewing?.version
-		let entry = Entry(uuid: id, name: name, version: version, installation: verified)
+		if let (_, signedApp) = signedOnly {
+			let staged = folder(id)
+			let destination = staged.appendingPathComponent("Signed.app")
+			let temporary = staged.appendingPathComponent(UUID().uuidString)
+			defer { try? manager.removeItem(at: temporary) }
+			try await Task.detached(priority: .utility) { try manager.copyItem(at: signedApp, to: temporary) }.value
+			if manager.fileExists(atPath: destination.path) {
+				_ = try manager.replaceItemAt(destination, withItemAt: temporary)
+			} else { try manager.moveItem(at: temporary, to: destination) }
+		}
+		let entry = Entry(uuid: id, name: name, version: version, installation: verified, pendingInstall: signedOnly?.0)
 		let row = existing ?? Signed(context: storage.context)
 		row.uuid = id
 		row.identifier = verified.record.bundleIdentifier
@@ -121,10 +153,48 @@ enum ZagNativeAppInventory {
 			throw error
 		}
 
+		if signedOnly == nil {
+			try markInstalled(verified.record.bundleIdentifier)
+			if renewing?.pendingInstall != nil {
+				if let staged = signedApp(entry) { try? manager.removeItem(at: staged) }
+				try removeSuperseded(by: entry)
+			}
+		}
+	}
+
+	static func signedApp(_ entry: Entry) -> URL? {
+		let url = folder(entry.uuid).appendingPathComponent("Signed.app")
+		return FileManager.default.fileExists(atPath: url.path) ? url : nil
+	}
+
+	static func confirm(_ entry: Entry, expiry: Date, certificateExpiry: Date) throws {
+		var updated = entry
+		updated.pendingInstall = nil
+		updated.installation.record.profileExpiresAt = expiry
+		updated.installation.record.certificateExpiresAt = certificateExpiry
+		updated.installation.record.expiryVerified = true
+		try JSONEncoder().encode(updated).write(to: folder(entry.uuid).appendingPathComponent("installation.json"),
+			options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		try markInstalled(updated.installation.record.bundleIdentifier)
+		if let staged = signedApp(entry) { try? FileManager.default.removeItem(at: staged) }
+		try removeSuperseded(by: updated)
+	}
+
+	private static func removeSuperseded(by entry: Entry) throws {
+		let request = Signed.fetchRequest()
+		request.predicate = NSPredicate(format: "identifier == %@", entry.installation.record.bundleIdentifier)
+		for row in try Storage.shared.context.fetch(request) where row.uuid != entry.uuid {
+			guard let old = Self.entry(row), old.pendingInstall == nil,
+				  old.installation.record.owner?.scope == entry.installation.record.owner?.scope else { continue }
+			Storage.shared.deleteApp(for: row)
+		}
+	}
+
+	private static func markInstalled(_ identifier: String) throws {
 		let key = "zagStore.managedInstalledBundleIDs"
 		let defaults = UserDefaults.standard
 		var installed = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) } ?? []
-		installed.insert(verified.record.bundleIdentifier)
+		installed.insert(identifier)
 		defaults.set(try JSONEncoder().encode(installed), forKey: key)
 	}
 

@@ -324,7 +324,7 @@ enum ZagCodeSignatureInspection {
 // MARK: - Installation
 
 /// What a verified installation must show.
-struct ZagInstallExpectation: Equatable, Sendable {
+struct ZagInstallExpectation: Codable, Equatable, Sendable {
 	let bundleIdentifier: String
 	let profileUUID: String
 	let profileExpiresAt: Date
@@ -382,6 +382,7 @@ enum ZagInstalledProfileCheck {
 
 /// What the device reported after an installation.
 enum ZagInstallVerification: Equatable, Sendable {
+	case signedOnly
 	/// The device itself reported this app's profile and its expiry.
 	case verified(profileExpiresAt: Date, certificateExpiresAt: Date)
 	/// The app is installed, but the device's expiry cannot be read back with
@@ -467,9 +468,13 @@ enum ZagNativeSigningPipeline {
 		provisioner: ZagFreeAccountProvisioner, secrets: ZagFreeAccountSecretStore,
 		signer: ZagAppSigning, installer: ZagFreeAccountInstaller,
 		verifyTarget: @MainActor () throws -> Void,
+		beforeSigning: @MainActor () throws -> Void = {},
+		beforeInstalling: @MainActor () throws -> Void = {},
 		renewing: ZagNativeInstalledProfiles? = nil,
 		progress: @Sendable (ZagNativeSigningProgress) async -> Void = { _ in },
 		onVerified: @Sendable (ZagNativeInstalledProfiles) async throws -> Void = { _ in },
+		onSignedOnly: (@Sendable (ZagNativeInstalledProfiles, ZagInstallExpectation, URL) async throws -> Void)? = nil,
+		onDeferredInstall: (@Sendable (ZagNativeInstalledProfiles, ZagInstallExpectation, URL) async throws -> Void)? = nil,
 		now: @Sendable () -> Date = { Date() }
 	) async throws -> ZagInstallVerification {
 		await progress(.provisioning)
@@ -495,6 +500,7 @@ enum ZagNativeSigningPipeline {
 				  }) else { throw Failure.changedIdentity }
 			guard result.expiresAt > renewing.record.profileExpiresAt else { throw Failure.expiryNotExtended }
 		}
+		try await beforeSigning()
 		await progress(.signing)
 		ZagSigningDiagnostics.record("Provisioning succeeded; reading Keychain identity")
 		guard let data = try secrets.load(.signingPrivateKey, account: request.accountID, team: request.team) else {
@@ -526,12 +532,28 @@ enum ZagNativeSigningPipeline {
 		guard result.expiresAt > now(), identity.expiresAt > now() else {
 			throw ZagFreeAccountSigningError.verification("The signing certificate or provisioning profile expired before installation.")
 		}
+		var saved = record
+		saved.expiryVerified = false
+		saved.owner = .init(scope: authorization.scope, teamKind: authorization.teamKind,
+			certificateSerial: identity.serialNumber, profileUUID: expectation.profileUUID)
+		let signed = ZagNativeInstalledProfiles(record: saved, profiles: components)
+		if let onSignedOnly {
+			try await onSignedOnly(signed, expectation, app)
+			ZagSigningDiagnostics.record("Signed app saved for later installation")
+			return .signedOnly
+		}
 		try await verifyTarget()
+		do { try await beforeInstalling() }
+		catch {
+			try await onDeferredInstall?(signed, expectation, app)
+			throw error
+		}
 		await progress(.installing)
 		ZagSigningDiagnostics.record("Installing via RPPairing")
 		do { try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier) }
 		catch {
 			ZagSigningDiagnostics.record("RPPairing installation failed")
+			try await onDeferredInstall?(signed, expectation, app)
 			throw error
 		}
 		ZagSigningDiagnostics.record("Installer returned success; verifying installed app")
@@ -556,7 +578,7 @@ enum ZagNativeSigningPipeline {
 			ZagSigningDiagnostics.record("Installed app and profile verified")
 		case .unverifiable: ZagSigningDiagnostics.record("Installed app could not be verified")
 		case .mismatch: ZagSigningDiagnostics.record("Installed app or profile did not match")
-		case .notInstalled: ZagSigningDiagnostics.record("App missing from installed-app list")
+		case .notInstalled, .signedOnly: ZagSigningDiagnostics.record("App missing from installed-app list")
 		}
 		return installed
 	}
@@ -716,7 +738,7 @@ struct ZagFreeAccountLifecycle: Sendable {
 			return .verified(record, profileExpiresAt: profileExpiresAt, certificateExpiresAt: certificateExpiresAt)
 		case .unverifiable:
 			return .unverified(record)
-		case .mismatch, .notInstalled:
+		case .mismatch, .notInstalled, .signedOnly:
 			return .failed(.installFailed)
 		}
 	}

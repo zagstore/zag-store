@@ -73,11 +73,6 @@ enum ZagSigningMethodAvailability {
 	static let developerAccountEnabled = false
 	#endif
 
-	static func presentsSigningSheet(askEveryTime: Bool, customize: Bool,
-									hasDefaultCertificate: Bool, freeAccountEnabled: Bool = freeAccountEnabled) -> Bool {
-		askEveryTime || customize || (freeAccountEnabled && !hasDefaultCertificate)
-	}
-
 	/// Methods to list, in display order.
 	static func listedMethods(
 		freeAccountEnabled: Bool = freeAccountEnabled,
@@ -128,6 +123,24 @@ enum ZagSigningMethodAvailability {
 			case .failed(let failure): return .actionRequired(failure.recovery)
 			case .signedIn(let session): return .ready(detail: session.team.name)
 			}
+		}
+	}
+}
+
+enum ZagSigningPreference: String, CaseIterable {
+	case appleAccount, importedCertificate, askEveryTime
+
+	static let key = "ZagStore.defaultSigningMethod"
+
+	static func resolve(saved: String?, legacyAsk: Bool) -> Self {
+		saved.flatMap(Self.init(rawValue:)) ?? (legacyAsk ? .askEveryTime : .importedCertificate)
+	}
+
+	var title: String {
+		switch self {
+		case .appleAccount: "Apple Account"
+		case .importedCertificate: "Imported Certificate"
+		case .askEveryTime: "Ask Every Time"
 		}
 	}
 }

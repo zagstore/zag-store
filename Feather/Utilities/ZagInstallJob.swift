@@ -70,6 +70,7 @@ struct ZagInstallJob: Equatable {
 	var cancelRequested = false
 	/// False for jobs that end without installing (sign only).
 	var offersCancel = true
+	var nativeCaption: String?
 }
 
 @MainActor
@@ -100,7 +101,7 @@ final class ZagInstallJobs: ObservableObject {
 		if !stage.isDownload { job.canPause = false }
 		// Install progress starts at zero; download progress is kept across
 		// pause and resume.
-		if stage == .installing { job.progress = 0 }
+		if stage == .installing && job.nativeCaption == nil { job.progress = 0 }
 		job.stage = stage
 		jobs[id] = job
 	}
@@ -115,6 +116,14 @@ final class ZagInstallJobs: ObservableObject {
 		// rather than on every network chunk.
 		guard abs(clamped - job.progress) >= 0.005 || (clamped == 1 && job.progress != 1) else { return }
 		job.progress = clamped
+		jobs[id] = job
+	}
+
+	func setNativeProgress(_ id: String, caption: String, fraction: Double) {
+		guard var job = jobs[id] else { return }
+		let previous = job.nativeCaption == nil ? 0 : job.progress
+		job.nativeCaption = caption
+		job.progress = max(previous, min(1, max(0, fraction)))
 		jobs[id] = job
 	}
 

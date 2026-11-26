@@ -28,6 +28,7 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 
 	var gate = ZagFreeAccountSigningGate.production
 	var workRoot = FileManager.default.temporaryDirectory
+	var beforeHandoff: @MainActor @Sendable () throws -> Void = {}
 	/// The paired device's profiles are read through misagent by default.
 	/// Tests can replace the callback; nil intentionally disables read-back.
 	var installedProfiles: (@Sendable () async -> Result<[Data], Error>)? = {
@@ -61,6 +62,8 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 		try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
 			Task { @MainActor in
 				do {
+					do { try beforeHandoff() }
+					catch { continuation.resume(throwing: error); return }
 					try ZagRPPairingCore.shared.installGate4IPA(at: ipa) { result in
 						continuation.resume(with: result.mapError { Failure.install($0.localizedDescription) })
 					}

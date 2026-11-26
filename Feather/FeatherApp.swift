@@ -689,7 +689,7 @@ final class ZagBackgroundUpdateRefresh {
 			for update in updates {
 				guard !Task.isCancelled else { return false }
 				do {
-					let signedUUID = try await ZagUpdateTransactionManager.shared.prepareAsync(update)
+					let signedUUID = try await ZagUpdateTransactionManager.shared.prepareAsync(update, interactive: false)
 					Logger.misc.info("[Zag Store Background] Prepared update for \(update.app.currentName)")
 
 					if UserDefaults.standard.bool(forKey: Self.automaticInstallationKey) {
@@ -697,8 +697,9 @@ final class ZagBackgroundUpdateRefresh {
 							Logger.misc.warning("[Zag Store Background] Automatic installation requires iOS 17 or later")
 							continue
 						}
-						try await ZagUpdateTransactionManager.shared.installPreparedUpdate(signedUUID: signedUUID)
-						Logger.misc.info("[Zag Store Background] Installed update for \(update.app.currentName)")
+						if try await ZagUpdateTransactionManager.shared.installPreparedUpdate(signedUUID: signedUUID) {
+							Logger.misc.info("[Zag Store Background] Installed update for \(update.app.currentName)")
+						}
 					}
 				} catch {
 					Logger.misc.error("[Zag Store Background] Automatic update failed for \(update.app.currentName): \(error.localizedDescription)")

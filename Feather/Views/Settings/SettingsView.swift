@@ -145,8 +145,7 @@ struct SettingsView: View {
     @AppStorage(ZagDockConfiguration.storageKey) private var _dockTabs = ""
 	@AppStorage("ZagStore.animatedSplashEnabled") private var _animatedSplashEnabled = true
 	@AppStorage("ZagStore.splashSoundEnabled") private var _splashSoundEnabled = true
-	@AppStorage(ZagCertificateSelection.askEveryTimeKey) private var _askCertificateEveryTime = false
-	@AppStorage(ZagCertificateSelection.allowCustomisationKey) private var _allowSigningCustomisation = false
+	@AppStorage(ZagSigningPreference.key) private var _signingPreference = ZagCertificateSelection.preference
 	@AppStorage(ZagBackgroundUpdateRefresh.enabledKey) private var _backgroundUpdatesEnabled = false
 	@AppStorage(ZagBackgroundUpdateRefresh.automaticPreparationKey) private var _automaticUpdatePreparation = false
 	@AppStorage(ZagBackgroundUpdateRefresh.automaticInstallationKey) private var _automaticUpdateInstallation = false
@@ -809,12 +808,13 @@ extension SettingsView {
 						.foregroundColor(.disabled())
 				}
 
-				Toggle(.localized("Ask every time"), isOn: $_askCertificateEveryTime)
-				Toggle(.localized("Allow Customisation"), isOn: $_allowSigningCustomisation)
+				Picker("Default Signing Method", selection: $_signingPreference) {
+					ForEach(ZagSigningPreference.allCases, id: \.self) { method in Text(method.title).tag(method) }
+				}
 			} header: {
 				Text(.localized("Certificates"))
 			} footer: {
-				Text("Manage certificated used for signing apps.")
+				Text("Manage the certificates used to sign apps.")
 			}
 
 		case .features:

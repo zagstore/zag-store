@@ -115,20 +115,42 @@ extension Storage {
 
 enum ZagCertificateSelection {
 	static let askEveryTimeKey = "ZagStore.askCertificateEveryTime"
-	static let allowCustomisationKey = "ZagStore.allowSigningCustomisation"
 
-	static var asksEveryTime: Bool {
-		UserDefaults.standard.bool(forKey: askEveryTimeKey)
+	static var preference: ZagSigningPreference {
+		let defaults = UserDefaults.standard
+		return .resolve(saved: defaults.string(forKey: ZagSigningPreference.key), legacyAsk: defaults.bool(forKey: askEveryTimeKey))
 	}
 
-	/// Quick actions and repository actions use the same decision. The full
-	/// signing screen owns selection and customization for both methods.
 	@MainActor
-	static func presentsSigningSheet() -> Bool {
-		let selected = UserDefaults.standard.integer(forKey: "feather.selectedCert")
-		return ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: asksEveryTime,
-			customize: UserDefaults.standard.bool(forKey: allowCustomisationKey),
-			hasDefaultCertificate: Storage.shared.getAllCertificates().indices.contains(selected))
+	static func activeCertificate() -> CertificatePair? {
+		let certificates = Storage.shared.getAllCertificates()
+		let index = UserDefaults.standard.integer(forKey: "feather.selectedCert")
+		return certificates.indices.contains(index) ? certificates[index] : nil
+	}
+
+	@MainActor
+	static func chooseMethod() async -> ZagSigningMethod? {
+		switch preference {
+		case .appleAccount: return .freeAppleAccount
+		case .importedCertificate: return .importedCertificate
+		case .askEveryTime: break
+		}
+		guard let presenter = UIApplication.topViewController() else { return nil }
+		return await withCheckedContinuation { continuation in
+			let alert = UIAlertController(title: "Signing Method", message: nil, preferredStyle: .actionSheet)
+			if ZagSigningMethodAvailability.freeAccountEnabled {
+				alert.addAction(UIAlertAction(title: "Apple Account", style: .default) { _ in continuation.resume(returning: .freeAppleAccount) })
+			}
+			alert.addAction(UIAlertAction(title: "Imported Certificate", style: .default) { _ in continuation.resume(returning: .importedCertificate) })
+			alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in continuation.resume(returning: nil) })
+			alert.popoverPresentationController?.sourceView = presenter.view
+			alert.popoverPresentationController?.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+			presenter.present(alert, animated: true)
+		}
+	}
+
+	static var asksEveryTime: Bool {
+		preference == .askEveryTime
 	}
 
 	@MainActor

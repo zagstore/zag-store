@@ -31,7 +31,6 @@ struct DownloadButtonView: View {
 	@State private var retryImportedUUID: String?
 	@State private var actionClaimed = false
 	@State private var isPALInfoPresented = false
-	@State private var signingSelection: AnyApp?
 
 	// A successful repository download remains in history even after its
 	// Imported, Signed, and Installed records are deleted.
@@ -150,19 +149,6 @@ struct DownloadButtonView: View {
 			_restoreSigningRetryIfAvailable()
 		}
 		.onDisappear { cancellable?.cancel() }
-		.fullScreenCover(item: $signingSelection, onDismiss: {
-			if zagPhase == .signing { zagPhase = .idle }
-			actionClaimed = false
-		}) { item in
-			SigningView(app: item.base, onSigned: { uuid in
-				if let imported = item.base as? Imported { _signedCopyReady(uuid, imported: imported) }
-			}, onVerifiedInstall: { id in
-				installedBundleID = id
-				retryImportedUUID = nil
-				UserDefaults.standard.removeObject(forKey: _signingRetryStorageKey)
-				zagPhase = .idle
-			})
-		}
 		.alert(.localized("Unable to Install"), isPresented: Binding(
 			get: { transactionError != nil },
 			set: { if !$0 { transactionError = nil } }
@@ -213,6 +199,9 @@ struct DownloadButtonView: View {
 	}
 
 	private var _actionCaption: (text: String, color: Color)? {
+		if let caption = jobs.job(_jobKey)?.nativeCaption, !jobs.isCancelRequested(_jobKey) {
+			return (caption, .secondary)
+		}
 		if !_stageCaption.isEmpty {
 			return (_stageCaption, .secondary)
 		}
@@ -676,7 +665,12 @@ struct DownloadButtonView: View {
 					{ _primaryTap(job: jobs.job(_jobKey), download: currentDownload) })
 		}
 		switch zagPhase {
-		case .downloading, .signing:
+		case .signing:
+			if let job = jobs.job(_jobKey), job.nativeCaption != nil, job.progress > 0 {
+				return (.progress(job.progress, .none), {})
+			}
+			return (.spinner(.none), {})
+		case .downloading:
 			return (.spinner(.none), {})
 		case .installing:
 			return (installationProgress > 0.03 ? .progress(installationProgress, .none) : .spinner(.none), {})
@@ -684,7 +678,8 @@ struct DownloadButtonView: View {
 			break
 		}
 		if retrySignedUUID != nil, _retrySignedCopy() != nil {
-			return (_pill(.localized("Retry"), enabled: !actionClaimed, label: "Retry installing \(app.currentName)"),
+			let title = _pendingNativeRetry ? "Install" : .localized("Retry")
+			return (_pill(title, enabled: !actionClaimed, label: "Retry installing \(app.currentName)"),
 					{ _performAction { _retryInstallation() } })
 		}
 		if retryImportedUUID != nil, _retryImportedCopy() != nil {
@@ -743,15 +738,13 @@ struct DownloadButtonView: View {
 		Task { @MainActor in
 			guard zagPhase == .idle else { return }
                 // Installation transport is selected automatically.
-			let presentsSigningSheet = ZagCertificateSelection.presentsSigningSheet()
-			let certificate = presentsSigningSheet ? nil : await ZagCertificateSelection.chooseForSigning()
-			guard presentsSigningSheet || certificate != nil else {
-				if Storage.shared.getAllCertificates().isEmpty {
-					_failTransaction(.localized("Add a signing certificate before downloading this app."))
-				} else {
-					zagPhase = .idle
-					actionClaimed = false
-				}
+			guard let method = await ZagCertificateSelection.chooseMethod() else {
+				actionClaimed = false
+				return
+			}
+			let certificate = method == .importedCertificate ? ZagCertificateSelection.activeCertificate() : nil
+			if method == .importedCertificate, certificate == nil {
+				_failTransaction("Select an imported certificate in Settings.")
 				return
 			}
 			guard zagPhase == .idle else { actionClaimed = false; return }
@@ -786,32 +779,46 @@ struct DownloadButtonView: View {
 						retryImportedUUID = uuid
 						UserDefaults.standard.set(uuid, forKey: _signingRetryStorageKey)
 						if let certificate { _signAndInstall(imported, certificate: certificate) }
-						else { _selectSigningMethod(imported) }
+						else { _signNative(imported) }
 					}
 				}
 			)
 		}
 	}
 
-	private func _selectSigningMethod(_ imported: Imported) {
+	private func _signNative(_ imported: Imported) {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		zagPhase = .signing
-		signingSelection = AnyApp(base: imported)
+		Task { @MainActor in
+			defer { zagPhase = .idle; actionClaimed = false }
+			let options = OptionsManager.shared.options
+			do {
+				let outcome = try await ZagNativeAccountInstall.runInline(imported, job: _jobKey, options: options,
+					onSaved: { @MainActor id in installedBundleID = id })
+				if outcome == .signedOnly, let original = imported.identifier,
+				   let entry = ZagNativeAppInventory.entry(originalIdentifier: original, pending: true) {
+					retrySignedUUID = entry.uuid
+					UserDefaults.standard.set(entry.uuid, forKey: _retryStorageKey)
+				}
+				retryImportedUUID = nil
+				UserDefaults.standard.removeObject(forKey: _signingRetryStorageKey)
+				if options.post_deleteAppAfterSigned { Storage.shared.deleteApp(for: imported) }
+			} catch is ZagInstallCancelled {
+			} catch {
+				ZagNativeAccountInstall.showInlineFailure(error)
+			}
+		}
+		#else
+		_failTransaction("Apple Account signing is unavailable in this build.")
+		#endif
 	}
 
 	private func _signAndInstall(_ imported: Imported) {
-		if ZagCertificateSelection.presentsSigningSheet() {
-			_selectSigningMethod(imported)
-			return
-		}
 		Task { @MainActor in
-			guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
-				if Storage.shared.getAllCertificates().isEmpty {
-					_failTransaction(
-						.localized("The app was downloaded and kept in Imported, but no signing certificate is selected.")
-					)
-				} else {
-					zagPhase = .idle
-				}
+			guard let method = await ZagCertificateSelection.chooseMethod() else { zagPhase = .idle; actionClaimed = false; return }
+			if method == .freeAppleAccount { _signNative(imported); return }
+			guard let certificate = ZagCertificateSelection.activeCertificate() else {
+				_failTransaction("Select an imported certificate in Settings.")
 				return
 			}
 			_signAndInstall(imported, certificate: certificate)
@@ -859,6 +866,14 @@ struct DownloadButtonView: View {
 				return
 			}
 			ZagLogger.shared.info("Signing", "Signing completed: \(app.currentName) | signedUUID=\(signedUUID ?? "unknown")")
+			if !options.post_installAppAfterSigned {
+				retryImportedUUID = nil
+				UserDefaults.standard.removeObject(forKey: _signingRetryStorageKey)
+				zagPhase = .idle
+				actionClaimed = false
+				if options.post_deleteAppAfterSigned { Storage.shared.deleteApp(for: imported) }
+				return
+			}
 			_signedCopyReady(signedUUID, imported: imported)
 		}
 	}
@@ -881,7 +896,31 @@ struct DownloadButtonView: View {
 		_installInline(signed, imported: imported)
 	}
 
+	private var _pendingNativeRetry: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return _retrySignedCopy().flatMap { ZagNativeAppInventory.entry($0) }?.pendingInstall != nil
+		#else
+		return false
+		#endif
+	}
+
 	private func _installInline(_ signed: Signed, imported: Imported? = nil) {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let entry = ZagNativeAppInventory.entry(signed), entry.pendingInstall != nil {
+			zagPhase = .installing
+			Task { @MainActor in
+				defer { zagPhase = .idle; actionClaimed = false }
+				do {
+					try await ZagNativeAccountInstall.installSaved(entry: entry, job: _jobKey)
+					retrySignedUUID = nil
+					UserDefaults.standard.removeObject(forKey: _retryStorageKey)
+					installedBundleID = entry.installation.record.bundleIdentifier
+				} catch is ZagInstallCancelled {
+				} catch { ZagNativeAccountInstall.showInlineFailure(error, title: "Installation Failed") }
+			}
+			return
+		}
+		#endif
 		let method: Int
 		if #available(iOS 17.0, *) {
 			method = 2 // Native RPPairing

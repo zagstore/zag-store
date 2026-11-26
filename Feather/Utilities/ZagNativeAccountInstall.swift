@@ -1,11 +1,12 @@
 #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 import Foundation
 import CryptoKit
+import UIKit
 
 @MainActor
 enum ZagNativeAccountInstall {
 	enum Failure: LocalizedError {
-		case busy, signIn, personalTeam, pairing, invalidApp
+		case busy, signIn, personalTeam, pairing, invalidApp, unsupportedOptions
 
 		var errorDescription: String? {
 			switch self {
@@ -13,6 +14,7 @@ enum ZagNativeAccountInstall {
 			case .signIn: "Sign in under Settings › Apple Accounts & Signing."
 			case .personalTeam: "No active Personal Team was found for this Apple Account."
 			case .pairing: "Pair this iPhone in Settings before signing and installing."
+			case .unsupportedOptions: "Some enabled signing options require an imported certificate. Review the app’s signing options before continuing."
 			case .invalidApp: "Zag Store could not read the app or one of its extensions."
 			}
 		}
@@ -114,6 +116,9 @@ enum ZagNativeAccountInstall {
 
 	static func install(source: URL, name: String, expectedScope: ZagSigningScope? = nil,
 						requiredInstalledIdentifier: String? = nil,
+						installAfterSigning: Bool = true,
+						checkpoint: @escaping @MainActor () throws -> Void = {},
+						beginInstalling: @escaping @MainActor @Sendable () throws -> Void = {},
 						onCertificateReady: (@Sendable () async -> Void)? = nil,
 						renewing: ZagNativeAppInventory.Entry? = nil,
 						progress: @escaping @Sendable (ZagNativeSigningProgress) async -> Void = { _ in },
@@ -126,14 +131,17 @@ enum ZagNativeAccountInstall {
 					throw ZagNativeAppInventory.Failure.wrongAccount
 				}
 				return try await performInstall(source: source, name: name, expectedScope: expectedScope,
-					requiredInstalledIdentifier: requiredInstalledIdentifier,
+					requiredInstalledIdentifier: requiredInstalledIdentifier, installAfterSigning: installAfterSigning,
+					checkpoint: checkpoint, beginInstalling: beginInstalling,
 					onCertificateReady: onCertificateReady, renewing: renewing, progress: progress, onSaved: onSaved)
 			}
 		}
 	}
 
 	private static func performInstall(source: URL, name: String, expectedScope: ZagSigningScope?,
-									   requiredInstalledIdentifier: String?,
+									   requiredInstalledIdentifier: String?, installAfterSigning: Bool,
+									   checkpoint: @escaping @MainActor () throws -> Void,
+									   beginInstalling: @escaping @MainActor @Sendable () throws -> Void,
 									   onCertificateReady: (@Sendable () async -> Void)?,
 									   renewing: ZagNativeAppInventory.Entry?,
 									   progress: @escaping @Sendable (ZagNativeSigningProgress) async -> Void,
@@ -187,7 +195,7 @@ enum ZagNativeAccountInstall {
 			secrets: secrets, certificateMinimumRemaining: 0, saveProfile: { cache.save($0) },
 			onCertificateReady: onCertificateReady, account: scope.accountID)
 		var request = ZagProvisioningRequest(accountID: scope.accountID, team: scope.teamID, deviceUDID: device.udid,
-											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: installedFreeApps)
+											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: installAfterSigning ? installedFreeApps : [])
 		let componentIDs = Set(components.map(\.originalBundleIdentifier))
 		let mappedIDs = Set(componentIDs.compactMap { id in
 			id == main.originalBundleIdentifier
@@ -217,18 +225,23 @@ enum ZagNativeAccountInstall {
 				throw ZagNativeSigningPipeline.Failure.changedIdentity
 			}
 		}
+		try checkpoint()
+		let retainSigned: @Sendable (ZagNativeInstalledProfiles, ZagInstallExpectation, URL) async throws -> Void = { metadata, expectation, signedApp in
+			try await ZagNativeAppInventory.save(metadata, source: source, name: name, renewing: nil, signedOnly: (expectation, signedApp))
+		}
 		do {
 			return try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: app,
 				provisioner: provisioner, secrets: secrets,
 				signer: ZagFreeAccountSigningAdapter(signer: ZagZsignCodeSigner(), keychainKeys: keys),
-				installer: ZagRPPairingFreeAccountInstaller(),
+				installer: ZagRPPairingFreeAccountInstaller(beforeHandoff: beginInstalling),
 				verifyTarget: {
 					guard ZagDeveloperTokenStore().load(scope: "device")?.accountID == token.accountID else { throw Failure.signIn }
 					guard pairing.hasSavedPairing, pairing.pairedIdentity == device else { throw Failure.pairing }
-				}, renewing: renewing?.installation, progress: progress, onVerified: { verified in
+				}, beforeSigning: checkpoint, beforeInstalling: checkpoint,
+				renewing: renewing?.installation, progress: progress, onVerified: { verified in
 					try await ZagNativeAppInventory.save(verified, source: source, name: name, renewing: renewing)
 					await onSaved(verified.record.bundleIdentifier)
-				})
+				}, onSignedOnly: installAfterSigning ? nil : retainSigned, onDeferredInstall: retainSigned)
 		} catch let failure as ZagProvisioningFailure {
 			switch failure.kind {
 			case .certificateRequestUnresolved:
@@ -247,6 +260,56 @@ enum ZagNativeAccountInstall {
 				throw CertificateIssue(failure: failure, scope: scope, teamName: team.name, recovery: nil)
 			default:
 				throw failure
+			}
+		}
+	}
+
+	/// Supported native options are the two post-signing actions. Retain
+	/// advanced certificate settings and report conflicts before portal work.
+	static func validateOptions(_ options: Options, app: AppInfoPresentable, hasIcon: Bool = false) throws {
+		var candidate = options
+		var defaults = Options.defaultOptions
+		candidate.ppqString = defaults.ppqString
+		candidate.post_installAppAfterSigned = defaults.post_installAppAfterSigned
+		candidate.post_deleteAppAfterSigned = defaults.post_deleteAppAfterSigned
+		defaults.identifiers = [:]
+		defaults.displayNames = [:]
+		let mappedID = app.identifier.flatMap { candidate.identifiers[$0] }
+		let mappedName = app.name.flatMap { candidate.displayNames[$0] }
+		candidate.identifiers = [:]
+		candidate.displayNames = [:]
+		guard !hasIcon, mappedID == nil, mappedName == nil, candidate == defaults else { throw Failure.unsupportedOptions }
+	}
+
+	static func installSaved(entry: ZagNativeAppInventory.Entry, job: String) async throws {
+		try await withExclusiveOperation {
+			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics()) {
+				guard let expectation = entry.pendingInstall, let source = ZagNativeAppInventory.signedApp(entry) else {
+					throw Failure.invalidApp
+				}
+				guard min(entry.installation.record.profileExpiresAt, expectation.certificateExpiresAt) > Date() else {
+					throw ZagFreeAccountSigningError.verification("The signing certificate or provisioning profile expired. Resign this app first.")
+				}
+				let pairing = ZagRPPairingCore.shared
+				guard pairing.hasSavedPairing else { throw Failure.pairing }
+				let (device, _) = try await pairing.signingDeviceInventory()
+				try ZagInstallJobs.shared.checkpoint(job)
+				ZagInstallJobs.shared.reportNative(job, .installing)
+				ZagSigningDiagnostics.record("Installing previously signed app")
+				let installer = ZagRPPairingFreeAccountInstaller(beforeHandoff: {
+					try ZagInstallJobs.shared.beginInstalling(job)
+					ZagInstallJobs.shared.setNativeProgress(job, caption: ZagNativeSigningProgress.installing.title,
+						fraction: ZagNativeSigningProgress.installing.fraction)
+				})
+				try await installer.install(signedApp: source, bundleIdentifier: expectation.bundleIdentifier)
+				guard pairing.pairedIdentity == device else { throw Failure.pairing }
+				ZagInstallJobs.shared.reportNative(job, .verifying)
+				guard case .verified(let expiry, let certExpiry) = await installer.verify(expectation) else {
+					ZagSigningDiagnostics.record("Installed app or profile could not be verified")
+					throw ZagNativeAppInventory.Failure.unverified
+				}
+				try ZagNativeAppInventory.confirm(entry, expiry: expiry, certificateExpiry: certExpiry)
+				ZagInstallJobs.shared.reportNative(job, .verified)
 			}
 		}
 	}
@@ -320,6 +383,90 @@ enum ZagNativeAccountInstall {
 
 	private static func appendingName(_ name: String, path: String) -> String {
 		"\(name) \(URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent)"
+	}
+}
+#endif
+
+#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+extension ZagInstallJobs {
+	func reportNative(_ id: String, _ stage: ZagNativeSigningProgress) {
+		if stage == .installing {
+			advance(id, to: .packaging)
+			setNativeProgress(id, caption: "Preparing Installation", fraction: stage.fraction)
+		} else { setNativeProgress(id, caption: stage.title, fraction: stage.fraction) }
+	}
+}
+
+extension ZagNativeAccountInstall {
+	static func runInline(_ app: AppInfoPresentable, job: String, options: Options, renew: Bool = false,
+		requiredInstalledIdentifier: String? = nil, onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
+		let entry = ZagNativeAppInventory.entry(app)
+		if let entry, renew {
+			guard let scope = entry.installation.record.owner?.scope, currentAccountMatches(scope) else {
+				throw ZagNativeAppInventory.Failure.wrongAccount
+			}
+			return try await ZagNativeAppInventory.withSource(entry) { source in
+				try await runInlineSource(source, name: entry.name, job: job, installAfterSigning: true, renewing: entry)
+			}
+		}
+		try validateOptions(options, app: app)
+		guard let source = Storage.shared.getAppDirectory(for: app) else { throw Failure.invalidApp }
+		return try await runInlineSource(source, name: app.name ?? "App", job: job,
+			installAfterSigning: options.post_installAppAfterSigned, requiredInstalledIdentifier: requiredInstalledIdentifier, onSaved: onSaved)
+	}
+
+	private static func runInlineSource(_ source: URL, name: String, job: String, installAfterSigning: Bool,
+		renewing: ZagNativeAppInventory.Entry? = nil, requiredInstalledIdentifier: String? = nil,
+		onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
+		let jobs = ZagInstallJobs.shared
+		let result = try await install(source: source, name: name, expectedScope: renewing?.installation.record.owner?.scope,
+			requiredInstalledIdentifier: requiredInstalledIdentifier, installAfterSigning: installAfterSigning, checkpoint: { try jobs.checkpoint(job) },
+			beginInstalling: {
+				try jobs.beginInstalling(job)
+				jobs.setNativeProgress(job, caption: ZagNativeSigningProgress.installing.title, fraction: ZagNativeSigningProgress.installing.fraction)
+			}, renewing: renewing,
+			progress: { @MainActor stage in jobs.reportNative(job, stage) }, onSaved: onSaved)
+		switch result {
+		case .verified, .signedOnly: return result
+		default: throw ZagNativeAppInventory.Failure.unverified
+		}
+	}
+
+	struct LocalCertificate: Identifiable {
+		let scope: ZagSigningScope
+		let title: String
+		let serial: String
+		let expires: Date
+		let hasPrivateKey: Bool
+		var id: ZagSigningScope { scope }
+	}
+
+	static func localCertificates() -> [LocalCertificate] {
+		let keys = ZagKeychainSigningKeyFactory(keys: ZagKeychainSigningKeys(namespace: namespace))
+		return ((try? secrets.signingIdentityScopes()) ?? []).compactMap { scope in
+			guard let data = try? secrets.load(.signingPrivateKey, account: scope.accountID, team: scope.teamID),
+				  let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: data),
+				  let certificate = ZagCertificateInspection(der: identity.certificate) else { return nil }
+			let matches: Bool
+			if identity.keyIsInKeychain, case .matches = keys.check(certificate: identity.certificate,
+				privateKey: Data(), account: scope.accountID, team: scope.teamID, keySlot: identity.keySlot) {
+				matches = true
+			} else { matches = false }
+			return LocalCertificate(scope: scope, title: certificate.commonName ?? "Apple Development",
+				serial: certificate.serialNumber, expires: certificate.expiresAt, hasPrivateKey: matches)
+		}.sorted { $0.expires > $1.expires }
+	}
+
+	static func showInlineFailure(_ error: Error, title: String = "Signing Failed", customise: (() -> Void)? = nil) {
+		var actions = [UIAlertAction(title: "OK", style: .cancel)]
+		let report = ZagSigningDiagnostics.latest
+		if !report.isEmpty {
+			actions.append(UIAlertAction(title: "Copy Diagnostics", style: .default) { _ in UIPasteboard.general.string = report })
+		}
+		if let customise {
+			actions.append(UIAlertAction(title: "Customise App", style: .default) { _ in customise() })
+		}
+		UIAlertController.showAlert(title: title, message: error.localizedDescription, actions: actions)
 	}
 }
 #endif

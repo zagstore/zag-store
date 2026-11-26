@@ -52,6 +52,7 @@ struct LibraryCellView: View {
 	var onInstallFailedAfterSigning: ((String) -> Void)? = nil
 
 	@State private var isDeleteConfirmationPresented = false
+	@State private var choosingSigningMethod = false
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 	private var _nativeEntry: ZagNativeAppInventory.Entry? { ZagNativeAppInventory.entry(app) }
 	#endif
@@ -108,7 +109,7 @@ struct LibraryCellView: View {
 	}
 
 	private var _jobCaption: String? {
-		jobs.job(_jobKey)?.cancelRequested == true ? .localized("Cancelling…") : nil
+		jobs.job(_jobKey)?.cancelRequested == true ? .localized("Cancelling…") : jobs.job(_jobKey)?.nativeCaption
 	}
 
 	// MARK: - Selections
@@ -267,11 +268,6 @@ struct LibraryCellView: View {
 	// MARK: - Description
 
 	private var _desc: String {
-		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-		if let entry = _nativeEntry {
-			return "Apple Account · " + entry.installation.record.profileExpiresAt.formatted(date: .abbreviated, time: .omitted)
-		}
-		#endif
 		let version = app.version
 
 		let storedDate: Date?
@@ -389,7 +385,10 @@ extension LibraryCellView {
 			if isManagedInstalled, let id = app.identifier {
 				Button("Open", systemImage: "app.badge.checkmark") { UIApplication.openApp(with: id) }
 			}
-			Button("Resign", systemImage: "signature") { selectedSigningAppPresenting = AnyApp(base: app) }
+			if _hasPendingNativeInstall {
+				Button("Install", systemImage: "square.and.arrow.down") { _startNative(installSaved: true) }
+			}
+			Button("Resign", systemImage: "signature") { _startNative() }
 		} else if app.isSigned {
 			if isManagedInstalled, let id = app.identifier {
 				Button(
@@ -420,7 +419,7 @@ extension LibraryCellView {
 				.localized("Re-sign"),
 				systemImage: "signature"
 			) {
-				selectedSigningAppPresenting = AnyApp(base: app)
+				_signImmediately(app)
 			}
 
 			Button(
@@ -444,9 +443,10 @@ extension LibraryCellView {
 				.localized("Sign"),
 				systemImage: "signature"
 			) {
-				selectedSigningAppPresenting = AnyApp(base: app)
+				_signImmediately(app)
 			}
 		}
+		Button("Customise", systemImage: "slider.horizontal.3") { selectedSigningAppPresenting = AnyApp(base: app) }
 	}
 
 	// MARK: - App Store Style Action
@@ -455,32 +455,25 @@ extension LibraryCellView {
 	private func _buttonActions(
 		for app: AppInfoPresentable
 	) -> some View {
-		if _isNativeAccountApp {
-			ZagInstallControl(mode: .pill(ZagInstallPill(title: "Resign", accessibilityLabel: "Resign \(app.name ?? "app")")),
-				action: { selectedSigningAppPresenting = AnyApp(base: app) })
-				.frame(width: ZagListLayout.actionWidth, height: ZagListLayout.compactRowHeight)
-		} else if app.isSigned {
-			// Avoid fetching and parsing the selected certificate twice while
-			// building the initial Apps cell.
-			let certificate = displayCertificate
+		if app.isSigned {
+			let certificate = _isNativeAccountApp ? nil : displayCertificate
+			let update = isManagedInstalled ? availableUpdate : nil
 			let certRevoked = certificate?.revoked == true
-			let certInfo = certificate?.expiration?.expirationInfo()
+			let expiry = _isNativeAccountApp ? _nativeProfileExpiry : certificate?.expiration
 			ZStack {
 				// One control: Install contracts into the progress circle and
 				// expands back into Install, Update or Open.
 				ZagInstallControl(
-					mode: _signedControlMode(update: isManagedInstalled ? availableUpdate : nil),
-					action: { _signedControlTap(update: isManagedInstalled ? availableUpdate : nil) },
+					mode: _isNativeAccountApp ? _nativeControlMode : _signedControlMode(update: update),
+					action: {
+						if _isNativeAccountApp { _startNative(installSaved: _hasPendingNativeInstall) }
+						else { _signedControlTap(update: update) }
+					},
 					cancelAction: _canCancelFromControl ? _requestCancel : nil
 				)
 
-				if let caption = _signedCaption(update: isManagedInstalled ? availableUpdate : nil) {
-					Text(caption)
-						.font(.system(size: 9, weight: .medium))
-						.foregroundStyle(.secondary)
-						.lineLimit(1)
-						.frame(width: 88, height: 11)
-						.offset(y: 26)
+				if let caption = _isNativeAccountApp ? _jobCaption : _signedCaption(update: update) {
+					_progressCaption(caption)
 				} else if certRevoked {
 					Text(.localized("Revoked"))
 						.font(
@@ -492,17 +485,8 @@ extension LibraryCellView {
 						.foregroundStyle(Color.red)
 						.lineLimit(1)
 						.offset(y: 24)
-				} else if let certInfo {
-					Text(certInfo.formatted)
-						.font(
-							.system(
-								size: 8,
-								weight: .regular
-							)
-						)
-						.foregroundStyle(certInfo.color)
-						.lineLimit(1)
-						.offset(y: 26)
+				} else if let expiry {
+					_expiryCaption(expiry)
 				}
 			}
 			.frame(width: ZagListLayout.actionWidth, height: ZagListLayout.compactRowHeight, alignment: .center)
@@ -511,16 +495,8 @@ extension LibraryCellView {
 					// One control: Sign contracts into the circle while signing
 					// and installing, and expands back.
 					ZagInstallControl(
-						mode: (isSigningImmediately || isInstallingImmediately)
-							? .spinner(.none)
-							: .pill(ZagInstallPill(title: .localized("Sign"), accessibilityLabel: "Sign \(app.name ?? "app")")),
-						action: {
-							if ZagCertificateSelection.presentsSigningSheet() {
-								selectedSigningAppPresenting = AnyApp(base: app)
-							} else {
-								_signImmediately(app)
-							}
-						},
+						mode: _runningMode ?? .pill(ZagInstallPill(title: .localized("Sign"), accessibilityLabel: "Sign \(app.name ?? "app")")),
+						action: { _signImmediately(app) },
 						cancelAction: _canCancelFromControl ? _requestCancel : nil
 					)
 
@@ -537,12 +513,78 @@ extension LibraryCellView {
 			}
 	}
 
+	private var _nativeControlMode: ZagInstallControlMode {
+		let title = _hasPendingNativeInstall ? "Install" : "Resign"
+		return _runningMode ?? .pill(ZagInstallPill(title: title, accessibilityLabel: "\(title) \(app.name ?? "app")"))
+	}
+
+	private var _hasPendingNativeInstall: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return _nativeEntry?.pendingInstall != nil
+		#else
+		return false
+		#endif
+	}
+
+	private var _nativeProfileExpiry: Date? {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return _nativeEntry?.installation.record.profileExpiresAt
+		#else
+		return nil
+		#endif
+	}
+
+	private var _runningMode: ZagInstallControlMode? {
+		guard let job = jobs.job(_jobKey) else { return nil }
+		return job.nativeCaption != nil && job.progress > 0 ? .progress(job.progress, .none) : .spinner(.none)
+	}
+
+	private func _progressCaption(_ caption: String) -> some View {
+		Text(caption).font(.system(size: 9, weight: .medium))
+			.foregroundStyle(.secondary).lineLimit(1).frame(width: 88, height: 11).offset(y: 26)
+	}
+
+	private func _expiryCaption(_ expiry: Date) -> some View {
+		let info = expiry.expirationInfo()
+		return Text(info.formatted).font(.system(size: 8, weight: .regular))
+			.foregroundStyle(info.color).lineLimit(1).offset(y: 26)
+	}
+
+	private func _startNative(installSaved: Bool = false) {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		guard jobs.begin(_jobKey, stage: installSaved ? .packaging : .signing) else { return }
+		Task { @MainActor in
+			defer { withAnimation(.easeInOut(duration: 0.25)) { jobs.finish(_jobKey) } }
+			do {
+				if installSaved, let entry = _nativeEntry {
+					try await ZagNativeAccountInstall.installSaved(entry: entry, job: _jobKey)
+				} else {
+					let options = OptionsManager.shared.options
+					let result = try await ZagNativeAccountInstall.runInline(app, job: _jobKey, options: options, renew: _isNativeAccountApp)
+					if !app.isSigned, options.post_deleteAppAfterSigned, !jobs.isCancelRequested(_jobKey) {
+						Storage.shared.deleteApp(for: app)
+					}
+					if case .verified = result { try? ZagRPPairingCore.shared.refreshInstalledApps() }
+				}
+			} catch is ZagInstallCancelled {
+			} catch {
+				ZagNativeAccountInstall.showInlineFailure(error) { selectedSigningAppPresenting = AnyApp(base: app) }
+			}
+		}
+		#else
+		UIAlertController.showAlertWithOk(title: "Apple Account", message: "Apple Account signing is unavailable in this build.")
+		#endif
+	}
+
 	// MARK: - Install control
 
 	/// The Signed row's action, in the same order as the previous branches.
 	private func _signedControlMode(update: UpdateManager.AvailableUpdate?) -> ZagInstallControlMode {
 		if let update {
 			let stage = updateTransaction.stage(for: update)
+			if let job = jobs.job(ZagUpdateTransactionManager.jobID(update)), job.nativeCaption != nil, job.progress > 0 {
+				return .progress(job.progress, .none)
+			}
 			if let stage, !isFailedUpdateStage(stage) { return .spinner(.none) }
 			return .pill(ZagInstallPill(title: stage?.title ?? .localized("Update"), accessibilityLabel: "Update \(app.name ?? "app")"))
 		}
@@ -565,6 +607,10 @@ extension LibraryCellView {
 
 	private func _signedCaption(update: UpdateManager.AvailableUpdate?) -> String? {
 		if let update {
+			if let job = jobs.job(ZagUpdateTransactionManager.jobID(update)) {
+				if job.cancelRequested { return .localized("Cancelling…") }
+				if let caption = job.nativeCaption { return caption }
+			}
 			let caption = updateStageCaption(updateTransaction.stage(for: update))
 			return caption.isEmpty ? nil : caption
 		}
@@ -604,7 +650,7 @@ extension LibraryCellView {
 			case .success(let signedUUID):
 				Task { @MainActor in
 					do {
-						try await updateTransaction.installPreparedUpdate(signedUUID: signedUUID)
+						guard try await updateTransaction.installPreparedUpdate(signedUUID: signedUUID) else { return }
 						try? ZagRPPairingCore.shared.refreshInstalledApps()
 					} catch {
 						updateTransaction.failInstallation(update: update, error: error)
@@ -729,26 +775,18 @@ extension LibraryCellView {
 	}
 
 	private func _signImmediately(_ app: AppInfoPresentable) {
-		guard !isSigningImmediately, !isInstallingImmediately else { return }
-
-		withAnimation(.easeInOut(duration: 0.25)) {
-			isSigningImmediately = true
-		}
-
+		guard !jobs.isActive(_jobKey), !choosingSigningMethod else { return }
+		choosingSigningMethod = true
 		Task { @MainActor in
-			guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
-				withAnimation(.easeInOut(duration: 0.25)) {
-					isSigningImmediately = false
-				}
-				if Storage.shared.getAllCertificates().isEmpty {
-					UIAlertController.showAlertWithOk(
-						title: .localized("No Certificate"),
-						message: .localized("Please go to settings and import a valid certificate"),
-						isCancel: true
-					)
-				}
+			defer { choosingSigningMethod = false }
+			guard let method = await ZagCertificateSelection.chooseMethod() else { return }
+			if method == .freeAppleAccount { _startNative(); return }
+			guard let certificate = ZagCertificateSelection.activeCertificate() else {
+				UIAlertController.showAlertWithOk(title: .localized("No Certificate"),
+					message: "Select an imported certificate in Settings.", isCancel: true)
 				return
 			}
+			withAnimation(.easeInOut(duration: 0.25)) { isSigningImmediately = true }
 
 			var options = OptionsManager.shared.options
 
@@ -796,13 +834,6 @@ extension LibraryCellView {
 					return
 				}
 
-				guard !app.isSigned else {
-					withAnimation(.easeInOut(duration: 0.25)) {
-						isSigningImmediately = false
-					}
-					return
-				}
-
 				if options.post_installAppAfterSigned {
 					guard
 						let signedUUID,
@@ -841,14 +872,14 @@ extension LibraryCellView {
 
 					_installImmediately(
 						signed,
-						importedAfterSigning: app
+						importedAfterSigning: app.isSigned ? nil : app
 					)
 				} else {
 					withAnimation(.easeInOut(duration: 0.25)) {
 						isSigningImmediately = false
 					}
 
-					if options.post_deleteAppAfterSigned {
+					if options.post_deleteAppAfterSigned && !app.isSigned {
 						Storage.shared.deleteApp(for: app)
 					}
 				}

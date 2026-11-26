@@ -139,6 +139,15 @@ struct ZagKeychainFreeAccountSecretStore: ZagFreeAccountSecretStore {
 		return ((result as? [[String: Any]]) ?? []).compactMap { $0[kSecAttrAccount as String] as? String }
 	}
 
+	func signingIdentityScopes() throws -> [ZagSigningScope] {
+		try itemNames().compactMap { item in
+			let parts = item.split(separator: ".").map(String.init)
+			guard parts.count == 3, parts[1] == ZagFreeAccountSecretKind.signingPrivateKey.rawValue,
+				  let account = UUID(uuidString: parts[0]), ZagDeveloperTeam.isValidIdentifier(parts[2]) else { return nil }
+			return .init(accountID: account, teamID: parts[2])
+		}
+	}
+
 	func accountIDs() throws -> Set<UUID> {
 		Set(try itemNames().compactMap { UUID(uuidString: String($0.prefix(36))) })
 	}

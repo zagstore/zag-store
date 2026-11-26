@@ -57,12 +57,12 @@ extension Tests {
 				== .mismatch("extension profile expiry"), "renewal refuses a mismatched installed extension expiration")
 
 			var scopes: Set<ZagSigningScope> = []
-			check(ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: true, customize: false,
-					hasDefaultCertificate: true, freeAccountEnabled: true)
-				&& !ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: false, customize: false,
-					hasDefaultCertificate: true, freeAccountEnabled: true)
-				&& ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: false, customize: false,
-					hasDefaultCertificate: false, freeAccountEnabled: true), "shared signing selection honours Ask Every Time and preserves quick certificate signing")
+			check(ZagSigningPreference.resolve(saved: nil, legacyAsk: true) == .askEveryTime
+				&& ZagSigningPreference.resolve(saved: nil, legacyAsk: false) == .importedCertificate
+				&& ZagSigningPreference.resolve(saved: "appleAccount", legacyAsk: true) == .appleAccount
+				&& ZagSigningPreference.resolve(saved: "importedCertificate", legacyAsk: true) == .importedCertificate,
+				"signing preference migrates legacy Ask Every Time and respects an explicit method")
+
 			var refreshAttempts: [String] = []
 			let batch = await ZagNativeSigningPipeline.refreshSequentially(accounts) { account, index in
 				refreshAttempts.append(account)
@@ -117,6 +117,29 @@ extension Tests {
 					} catch ZagNativeSigningPipeline.Failure.expiryNotExtended {
 						check(true, "unchanged profile expiry is rejected before installation")
 					}
+					let pending = NativeLifecycleCheckpoints()
+					let signedOnly = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+						provisioner: provisioner, secrets: secrets, signer: AppIDTestSigner(), installer: AppIDTestInstaller(refuseInstall: true),
+						verifyTarget: { throw ZagPortalError.network }, progress: { await pending.report($0) },
+						onVerified: { await pending.record($0) }, onSignedOnly: { metadata, expected, _ in
+							await pending.recordPending(metadata, expectation: expected)
+						}, now: { clock.now })
+					let saved = await pending.pendingExpectation
+					let signedMetadata = await pending.pendingMetadata
+					let savedStages = await pending.progress
+					let verifiedWhileSigning = await pending.installation
+					check(signedOnly == .signedOnly && savedStages == [.provisioning, .signing]
+						&& signedMetadata?.record.expiryVerified == false && verifiedWhileSigning == nil,
+						"native sign-only saves a signed copy without installing or claiming verification")
+					if let saved {
+						let restored = try JSONDecoder().decode(ZagInstallExpectation.self, from: JSONEncoder().encode(saved))
+						let later = AppIDTestInstaller()
+						try await later.install(signedApp: root, bundleIdentifier: restored.bundleIdentifier)
+						let readback = await later.verify(restored)
+						check(readback == .verified(profileExpiresAt: expiration, certificateExpiresAt: certificate.expiresAt),
+							"the saved native package installs later using persisted verification expectations")
+					} else { check(false, "signed-only installation expectation was saved") }
+
 					let extended = expiration + 3_600
 					await transport.renewProfile(until: extended)
 					let renewal = NativeLifecycleCheckpoints()
@@ -192,6 +215,12 @@ extension Tests {
 private actor NativeLifecycleCheckpoints {
 	var progress: [ZagNativeSigningProgress] = []
 	var installation: ZagNativeInstalledProfiles?
+	var pendingMetadata: ZagNativeInstalledProfiles?
+	var pendingExpectation: ZagInstallExpectation?
+	func recordPending(_ value: ZagNativeInstalledProfiles, expectation: ZagInstallExpectation) {
+		pendingMetadata = value
+		pendingExpectation = expectation
+	}
 	func report(_ stage: ZagNativeSigningProgress) { progress.append(stage) }
 	func record(_ value: ZagNativeInstalledProfiles) { installation = value }
 }
