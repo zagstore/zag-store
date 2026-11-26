@@ -667,10 +667,13 @@ extension ZagNativeAccountInstall {
 				}
 				ZagInstallJobs.shared.advance(job, to: .signing)
 				guard ZagNativeAppInventory.hasSource(entry) else { throw ZagNativeAppInventory.Failure.missingSource }
-				return try await RefreshCoordinator.onDevice {
-					let started = ContinuousClock.now
-					return try await ZagNativeAppInventory.withSource(entry) { source in
-						let unpacked = started.duration(to: .now)
+				let started = ContinuousClock.now
+				return try await ZagNativeAppInventory.withSource(entry) { source in
+					let unpacked = started.duration(to: .now)
+					let queued = ContinuousClock.now
+					return try await RefreshCoordinator.onDevice {
+						ZagSigningDiagnostics.elapsed("Full re-sign device queue wait", since: queued)
+						try ZagInstallJobs.shared.checkpoint(job)
 						return try await runInlineSource(source, name: entry.name, accountID: id, job: job,
 							installAfterSigning: true, renewing: entry, interactive: interactive,
 							archiveTime: unpacked)
