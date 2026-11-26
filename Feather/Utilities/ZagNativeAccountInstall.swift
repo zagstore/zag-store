@@ -176,23 +176,42 @@ enum ZagNativeAccountInstall {
 		// Coalesce ready requests only; a slow developer request must not hold
 		// up the entire batch. Each participant retains its own verification.
 		private struct ProfileHandoff {
+			let id: UUID
 			let profiles: [Data]
 			let prepare: @MainActor () throws -> Void
 			let continuation: CheckedContinuation<[Data], Error>
 		}
 		private var pendingHandoffs: [ProfileHandoff] = []
 		private var handoffScheduled = false
+		private var cancelledHandoffs: Set<UUID> = []
+		private var waitingHandoffs: Set<UUID> = []
 
 		private func handoff(_ profiles: [Data], prepare: @escaping @MainActor () throws -> Void) async throws -> [Data] {
 			try Task.checkCancellation()
-			return try await withCheckedThrowingContinuation { continuation in
-				pendingHandoffs.append(.init(profiles: profiles, prepare: prepare, continuation: continuation))
-				guard !handoffScheduled else { return }
-				handoffScheduled = true
+			let id = UUID()
+			waitingHandoffs.insert(id)
+			defer {
+				waitingHandoffs.remove(id)
+				cancelledHandoffs.remove(id)
+			}
+			return try await withTaskCancellationHandler {
+				try await withCheckedThrowingContinuation { continuation in
+					pendingHandoffs.append(.init(id: id, profiles: profiles, prepare: prepare, continuation: continuation))
+					guard !handoffScheduled else { return }
+					handoffScheduled = true
+					Task { @MainActor in
+						try? await Task.sleep(for: .milliseconds(150))
+						await self.flushHandoffs()
+					}
+				}
+			} onCancel: {
 				Task { @MainActor in
-					// A bounded collection window, not a barrier across all apps.
-					try? await Task.sleep(for: .milliseconds(150))
-					await self.flushHandoffs()
+					guard self.waitingHandoffs.contains(id) else { return }
+					self.cancelledHandoffs.insert(id)
+					if let index = self.pendingHandoffs.firstIndex(where: { $0.id == id }) {
+						let item = self.pendingHandoffs.remove(at: index)
+						item.continuation.resume(throwing: CancellationError())
+					}
 				}
 			}
 		}
@@ -206,6 +225,7 @@ enum ZagNativeAccountInstall {
 					var ready: [ProfileHandoff] = []
 					for item in pending {
 						do {
+							guard !self.cancelledHandoffs.contains(item.id) else { throw CancellationError() }
 							try item.prepare()
 							ready.append(item)
 						} catch {
@@ -220,6 +240,7 @@ enum ZagNativeAccountInstall {
 						}
 					}
 					do {
+						ZagSigningDiagnostics.record("Shared profile handoff: \(ready.count) apps, \(unique.count) distinct profiles")
 						let observed = try await Self.installAndReadBack(unique)
 						for item in ready { item.continuation.resume(returning: observed) }
 					} catch {
