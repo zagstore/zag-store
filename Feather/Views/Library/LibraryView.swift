@@ -337,7 +337,7 @@ struct LibraryView: View {
 				defer { ZagInstallJobs.shared.finish(job) }
 				let previous = ZagSigningDiagnostics.latest
 				do {
-					_ = try await ZagNativeAccountInstall.runInline(app, job: job, options: .defaultOptions, renew: true)
+					_ = try await ZagNativeAccountInstall.runInline(app, job: job, options: OptionsManager.shared.appleIDOptions, renew: true)
 					renewed += 1
 				} catch {
 					lines.append("\(entry.name). \(error.localizedDescription)")
@@ -3238,34 +3238,31 @@ private struct ZagLibraryHeader: View {
 	var body: some View {
 		HStack(spacing: 8) {
 			Button(action: onToggle) {
-				HStack(spacing: 8) {
-					ZagSectionHeader(
-						title: title,
-						count: count
-					)
-
-					Spacer(minLength: 8)
-
-					Image(systemName: "chevron.down")
-						.font(.system(size: 20, weight: .semibold))
-						.foregroundStyle(.secondary)
-						.frame(width: 44, height: 44)
-						.rotationEffect(.degrees(isCollapsed ? -90 : 0))
-						.animation(.easeInOut(duration: 0.28), value: isCollapsed)
-				}
-				.frame(maxWidth: .infinity, alignment: .leading)
-				.contentShape(Rectangle())
+				ZagSectionHeader(title: title, count: count)
+					.frame(maxWidth: .infinity, alignment: .leading)
+					.contentShape(Rectangle())
 			}
 			.buttonStyle(.plain)
 			.accessibilityLabel(Text(title))
 			.accessibilityValue(Text(isCollapsed ? "Collapsed" : "Expanded"))
 			.accessibilityHint(Text(isCollapsed ? "Expand section" : "Collapse section"))
+
 			if let trailingAction {
-				Button("Refresh All", action: trailingAction)
-					.font(.subheadline.weight(.semibold))
-					.foregroundStyle(.tint)
+				Button(action: trailingAction) { ZagCountBadge(title: "Refresh All") }
 					.buttonStyle(.plain)
 			}
+
+			Button(action: onToggle) {
+				Image(systemName: "chevron.down")
+					.font(.system(size: 20, weight: .semibold))
+					.foregroundStyle(.secondary)
+					.frame(width: 44, height: 44)
+					.contentShape(Rectangle())
+					.rotationEffect(.degrees(isCollapsed ? -90 : 0))
+					.animation(.easeInOut(duration: 0.28), value: isCollapsed)
+			}
+			.buttonStyle(.plain)
+			.accessibilityHidden(true)
 		}
 	}
 }
@@ -3680,8 +3677,9 @@ final class ZagUpdateTransactionManager: ObservableObject {
 					guard ZagInstallJobs.shared.begin(job, stage: .signing) else { throw ZagNativeAccountInstall.Failure.busy }
 					var keepJob = false
 					defer { if !keepJob { ZagInstallJobs.shared.finish(job) } }
-					var options = selectedOptions
-					options.post_installAppAfterSigned = false
+					let preferredOptions = OptionsManager.shared.appleIDOptions
+					var options = preferredOptions
+					options.installAfterSigning = false
 					do {
 						_ = try await ZagNativeAccountInstall.runInline(imported, job: job, options: options, requiredInstalledIdentifier: target)
 					} catch {
@@ -3691,7 +3689,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 					guard let saved = ZagNativeAppInventory.pendingEntry(bundleIdentifier: target) else {
 						throw ZagUpdateTransactionError.signedRecordNotFound
 					}
-					if selectedOptions.post_installAppAfterSigned {
+					if preferredOptions.installAfterSigning {
 						nativePendingUpdates[saved.uuid] = update.id
 						stages[update.id] = .readyToInstall
 						keepJob = interactive
@@ -3699,7 +3697,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 						savedOnlyUpdates.insert(saved.uuid)
 						stages[update.id] = nil
 					}
-					if selectedOptions.post_deleteAppAfterSigned { Storage.shared.deleteApp(for: imported) }
+					if preferredOptions.deleteImportAfterSigning { Storage.shared.deleteApp(for: imported) }
 					try? FileManager.default.removeItem(at: localURL)
 					completion(.success(saved.uuid))
 					return

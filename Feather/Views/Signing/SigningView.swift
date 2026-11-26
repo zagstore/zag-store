@@ -14,7 +14,8 @@ struct SigningView: View {
 	@Environment(\.dismiss) var dismiss
 	@StateObject private var _optionsManager = OptionsManager.shared
 	
-	@State private var _temporaryOptions: Options = OptionsManager.shared.options
+	@State private var _temporaryOptions: Options
+	private let _certificateDefaults: Options
 	@State private var _temporaryCertificate: Int
 	@State private var _isAltPickerPresenting = false
 	@State private var _isFilePickerPresenting = false
@@ -23,6 +24,12 @@ struct SigningView: View {
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 	@ObservedObject private var _accountPairing = ZagRPPairingCore.shared
 	@State private var _signingMethod: ZagSigningMethod = .importedCertificate
+	@State private var _appleIDOptions = OptionsManager.shared.appleIDOptions
+	@State private var _useOnlyAppleIDOptions = false
+	private var _certificateChanges: [String] {
+		_temporaryOptions.certificateCustomisations(since: _certificateDefaults,
+			identifier: app.identifier, name: app.name, hasIcon: appIcon != nil)
+	}
 	@State private var _accountInstallMessage: String?
 	@State private var _certificateIssue: ZagNativeAccountInstall.CertificateIssue?
 	@State private var _nativeProgress: ZagNativeSigningProgress?
@@ -64,6 +71,14 @@ struct SigningView: View {
 		#endif
 		let storedCert = UserDefaults.standard.integer(forKey: "feather.selectedCert")
 		__temporaryCertificate = State(initialValue: storedCert)
+		var certificate = OptionsManager.shared.options
+		if certificate.ppqProtection, let identifier = app.identifier, ZagCertificateSelection.activeCertificate()?.ppQCheck == true {
+			certificate.appIdentifier = "\(identifier).\(certificate.ppqString)"
+		}
+		if let id = app.identifier, let mapped = certificate.identifiers[id] { certificate.appIdentifier = mapped }
+		if let name = app.name, let mapped = certificate.displayNames[name] { certificate.appName = mapped }
+		_certificateDefaults = certificate
+		__temporaryOptions = State(initialValue: certificate)
 	}
 		
 	// MARK: Body
@@ -74,7 +89,8 @@ struct SigningView: View {
 				if _renewing == nil {
 					Picker("Signing Method", selection: $_signingMethod) {
 						Text(ZagSigningMethod.importedCertificate.title).tag(ZagSigningMethod.importedCertificate)
-						Text(ZagSigningMethod.freeAppleAccount.title).tag(ZagSigningMethod.freeAppleAccount)
+						ZagSigningMethodLabel(title: ZagSigningMethod.freeAppleAccount.title, appleID: true)
+							.tag(ZagSigningMethod.freeAppleAccount)
 					}
 				}
 				if _signingMethod == .freeAppleAccount {
@@ -100,21 +116,12 @@ struct SigningView: View {
 							}
 						}
 					} else {
-						Toggle("Install After Signing", isOn: $_temporaryOptions.post_installAppAfterSigned)
-						Toggle("Delete Imported App After Signing", isOn: $_temporaryOptions.post_deleteAppAfterSigned)
-						Text("Advanced customisation requires an imported certificate. Apple Account signing keeps the app’s original customisation settings.")
-							.font(.footnote).foregroundStyle(.secondary)
-						if (try? ZagNativeAccountInstall.validateOptions(_temporaryOptions, app: app, hasIcon: appIcon != nil)) == nil {
-							Text("The current signing options include changes that require an imported certificate.")
+						Toggle("Install After Signing", isOn: $_appleIDOptions.installAfterSigning)
+						Toggle("Delete Imported App After Signing", isOn: $_appleIDOptions.deleteImportAfterSigning)
+						if !_certificateChanges.isEmpty {
+							Text(ZagNativeAccountInstall.Failure.unsupportedOptions(_certificateChanges).localizedDescription)
 								.font(.footnote).foregroundStyle(.orange)
-							Button("Use Apple Account Options") {
-								let install = _temporaryOptions.post_installAppAfterSigned
-								let delete = _temporaryOptions.post_deleteAppAfterSigned
-								_temporaryOptions = .defaultOptions
-								_temporaryOptions.post_installAppAfterSigned = install
-								_temporaryOptions.post_deleteAppAfterSigned = delete
-								appIcon = nil
-							}
+							Toggle("Use only Apple ID options for this signing", isOn: $_useOnlyAppleIDOptions)
 						}
 					}
 					if let progress = _nativeProgress {
@@ -183,7 +190,14 @@ struct SigningView: View {
 				NBToolbarButton(role: .dismiss)
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button("Reset") {
-                        _temporaryOptions = OptionsManager.shared.options
+                        #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+                        if _signingMethod == .freeAppleAccount {
+                            _appleIDOptions = OptionsManager.shared.appleIDOptions
+                            _useOnlyAppleIDOptions = false
+                            return
+                        }
+                        #endif
+                        _temporaryOptions = _certificateDefaults
                         appIcon = nil
                     }
                     .accessibilityLabel("Reset Signing Options")
@@ -191,7 +205,7 @@ struct SigningView: View {
                     Button { _closeSigning() } label: {
                         Image(systemName: "xmark")
                     }
-                    .accessibilityLabel("Close Sign App")
+                    .accessibilityLabel("Close Customise App")
                 }
 			}
 			.sheet(isPresented: $_isAltPickerPresenting) { SigningAlternativeIconView(app: app, appIcon: $appIcon, isModifing: .constant(true)) }
@@ -232,32 +246,9 @@ struct SigningView: View {
 			Text(_accountInstallMessage ?? "")
 		}
 		.interactiveDismissDisabled(_isSigning && _signingMethod == .freeAppleAccount)
+		.onChange(of: _temporaryOptions) { _ in _useOnlyAppleIDOptions = false }
+		.onChange(of: appIcon != nil) { _ in _useOnlyAppleIDOptions = false }
 		#endif
-		.onAppear {
-			// ppq protection
-			if
-				_optionsManager.options.ppqProtection,
-				let identifier = app.identifier,
-				let cert = _selectedCert(),
-				cert.ppQCheck
-			{
-				_temporaryOptions.appIdentifier = "\(identifier).\(_optionsManager.options.ppqString)"
-			}
-			
-			if
-				let currentBundleId = app.identifier,
-				let newBundleId = _temporaryOptions.identifiers[currentBundleId]
-			{
-				_temporaryOptions.appIdentifier = newBundleId
-			}
-			
-			if
-				let currentName = app.name,
-				let newName = _temporaryOptions.displayNames[currentName]
-			{
-				_temporaryOptions.appName = newName
-			}
-		}
 	}
 }
 
@@ -958,7 +949,7 @@ extension SigningView {
 			if let issue = _certificateIssue, ZagNativeAccountInstall.currentAccountMatches(issue.scope) {
 				return "Resume Sign and Install"
 			}
-			return _temporaryOptions.post_installAppAfterSigned ? "Sign and Install" : "Sign"
+			return _appleIDOptions.installAfterSigning ? "Sign and Install" : "Sign"
 		}
 		#endif
 		return .localized("Start Signing")
@@ -972,7 +963,7 @@ extension SigningView {
 				guard let scope = entry.installation.record.owner?.scope, ZagNativeAccountInstall.currentAccountMatches(scope) else { return false }
 				return ZagNativeAppInventory.hasSource(entry) || _sourceImportID != nil
 			}
-			return true
+			return _useOnlyAppleIDOptions || _certificateChanges.isEmpty
 		}
 		#endif
 		return true
@@ -1000,16 +991,16 @@ extension SigningView {
 				if let entry = _renewing {
 					try await _renew(entry)
 				} else {
-					try ZagNativeAccountInstall.validateOptions(_temporaryOptions, app: app, hasIcon: appIcon != nil)
+					try ZagNativeAccountInstall.validateOptions(explicitCertificateChanges: _useOnlyAppleIDOptions ? [] : _certificateChanges)
 					guard let source = Storage.shared.getAppDirectory(for: app) else { throw ZagNativeAccountInstall.Failure.invalidApp }
 					let result = try await ZagNativeAccountInstall.install(
 						source: source, name: app.name ?? "App", expectedScope: expectedScope,
-						installAfterSigning: _temporaryOptions.post_installAppAfterSigned,
+						installAfterSigning: _appleIDOptions.installAfterSigning,
 						onCertificateReady: { @MainActor in _certificateIssue = nil }, progress: _reportNativeProgress
 					)
 					switch result {
 					case .verified, .signedOnly:
-						if _temporaryOptions.post_deleteAppAfterSigned, !app.isSigned { Storage.shared.deleteApp(for: app) }
+						if _appleIDOptions.deleteImportAfterSigning, !app.isSigned { Storage.shared.deleteApp(for: app) }
 					default: throw ZagNativeAppInventory.Failure.unverified
 					}
 					if case .signedOnly = result {

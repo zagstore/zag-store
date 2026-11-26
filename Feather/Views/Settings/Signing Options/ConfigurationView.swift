@@ -18,6 +18,12 @@ struct ConfigurationView: View {
 	// MARK: Body
 	var body: some View {
 		List {
+			if ZagSigningMethodAvailability.freeAccountEnabled {
+				Section {
+					Toggle("Install After Signing", isOn: $_optionsManager.appleIDOptions.installAfterSigning)
+					Toggle("Delete Imported App After Signing", isOn: $_optionsManager.appleIDOptions.deleteImportAfterSigning)
+				} header: { ZagSigningMethodLabel(title: ZagSigningMethod.freeAppleAccount.title, appleID: true) }
+			}
 			Section {
 				NavigationLink(destination: ConfigurationDictView(
 					title: .localized("Display Names"),
@@ -39,7 +45,9 @@ struct ConfigurationView: View {
 					Label("PPQ String", systemImage: "character.textbox")
 						.foregroundStyle(.primary)
 				}
-			}footer: {
+			} header: {
+				Text("Certificate")
+			} footer: {
 				Text(.localized("This allows you to set rules for automatically replacing the Bundle ID/Display Name when signing an app."))
 			}
 			SigningOptionsView(options: $_optionsManager.options)

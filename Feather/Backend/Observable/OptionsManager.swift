@@ -6,37 +6,31 @@
 //
 
 import Foundation
-import UIKit
+import Combine
+#if canImport(NimbleExtensions)
+import NimbleExtensions
+#endif
 
 // MARK: - OptionsManager
 class OptionsManager: ObservableObject {
 	static let shared = OptionsManager()
 	
 	@Published var options: Options
+	@Published var appleIDOptions: ZagAppleIDSigningOptions {
+		didSet { appleIDOptions.save(to: .standard) }
+	}
 	private let _key = "signing_options"
 	
 	init() {
-		if
-			let data = UserDefaults.standard.data(forKey: _key),
-			let savedOptions = try? JSONDecoder().decode(Options.self, from: data)
-		{
-			self.options = savedOptions
-		} else {
-			self.options = Options.defaultOptions
-			self.saveOptions()
-		}
-
-		// Zag Store previously used a custom entitlement file while testing
-		// SideStore signing. Clear that persisted selection once so unrelated
-		// apps are signed from their own/profile-derived entitlements again.
-		let cleanupKey = "zag.didClearLegacySideStoreEntitlements"
-		if !UserDefaults.standard.bool(forKey: cleanupKey) {
-			options.appEntitlementsFile = nil
-			saveOptions()
-			UserDefaults.standard.set(true, forKey: cleanupKey)
-		}
+		let defaults = UserDefaults.standard
+		let certificate = defaults.data(forKey: _key).flatMap { try? JSONDecoder().decode(Options.self, from: $0) }
+			?? .defaultOptions
+		options = certificate
+		appleIDOptions = .load(from: defaults, inheriting: .init(
+			installAfterSigning: certificate.post_installAppAfterSigned,
+			deleteImportAfterSigning: certificate.post_deleteAppAfterSigned))
 	}
-	
+
 	/// Saves options
 	func saveOptions() {
 		if let encoded = try? JSONEncoder().encode(options) {
@@ -244,5 +238,47 @@ extension LocalizedDescribable where Self: RawRepresentable, RawValue == String 
 	var localizedDescription: String {
 		let localized = NSLocalizedString(self.rawValue, comment: "")
 		return localized == self.rawValue ? self.rawValue : localized
+	}
+}
+
+extension Options {
+	/// Changes explicitly made in the Certificate editor during this sheet.
+	/// Saved certificate defaults are the comparison baseline, never input to
+	/// Apple ID signing.
+	func certificateCustomisations(since baseline: Self, identifier: String?, name: String?, hasIcon: Bool) -> [String] {
+		var changes: [String] = []
+		func compare<Value: Equatable>(_ key: KeyPath<Self, Value>, _ title: String) {
+			if self[keyPath: key] != baseline[keyPath: key] { changes.append(title) }
+		}
+		if hasIcon { changes.append("App Icon") }
+		compare(\.appName, "Display Name")
+		compare(\.appVersion, "Version")
+		compare(\.appIdentifier, "Bundle Identifier")
+		compare(\.appEntitlementsFile, "Custom Entitlements")
+		compare(\.appAppearance, "Appearance")
+		compare(\.minimumAppRequirement, "Minimum iOS")
+		compare(\.signingOption, "Signing Type")
+		compare(\.ppqProtection, "PPQ Protection")
+		if ppqProtection { compare(\.ppqString, "PPQ String") }
+		compare(\.dynamicProtection, "Dynamic Protection")
+		compare(\.injectionFiles, "Injected Tweaks")
+		compare(\.disInjectionFiles, "Removed Load Paths")
+		compare(\.removeFiles, "Removed Files")
+		compare(\.fileSharing, "File Sharing")
+		compare(\.itunesFileSharing, "iTunes File Sharing")
+		compare(\.proMotion, "ProMotion")
+		compare(\.gameMode, "Game Mode")
+		compare(\.ipadFullscreen, "iPad Fullscreen")
+		compare(\.removeURLScheme, "Remove URL Schemes")
+		compare(\.removeProvisioning, "Remove Provisioning Profile")
+		compare(\.changeLanguageFilesForCustomDisplayName, "Localised App Name")
+		compare(\.injectIntoExtensions, "Inject into Extensions")
+		compare(\.injectPath, "Tweak Load Path")
+		compare(\.injectFolder, "Tweak Folder")
+		compare(\.experiment_supportLiquidGlass, "Liquid Glass")
+		compare(\.experiment_replaceSubstrateWithEllekit, "ElleKit Replacement")
+		if let identifier, identifiers[identifier] != baseline.identifiers[identifier] { changes.append("Bundle Identifier Rule") }
+		if let name, displayNames[name] != baseline.displayNames[name] { changes.append("Display Name Rule") }
+		return changes
 	}
 }

@@ -139,9 +139,9 @@ enum ZagCertificateSelection {
 		return await withCheckedContinuation { continuation in
 			let alert = UIAlertController(title: "Signing Method", message: nil, preferredStyle: .actionSheet)
 			if ZagSigningMethodAvailability.freeAccountEnabled {
-				alert.addAction(UIAlertAction(title: "Apple Account", style: .default) { _ in continuation.resume(returning: .freeAppleAccount) })
+				alert.addAction(UIAlertAction(title: UIImage(systemName: "apple.logo") == nil ? "Apple ID" : " Apple ID", style: .default) { _ in continuation.resume(returning: .freeAppleAccount) })
 			}
-			alert.addAction(UIAlertAction(title: "Imported Certificate", style: .default) { _ in continuation.resume(returning: .importedCertificate) })
+			alert.addAction(UIAlertAction(title: ZagSigningMethod.importedCertificate.title, style: .default) { _ in continuation.resume(returning: .importedCertificate) })
 			alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in continuation.resume(returning: nil) })
 			alert.popoverPresentationController?.sourceView = presenter.view
 			alert.popoverPresentationController?.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)

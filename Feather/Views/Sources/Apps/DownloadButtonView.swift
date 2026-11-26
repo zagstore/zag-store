@@ -791,7 +791,7 @@ struct DownloadButtonView: View {
 		zagPhase = .signing
 		Task { @MainActor in
 			defer { zagPhase = .idle; actionClaimed = false }
-			let options = OptionsManager.shared.options
+			let options = OptionsManager.shared.appleIDOptions
 			do {
 				let outcome = try await ZagNativeAccountInstall.runInline(imported, job: _jobKey, options: options,
 					onSaved: { @MainActor id in installedBundleID = id })
@@ -802,7 +802,7 @@ struct DownloadButtonView: View {
 				}
 				retryImportedUUID = nil
 				UserDefaults.standard.removeObject(forKey: _signingRetryStorageKey)
-				if options.post_deleteAppAfterSigned { Storage.shared.deleteApp(for: imported) }
+				if options.deleteImportAfterSigning { Storage.shared.deleteApp(for: imported) }
 			} catch is ZagInstallCancelled {
 			} catch {
 				ZagNativeAccountInstall.showInlineFailure(error)

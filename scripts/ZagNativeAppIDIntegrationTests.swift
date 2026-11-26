@@ -63,6 +63,44 @@ extension Tests {
 				&& ZagSigningPreference.resolve(saved: "importedCertificate", legacyAsk: true) == .importedCertificate,
 				"signing preference migrates legacy Ask Every Time and respects an explicit method")
 
+			check(ZagSigningPreference.allCases.map(\.title) == ["Apple ID", "Certificate", "Always Ask"],
+				"signing method labels leave preference storage values unchanged")
+			let preferenceSuite = "ZagSigningOptionTests." + UUID().uuidString
+			let preferences = UserDefaults(suiteName: preferenceSuite)!
+			defer { preferences.removePersistentDomain(forName: preferenceSuite) }
+			let oldOptions = ZagAppleIDSigningOptions(installAfterSigning: true, deleteImportAfterSigning: false)
+			let freshOptions = ZagAppleIDSigningOptions(installAfterSigning: false, deleteImportAfterSigning: true)
+			check(ZagAppleIDSigningOptions.load(from: preferences, inheriting: oldOptions) == oldOptions,
+				"Apple ID migrates only the legacy post-signing actions")
+			check(ZagAppleIDSigningOptions.load(from: preferences, inheriting: freshOptions) == oldOptions,
+				"later changes to certificate options leave Apple ID settings intact")
+			freshOptions.save(to: preferences)
+			check(ZagAppleIDSigningOptions.load(from: preferences, inheriting: oldOptions) == freshOptions,
+				"Apple ID preferences round-trip independently")
+			var certificateDefaults = Options.defaultOptions
+			certificateDefaults.ppqProtection = true
+			certificateDefaults.dynamicProtection = true
+			certificateDefaults.identifiers[original] = "com.example.advanced"
+			certificateDefaults.appEntitlementsFile = URL(fileURLWithPath: "/fixture/legacy.plist")
+			check(certificateDefaults.certificateCustomisations(since: certificateDefaults,
+				identifier: original, name: nil, hasIcon: false).isEmpty,
+				"saved certificate defaults produce no Apple ID customisation conflicts")
+			var custom = certificateDefaults
+			custom.appName = "Edited name"
+			custom.removeProvisioning = true
+			custom.post_installAppAfterSigned = true
+			let conflicts = custom.certificateCustomisations(since: certificateDefaults,
+				identifier: original, name: nil, hasIcon: true)
+			check(conflicts == ["App Icon", "Display Name", "Remove Provisioning Profile"],
+				"explicit certificate edits are named and supported post-signing settings do not conflict")
+			let validityBoundaries: [(TimeInterval, ZagAppleIDProfileValidity)] = [
+				(345_600.001, .valid), (345_600, .soon), (172_800.001, .soon), (172_800, .urgent),
+				(0.001, .urgent), (0, .expired), (-1, .expired)
+			]
+			check(validityBoundaries.allSatisfy { remaining, expected in
+				ZagAppleIDProfileValidity(expiresAt: clock.now + remaining, now: clock.now) == expected
+			}, "Apple ID expiry changes at the exact two-day, four-day and expiry boundaries")
+
 			var refreshAttempts: [String] = []
 			let batch = await ZagNativeSigningPipeline.refreshSequentially(accounts) { account, index in
 				refreshAttempts.append(account)

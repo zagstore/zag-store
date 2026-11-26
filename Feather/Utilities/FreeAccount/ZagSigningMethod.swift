@@ -14,8 +14,8 @@ enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 
 	var title: String {
 		switch self {
-		case .freeAppleAccount: return "Free Apple Account"
-		case .importedCertificate: return "Imported Certificate"
+		case .freeAppleAccount: return "Apple ID"
+		case .importedCertificate: return "Certificate"
 		case .byoc: return "BYOC"
 		case .developerAccount: return "Developer Account"
 		}
@@ -138,9 +138,30 @@ enum ZagSigningPreference: String, CaseIterable {
 
 	var title: String {
 		switch self {
-		case .appleAccount: "Apple Account"
-		case .importedCertificate: "Imported Certificate"
-		case .askEveryTime: "Ask Every Time"
+		case .appleAccount: ZagSigningMethod.freeAppleAccount.title
+		case .importedCertificate: ZagSigningMethod.importedCertificate.title
+		case .askEveryTime: "Always Ask"
 		}
+	}
+}
+
+/// Only the options the native signer supports. A legacy installation seeds
+/// these two preferences once, without changing the certificate options.
+struct ZagAppleIDSigningOptions: Codable, Equatable {
+	var installAfterSigning: Bool
+	var deleteImportAfterSigning: Bool
+
+	private static let key = "zagStore.appleIDSigningOptions"
+
+	static func load(from defaults: UserDefaults, inheriting legacy: Self) -> Self {
+		if let saved = defaults.data(forKey: key), let decoded = try? JSONDecoder().decode(Self.self, from: saved) {
+			return decoded
+		}
+		legacy.save(to: defaults)
+		return legacy
+	}
+
+	func save(to defaults: UserDefaults) {
+		if let data = try? JSONEncoder().encode(self) { defaults.set(data, forKey: Self.key) }
 	}
 }

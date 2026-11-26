@@ -87,7 +87,7 @@ struct CertificatesView: View {
         if _hasNativeCertificates {
             Section {
                 HStack(spacing: 8) {
-                    Text("Apple Account Certificates")
+                    Text("Apple ID Certificates")
                     _certificateCountBadge(_nativeCertificates.count)
                 }
                 .modifier(ZagCertificateSectionTitleRow())
@@ -111,7 +111,7 @@ struct CertificatesView: View {
         let active = _signingPreference == .appleAccount && cert.hasPrivateKey && cert.expires > Date()
             && ZagNativeAccountInstall.currentAccountMatches(cert.scope)
         let keyStatus = cert.hasPrivateKey ? "Private key available" : "Private key unavailable"
-        let detail = [active ? "Active Apple Account" : nil, keyStatus, "Certificate expiry"]
+        let detail = [active ? "Active Apple ID" : nil, keyStatus, "Certificate expiry"]
             .compactMap { $0 }.joined(separator: " · ")
         return ZagCertificateCard(title: cert.title, team: "Personal Team · " + cert.scope.teamID,
             expiry: cert.expires, needsAttention: !cert.hasPrivateKey || cert.expires <= Date().addingTimeInterval(30 * 86_400),

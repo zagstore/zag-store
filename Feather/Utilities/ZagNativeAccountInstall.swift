@@ -6,7 +6,8 @@ import UIKit
 @MainActor
 enum ZagNativeAccountInstall {
 	enum Failure: LocalizedError {
-		case busy, signIn, personalTeam, pairing, invalidApp, unsupportedOptions
+		case busy, signIn, personalTeam, pairing, invalidApp
+		case unsupportedOptions([String])
 
 		var errorDescription: String? {
 			switch self {
@@ -14,7 +15,7 @@ enum ZagNativeAccountInstall {
 			case .signIn: "Sign in under Settings › Apple Accounts & Signing."
 			case .personalTeam: "No active Personal Team was found for this Apple Account."
 			case .pairing: "Pair this iPhone in Settings before signing and installing."
-			case .unsupportedOptions: "Some enabled signing options require an imported certificate. Review the app’s signing options before continuing."
+			case .unsupportedOptions(let changes): "Use Certificate to apply these customisations: \(changes.joined(separator: ", "))."
 			case .invalidApp: "Zag Store could not read the app or one of its extensions."
 			}
 		}
@@ -264,21 +265,8 @@ enum ZagNativeAccountInstall {
 		}
 	}
 
-	/// Supported native options are the two post-signing actions. Retain
-	/// advanced certificate settings and report conflicts before portal work.
-	static func validateOptions(_ options: Options, app: AppInfoPresentable, hasIcon: Bool = false) throws {
-		var candidate = options
-		var defaults = Options.defaultOptions
-		candidate.ppqString = defaults.ppqString
-		candidate.post_installAppAfterSigned = defaults.post_installAppAfterSigned
-		candidate.post_deleteAppAfterSigned = defaults.post_deleteAppAfterSigned
-		defaults.identifiers = [:]
-		defaults.displayNames = [:]
-		let mappedID = app.identifier.flatMap { candidate.identifiers[$0] }
-		let mappedName = app.name.flatMap { candidate.displayNames[$0] }
-		candidate.identifiers = [:]
-		candidate.displayNames = [:]
-		guard !hasIcon, mappedID == nil, mappedName == nil, candidate == defaults else { throw Failure.unsupportedOptions }
+	static func validateOptions(explicitCertificateChanges: [String]) throws {
+		guard explicitCertificateChanges.isEmpty else { throw Failure.unsupportedOptions(explicitCertificateChanges) }
 	}
 
 	static func installSaved(entry: ZagNativeAppInventory.Entry, job: String) async throws {
@@ -398,7 +386,7 @@ extension ZagInstallJobs {
 }
 
 extension ZagNativeAccountInstall {
-	static func runInline(_ app: AppInfoPresentable, job: String, options: Options, renew: Bool = false,
+	static func runInline(_ app: AppInfoPresentable, job: String, options: ZagAppleIDSigningOptions, renew: Bool = false,
 		requiredInstalledIdentifier: String? = nil, onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
 		let entry = ZagNativeAppInventory.entry(app)
 		if let entry, renew {
@@ -409,10 +397,9 @@ extension ZagNativeAccountInstall {
 				try await runInlineSource(source, name: entry.name, job: job, installAfterSigning: true, renewing: entry)
 			}
 		}
-		try validateOptions(options, app: app)
 		guard let source = Storage.shared.getAppDirectory(for: app) else { throw Failure.invalidApp }
 		return try await runInlineSource(source, name: app.name ?? "App", job: job,
-			installAfterSigning: options.post_installAppAfterSigned, requiredInstalledIdentifier: requiredInstalledIdentifier, onSaved: onSaved)
+			installAfterSigning: options.installAfterSigning, requiredInstalledIdentifier: requiredInstalledIdentifier, onSaved: onSaved)
 	}
 
 	private static func runInlineSource(_ source: URL, name: String, job: String, installAfterSigning: Bool,

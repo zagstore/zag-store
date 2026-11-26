@@ -25,20 +25,6 @@ struct LibraryCellView: View {
 	// Repository state is observed only by the badge and menu label below,
 	// so a refreshed repository no longer re-renders every Apps row.
 
-	private var displayCertificate: CertificatePair? {
-		if let certificate = Storage.shared.getCertificate(from: app) {
-			return certificate
-		}
-
-		let certificates = Storage.shared.getAllCertificates()
-		let selectedIndex = UserDefaults.standard.integer(forKey: "feather.selectedCert")
-		if certificates.indices.contains(selectedIndex) {
-			return certificates[selectedIndex]
-		}
-
-		return certificates.first
-	}
-
 	var app: AppInfoPresentable
 	var isManagedInstalled: Bool = false
 	var availableUpdate: UpdateManager.AvailableUpdate? = nil
@@ -386,9 +372,8 @@ extension LibraryCellView {
 				Button("Open", systemImage: "app.badge.checkmark") { UIApplication.openApp(with: id) }
 			}
 			if _hasPendingNativeInstall {
-				Button("Install", systemImage: "square.and.arrow.down") { _startNative(installSaved: true) }
+				Button("Resign", systemImage: "signature") { _startNative() }
 			}
-			Button("Resign", systemImage: "signature") { _startNative() }
 		} else if app.isSigned {
 			if isManagedInstalled, let id = app.identifier {
 				Button(
@@ -438,13 +423,6 @@ extension LibraryCellView {
 			) {
 				selectedInstallAppPresenting = AnyApp(base: app)
 			}
-
-			Button(
-				.localized("Sign"),
-				systemImage: "signature"
-			) {
-				_signImmediately(app)
-			}
 		}
 		Button("Customise", systemImage: "slider.horizontal.3") { selectedSigningAppPresenting = AnyApp(base: app) }
 	}
@@ -456,7 +434,7 @@ extension LibraryCellView {
 		for app: AppInfoPresentable
 	) -> some View {
 		if app.isSigned {
-			let certificate = _isNativeAccountApp ? nil : displayCertificate
+			let certificate = _isNativeAccountApp ? nil : Storage.shared.getCertificate(from: app)
 			let update = isManagedInstalled ? availableUpdate : nil
 			let certRevoked = certificate?.revoked == true
 			let expiry = _isNativeAccountApp ? _nativeProfileExpiry : certificate?.expiration
@@ -486,7 +464,7 @@ extension LibraryCellView {
 						.lineLimit(1)
 						.offset(y: 24)
 				} else if let expiry {
-					_expiryCaption(expiry)
+					_expiryCaption(expiry, appleID: _isNativeAccountApp)
 				}
 			}
 			.frame(width: ZagListLayout.actionWidth, height: ZagListLayout.compactRowHeight, alignment: .center)
@@ -544,10 +522,28 @@ extension LibraryCellView {
 			.foregroundStyle(.secondary).lineLimit(1).frame(width: 88, height: 11).offset(y: 26)
 	}
 
-	private func _expiryCaption(_ expiry: Date) -> some View {
-		let info = expiry.expirationInfo()
-		return Text(info.formatted).font(.system(size: 8, weight: .regular))
-			.foregroundStyle(info.color).lineLimit(1).offset(y: 26)
+	private func _expiryCaption(_ expiry: Date, appleID: Bool) -> some View {
+		let now = Date()
+		let info = expiry.expirationInfo(from: now)
+		let color: Color
+		if appleID {
+			switch ZagAppleIDProfileValidity(expiresAt: expiry, now: now) {
+			case .valid: color = .green
+			case .soon: color = .orange
+			case .urgent, .expired: color = .red
+			}
+		} else { color = info.color }
+		return HStack(alignment: .firstTextBaseline, spacing: 2) {
+			if appleID { ZagAppleIDMark() }
+			else { Image(systemName: "shield").accessibilityHidden(true) }
+			Text(info.formatted)
+		}
+		.font(.system(size: 8, weight: .regular))
+		.foregroundStyle(color)
+		.lineLimit(1)
+		.offset(y: 26)
+		.accessibilityElement(children: .ignore)
+		.accessibilityLabel(Text("\(appleID ? "Apple ID" : "Certificate"), \(info.formatted)"))
 	}
 
 	private func _startNative(installSaved: Bool = false) {
@@ -559,9 +555,9 @@ extension LibraryCellView {
 				if installSaved, let entry = _nativeEntry {
 					try await ZagNativeAccountInstall.installSaved(entry: entry, job: _jobKey)
 				} else {
-					let options = OptionsManager.shared.options
+					let options = OptionsManager.shared.appleIDOptions
 					let result = try await ZagNativeAccountInstall.runInline(app, job: _jobKey, options: options, renew: _isNativeAccountApp)
-					if !app.isSigned, options.post_deleteAppAfterSigned, !jobs.isCancelRequested(_jobKey) {
+					if !app.isSigned, options.deleteImportAfterSigning, !jobs.isCancelRequested(_jobKey) {
 						Storage.shared.deleteApp(for: app)
 					}
 					if case .verified = result { try? ZagRPPairingCore.shared.refreshInstalledApps() }

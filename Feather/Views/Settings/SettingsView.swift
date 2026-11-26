@@ -808,9 +808,23 @@ extension SettingsView {
 						.foregroundColor(.disabled())
 				}
 
-				Picker("Default Signing Method", selection: $_signingPreference) {
-					ForEach(ZagSigningPreference.allCases, id: \.self) { method in Text(method.title).tag(method) }
+				LabeledContent("Signing Method") {
+					Menu {
+						Picker("Signing Method", selection: $_signingPreference) {
+							ForEach(ZagSigningPreference.allCases, id: \.self) { method in
+								ZagSigningMethodLabel(title: method.title, appleID: method == .appleAccount).tag(method)
+							}
+						}
+					} label: {
+						HStack(spacing: 6) {
+							ZagSigningMethodLabel(title: _signingPreference.title, appleID: _signingPreference == .appleAccount)
+							Image(systemName: "chevron.up.chevron.down").font(.caption).accessibilityHidden(true)
+						}
+						.foregroundStyle(.secondary)
+						.fixedSize(horizontal: true, vertical: false)
+					}
 				}
+				.lineLimit(1)
 			} header: {
 				Text(.localized("Certificates"))
 			} footer: {
