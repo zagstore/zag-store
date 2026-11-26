@@ -10,6 +10,8 @@ struct ZagAppleSigningSettingsView: View {
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 	@State private var deviceCount: Int?
 	@State private var checkingDevice = false
+	@State private var deviceCheckedAt: Date?
+	@State private var deviceCheckFailed = false
 	@ObservedObject private var runningInstallation = ZagRunningInstallation.shared
 	#endif
 
@@ -36,9 +38,16 @@ struct ZagAppleSigningSettingsView: View {
 				}
 				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 				Section("Zag Store Installation") {
-					LabeledContent("Signing Method", value: runningInstallation.method.rawValue)
-					LabeledContent("Verified expiration", value: runningInstallation.expiry?.formatted() ?? "Unknown")
-					LabeledContent("Profile renewal", value: ZagBatchCoordinator.shared.canRefreshRunning() ? "Available" : "Unavailable")
+					LabeledContent("Signing Method", value: runningInstallation.method == .imported ? "Certificate" : runningInstallation.method.rawValue)
+					LabeledContent("Expiration", value: runningInstallation.expiry?.formatted(date: .abbreviated, time: .omitted) ?? "Unknown")
+					if let expiry = runningInstallation.expiry {
+						LabeledContent("Validity") {
+							Text(expiry.expirationInfo(from: Date()).formatted).foregroundStyle(expiry.expirationInfo(from: Date()).color)
+						}
+					}
+					if ZagBatchCoordinator.shared.canRefreshRunning() {
+						LabeledContent("Profile renewal", value: "Available")
+					}
 					if let recovery = runningInstallation.recovery {
 						Text(recovery).font(.footnote).foregroundStyle(.secondary)
 						Button("Retry Verification") {
@@ -49,22 +58,27 @@ struct ZagAppleSigningSettingsView: View {
 				}
 				.task { await runningInstallation.inspect(verifyPersonal: true) }
 				Section {
-					LabeledContent("Verified free-profile apps", value: deviceCount.map(String.init) ?? "Unknown")
-					LabeledContent("Installation capacity", value: "Unknown")
-					LabeledContent("Available slots", value: "Unknown")
-					Button(checkingDevice ? "Checking" : "Check Device") {
-						checkingDevice = true
-						Task {
-							defer { checkingDevice = false }
-							do { deviceCount = try await ZagAppleIDCapacity.synchronizeDevice() }
-							catch { deviceCount = nil; failure = "Check installation pairing and the device connection, then try again." }
+					LabeledContent("Free-signed apps", value: deviceCount.map { "At least \($0)" } ?? "Unknown")
+					LabeledContent("Standard free limit", value: "3")
+					if let count = deviceCount {
+						HStack(spacing: 5) {
+							ForEach(0..<3, id: \.self) { index in
+								Capsule().fill(index < count ? Color(hex: themeColorHex) : Color.secondary.opacity(0.2)).frame(height: 6)
+							}
 						}
+						.accessibilityLabel("At least \(count) verified free-signed apps")
+						LabeledContent("Possible available slots", value: "Up to \(max(0, 3 - count))")
 					}
-					.disabled(checkingDevice || runningInstallation.inspecting || !pairing.hasSavedPairing)
+					if let deviceCheckedAt {
+						LabeledContent("Last checked") { Text(deviceCheckedAt, style: .relative).foregroundStyle(.secondary) }
+					}
+					if deviceCheckFailed { Text("Could not refresh device capacity. Previous results may be stale.").font(.footnote).foregroundStyle(.secondary) }
+					Button(checkingDevice ? "Checking" : "Refresh") { Task { await refreshDevice(force: true) } }
+						.disabled(checkingDevice || runningInstallation.inspecting || !pairing.hasSavedPairing)
 				} header: {
 					Text("Device Capacity")
 				} footer: {
-					Text("This count covers apps Zag Store can verify. iOS decides whether another app can be installed.")
+					Text("The count is a verified minimum, not a complete device inventory. The standard limit is three; iOS determines actual installation eligibility.")
 				}
 				#endif
 			} else {
@@ -75,12 +89,35 @@ struct ZagAppleSigningSettingsView: View {
 		.tint(Color(hex: themeColorHex))
 		.onAppear { reload() }
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
-		.onReceive(ZagNativeAppInventory.changes) { _ in deviceCount = nil }
+		.task {
+			if let cached = ZagAppleIDCapacity.cachedDevice {
+				deviceCount = cached.count
+				deviceCheckedAt = cached.checkedAt == .distantPast ? nil : cached.checkedAt
+			}
+			await refreshDevice(force: false)
+		}
+		.onReceive(ZagNativeAppInventory.changes) { _ in
+			ZagAppleIDCapacity.invalidateDevice()
+			deviceCheckFailed = true
+		}
 		#endif
 		.alert("Apple ID", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
 			Button("OK", role: .cancel) {}
 		} message: { Text(failure ?? "") }
 	}
+
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private func refreshDevice(force: Bool) async {
+		guard !checkingDevice, pairing.hasSavedPairing else { return }
+		checkingDevice = true
+		defer { checkingDevice = false }
+		do {
+			deviceCount = try await ZagAppleIDCapacity.synchronizeDevice(force: force)
+			deviceCheckedAt = ZagAppleIDCapacity.cachedDevice?.checkedAt
+			deviceCheckFailed = false
+		} catch { deviceCheckFailed = true }
+	}
+	#endif
 
 	private func reload() {
 		do { catalog = try ZagNativeAppleIDs.shared.catalog() }
