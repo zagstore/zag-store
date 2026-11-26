@@ -21,7 +21,11 @@ extension Storage {
 		return FileManager.default.getPath(in: url, for: "app")
 	}
 	
+	@MainActor
 	func deleteApp(for app: AppInfoPresentable) {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		ZagNativeAppInventory.forget(app)
+		#endif
 		do {
 			if let url = getUuidDirectory(for: app) {
 				try? FileManager.default.removeItem(at: url)

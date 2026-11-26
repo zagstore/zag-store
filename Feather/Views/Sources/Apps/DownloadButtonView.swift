@@ -31,6 +31,7 @@ struct DownloadButtonView: View {
 	@State private var retryImportedUUID: String?
 	@State private var actionClaimed = false
 	@State private var isPALInfoPresented = false
+	@State private var signingSelection: AnyApp?
 
 	// A successful repository download remains in history even after its
 	// Imported, Signed, and Installed records are deleted.
@@ -149,6 +150,19 @@ struct DownloadButtonView: View {
 			_restoreSigningRetryIfAvailable()
 		}
 		.onDisappear { cancellable?.cancel() }
+		.fullScreenCover(item: $signingSelection, onDismiss: {
+			if zagPhase == .signing { zagPhase = .idle }
+			actionClaimed = false
+		}) { item in
+			SigningView(app: item.base, onSigned: { uuid in
+				if let imported = item.base as? Imported { _signedCopyReady(uuid, imported: imported) }
+			}, onVerifiedInstall: { id in
+				installedBundleID = id
+				retryImportedUUID = nil
+				UserDefaults.standard.removeObject(forKey: _signingRetryStorageKey)
+				zagPhase = .idle
+			})
+		}
 		.alert(.localized("Unable to Install"), isPresented: Binding(
 			get: { transactionError != nil },
 			set: { if !$0 { transactionError = nil } }
@@ -681,7 +695,7 @@ struct DownloadButtonView: View {
 			return (_pill("PAL", label: "About AltStore PAL distribution for \(app.currentName)"),
 					{ UIImpactFeedbackGenerator(style: .light).impactOccurred(); isPALInfoPresented = true })
 		}
-		if let bundleID = app.id, installedBundleID == bundleID {
+		if let bundleID = installedBundleID {
 			return (_pill(.localized("Open"), label: "Open \(app.currentName)"),
 					{ _performAction(claim: false) { UIApplication.openApp(with: bundleID) } })
 		}
@@ -729,7 +743,9 @@ struct DownloadButtonView: View {
 		Task { @MainActor in
 			guard zagPhase == .idle else { return }
                 // Installation transport is selected automatically.
-			guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
+			let presentsSigningSheet = ZagCertificateSelection.presentsSigningSheet()
+			let certificate = presentsSigningSheet ? nil : await ZagCertificateSelection.chooseForSigning()
+			guard presentsSigningSheet || certificate != nil else {
 				if Storage.shared.getAllCertificates().isEmpty {
 					_failTransaction(.localized("Add a signing certificate before downloading this app."))
 				} else {
@@ -769,14 +785,24 @@ struct DownloadButtonView: View {
 						}
 						retryImportedUUID = uuid
 						UserDefaults.standard.set(uuid, forKey: _signingRetryStorageKey)
-						_signAndInstall(imported, certificate: certificate)
+						if let certificate { _signAndInstall(imported, certificate: certificate) }
+						else { _selectSigningMethod(imported) }
 					}
 				}
 			)
 		}
 	}
 
+	private func _selectSigningMethod(_ imported: Imported) {
+		zagPhase = .signing
+		signingSelection = AnyApp(base: imported)
+	}
+
 	private func _signAndInstall(_ imported: Imported) {
+		if ZagCertificateSelection.presentsSigningSheet() {
+			_selectSigningMethod(imported)
+			return
+		}
 		Task { @MainActor in
 			guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
 				if Storage.shared.getAllCertificates().isEmpty {
@@ -833,23 +859,26 @@ struct DownloadButtonView: View {
 				return
 			}
 			ZagLogger.shared.info("Signing", "Signing completed: \(app.currentName) | signedUUID=\(signedUUID ?? "unknown")")
-			guard let signedUUID, let signed = _signedApp(uuid: signedUUID) else {
-				_failTransaction(.localized("Signing completed, but Zag Store could not locate the signed app."))
-				return
-			}
-			// Safe point: signing committed the Signed record; keep it and stop.
-			if jobs.isCancelRequested(_jobKey) {
-				_finishCancelled()
-				return
-			}
-			retryImportedUUID = nil
-			UserDefaults.standard.removeObject(forKey: _signingRetryStorageKey)
-			retrySignedUUID = signedUUID
-			UserDefaults.standard.set(signedUUID, forKey: _retryStorageKey)
-			zagPhase = .installing
-			installationProgress = 0
-			_installInline(signed, imported: imported)
+			_signedCopyReady(signedUUID, imported: imported)
 		}
+	}
+
+	private func _signedCopyReady(_ uuid: String?, imported: Imported) {
+		guard let uuid, let signed = _signedApp(uuid: uuid) else {
+			_failTransaction(.localized("Signing completed, but Zag Store could not locate the signed app."))
+			return
+		}
+		if jobs.isCancelRequested(_jobKey) {
+			_finishCancelled()
+			return
+		}
+		retryImportedUUID = nil
+		UserDefaults.standard.removeObject(forKey: _signingRetryStorageKey)
+		retrySignedUUID = uuid
+		UserDefaults.standard.set(uuid, forKey: _retryStorageKey)
+		zagPhase = .installing
+		installationProgress = 0
+		_installInline(signed, imported: imported)
 	}
 
 	private func _installInline(_ signed: Signed, imported: Imported? = nil) {

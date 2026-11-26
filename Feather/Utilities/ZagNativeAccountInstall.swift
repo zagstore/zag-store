@@ -113,17 +113,31 @@ enum ZagNativeAccountInstall {
 	}
 
 	static func install(source: URL, name: String, expectedScope: ZagSigningScope? = nil,
-						onCertificateReady: (@Sendable () async -> Void)? = nil) async throws -> ZagInstallVerification {
+						requiredInstalledIdentifier: String? = nil,
+						onCertificateReady: (@Sendable () async -> Void)? = nil,
+						renewing: ZagNativeAppInventory.Entry? = nil,
+						progress: @escaping @Sendable (ZagNativeSigningProgress) async -> Void = { _ in },
+						onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
 		try await withExclusiveOperation {
 			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics()) {
 				ZagSigningDiagnostics.record("Native signing attempt started")
-				return try await performInstall(source: source, name: name, expectedScope: expectedScope, onCertificateReady: onCertificateReady)
+				await progress(.preparing)
+				if let renewing, renewing.installation.record.owner?.scope != expectedScope {
+					throw ZagNativeAppInventory.Failure.wrongAccount
+				}
+				return try await performInstall(source: source, name: name, expectedScope: expectedScope,
+					requiredInstalledIdentifier: requiredInstalledIdentifier,
+					onCertificateReady: onCertificateReady, renewing: renewing, progress: progress, onSaved: onSaved)
 			}
 		}
 	}
 
 	private static func performInstall(source: URL, name: String, expectedScope: ZagSigningScope?,
-									   onCertificateReady: (@Sendable () async -> Void)?) async throws -> ZagInstallVerification {
+									   requiredInstalledIdentifier: String?,
+									   onCertificateReady: (@Sendable () async -> Void)?,
+									   renewing: ZagNativeAppInventory.Entry?,
+									   progress: @escaping @Sendable (ZagNativeSigningProgress) async -> Void,
+									   onSaved: @escaping @Sendable (String) async -> Void) async throws -> ZagInstallVerification {
 		let pairing = ZagRPPairingCore.shared
 		guard pairing.hasSavedPairing else { throw Failure.pairing }
 		guard let token = ZagDeveloperTokenStore().load(scope: "device"), token.isUsable(at: Date()) else {
@@ -135,7 +149,10 @@ enum ZagNativeAccountInstall {
 		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
 		defer { try? FileManager.default.removeItem(at: directory) }
 		let app = directory.appendingPathComponent(source.lastPathComponent, isDirectory: true)
-		try FileManager.default.copyItem(at: source, to: app)
+		try await Task.detached(priority: .userInitiated) {
+			try FileManager.default.copyItem(at: source, to: app)
+		}.value
+		try Task.checkCancellation()
 		let main = try component(at: app, name: name)
 		let extensions = try ZagFreeAccountSigningAdapter.extensionPaths(in: app).values.sorted().map {
 			try component(at: app.appendingPathComponent($0), name: appendingName(name, path: $0))
@@ -177,9 +194,28 @@ enum ZagNativeAccountInstall {
 				? ZagBundleIdentifierMapping.mapped(id, team: scope.teamID)
 				: ZagBundleIdentifierMapping.mappedExtension(id, appOriginal: main.originalBundleIdentifier, team: scope.teamID)
 		})
-		request.reusableProfiles = (profiles + mappedIDs.compactMap { cache.profile(for: $0) }).filter {
+		let mappedMain = ZagBundleIdentifierMapping.mapped(main.originalBundleIdentifier, team: scope.teamID)
+		if let requiredInstalledIdentifier, requiredInstalledIdentifier != mappedMain {
+			throw ZagNativeSigningPipeline.Failure.changedIdentity
+		}
+		if let mappedMain,
+		   let existing = ZagNativeAppInventory.entry(bundleIdentifier: mappedMain),
+		   existing.installation.record.owner?.scope != scope {
+			throw ZagNativeAppInventory.Failure.wrongAccount
+		}
+		if renewing == nil {
+			request.reusableProfiles = (profiles + mappedIDs.compactMap { cache.profile(for: $0) }).filter {
 			$0.teamIdentifier == scope.teamID && mappedIDs.contains($0.bundleIdentifier)
-				&& (try? ZagCMSVerifier.verify($0.data).get()) != nil
+					&& (try? ZagCMSVerifier.verify($0.data).get()) != nil
+			}
+		}
+		if let renewing {
+			let originalIDs = Set(renewing.installation.profiles.map(\.originalBundleIdentifier))
+			let mapped = Set(renewing.installation.profiles.map(\.bundleIdentifier))
+			guard originalIDs == componentIDs, mapped == mappedIDs,
+				  main.originalBundleIdentifier == renewing.installation.record.originalBundleIdentifier else {
+				throw ZagNativeSigningPipeline.Failure.changedIdentity
+			}
 		}
 		do {
 			return try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: app,
@@ -189,6 +225,9 @@ enum ZagNativeAccountInstall {
 				verifyTarget: {
 					guard ZagDeveloperTokenStore().load(scope: "device")?.accountID == token.accountID else { throw Failure.signIn }
 					guard pairing.hasSavedPairing, pairing.pairedIdentity == device else { throw Failure.pairing }
+				}, renewing: renewing?.installation, progress: progress, onVerified: { verified in
+					try await ZagNativeAppInventory.save(verified, source: source, name: name, renewing: renewing)
+					await onSaved(verified.record.bundleIdentifier)
 				})
 		} catch let failure as ZagProvisioningFailure {
 			switch failure.kind {
@@ -210,6 +249,67 @@ enum ZagNativeAccountInstall {
 				throw failure
 			}
 		}
+	}
+
+	/// Adopt an earlier native installation only when the original import, the
+	/// scoped cached profiles and the paired device all prove the exact match.
+	static func reconcile(imports: [Imported], installedIDs: Set<String>) async {
+		guard !imports.isEmpty, !installedIDs.isEmpty, let token = ZagDeveloperTokenStore().load(scope: "device"),
+			  token.isUsable(at: Date()), ZagRPPairingCore.shared.hasSavedPairing else { return }
+		try? await withExclusiveOperation {
+			let teams = try await portal(token: token, consent: ZagDenyingMutationConsent(), maxRequests: 1).teams()
+			guard let team = ZagNativeDeveloperTeam.personalTeam(in: teams) else { return }
+			let auth = ZagSigningAuthorization.nativeAccount(token: token, teamID: team.teamID)
+			let scope = auth.scope
+			let cache = ProfileCache(scope: scope)
+			guard let raw = try secrets.load(.signingPrivateKey, account: scope.accountID, team: scope.teamID),
+				  let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: raw),
+				  identity.keyIsInKeychain else { return }
+			let keys = ZagKeychainSigningKeyFactory(keys: ZagKeychainSigningKeys(namespace: namespace))
+			guard case .matches = keys.check(certificate: identity.certificate, privateKey: identity.privateKey,
+				account: scope.accountID, team: scope.teamID, keySlot: identity.keySlot) else { return }
+			let installedProfiles = try await ZagRPPairingFreeAccountInstaller.readProfiles().get()
+			for imported in imports {
+				guard currentAccountMatches(scope), let original = imported.identifier,
+					  let mapped = ZagBundleIdentifierMapping.mapped(original, team: scope.teamID),
+					  installedIDs.contains(mapped), ZagNativeAppInventory.entry(bundleIdentifier: mapped) == nil,
+					  let source = Storage.shared.getAppDirectory(for: imported),
+					  let metadata = try? reconcileProfiles(source: source, original: original, mapped: mapped, scope: scope,
+						auth: auth, identity: identity, cache: cache, installed: installedProfiles) else { continue }
+				try await ZagNativeAppInventory.save(metadata, source: source, name: imported.name ?? "App", renewing: nil)
+			}
+		}
+	}
+
+	private static func reconcileProfiles(source: URL, original: String, mapped: String, scope: ZagSigningScope,
+		auth: ZagSigningAuthorization, identity: ZagSigningIdentity, cache: ProfileCache, installed: [Data]) throws -> ZagNativeInstalledProfiles? {
+		var identifiers = [(original, mapped)]
+		for extensionID in try ZagFreeAccountSigningAdapter.extensionPaths(in: source).keys.sorted() {
+			guard let mappedExtension = ZagBundleIdentifierMapping.mappedExtension(extensionID, appOriginal: original, team: scope.teamID) else { return nil }
+			identifiers.append((extensionID, mappedExtension))
+		}
+		var components: [ZagNativeInstalledProfiles.Component] = []
+		var profiles: [ZagIssuedProfile] = []
+		for (originalID, mappedID) in identifiers {
+			guard let profile = cache.profile(for: mappedID), installed.contains(profile.data),
+				  (try? ZagCMSVerifier.verify(profile.data).get()) != nil,
+				  profile.teamIdentifier == scope.teamID, profile.bundleIdentifier == mappedID,
+				  profile.certificateSerials.contains(identity.serialNumber) else { return nil }
+			profiles.append(profile)
+			components.append(.init(originalBundleIdentifier: originalID, bundleIdentifier: mappedID,
+				uuid: profile.uuid, expiresAt: profile.expiresAt))
+		}
+		guard let main = profiles.first, let expires = profiles.map(\.expiresAt).min(),
+			  let installedApp = ZagRPPairingCore.shared.installedAppInfo(bundleID: mapped),
+			  let cn = ZagCertificateInspection(der: identity.certificate)?.commonName, installedApp.signerIdentity == cn else { return nil }
+		let bundle = Bundle(url: source)
+		guard bundle?.version == installedApp.version,
+			  bundle?.object(forInfoDictionaryKey: "CFBundleVersion") as? String == installedApp.build else { return nil }
+		let record = ZagSignedAppRecord(bundleIdentifier: mapped, originalBundleIdentifier: original, signedAt: main.createdAt,
+			profileExpiresAt: expires, certificateExpiresAt: identity.expiresAt,
+			owner: .init(scope: scope, teamKind: auth.teamKind, certificateSerial: identity.serialNumber, profileUUID: main.uuid),
+			expiryVerified: true)
+		return .init(record: record, profiles: components)
 	}
 
 	private static func component(at app: URL, name: String) throws -> ZagProvisioningRequest.Component {

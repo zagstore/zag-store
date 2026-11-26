@@ -51,7 +51,7 @@ struct InstallPreviewView: View {
 		}()
 		
 		ZStack {
-			InstallProgressView(app: app, viewModel: viewModel)
+			InstallProgressView(app: app, progress: viewModel.overallProgress, completed: viewModel.isCompleted)
 			_status()
 			_button()
 		}

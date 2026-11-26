@@ -163,6 +163,9 @@ struct LibraryView: View {
 
 	@State private var _editMode: EditMode = .inactive
     @AppStorage("zagStore.apps.sortOrder") private var _sortOrder = 0
+	@AppStorage("zagStore.apps.signingMethodFilter") private var _signingFilter = 0
+	@State private var _refreshNativeApps: [Signed] = []
+	@State private var _checkedNativeReconciliation = false
     @State private var _showAppDiagnostics = false
 
 
@@ -229,7 +232,7 @@ struct LibraryView: View {
         let startedAt = shouldMeasure ? ZagPerformanceMonitor.now() : 0
         let managed = _managedInstalledBundleIDs
         let signed = filteredAndSortedApps(from: _signedApps).filter {
-            $0.identifier != Bundle.main.bundleIdentifier
+            $0.identifier != Bundle.main.bundleIdentifier && _matchesSigningFilter($0)
         }
         let installed = signed.filter { app in
             guard let id = app.identifier, !id.isEmpty else { return false }
@@ -281,10 +284,19 @@ struct LibraryView: View {
         )
     }
 
+	private func _matchesSigningFilter(_ app: Signed) -> Bool {
+		guard _signingFilter != 0 else { return true }
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return (ZagNativeAppInventory.entry(app) != nil) == (_signingFilter == 1)
+		#else
+		return _signingFilter != 1
+		#endif
+	}
+
     // Keep device inventory intact; hide the store's own signed archive from Library.
     private var _filteredSignedApps: [Signed] {
 		filteredAndSortedApps(from: _signedApps).filter {
-			$0.identifier != Bundle.main.bundleIdentifier
+			$0.identifier != Bundle.main.bundleIdentifier && _matchesSigningFilter($0)
 		}
 	}
 
@@ -566,7 +578,7 @@ struct LibraryView: View {
 
 	@ViewBuilder
 	private func _signingCoverContent(_ app: AnyApp) -> some View {
-		SigningView(app: app.base)
+		SigningView(app: app.base, refreshApps: _refreshNativeApps)
 			.compatNavigationTransition(id: app.base.uuid ?? "", ns: _namespace)
 	}
 
@@ -992,6 +1004,35 @@ struct LibraryView: View {
                             Text("Name A–Z").tag(1)
                             Text("Name Z–A").tag(2)
                         }
+                        #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+                        Picker("Signing Method", selection: $_signingFilter) {
+                            Text("All").tag(0)
+                            Text("Apple Account").tag(1)
+                            Text("Certificates").tag(2)
+                        }
+                        Button {
+                            let installed = _managedInstalledBundleIDs
+                            _refreshNativeApps = _signedApps.filter { app in
+                                guard let id = app.identifier, installed.contains(id),
+                                      let entry = ZagNativeAppInventory.entry(app),
+                                      let scope = entry.installation.record.owner?.scope else { return false }
+                                return ZagNativeAccountInstall.currentAccountMatches(scope) && ZagNativeAppInventory.hasSource(entry)
+                            }.sorted {
+                                let a = ZagNativeAppInventory.entry($0)?.installation.record.profileExpiresAt ?? .distantFuture
+                                let b = ZagNativeAppInventory.entry($1)?.installation.record.profileExpiresAt ?? .distantFuture
+                                return a < b
+                            }
+                            if let first = _refreshNativeApps.first { _selectedSigningAppPresenting = AnyApp(base: first) }
+                        } label: {
+                            Label("Refresh All", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(!_signedApps.contains { app in
+                            guard let id = app.identifier, _managedInstalledBundleIDs.contains(id),
+                                  let entry = ZagNativeAppInventory.entry(app),
+                                  let scope = entry.installation.record.owner?.scope else { return false }
+                            return ZagNativeAccountInstall.currentAccountMatches(scope) && ZagNativeAppInventory.hasSource(entry)
+                        })
+                        #endif
                         Divider()
                         Button {
                             _showAppDiagnostics = true
@@ -1089,7 +1130,7 @@ struct LibraryView: View {
 				_installSheetContent(app)
 			}
 
-			.fullScreenCover(item: $_selectedSigningAppPresenting) { app in
+			.fullScreenCover(item: $_selectedSigningAppPresenting, onDismiss: { _refreshNativeApps = [] }) { app in
 				_signingCoverContent(app)
 			}
 
@@ -1319,6 +1360,12 @@ extension LibraryView {
 							_managedInstalledBundleIDsData = encoded
 						}
 						_updateRepositoryUpdates()
+						#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+						if !_checkedNativeReconciliation, ZagNativeAccountInstall.hasSession, !_importedApps.isEmpty {
+							_checkedNativeReconciliation = true
+							Task { await ZagNativeAccountInstall.reconcile(imports: Array(_importedApps), installedIDs: installedBundleIDs) }
+						}
+						#endif
 
 					case .failure(let error):
 						print(
@@ -3537,47 +3584,67 @@ final class ZagUpdateTransactionManager: ObservableObject {
 
 				stages[update.id] = .signing
 
-				guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
-					throw ZagUpdateTransactionError.missingCertificate
+				let signedUUID: String
+				if ZagCertificateSelection.presentsSigningSheet() {
+					let selection = try await chooseUpdateSigning(imported, target: update.app.id)
+					switch selection {
+					case .signed(let uuid):
+						signedUUID = uuid
+					case .verified(let id):
+						guard id == update.app.id else { throw ZagUpdateTransactionError.signedRecordNotFound }
+						alreadyVerifiedUpdates.insert(id)
+						try? FileManager.default.removeItem(at: localURL)
+						Storage.shared.deleteApp(for: imported)
+						stages[update.id] = nil
+						recordActivity(updateID: update.id, status: "Installed", appName: updateNames[update.id])
+						UpdateManager.shared.refresh(repositories: Array(SourcesViewModel.shared.sources.values))
+						completion(.success(id))
+						return
+					}
+				} else {
+					guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
+						throw ZagUpdateTransactionError.missingCertificate
+					}
+
+					var options = OptionsManager.shared.options
+
+					if
+						options.ppqProtection,
+						let identifier = imported.identifier,
+						certificate.ppQCheck
+					{
+						options.appIdentifier =
+							"\(identifier).\(OptionsManager.shared.options.ppqString)"
+					}
+
+					if
+						let identifier = imported.identifier,
+						let mappedIdentifier = options.identifiers[identifier]
+					{
+						options.appIdentifier = mappedIdentifier
+					}
+
+					if
+						let name = imported.name,
+						let mappedName = options.displayNames[name]
+					{
+						options.appName = mappedName
+					}
+
+					let signingHandler = SigningHandler(
+						app: imported,
+						options: options
+					)
+
+					signingHandler.appCertificate = certificate
+
+					try await signingHandler.copy()
+					try await signingHandler.modify()
+					try? await signingHandler.clean()
+
+					signedUUID = signingHandler.uuid
 				}
-
-				var options = OptionsManager.shared.options
-
-				if
-					options.ppqProtection,
-					let identifier = imported.identifier,
-					certificate.ppQCheck
-				{
-					options.appIdentifier =
-						"\(identifier).\(OptionsManager.shared.options.ppqString)"
-				}
-
-				if
-					let identifier = imported.identifier,
-					let mappedIdentifier = options.identifiers[identifier]
-				{
-					options.appIdentifier = mappedIdentifier
-				}
-
-				if
-					let name = imported.name,
-					let mappedName = options.displayNames[name]
-				{
-					options.appName = mappedName
-				}
-
-				let signingHandler = SigningHandler(
-					app: imported,
-					options: options
-				)
-
-				signingHandler.appCertificate = certificate
-
-				try await signingHandler.copy()
-				try await signingHandler.modify()
-				try? await signingHandler.clean()
-
-				guard let newSigned = signedApp(uuid: signingHandler.uuid) else {
+				guard let newSigned = signedApp(uuid: signedUUID) else {
 					throw ZagUpdateTransactionError.signedRecordNotFound
 				}
 
@@ -3585,16 +3652,16 @@ final class ZagUpdateTransactionManager: ObservableObject {
 					matchingIdentifier: newSigned.identifier,
 					name: newSigned.name,
 					version: update.installedVersion,
-					excludingUUID: signingHandler.uuid
+					excludingUUID: signedUUID
 				).compactMap(\.uuid)
 
-				pendingBySignedUUID[signingHandler.uuid] = PendingUpdate(
+				pendingBySignedUUID[signedUUID] = PendingUpdate(
 					updateID: update.id,
 					importedUUID: importHandler.uuid,
-					signedUUID: signingHandler.uuid,
+					signedUUID: signedUUID,
 					supersededSignedUUIDs: supersededSignedUUIDs
 				)
-				recordPendingInstallation(update, signedUUID: signingHandler.uuid)
+				recordPendingInstallation(update, signedUUID: signedUUID)
 				// New signed records must not make the device look updated before
 				// Gate4 confirms the installation.
 				UpdateManager.shared.refresh(
@@ -3605,7 +3672,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 
 				stages[update.id] = .readyToInstall
                 recordActivity(updateID: update.id, status: "Ready to Install", appName: updateNames[update.id])
-				completion(.success(signingHandler.uuid))
+				completion(.success(signedUUID))
 			} catch {
 				if let downloadedFile {
 					try? FileManager.default.removeItem(at: downloadedFile)
@@ -3618,6 +3685,32 @@ final class ZagUpdateTransactionManager: ObservableObject {
 		}
 	}
 
+	private enum UpdateSigningResult { case signed(String), verified(String) }
+	private var alreadyVerifiedUpdates: Set<String> = []
+
+	private func chooseUpdateSigning(_ imported: Imported, target: String?) async throws -> UpdateSigningResult {
+		guard let presenter = UIApplication.topViewController() else { throw CancellationError() }
+		return try await withCheckedThrowingContinuation { continuation in
+			var finished = false
+			func finish(_ result: Result<UpdateSigningResult, Error>) {
+				guard !finished else { return }
+				finished = true
+				continuation.resume(with: result)
+			}
+			let content = SigningView(app: imported, onSigned: { finish(.success(.signed($0))) },
+				onVerifiedInstall: { id in
+					finish(.success(.verified(id)))
+					presenter.dismiss(animated: true)
+				},
+				requiredInstalledIdentifier: target, onClose: { presenter.dismiss(animated: true) })
+				.environment(\.managedObjectContext, Storage.shared.context)
+				.onDisappear { finish(.failure(CancellationError())) }
+			let host = UIHostingController(rootView: content)
+			host.modalPresentationStyle = .fullScreen
+			presenter.present(host, animated: true)
+		}
+	}
+
 	func prepareAsync(_ update: UpdateManager.AvailableUpdate) async throws -> String {
 		try await withCheckedThrowingContinuation { continuation in
 			prepare(update) { result in
@@ -3627,6 +3720,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 	}
 
 	func installPreparedUpdate(signedUUID: String) async throws {
+		if alreadyVerifiedUpdates.remove(signedUUID) != nil { return }
 		guard let signed = signedApp(uuid: signedUUID) else {
 			throw ZagUpdateTransactionError.signedRecordNotFound
 		}

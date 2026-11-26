@@ -52,10 +52,9 @@ struct LibraryCellView: View {
 	var onInstallFailedAfterSigning: ((String) -> Void)? = nil
 
 	@State private var isDeleteConfirmationPresented = false
-	@AppStorage(ZagCertificateSelection.allowCustomisationKey)
-	private var allowSigningCustomisation = false
-	@AppStorage(ZagCertificateSelection.askEveryTimeKey)
-	private var askCertificateEveryTime = false
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private var _nativeEntry: ZagNativeAppInventory.Entry? { ZagNativeAppInventory.entry(app) }
+	#endif
 	/// The authoritative per-job state; survives scrolling and Shortcuts handoffs.
 	@ObservedObject private var jobs = ZagInstallJobs.shared
 	@ObservedObject private var updateTransaction = ZagUpdateTransactionManager.shared
@@ -64,6 +63,14 @@ struct LibraryCellView: View {
 	@Binding var selectedSigningAppPresenting: AnyApp?
 	@Binding var selectedInstallAppPresenting: AnyApp?
 	@Binding var selectedAppUUIDs: Set<String>
+
+	private var _isNativeAccountApp: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return _nativeEntry != nil
+		#else
+		return false
+		#endif
+	}
 
 	// MARK: - Install job
 
@@ -260,6 +267,11 @@ struct LibraryCellView: View {
 	// MARK: - Description
 
 	private var _desc: String {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let entry = _nativeEntry {
+			return "Apple Account · " + entry.installation.record.profileExpiresAt.formatted(date: .abbreviated, time: .omitted)
+		}
+		#endif
 		let version = app.version
 
 		let storedDate: Date?
@@ -373,7 +385,12 @@ extension LibraryCellView {
 	private func _contextActionsExtra(
 		for app: AppInfoPresentable
 	) -> some View {
-		if app.isSigned {
+		if _isNativeAccountApp {
+			if isManagedInstalled, let id = app.identifier {
+				Button("Open", systemImage: "app.badge.checkmark") { UIApplication.openApp(with: id) }
+			}
+			Button("Resign", systemImage: "signature") { selectedSigningAppPresenting = AnyApp(base: app) }
+		} else if app.isSigned {
 			if isManagedInstalled, let id = app.identifier {
 				Button(
 					.localized("Open"),
@@ -438,7 +455,11 @@ extension LibraryCellView {
 	private func _buttonActions(
 		for app: AppInfoPresentable
 	) -> some View {
-		if app.isSigned {
+		if _isNativeAccountApp {
+			ZagInstallControl(mode: .pill(ZagInstallPill(title: "Resign", accessibilityLabel: "Resign \(app.name ?? "app")")),
+				action: { selectedSigningAppPresenting = AnyApp(base: app) })
+				.frame(width: ZagListLayout.actionWidth, height: ZagListLayout.compactRowHeight)
+		} else if app.isSigned {
 			// Avoid fetching and parsing the selected certificate twice while
 			// building the initial Apps cell.
 			let certificate = displayCertificate
@@ -494,7 +515,7 @@ extension LibraryCellView {
 							? .spinner(.none)
 							: .pill(ZagInstallPill(title: .localized("Sign"), accessibilityLabel: "Sign \(app.name ?? "app")")),
 						action: {
-							if askCertificateEveryTime {
+							if ZagCertificateSelection.presentsSigningSheet() {
 								selectedSigningAppPresenting = AnyApp(base: app)
 							} else {
 								_signImmediately(app)

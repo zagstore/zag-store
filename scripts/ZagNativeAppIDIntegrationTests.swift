@@ -33,7 +33,44 @@ extension Tests {
 				.init(identifier: "EXISTING", bundleIdentifier: existingBundle, expiresAt: expiration),
 				.init(identifier: "EXPIRED", bundleIdentifier: "com.example.expired", expiresAt: clock.now - 1)
 			], team: teams[2])
+			let mainID = "com.example.main"
+			let extensionID = "com.example.main.widget"
+			let extensionExpiry = expiration - 3_600
+			func installedProfile(id: String, uuid: String, expiry: Date) throws -> Data {
+				try PropertyListSerialization.data(fromPropertyList: [
+					"CreationDate": clock.now, "ExpirationDate": expiry,
+					"DeveloperCertificates": [fixture], "Entitlements": ["application-identifier": "\(teams[0]).\(id)"],
+					"TeamIdentifier": [teams[0]], "UUID": uuid
+				], format: .xml, options: 0)
+			}
+			let expectation = ZagInstallExpectation(bundleIdentifier: mainID, profileUUID: "MAIN",
+				profileExpiresAt: expiration, certificateExpiresAt: certificate.expiresAt, signerCommonName: nil,
+				teamIdentifier: teams[0], extensionProfileUUIDs: ["EXT"], certificateSerial: certificate.serialNumber,
+				extensionIdentifiers: ["EXT": extensionID], extensionProfileExpirations: ["EXT": extensionExpiry])
+			let mainProfile = try installedProfile(id: mainID, uuid: "MAIN", expiry: expiration)
+			let extensionProfile = try installedProfile(id: extensionID, uuid: "EXT", expiry: extensionExpiry)
+			let olderProfile = try installedProfile(id: extensionID, uuid: "EXT", expiry: extensionExpiry - 3_600)
+			check(ZagInstalledProfileCheck.verify(expectation, installedProfiles: [mainProfile, extensionProfile])
+				== .verified(profileExpiresAt: extensionExpiry, certificateExpiresAt: certificate.expiresAt),
+				"the earliest installed component profile expiry determines the saved expiration")
+			check(ZagInstalledProfileCheck.verify(expectation, installedProfiles: [mainProfile, olderProfile])
+				== .mismatch("extension profile expiry"), "renewal refuses a mismatched installed extension expiration")
+
 			var scopes: Set<ZagSigningScope> = []
+			check(ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: true, customize: false,
+					hasDefaultCertificate: true, freeAccountEnabled: true)
+				&& !ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: false, customize: false,
+					hasDefaultCertificate: true, freeAccountEnabled: true)
+				&& ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: false, customize: false,
+					hasDefaultCertificate: false, freeAccountEnabled: true), "shared signing selection honours Ask Every Time and preserves quick certificate signing")
+			var refreshAttempts: [String] = []
+			let batch = await ZagNativeSigningPipeline.refreshSequentially(accounts) { account, index in
+				refreshAttempts.append(account)
+				if index == 1 { throw ZagPortalError.network }
+			}
+			let batchFailures = batch.filter { if case .failure = $0 { return true }; return false }.count
+			check(refreshAttempts == accounts && batchFailures == 1, "bulk renewal visits each app in order and isolates an individual failure")
+
 			for index in accounts.indices {
 				await transport.select(accounts[index])
 				let discovered = try await portals[index].teams()
@@ -58,11 +95,54 @@ extension Tests {
 				let request = ZagProvisioningRequest(accountID: authorization.scope.accountID, team: team.teamID, deviceUDID: udid,
 					deviceName: "Test Device", app: .init(originalBundleIdentifier: original, name: "Integration Test", entitlements: appEntitlements),
 					extensions: [], installedFreeAccountApps: [])
+				let checkpoints = NativeLifecycleCheckpoints()
 				let actual = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
 					provisioner: provisioner, secrets: secrets, signer: AppIDTestSigner(), installer: AppIDTestInstaller(),
-					verifyTarget: {}, now: { clock.now })
+					verifyTarget: {}, progress: { await checkpoints.report($0) },
+					onVerified: { await checkpoints.record($0) }, now: { clock.now })
+				let stages = await checkpoints.progress
+				check(stages == [.provisioning, .signing, .installing, .verifying, .verified], "native signing advances through verified installation in order")
 				check(actual == .verified(profileExpiresAt: expiration, certificateExpiresAt: certificate.expiresAt),
 					"native account \(index + 1) provisions, signs, installs and verifies the app")
+				if index == 0, let installed = await checkpoints.installation {
+					let data = try JSONEncoder().encode(installed)
+					let restored = try JSONDecoder().decode(ZagNativeInstalledProfiles.self, from: data)
+					check(restored == installed && restored.record.owner?.scope == authorization.scope,
+						"persistent installation metadata round-trips with its account and verified profiles")
+					do {
+						_ = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+							provisioner: provisioner, secrets: secrets, signer: AppIDTestSigner(), installer: AppIDTestInstaller(),
+							verifyTarget: {}, renewing: restored, now: { clock.now })
+						check(false, "same expiry must not be installed as a renewal")
+					} catch ZagNativeSigningPipeline.Failure.expiryNotExtended {
+						check(true, "unchanged profile expiry is rejected before installation")
+					}
+					let extended = expiration + 3_600
+					await transport.renewProfile(until: extended)
+					let renewal = NativeLifecycleCheckpoints()
+					let result = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+						provisioner: provisioner, secrets: secrets, signer: AppIDTestSigner(), installer: AppIDTestInstaller(),
+						verifyTarget: {}, renewing: restored, progress: { await renewal.report($0) },
+						onVerified: { await renewal.record($0) }, now: { clock.now })
+					let renewed = await renewal.installation?.record
+					check(result == .verified(profileExpiresAt: extended, certificateExpiresAt: certificate.expiresAt)
+						&& renewed?.bundleIdentifier == restored.record.bundleIdentifier
+						&& renewed?.owner?.scope == restored.record.owner?.scope,
+						"renewal extends expiry with the same mapped identity and account")
+					let failure = NativeLifecycleCheckpoints()
+					do {
+						_ = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+							provisioner: provisioner, secrets: secrets, signer: AppIDTestSigner(), installer: AppIDTestInstaller(refuseInstall: true),
+							verifyTarget: {}, renewing: restored, progress: { await failure.report($0) },
+							onVerified: { await failure.record($0) }, now: { clock.now })
+						check(false, "installation should fail before recording expiration")
+					} catch {
+						let saved = await failure.installation
+						let last = await failure.progress.last
+						check(saved == nil && last == .installing, "installation failure neither commits expiry nor reports verification")
+					}
+					await transport.renewProfile(until: expiration)
+				}
 			}
 			let registrationCounts = await transport.registrations
 			check(scopes.count == 3 && registrationCounts == [teams[0]: 1, teams[1]: 1],
@@ -109,6 +189,13 @@ extension Tests {
 	}
 }
 
+private actor NativeLifecycleCheckpoints {
+	var progress: [ZagNativeSigningProgress] = []
+	var installation: ZagNativeInstalledProfiles?
+	func report(_ stage: ZagNativeSigningProgress) { progress.append(stage) }
+	func record(_ value: ZagNativeInstalledProfiles) { installation = value }
+}
+
 private actor NativeAppIDTransport: ZagHTTPTransport {
 	let teams: [String: String]
 	let certDER: Data
@@ -125,6 +212,7 @@ private actor NativeAppIDTransport: ZagHTTPTransport {
 	var capabilityEnabled = Set<String>()
 	var assigned: [String: [String]] = [:]
 	var profileFailure = false
+	var profileExpiry: Date?
 
 	init(teams: [String: String], certDER: Data, certificateSerial: String, now: Date) {
 		self.teams = teams
@@ -138,6 +226,7 @@ private actor NativeAppIDTransport: ZagHTTPTransport {
 	func rejectRegistration(code: Int) { registrationRejection = code }
 	func certificateReady() { certificatesReady += 1 }
 	func setProfileFailure(_ value: Bool) { profileFailure = value }
+	func renewProfile(until expiry: Date) { profileExpiry = expiry }
 
 	func headers(for token: ZagPersistedDeveloperToken) throws -> [String: String] {
 		guard selected == token.accountID else { throw ZagPortalError.sessionRejected }
@@ -230,7 +319,7 @@ private actor NativeAppIDTransport: ZagHTTPTransport {
 				throw ZagPortalError.malformedResponse
 			}
 			let profile = try PropertyListSerialization.data(fromPropertyList: [
-				"CreationDate": now, "ExpirationDate": now + 7 * 86_400,
+				"CreationDate": now, "ExpirationDate": profileExpiry ?? now + 7 * 86_400,
 				"DeveloperCertificates": [certDER],
 				"Entitlements": ["application-identifier": "\(team).\(app.bundleIdentifier)",
 				                 ZagFreeAccountEntitlements.appGroupsKey: assigned[team] ?? []],
@@ -258,9 +347,12 @@ private struct AppIDTestSigner: ZagAppSigning {
 }
 
 private actor AppIDTestInstaller: ZagFreeAccountInstaller {
+	var refuseInstall = false
+	init(refuseInstall: Bool = false) { self.refuseInstall = refuseInstall }
 	var installed: String?
 	var installedProfiles: [Data] = []
 	func install(signedApp: URL, bundleIdentifier: String) async throws {
+		if refuseInstall { throw ZagPortalError.network }
 		guard try String(contentsOf: signedApp.appendingPathComponent("signature"), encoding: .utf8) == bundleIdentifier else {
 			throw ZagFreeAccountSigningError.verification("test signature")
 		}

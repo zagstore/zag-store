@@ -24,7 +24,7 @@ enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 	var summary: String {
 		switch self {
 		case .freeAppleAccount:
-			return "Sign with your own Apple Account. Apps last 7 days and need refreshing."
+			return "Sign with your own Apple Account and renew apps before their provisioning profiles expire."
 		case .importedCertificate:
 			return "Sign with a .p12 certificate and provisioning profile you already have."
 		case .byoc:
@@ -72,6 +72,11 @@ enum ZagSigningMethodAvailability {
 	#else
 	static let developerAccountEnabled = false
 	#endif
+
+	static func presentsSigningSheet(askEveryTime: Bool, customize: Bool,
+									hasDefaultCertificate: Bool, freeAccountEnabled: Bool = freeAccountEnabled) -> Bool {
+		askEveryTime || customize || (freeAccountEnabled && !hasDefaultCertificate)
+	}
 
 	/// Methods to list, in display order.
 	static func listedMethods(

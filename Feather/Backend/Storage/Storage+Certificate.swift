@@ -121,6 +121,16 @@ enum ZagCertificateSelection {
 		UserDefaults.standard.bool(forKey: askEveryTimeKey)
 	}
 
+	/// Quick actions and repository actions use the same decision. The full
+	/// signing screen owns selection and customization for both methods.
+	@MainActor
+	static func presentsSigningSheet() -> Bool {
+		let selected = UserDefaults.standard.integer(forKey: "feather.selectedCert")
+		return ZagSigningMethodAvailability.presentsSigningSheet(askEveryTime: asksEveryTime,
+			customize: UserDefaults.standard.bool(forKey: allowCustomisationKey),
+			hasDefaultCertificate: Storage.shared.getAllCertificates().indices.contains(selected))
+	}
+
 	@MainActor
 	static func chooseForSigning() async -> CertificatePair? {
 		let certificates = Storage.shared.getAllCertificates()
