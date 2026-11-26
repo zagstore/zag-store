@@ -713,6 +713,23 @@ struct LibraryView: View {
 					diagnostics.append("\(safeName): \(safeReason)")
 				}
 			}
+			let batchReport = diagnostics.joined(separator: "\n\n")
+			UserDefaults.standard.set(batchReport, forKey: "ZagNativeSigningDiagnostics")
+			let developerOptions = UserDefaults.standard.bool(forKey: "ZagStore.advancedSettingsUnlocked")
+			if !developerOptions {
+				let needsAttention = results.contains { result in
+					switch result {
+					case .failed: return true
+					case .skipped(let reason): return reason != "Cancelled." && reason != "A job is already running."
+					case .refreshed: return false
+					}
+				}
+				if needsAttention {
+					UIAlertController.showAlert(title: summary.title, message: summary.message,
+						actions: [UIAlertAction(title: "OK", style: .cancel)])
+				}
+				return
+			}
 			var actions = [UIAlertAction(title: "OK", style: .cancel)]
 			if !diagnostics.isEmpty {
 				actions.append(UIAlertAction(title: "Copy Diagnostics", style: .default) { _ in
