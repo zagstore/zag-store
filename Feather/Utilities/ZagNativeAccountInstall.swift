@@ -198,16 +198,20 @@ enum ZagNativeAccountInstall {
 
 		func renew(_ entry: ZagNativeAppInventory.Entry, job: String) async throws -> ZagInstallVerification {
 			let receipt = entry.installation
-			guard let owner = receipt.record.owner, let identity = receipt.executableIdentity,
-				  let certificate = ZagCertificateInspection(der: identity.certificate),
-				  certificate.serialNumber == owner.certificateSerial,
-				  certificate.organizationalUnit == owner.scope.teamID,
-				  certificate.expiresAt > Date(),
-				  receipt.profiles.allSatisfy({ $0.signedEntitlements != nil }) else {
-				throw ZagProfileOnlyRenewal.Failure.needsResign
-			}
 			let start = ContinuousClock.now
-			defer { ZagSigningDiagnostics.elapsed("Profile-only total", since: start) }
+			defer { ZagSigningDiagnostics.elapsed("Profile-only attempt total", since: start) }
+			ZagSigningDiagnostics.record("Renewal strategy: attempting profile-only")
+			func requiresResign(_ reason: String) -> ZagProfileOnlyRenewal.Failure {
+				ZagSigningDiagnostics.record("Profile-only rejected: \(reason)")
+				return .needsResign
+			}
+			guard let owner = receipt.record.owner else { throw requiresResign("missing signing owner") }
+			guard let identity = receipt.executableIdentity else { throw requiresResign("missing executable identity (legacy receipt)") }
+			guard let certificate = ZagCertificateInspection(der: identity.certificate) else { throw requiresResign("saved certificate could not be inspected") }
+			guard certificate.serialNumber == owner.certificateSerial else { throw requiresResign("certificate serial mismatch") }
+			guard certificate.organizationalUnit == owner.scope.teamID else { throw requiresResign("certificate team mismatch") }
+			guard certificate.expiresAt > Date() else { throw requiresResign("certificate expired") }
+			guard receipt.profiles.allSatisfy({ $0.signedEntitlements != nil }) else { throw requiresResign("missing signed component entitlements") }
 			let jobs = ZagInstallJobs.shared
 			try jobs.checkpoint(job)
 			jobs.reportNative(job, .provisioning)
@@ -226,7 +230,7 @@ enum ZagNativeAccountInstall {
 			guard discovered.certificates.contains(where: {
 				$0.serialNumber == owner.certificateSerial && $0.expiresAt > Date()
 					&& ($0.data == nil || $0.data == identity.certificate)
-			}) else { throw ZagProfileOnlyRenewal.Failure.needsResign }
+			}) else { throw requiresResign("saved certificate not found or incompatible in developer inventory") }
 
 			let requestStart = ContinuousClock.now
 			var requested: [ZagIssuedProfile] = []
@@ -236,7 +240,7 @@ enum ZagNativeAccountInstall {
 				try Task.checkCancellation()
 				try jobs.checkpoint(job)
 				guard let appID = discovered.appIDs.first(where: { $0.bundleIdentifier == component.bundleIdentifier }) else {
-					throw ZagProfileOnlyRenewal.Failure.needsResign
+					throw requiresResign("registered component App ID missing")
 				}
 				let profile: ZagIssuedProfile
 				do {
@@ -250,8 +254,13 @@ enum ZagNativeAccountInstall {
 					try? ZagNativeAppleIDs.shared.invalidate(discovered.token)
 					throw error
 				}
-				requested.append(try ZagProfileOnlyRenewal.validate(profile.data, component: component,
-					team: owner.scope.teamID, certificate: identity.certificate, udid: device.udid))
+				do {
+					requested.append(try ZagProfileOnlyRenewal.validate(profile.data, component: component,
+						team: owner.scope.teamID, certificate: identity.certificate, udid: device.udid))
+				} catch {
+					ZagSigningDiagnostics.record("Profile-only component validation failed")
+					throw error
+				}
 			}
 			ZagSigningDiagnostics.elapsed("Renew and validate profiles", since: requestStart)
 			_ = try ZagProfileOnlyRenewal.effectiveExpiry(requested, certificateExpires: certificate.expiresAt,
@@ -652,6 +661,10 @@ extension ZagNativeAccountInstall {
 				}
 			} catch where (error as? ZagProfileOnlyRenewal.Failure) == .needsResign
 				|| error.localizedDescription.localizedCaseInsensitiveContains("misagent over RSD failed: service not found") {
+				ZagSigningDiagnostics.record("Renewal strategy: full re-sign fallback")
+				if (error as? ZagProfileOnlyRenewal.Failure) != .needsResign {
+					ZagSigningDiagnostics.record("Fallback reason: misagent service unavailable")
+				}
 				ZagInstallJobs.shared.advance(job, to: .signing)
 				guard ZagNativeAppInventory.hasSource(entry) else { throw ZagNativeAppInventory.Failure.missingSource }
 				return try await RefreshCoordinator.onDevice {
