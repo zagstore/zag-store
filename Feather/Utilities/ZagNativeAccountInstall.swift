@@ -273,7 +273,7 @@ enum ZagNativeAccountInstall {
 					guard pairing.hasSavedPairing, pairing.pairedIdentity == device else { throw Failure.pairing }
 				}, beforeSigning: checkpoint, beforeInstalling: {
 					try checkpoint()
-					try checkFreeAppLimit(target: mappedMain,
+					recordFreeAppLimitAdvisory(target: mappedMain,
 						freeTeam: authorization.teamKind == .personalFree, installed: installed, profiles: profiles)
 				},
 				renewing: renewing?.installation, progress: progress, onVerified: { verified in
@@ -311,8 +311,8 @@ enum ZagNativeAccountInstall {
 		guard explicitCertificateChanges.isEmpty else { throw Failure.unsupportedOptions(explicitCertificateChanges) }
 	}
 
-	private static func checkFreeAppLimit(target: String?, freeTeam: Bool,
-		installed: [String: ZagRPPairingCore.InstalledAppInfo], profiles: [ZagIssuedProfile]) throws {
+	private static func recordFreeAppLimitAdvisory(target: String?, freeTeam: Bool,
+		installed: [String: ZagRPPairingCore.InstalledAppInfo], profiles: [ZagIssuedProfile]) {
 		guard freeTeam, let target, installed[target] == nil else { return }
 		let proven = Set(profiles.compactMap { profile -> String? in
 			guard installed[profile.bundleIdentifier] != nil,
@@ -324,7 +324,7 @@ enum ZagNativeAccountInstall {
 			return profile.bundleIdentifier
 		})
 		if case .full(let installed) = ZagInstallSlotPlan.make(installing: target, installedFreeAccountApps: proven) {
-			throw ZagFreeAppLimitReached(bundleIDs: installed)
+			ZagSigningDiagnostics.record("Free app limit advisory: \(installed.count) verified free-profile apps are installed. Proceeding with installation for iOS to decide.")
 		}
 	}
 
@@ -348,7 +348,7 @@ enum ZagNativeAccountInstall {
 				}
 				if installed[expectation.bundleIdentifier] == nil, entry.installation.record.owner?.teamKind == .personalFree,
 				   let readback = try? await ZagRPPairingFreeAccountInstaller.readProfiles().get() {
-					try checkFreeAppLimit(target: expectation.bundleIdentifier, freeTeam: true, installed: installed,
+					recordFreeAppLimitAdvisory(target: expectation.bundleIdentifier, freeTeam: true, installed: installed,
 						profiles: readback.compactMap { try? ZagIssuedProfile(profileData: $0) })
 				}
 				try ZagInstallJobs.shared.checkpoint(job)
