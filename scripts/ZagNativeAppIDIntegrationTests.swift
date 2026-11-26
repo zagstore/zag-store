@@ -5,6 +5,7 @@ extension Tests {
 	static func nativeAppIDsAcrossAccounts() async {
 		await testNativeAccountLibrary()
 		await testMixedRefreshBatch()
+		testSigningPresentation()
 		let clock = TestClock()
 		let secrets = MemorySecrets()
 		let original = "com.example.integration"
@@ -222,12 +223,19 @@ extension Tests {
 						_ = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
 							provisioner: provisioner, secrets: secrets, signer: AppIDTestSigner(), installer: AppIDTestInstaller(refuseInstall: true),
 							verifyTarget: {}, renewing: restored, progress: { await failure.report($0) },
-							onVerified: { await failure.record($0) }, now: { clock.now })
+							onVerified: { await failure.record($0) }, onDeferredInstall: { metadata, expectation, _ in
+								await failure.recordPending(metadata, expectation: expectation)
+							}, now: { clock.now })
 						check(false, "installation should fail before recording expiration")
 					} catch {
 						let saved = await failure.installation
 						let last = await failure.progress.last
-						check(saved == nil && last == .installing, "installation failure neither commits expiry nor reports verification")
+						let retained = await failure.pendingMetadata
+						let expectation = await failure.pendingExpectation
+						check(saved == nil && last == .installing && retained?.record.expiryVerified == false
+							&& retained?.record.owner?.scope == authorization.scope && expectation?.signingScope == authorization.scope
+							&& (error as? ZagStagedSigningFailure)?.phase == .installation,
+							"installation failure preserves the scoped signed artifact without claiming verification")
 					}
 					await transport.renewProfile(until: expiration)
 				}
@@ -305,6 +313,38 @@ private final class HostedAppleIDVault: ZagNativeAppleIDVault {
 }
 
 extension Tests {
+	static func testSigningPresentation() {
+		check(ZagNativeSigningProgress.allCases.map(\.title) == ["Preparing", "Provisioning", "Signing", "Installing", "Verifying", "Verifying"],
+			"compact native progress stages use a single word")
+		let now = Date(timeIntervalSince1970: 1_000)
+		check((now + 7 * 86_400 - 1).expirationInfo(from: now).formatted == (now + 7 * 86_400).expirationInfo(from: now).formatted
+			&& (now + 13 * 86_400 + 86_399).expirationInfo(from: now).color == .red,
+			"the shared expiration formatter rounds days up without rounding certificate warning thresholds")
+		check(ZagAppRowAction.resolve(installed: true, hasUpdate: false, signed: true, launchable: true, canRefresh: true) == .open
+			&& ZagAppRowAction.resolve(installed: true, hasUpdate: true, signed: true, launchable: true, canRefresh: true) == .update
+			&& ZagAppRowAction.resolve(installed: false, hasUpdate: false, signed: true, launchable: true, canRefresh: true) == .install
+			&& ZagAppRowAction.resolve(installed: true, hasUpdate: false, signed: true, launchable: false, canRefresh: true) == .refresh
+			&& ZagAppRowAction.resolve(installed: false, hasUpdate: false, signed: false, launchable: false, canRefresh: false) == .sign,
+			"the shared row state resolves Open, Update, Install, Sign and expired recovery independently of signing method")
+		let summary = ZagNativeSigningPipeline.RefreshSummary([.refreshed], cancelled: false)
+		let partial = ZagNativeSigningPipeline.RefreshSummary([.refreshed, .failed("private technical details")], cancelled: false)
+		check(summary.title == "Refresh Complete" && summary.message == "1 app refreshed successfully."
+			&& partial.message.contains("1 app couldn’t be refreshed") && !partial.message.contains("private technical details"),
+			"Refresh Complete has singular wording and keeps detailed failures in diagnostics")
+		let device = NSError(domain: "MIInstallerErrorDomain", code: 13, userInfo: [NSLocalizedDescriptionKey:
+			"Maximum number of installed apps using a free developer profile: TEAM000001.com.a.one TEAM000002.com.b.two TEAM000003.com.c.three\nAuthorization: Bearer fixture-secret"])
+		let wrapped = ZagStagedSigningFailure(phase: .installation, underlying: device)
+		let details = ZagSigningDiagnostics.failureDetails(.installation, wrapped)
+		check(ZagFreeAppLimitReached.classify(wrapped)?.bundleIDs == ["com.a.one", "com.b.two", "com.c.three"]
+			&& details.contains("MIInstallerErrorDomain 13") && details.contains("TEAM000002.com.b.two")
+			&& details.contains("Installation failed") && !details.contains("fixture-secret")
+			&& ZagFreeAppLimitReached.classify(NSError(domain: "MIInstallerErrorDomain", code: 13)) == nil,
+			"free app limits are specific, device-wide, and copied diagnostics redact credentials")
+		let occupied: Set<String> = ["com.a.one", "com.b.two", "com.c.three"]
+		check(ZagInstallSlotPlan.make(installing: "com.b.two", installedFreeAccountApps: occupied) == .replacesInstalledApp,
+			"in-place renewal remains allowed at the device-wide free-app limit")
+	}
+
 	@MainActor
 	static func testMixedRefreshBatch() async {
 		let vault = HostedAppleIDVault()

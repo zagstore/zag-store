@@ -1,5 +1,6 @@
 #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 import CoreData
+import Combine
 import Foundation
 import UIKit
 import Zip
@@ -8,6 +9,7 @@ import Zip
 /// The library row uses the existing Signed store. Files live outside Documents.
 @MainActor
 enum ZagNativeAppInventory {
+	static let changes = PassthroughSubject<String, Never>()
 	struct Entry: Codable, Sendable {
 		let uuid: String
 		let name: String
@@ -161,6 +163,7 @@ enum ZagNativeAppInventory {
 				try removeSuperseded(by: entry)
 			}
 		}
+		changes.send(id)
 	}
 
 	static func signedApp(_ entry: Entry) -> URL? {
@@ -179,6 +182,7 @@ enum ZagNativeAppInventory {
 		try markInstalled(updated.installation.record.bundleIdentifier)
 		if let staged = signedApp(entry) { try? FileManager.default.removeItem(at: staged) }
 		try removeSuperseded(by: updated)
+		changes.send(entry.uuid)
 	}
 
 	private static func removeSuperseded(by entry: Entry) throws {

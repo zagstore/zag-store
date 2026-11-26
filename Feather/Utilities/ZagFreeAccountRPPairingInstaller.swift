@@ -15,13 +15,11 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 	enum Failure: LocalizedError, Equatable {
 		case disabled
 		case packaging
-		case install(String)
 
 		var errorDescription: String? {
 			switch self {
 			case .disabled: "Apple Account installation is unavailable in this build."
 			case .packaging: "Zag Store could not package the signed app for installation."
-			case .install(let reason): reason
 			}
 		}
 	}
@@ -65,10 +63,10 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 					do { try beforeHandoff() }
 					catch { continuation.resume(throwing: error); return }
 					try ZagRPPairingCore.shared.installGate4IPA(at: ipa) { result in
-						continuation.resume(with: result.mapError { Failure.install($0.localizedDescription) })
+						continuation.resume(with: result)
 					}
 				} catch {
-					continuation.resume(throwing: Failure.install(error.localizedDescription))
+					continuation.resume(throwing: error)
 				}
 			}
 		}

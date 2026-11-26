@@ -289,7 +289,7 @@ extension Result where Failure == ZagProvisioningFailure {
 					provisioner: harness.provisioner, secrets: harness.secrets, signer: signer, installer: Installer(interrupted: true),
 					verifyTarget: {}, now: { harness.clock.now })
 				check(false, "interrupted installer must report its failure")
-			} catch Interruption.duringInstall {
+			} catch let failure as ZagStagedSigningFailure where failure.phase == .installation && failure.underlying is Interruption {
 				check(true, "the production pipeline surfaces a simulated installation interruption")
 			}
 			guard let result = signer.result else { return check(false, "signing produced a provisioning result") }

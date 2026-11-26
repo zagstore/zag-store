@@ -179,7 +179,7 @@ struct ZagProvisioningFailure: LocalizedError, Equatable, Sendable {
 		switch kind {
 		case .invalidRequest: return "This app cannot be signed with a free Apple Account."
 		case .notAuthorized: return "This Apple Account is not signed in. Sign in to it to sign or refresh its apps."
-		case .installSlotsFull: return "Three apps signed with this Apple Account are already installed. Remove one first."
+		case .installSlotsFull: return ZagFreeAppLimitReached.message
 		case .deviceLimitReached: return "This Apple Account already has three registered devices."
 		case .appIDCapacityExhausted(let needed, let available, _):
 			return "This app needs \(needed) new App IDs. Zag Store counted \(available) available slots for this team."

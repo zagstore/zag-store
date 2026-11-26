@@ -268,12 +268,17 @@ enum ZagCodeSignatureInspection {
 	static let codeDirectorySlot = 0
 	static let cmsSlot = 0x10000
 
-	static func matchesSigner(_ certificate: Data, in executable: Data) -> Bool {
-		guard let slices = signatureBlobs(executable), !slices.isEmpty else { return false }
-		return slices.allSatisfy { slice in
-			guard let cms = slice[cmsSlot], cms.count > 8 else { return false }
-			return ZagCMSVerifier.embeddedSigner(Data(cms.dropFirst(8))) == certificate
+	static func signerCertificates(in executable: Data) -> [Data]? {
+		guard let slices = signatureBlobs(executable), !slices.isEmpty else { return nil }
+		let signers = slices.compactMap { slice -> Data? in
+			guard let cms = slice[cmsSlot], cms.count > 8 else { return nil }
+			return ZagCMSVerifier.embeddedSigner(Data(cms.dropFirst(8)))
 		}
+		return signers.count == slices.count ? signers : nil
+	}
+
+	static func matchesSigner(_ certificate: Data, in executable: Data) -> Bool {
+		signerCertificates(in: executable)?.allSatisfy { $0 == certificate } == true
 	}
 
 	/// Whether every slice holds a non-empty CMS signature.
@@ -348,6 +353,7 @@ struct ZagInstallExpectation: Codable, Equatable, Sendable {
 	var extensionIdentifiers: [String: String] = [:]
 	var extensionProfileExpirations: [String: Date] = [:]
 	var allowsWildcardProfile: Bool?
+	var signingScope: ZagSigningScope?
 }
 
 /// Compares the provisioning profiles the device reports as installed
@@ -423,12 +429,12 @@ enum ZagNativeSigningProgress: Int, CaseIterable, Comparable, Sendable {
 
 	var title: String {
 		switch self {
-		case .preparing: "Preparing App"
+		case .preparing: "Preparing"
 		case .provisioning: "Provisioning"
-		case .signing: "Signing and Checking Signature"
+		case .signing: "Signing"
 		case .installing: "Installing"
-		case .verifying: "Verifying Installation"
-		case .verified: "Installed and Verified"
+		case .verifying: "Verifying"
+		case .verified: "Verifying"
 		}
 	}
 }
@@ -443,6 +449,64 @@ struct ZagNativeInstalledProfiles: Codable, Equatable, Sendable {
 	}
 	var record: ZagSignedAppRecord
 	let profiles: [Component]
+}
+
+extension ZagNativeInstalledProfiles {
+	func validateArtifact(_ source: URL, expectation: ZagInstallExpectation, deviceUDID: String) throws {
+		let error = ZagFreeAccountSigningError.verification("Saved app identity or provisioning profile")
+		guard let owner = record.owner,
+			  record.bundleIdentifier == expectation.bundleIdentifier,
+			  owner.scope.teamID == expectation.teamIdentifier,
+			  expectation.signingScope == nil || expectation.signingScope == owner.scope,
+			  owner.profileUUID == expectation.profileUUID,
+			  owner.certificateSerial == expectation.certificateSerial,
+			  record.certificateExpiresAt == expectation.certificateExpiresAt,
+			  profiles.map(\.expiresAt).min() == record.profileExpiresAt else { throw error }
+
+		let components = [source] + ZagFreeAccountSigningAdapter.nestedBundles(in: source).map { source.appendingPathComponent($0) }
+		guard components.count == profiles.count else { throw error }
+		var verified: Set<String> = []
+		for component in components {
+			guard let bundle = Bundle(url: component), let id = bundle.bundleIdentifier, verified.insert(id).inserted,
+				  let saved = profiles.first(where: { $0.bundleIdentifier == id }),
+				  let bytes = try? Data(contentsOf: component.appendingPathComponent("embedded.mobileprovision")),
+				  let authentic = try? ZagCMSVerifier.verify(bytes).get(),
+				  let profile = try? ZagIssuedProfile(profileData: authentic),
+				  let contents = ZagMobileProvision.parseUnverified(authentic),
+				  profile.uuid == saved.uuid, profile.expiresAt == saved.expiresAt,
+				  profile.teamIdentifier == owner.scope.teamID, profile.bundleIdentifier == id,
+				  profile.deviceUDIDs.contains(where: { $0.caseInsensitiveCompare(deviceUDID) == .orderedSame }),
+				  let executable = bundle.executableURL,
+				  let binary = try? Data(contentsOf: executable, options: .mappedIfSafe),
+				  let signers = ZagCodeSignatureInspection.signerCertificates(in: binary),
+				  signers.allSatisfy({ der in
+					  guard let certificate = ZagCertificateInspection(der: der) else { return false }
+					  return contents.developerCertificates.contains(der) && certificate.serialNumber == owner.certificateSerial
+						  && certificate.organizationalUnit == owner.scope.teamID && certificate.expiresAt == expectation.certificateExpiresAt
+				  }) else { throw error }
+			if id == record.bundleIdentifier {
+				guard component == source, saved.uuid == expectation.profileUUID,
+					  saved.expiresAt == expectation.profileExpiresAt,
+					  bundle.infoDictionary?["CFBundleShortVersionString"] as? String == expectation.version,
+					  bundle.infoDictionary?["CFBundleVersion"] as? String == expectation.build else { throw error }
+			} else {
+				guard expectation.extensionProfileUUIDs.contains(saved.uuid),
+					  expectation.extensionIdentifiers[saved.uuid] == id,
+					  expectation.extensionProfileExpirations[saved.uuid] == saved.expiresAt else { throw error }
+			}
+		}
+	}
+}
+
+enum ZagAppRowAction: String {
+	case open = "Open", update = "Update", install = "Install", sign = "Sign", refresh = "Refresh"
+
+	static func resolve(installed: Bool, hasUpdate: Bool, signed: Bool, launchable: Bool, canRefresh: Bool) -> Self {
+		if installed && hasUpdate { return .update }
+		if installed && launchable { return .open }
+		if !installed && signed && launchable { return .install }
+		return canRefresh ? .refresh : .sign
+	}
 }
 
 enum ZagNativeSigningPipeline {
@@ -467,6 +531,23 @@ enum ZagNativeSigningPipeline {
 		case refreshed
 		case skipped(String)
 		case failed(String)
+	}
+
+	struct RefreshSummary {
+		let title: String
+		let message: String
+
+		init(_ results: [RefreshOutcome], cancelled: Bool) {
+			let count = results.filter { $0 == .refreshed }.count
+			let unfinished = results.count - count - results.filter { $0 == .skipped("Cancelled.") }.count
+			title = cancelled ? "Refresh Cancelled" : "Refresh Complete"
+			var text = count == 1 ? "1 app refreshed successfully." : "\(count) apps refreshed successfully."
+			if unfinished > 0 {
+				text += unfinished == 1 ? "\n1 app couldn’t be refreshed. See diagnostics."
+					: "\n\(unfinished) apps couldn’t be refreshed. See diagnostics."
+			}
+			message = text
+		}
 	}
 
 	@MainActor
@@ -522,6 +603,7 @@ enum ZagNativeSigningPipeline {
 				  renewing.profiles.allSatisfy({ prior in
 					prior.appGroups == nil || components.first(where: { $0.bundleIdentifier == prior.bundleIdentifier })?.appGroups == prior.appGroups
 				  }) else { throw Failure.changedIdentity }
+			ZagSigningDiagnostics.record("Profile renewal expiry: installed \(renewing.record.profileExpiresAt); issued \(result.expiresAt)")
 			guard result.expiresAt > renewing.record.profileExpiresAt else { throw Failure.expiryNotExtended }
 		}
 		try await beforeSigning()
@@ -550,7 +632,8 @@ enum ZagNativeSigningPipeline {
 			version: info?["CFBundleShortVersionString"] as? String,
 			build: info?["CFBundleVersion"] as? String, certificateSerial: identity.serialNumber,
 			extensionIdentifiers: Dictionary(result.extensions.map { ($0.profile.uuid, $0.bundleIdentifier) }, uniquingKeysWith: { first, _ in first }),
-			extensionProfileExpirations: Dictionary(result.extensions.map { ($0.profile.uuid, $0.profile.expiresAt) }, uniquingKeysWith: { first, _ in first })
+			extensionProfileExpirations: Dictionary(result.extensions.map { ($0.profile.uuid, $0.profile.expiresAt) }, uniquingKeysWith: { first, _ in first }),
+			signingScope: authorization.scope
 		)
 		try Task.checkCancellation()
 		guard result.expiresAt > now(), identity.expiresAt > now() else {
@@ -566,45 +649,40 @@ enum ZagNativeSigningPipeline {
 			ZagSigningDiagnostics.record("Signed app saved for later installation")
 			return .signedOnly
 		}
-		try await verifyTarget()
-		do { try await beforeInstalling() }
-		catch {
-			try await onDeferredInstall?(signed, expectation, app)
-			throw error
-		}
-		await progress(.installing)
-		ZagSigningDiagnostics.record("Installing via RPPairing")
-		do { try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier) }
-		catch {
-			ZagSigningDiagnostics.record("RPPairing installation failed")
-			try await onDeferredInstall?(signed, expectation, app)
-			throw error
-		}
-		ZagSigningDiagnostics.record("Installer returned success; verifying installed app")
-		try await verifyTarget()
-		await progress(.verifying)
-		let installed = await installer.verify(expectation)
-		switch installed {
-		case .verified(let profileExpiry, let certificateExpiry):
-			if let renewing, profileExpiry <= renewing.record.profileExpiresAt {
-				ZagSigningDiagnostics.record("Installed profile expiry did not advance")
-				throw Failure.expiryNotExtended
+		var phase: ZagSigningFailurePhase = .installation
+		do {
+			try await verifyTarget()
+			try await beforeInstalling()
+			await progress(.installing)
+			ZagSigningDiagnostics.record("Installing via RPPairing")
+			try await installer.install(signedApp: app, bundleIdentifier: record.bundleIdentifier)
+			phase = .verification
+			ZagSigningDiagnostics.record("Installer returned success; verifying installed app")
+			try await verifyTarget()
+			await progress(.verifying)
+			let installed = await installer.verify(expectation)
+			guard case .verified(let profileExpiry, let certificateExpiry) = installed else {
+				throw ZagFreeAccountSigningError.verification(String(describing: installed))
 			}
-			var verified = record
-			verified.profileExpiresAt = profileExpiry
-			verified.certificateExpiresAt = certificateExpiry
-			verified.expiryVerified = true
-			verified.owner = .init(scope: authorization.scope, teamKind: authorization.teamKind,
-				certificateSerial: identity.serialNumber, profileUUID: expectation.profileUUID)
-			if renewing != nil { verified.lastSuccessfulRefresh = now() }
-			try await onVerified(.init(record: verified, profiles: components))
+			if let renewing {
+				ZagSigningDiagnostics.record("Installed profile expiry: before \(renewing.record.profileExpiresAt); after \(profileExpiry)")
+				guard profileExpiry > renewing.record.profileExpiresAt else { throw Failure.expiryNotExtended }
+			}
+			var verified = signed
+			verified.record.profileExpiresAt = profileExpiry
+			verified.record.certificateExpiresAt = certificateExpiry
+			verified.record.expiryVerified = true
+			if renewing != nil { verified.record.lastSuccessfulRefresh = now() }
+			try await onVerified(verified)
 			await progress(.verified)
 			ZagSigningDiagnostics.record("Installed app and profile verified")
-		case .unverifiable: ZagSigningDiagnostics.record("Installed app could not be verified")
-		case .mismatch: ZagSigningDiagnostics.record("Installed app or profile did not match")
-		case .notInstalled, .signedOnly: ZagSigningDiagnostics.record("App missing from installed-app list")
+			return installed
+		} catch {
+			ZagSigningDiagnostics.recordFailure(phase, error)
+			do { try await onDeferredInstall?(signed, expectation, app) }
+			catch { ZagSigningDiagnostics.recordFailure(.signing, error) }
+			throw error is CancellationError ? error : ZagStagedSigningFailure(phase: phase, underlying: error)
 		}
-		return installed
 	}
 }
 

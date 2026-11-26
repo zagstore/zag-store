@@ -20,7 +20,6 @@ struct ConfigurationView: View {
 		List {
 			if ZagSigningMethodAvailability.freeAccountEnabled {
 				Section {
-					Toggle("Install After Signing", isOn: $_optionsManager.appleIDOptions.installAfterSigning)
 					Toggle("Delete Imported App After Signing", isOn: $_optionsManager.appleIDOptions.deleteImportAfterSigning)
 				} header: { ZagSigningMethodLabel(title: ZagSigningMethod.freeAppleAccount.title, appleID: true) }
 			}

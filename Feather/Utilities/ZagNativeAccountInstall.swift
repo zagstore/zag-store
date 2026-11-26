@@ -5,7 +5,7 @@ import UIKit
 
 @MainActor
 enum ZagNativeAccountInstall {
-	enum Failure: LocalizedError {
+	enum Failure: LocalizedError, Equatable {
 		case busy, signIn, personalTeam, pairing, invalidApp
 		case unsupportedOptions([String])
 
@@ -183,10 +183,21 @@ enum ZagNativeAccountInstall {
 		let (device, installed) = try await pairing.signingDeviceInventory()
 		let installedProfiles = (try? await ZagRPPairingFreeAccountInstaller.readProfiles().get()) ?? []
 		let profiles = installedProfiles.compactMap { try? ZagIssuedProfile(profileData: $0) }
-		let installedFreeApps = Set(profiles.filter {
-			installed[$0.bundleIdentifier] != nil && $0.expiresAt > Date()
-				&& $0.expiresAt.timeIntervalSince($0.createdAt) <= 7 * 86_400 + 60
-		}.map(\.bundleIdentifier))
+
+
+		if let renewing {
+			let prior = renewing.installation
+			let observed = prior.profiles.compactMap { expected in
+				profiles.first { $0.uuid == expected.uuid && $0.bundleIdentifier == expected.bundleIdentifier
+					&& $0.teamIdentifier == prior.record.owner?.scope.teamID }?.expiresAt
+			}
+			if observed.count == prior.profiles.count, let expiry = observed.min() {
+				ZagSigningDiagnostics.record("Before refresh: installed profile expiry \(expiry)")
+				guard expiry == prior.record.profileExpiresAt else { throw ZagNativeSigningPipeline.Failure.changedIdentity }
+			} else {
+				ZagSigningDiagnostics.record("Before refresh: last verified expiry \(prior.record.profileExpiresAt); prior profiles not all readable")
+			}
+		}
 
 		let consent = ZagMutationConsentCoordinator()
 		defer { consent.cancel() }
@@ -215,7 +226,7 @@ enum ZagNativeAccountInstall {
 			secrets: secrets, certificateMinimumRemaining: 0, saveProfile: { cache.save($0) },
 			onCertificateReady: onCertificateReady, account: scope.accountID)
 		var request = ZagProvisioningRequest(accountID: scope.accountID, team: scope.teamID, deviceUDID: device.udid,
-											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: installAfterSigning ? installedFreeApps : [])
+											 deviceName: device.name, app: main, extensions: extensions, installedFreeAccountApps: [])
 		let componentIDs = Set(components.map(\.originalBundleIdentifier))
 		let mappedIDs = Set(componentIDs.compactMap { id in
 			id == main.originalBundleIdentifier
@@ -250,7 +261,6 @@ enum ZagNativeAccountInstall {
 		}
 		try checkpoint()
 		let retainSigned: @Sendable (ZagNativeInstalledProfiles, ZagInstallExpectation, URL) async throws -> Void = { metadata, expectation, signedApp in
-			guard await ZagNativeAppleIDs.shared.connectedToken(accountID) == token else { throw Failure.signIn }
 			try await ZagNativeAppInventory.save(metadata, source: source, name: name, renewing: nil, signedOnly: (expectation, signedApp))
 		}
 		do {
@@ -261,11 +271,17 @@ enum ZagNativeAccountInstall {
 				verifyTarget: {
 					guard ZagNativeAppleIDs.shared.connectedToken(accountID) == token else { throw Failure.signIn }
 					guard pairing.hasSavedPairing, pairing.pairedIdentity == device else { throw Failure.pairing }
-				}, beforeSigning: checkpoint, beforeInstalling: checkpoint,
+				}, beforeSigning: checkpoint, beforeInstalling: {
+					try checkpoint()
+					try checkFreeAppLimit(target: mappedMain,
+						freeTeam: authorization.teamKind == .personalFree, installed: installed, profiles: profiles)
+				},
 				renewing: renewing?.installation, progress: progress, onVerified: { verified in
 					try await ZagNativeAppInventory.save(verified, source: source, name: name, renewing: renewing)
 					await onSaved(verified.record.bundleIdentifier)
 				}, onSignedOnly: installAfterSigning ? nil : retainSigned, onDeferredInstall: retainSigned)
+		} catch let error as ZagStagedSigningFailure where error.underlying is ZagInstallCancelled {
+			throw error.underlying
 		} catch let failure as ZagProvisioningFailure {
 			switch failure.kind {
 			case .certificateRequestUnresolved:
@@ -295,6 +311,23 @@ enum ZagNativeAccountInstall {
 		guard explicitCertificateChanges.isEmpty else { throw Failure.unsupportedOptions(explicitCertificateChanges) }
 	}
 
+	private static func checkFreeAppLimit(target: String?, freeTeam: Bool,
+		installed: [String: ZagRPPairingCore.InstalledAppInfo], profiles: [ZagIssuedProfile]) throws {
+		guard freeTeam, let target, installed[target] == nil else { return }
+		let proven = Set(profiles.compactMap { profile -> String? in
+			guard installed[profile.bundleIdentifier] != nil,
+				  let entry = ZagNativeAppInventory.entry(bundleIdentifier: profile.bundleIdentifier),
+				  entry.pendingInstall == nil, entry.installation.record.expiryVerified == true,
+				  let owner = entry.installation.record.owner, owner.teamKind == .personalFree,
+				  owner.profileUUID == profile.uuid, owner.scope.teamID == profile.teamIdentifier,
+				  profile.certificateSerials.contains(owner.certificateSerial) else { return nil }
+			return profile.bundleIdentifier
+		})
+		if case .full(let installed) = ZagInstallSlotPlan.make(installing: target, installedFreeAccountApps: proven) {
+			throw ZagFreeAppLimitReached(bundleIDs: installed)
+		}
+	}
+
 	static func installSaved(entry: ZagNativeAppInventory.Entry, job: String) async throws {
 		try await withExclusiveOperation {
 			try await ZagSigningDiagnostics.current.withValue(ZagSigningDiagnostics()) {
@@ -306,7 +339,18 @@ enum ZagNativeAccountInstall {
 				}
 				let pairing = ZagRPPairingCore.shared
 				guard pairing.hasSavedPairing else { throw Failure.pairing }
-				let (device, _) = try await pairing.signingDeviceInventory()
+				let (device, installed) = try await pairing.signingDeviceInventory()
+				ZagSigningDiagnostics.record("Validating previously signed app")
+				do { try entry.installation.validateArtifact(source, expectation: expectation, deviceUDID: device.udid) }
+				catch {
+					ZagSigningDiagnostics.recordFailure(.verification, error)
+					throw ZagStagedSigningFailure(phase: .verification, underlying: error)
+				}
+				if installed[expectation.bundleIdentifier] == nil, entry.installation.record.owner?.teamKind == .personalFree,
+				   let readback = try? await ZagRPPairingFreeAccountInstaller.readProfiles().get() {
+					try checkFreeAppLimit(target: expectation.bundleIdentifier, freeTeam: true, installed: installed,
+						profiles: readback.compactMap { try? ZagIssuedProfile(profileData: $0) })
+				}
 				try ZagInstallJobs.shared.checkpoint(job)
 				ZagInstallJobs.shared.reportNative(job, .installing)
 				ZagSigningDiagnostics.record("Installing previously signed app")
@@ -315,12 +359,19 @@ enum ZagNativeAccountInstall {
 					ZagInstallJobs.shared.setNativeProgress(job, caption: ZagNativeSigningProgress.installing.title,
 						fraction: ZagNativeSigningProgress.installing.fraction)
 				})
-				try await installer.install(signedApp: source, bundleIdentifier: expectation.bundleIdentifier)
+				do { try await installer.install(signedApp: source, bundleIdentifier: expectation.bundleIdentifier) }
+				catch is ZagInstallCancelled { throw ZagInstallCancelled() }
+				catch {
+					ZagSigningDiagnostics.recordFailure(.installation, error)
+					throw ZagStagedSigningFailure(phase: .installation, underlying: error)
+				}
 				guard pairing.pairedIdentity == device else { throw Failure.pairing }
 				ZagInstallJobs.shared.reportNative(job, .verifying)
-				guard case .verified(let expiry, let certExpiry) = await installer.verify(expectation) else {
-					ZagSigningDiagnostics.record("Installed app or profile could not be verified")
-					throw ZagNativeAppInventory.Failure.unverified
+				let result = await installer.verify(expectation)
+				guard case .verified(let expiry, let certExpiry) = result else {
+					let error = ZagFreeAccountSigningError.verification(String(describing: result))
+					ZagSigningDiagnostics.recordFailure(.verification, error)
+					throw ZagStagedSigningFailure(phase: .verification, underlying: error)
 				}
 				try ZagNativeAppInventory.confirm(entry, expiry: expiry, certificateExpiry: certExpiry)
 				ZagInstallJobs.shared.reportNative(job, .verified)
@@ -409,7 +460,7 @@ extension ZagInstallJobs {
 	func reportNative(_ id: String, _ stage: ZagNativeSigningProgress) {
 		if stage == .installing {
 			advance(id, to: .packaging)
-			setNativeProgress(id, caption: "Preparing Installation", fraction: stage.fraction)
+			setNativeProgress(id, caption: "Preparing", fraction: stage.fraction)
 		} else { setNativeProgress(id, caption: stage.title, fraction: stage.fraction) }
 	}
 }
@@ -423,12 +474,14 @@ extension ZagNativeAccountInstall {
 			guard let entry, let scope = entry.installation.record.owner?.scope else {
 				throw ZagNativeAppInventory.Failure.wrongAccount
 			}
+			ZagInstallJobs.shared.setNativeProgress(job, caption: hasConnectedAccount(scope.accountID) ? "Refreshing" : "Authenticating", fraction: 0)
 			let id = try await ZagAppleIDSigningSelection.resolve(required: scope.accountID, interactive: interactive)
 			return try await ZagNativeAppInventory.withSource(entry) { source in
 				try await runInlineSource(source, name: entry.name, accountID: id, job: job, installAfterSigning: true, renewing: entry, interactive: interactive)
 			}
 		}
 		guard let source = Storage.shared.getAppDirectory(for: app) else { throw Failure.invalidApp }
+		ZagInstallJobs.shared.setNativeProgress(job, caption: "Authenticating", fraction: 0)
 		let id = try await ZagAppleIDSigningSelection.resolve(required: requiredScope?.accountID, interactive: interactive)
 		return try await runInlineSource(source, name: app.name ?? "App", accountID: id, job: job,
 			installAfterSigning: options.installAfterSigning, requiredInstalledIdentifier: requiredInstalledIdentifier,
@@ -500,16 +553,41 @@ extension ZagNativeAccountInstall {
 		}.sorted { $0.expires > $1.expires }
 	}
 
-	static func showInlineFailure(_ error: Error, title: String = "Signing Failed", customise: (() -> Void)? = nil) {
-		var actions = [UIAlertAction(title: "OK", style: .cancel)]
-		let report = ZagSigningDiagnostics.latest
-		if !report.isEmpty {
-			actions.append(UIAlertAction(title: "Copy Diagnostics", style: .default) { _ in UIPasteboard.general.string = report })
+	static func failurePhase(_ error: Error, fallback: ZagSigningFailurePhase = .signing) -> ZagSigningFailurePhase {
+		let staged = error as? ZagStagedSigningFailure
+		let cause = staged?.underlying ?? error
+		if (cause as? ZagNativeSigningPipeline.Failure) == .expiryNotExtended { return .refresh }
+		if cause is ZagNativeAppleIDs.Failure || (cause as? Failure) == .signIn
+			|| (cause as? ZagFreeAccountSigningError) == .notAuthorized { return .authentication }
+		if let staged { return staged.phase }
+		if let failure = cause as? ZagProvisioningFailure {
+			return failure.kind == .sessionRejected || failure.kind == .notAuthorized ? .authentication : .provisioning
 		}
-		if let customise {
+		if (cause as? ZagPortalOperationFailure)?.underlying == .sessionRejected { return .authentication }
+		if cause is ZagPortalOperationFailure || cause is CertificateIssue || (cause as? Failure) == .personalTeam { return .provisioning }
+		if case .verification? = cause as? ZagFreeAccountSigningError { return .verification }
+		return fallback
+	}
+
+	static func showInlineFailure(_ error: Error, fallback: ZagSigningFailurePhase = .signing, customise: (() -> Void)? = nil) {
+		let phase = failurePhase(error, fallback: fallback)
+		let limit = ZagFreeAppLimitReached.classify(error)
+		let report = [ZagSigningDiagnostics.latest, ZagSigningDiagnostics.failureDetails(phase, error)].filter { !$0.isEmpty }.joined(separator: "\n")
+		var actions = [UIAlertAction(title: "OK", style: .cancel),
+			UIAlertAction(title: "Copy Diagnostics", style: .default) { _ in UIPasteboard.general.string = report }]
+		if let limit {
+			let installed = ZagRPPairingCore.shared.installedApps
+			for id in limit.bundleIDs {
+				guard let app = installed[id], !app.name.isEmpty, app.name != id else { continue }
+				actions.append(UIAlertAction(title: "Open \(app.name)", style: .default) { _ in UIApplication.openApp(with: id) })
+			}
+		} else if phase == .signing, let customise {
 			actions.append(UIAlertAction(title: "Customise App", style: .default) { _ in customise() })
 		}
-		UIAlertController.showAlert(title: title, message: error.localizedDescription, actions: actions)
+		let expiredRefresh = ((error as? ZagStagedSigningFailure)?.underlying ?? error) as? ZagNativeSigningPipeline.Failure
+		let message = expiredRefresh == .expiryNotExtended ? "Apple did not issue a profile with a later expiration." : phase.message
+		UIAlertController.showAlert(title: limit == nil ? phase.title : ZagFreeAppLimitReached.title,
+			message: limit == nil ? message : ZagFreeAppLimitReached.message, actions: actions)
 	}
 }
 #endif

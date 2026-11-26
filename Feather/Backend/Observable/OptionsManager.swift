@@ -31,6 +31,14 @@ class OptionsManager: ObservableObject {
 			deleteImportAfterSigning: certificate.post_deleteAppAfterSigned))
 	}
 
+	/// Automatic installation is the shared Post Signing preference. The other
+	/// Apple ID settings and an explicit per-operation override remain separate.
+	var appleIDSigningDefaults: ZagAppleIDSigningOptions {
+		var defaults = appleIDOptions
+		defaults.installAfterSigning = options.post_installAppAfterSigned
+		return defaults
+	}
+
 	/// Saves options
 	func saveOptions() {
 		if let encoded = try? JSONEncoder().encode(options) {

@@ -1360,13 +1360,27 @@ private enum InstalledAppsError: LocalizedError {
 }
 
 
-private enum Gate4InstallError: LocalizedError {
+private enum Gate4InstallError: LocalizedError, CustomNSError {
 	case alreadyRunning
 	case couldNotStart
 	case installFailed(String)
 	/// User installs: the raw error plus what it means and whether anything
 	/// changed on the device.
 	case classifiedFailure(String, ZagRPPairingFailureKind)
+
+	static let errorDomain = "ZagStore.RPPairing.Install"
+
+	var errorCode: Int {
+		switch self {
+		case .alreadyRunning: -1
+		case .couldNotStart: -2
+		case .installFailed, .classifiedFailure: -4
+		}
+	}
+
+	var errorUserInfo: [String: Any] {
+		[NSLocalizedDescriptionKey: errorDescription ?? "Installation failed."]
+	}
 
 	var errorDescription: String? {
 		switch self {

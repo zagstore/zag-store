@@ -202,10 +202,28 @@ struct DownloadButtonView: View {
 		if let caption = jobs.job(_jobKey)?.nativeCaption, !jobs.isCancelRequested(_jobKey) {
 			return (caption, .secondary)
 		}
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let entry = _nativeInstalledEntry,
+		   let caption = jobs.job(ZagUpdateTransactionManager.jobID(entry.installation.record.bundleIdentifier))?.nativeCaption {
+			return (caption, .secondary)
+		}
+		#endif
 		if !_stageCaption.isEmpty {
 			return (_stageCaption, .secondary)
 		}
 
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let entry = _nativeInstalledEntry {
+			let expiry = entry.installation.record.expiresAt
+			let color: Color
+			switch ZagAppleIDProfileValidity(expiresAt: expiry, now: Date()) {
+			case .valid: color = .green
+			case .soon: color = .orange
+			case .urgent, .expired: color = .red
+			}
+			return (expiry.expirationInfo().formatted, color)
+		}
+		#endif
 		if
 			let bundleID = app.id,
 			pairingCore.isInstalled(bundleID: bundleID),
@@ -233,12 +251,7 @@ struct DownloadButtonView: View {
 			return certificate.expiration
 		}
 
-		let certificates = Storage.shared.getAllCertificates()
-		let selectedIndex = UserDefaults.standard.integer(forKey: "feather.selectedCert")
-		if certificates.indices.contains(selectedIndex) {
-			return certificates[selectedIndex].expiration
-		}
-		return certificates.first?.expiration
+		return nil
 	}
 
 	private var _modificationLabel: String? {
@@ -269,13 +282,13 @@ struct DownloadButtonView: View {
 
 	private var _stageCaption: String {
 		if let job = jobs.job(_jobKey) {
-			if job.cancelRequested { return .localized("Cancelling…") }
+			if job.cancelRequested { return .localized("Preparing") }
 			if job.stage == .paused { return .localized("Paused") }
 		}
 		switch zagPhase {
-		case .downloading: return .localized("Downloading…")
-		case .signing: return .localized("Preparing…")
-		case .installing: return .localized("Installing…")
+		case .downloading: return .localized("Downloading")
+		case .signing: return .localized("Preparing")
+		case .installing: return .localized("Installing")
 		default: return ""
 		}
 	}
@@ -649,6 +662,59 @@ struct DownloadButtonView: View {
 		.pill(ZagInstallPill(title: title, systemImage: image, filled: filled, enabled: enabled, compactLabel: compactLabel, accessibilityLabel: label))
 	}
 
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private var _nativeInstalledEntry: ZagNativeAppInventory.Entry? {
+		let entry = installedBundleID.flatMap { ZagNativeAppInventory.entry(bundleIdentifier: $0) }
+			?? app.id.flatMap { ZagNativeAppInventory.entry(originalIdentifier: $0) }
+		guard let entry, entry.pendingInstall == nil, entry.installation.record.expiryVerified == true,
+			  pairingCore.isInstalled(bundleID: entry.installation.record.bundleIdentifier) else { return nil }
+		return entry
+	}
+
+	private func _startNativeRepositoryUpdate(_ entry: ZagNativeAppInventory.Entry) {
+		let id = entry.installation.record.bundleIdentifier
+		let updates = UpdateManager.shared.updates.filter { $0.installedBundleID == id && $0.app.currentUniqueId == app.currentUniqueId }
+		guard updates.count == 1, let update = updates.first else {
+			_failTransaction("Open Apps to update this installed copy.")
+			return
+		}
+		let manager = ZagUpdateTransactionManager.shared
+		if let stage = manager.stage(for: update), case .failed = stage {
+			// The coordinator can reuse the existing staged update.
+		} else if manager.stage(for: update) != nil {
+			actionClaimed = false
+			return
+		}
+		zagPhase = .signing
+		manager.prepare(update) { result in
+			Task { @MainActor in
+				defer { zagPhase = .idle; actionClaimed = false }
+				do {
+					let uuid = try result.get()
+					if try await manager.installPreparedUpdate(signedUUID: uuid) { installedBundleID = id }
+				} catch is ZagInstallCancelled {
+				} catch {
+					if case .success = result { manager.failInstallation(update: update, error: error) }
+					ZagNativeAccountInstall.showInlineFailure(error, fallback: (try? result.get()) == nil ? .signing : .installation)
+				}
+			}
+		}
+	}
+
+	private func _refreshNativeRepositoryApp(_ entry: ZagNativeAppInventory.Entry) {
+		guard let row = _signedApp(uuid: entry.uuid) else { actionClaimed = false; return }
+		zagPhase = .signing
+		Task { @MainActor in
+			defer { zagPhase = .idle; actionClaimed = false }
+			do {
+				_ = try await ZagNativeAccountInstall.runInline(row, job: _jobKey,
+					options: OptionsManager.shared.appleIDSigningDefaults, renew: true)
+			} catch is ZagInstallCancelled {
+			} catch { ZagNativeAccountInstall.showInlineFailure(error, fallback: .refresh) }
+		}
+	}
+	#endif
+
 	/// The row's action as one mode plus its tap, in the same order as the
 	/// previous branches.
 	private var _control: (mode: ZagInstallControlMode, action: () -> Void) {
@@ -690,12 +756,33 @@ struct DownloadButtonView: View {
 			return (_pill("PAL", label: "About AltStore PAL distribution for \(app.currentName)"),
 					{ UIImpactFeedbackGenerator(style: .light).impactOccurred(); isPALInfoPresented = true })
 		}
-		if let bundleID = installedBundleID {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let entry = _nativeInstalledEntry {
+			let bundleID = entry.installation.record.bundleIdentifier
+			let action = ZagAppRowAction.resolve(installed: true, hasUpdate: _installedReleaseRelationship(bundleID: bundleID) == .newer,
+				signed: true, launchable: entry.installation.record.expiresAt > Date(), canRefresh: true)
+			return (_pill(action.rawValue, label: "\(action.rawValue) \(app.currentName)"), {
+				switch action {
+				case .update: _performAction { _startNativeRepositoryUpdate(entry) }
+				case .refresh: _performAction { _refreshNativeRepositoryApp(entry) }
+				default: _performAction(claim: false) { UIApplication.openApp(with: bundleID) }
+				}
+			})
+		}
+		#endif
+		if let bundleID = installedBundleID, pairingCore.isInstalled(bundleID: bundleID),
+		   _installedCertificateExpiration(bundleID: bundleID).map({ $0 > Date() }) != false {
 			return (_pill(.localized("Open"), label: "Open \(app.currentName)"),
 					{ _performAction(claim: false) { UIApplication.openApp(with: bundleID) } })
 		}
 		if let bundleID = app.id, pairingCore.isInstalled(bundleID: bundleID), _matchesTrackedVariant(bundleID: bundleID) {
-			switch _installedReleaseRelationship(bundleID: bundleID) {
+			let relationship = _installedReleaseRelationship(bundleID: bundleID)
+			if relationship != .newer, _installedCertificateExpiration(bundleID: bundleID).map({ $0 <= Date() }) == true {
+				return (_pill("Refresh", label: "Refresh \(app.currentName)"), {
+					_failTransaction("Open Apps to recover this app’s expired signing profile.")
+				})
+			}
+			switch relationship {
 			case .newer:
 				return (_pill(.localized("Update"), enabled: !actionClaimed, label: "Update \(app.currentName)"),
 						{ _performAction { _startGetAndInstall() } })
@@ -791,7 +878,7 @@ struct DownloadButtonView: View {
 		zagPhase = .signing
 		Task { @MainActor in
 			defer { zagPhase = .idle; actionClaimed = false }
-			let options = OptionsManager.shared.appleIDOptions
+			let options = OptionsManager.shared.appleIDSigningDefaults
 			do {
 				let outcome = try await ZagNativeAccountInstall.runInline(imported, job: _jobKey, options: options,
 					onSaved: { @MainActor id in installedBundleID = id })
@@ -805,6 +892,11 @@ struct DownloadButtonView: View {
 				if options.deleteImportAfterSigning { Storage.shared.deleteApp(for: imported) }
 			} catch is ZagInstallCancelled {
 			} catch {
+				if let original = imported.identifier,
+				   let entry = ZagNativeAppInventory.entry(originalIdentifier: original, pending: true) {
+					retrySignedUUID = entry.uuid
+					UserDefaults.standard.set(entry.uuid, forKey: _retryStorageKey)
+				}
 				ZagNativeAccountInstall.showInlineFailure(error)
 			}
 		}
@@ -916,7 +1008,7 @@ struct DownloadButtonView: View {
 					UserDefaults.standard.removeObject(forKey: _retryStorageKey)
 					installedBundleID = entry.installation.record.bundleIdentifier
 				} catch is ZagInstallCancelled {
-				} catch { ZagNativeAccountInstall.showInlineFailure(error, title: "Installation Failed") }
+				} catch { ZagNativeAccountInstall.showInlineFailure(error, fallback: .installation) }
 			}
 			return
 		}

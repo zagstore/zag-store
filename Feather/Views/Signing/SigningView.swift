@@ -24,7 +24,7 @@ struct SigningView: View {
 	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 	@ObservedObject private var _accountPairing = ZagRPPairingCore.shared
 	@State private var _signingMethod: ZagSigningMethod = .importedCertificate
-	@State private var _appleIDOptions = OptionsManager.shared.appleIDOptions
+	@State private var _appleIDOptions = OptionsManager.shared.appleIDSigningDefaults
 	@State private var _useOnlyAppleIDOptions = false
 	private var _certificateChanges: [String] {
 		_temporaryOptions.certificateCustomisations(since: _certificateDefaults,
@@ -195,7 +195,7 @@ struct SigningView: View {
                     Button("Reset") {
                         #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
                         if _signingMethod == .freeAppleAccount {
-                            _appleIDOptions = OptionsManager.shared.appleIDOptions
+                            _appleIDOptions = OptionsManager.shared.appleIDSigningDefaults
                             _useOnlyAppleIDOptions = false
                             return
                         }
@@ -1023,8 +1023,13 @@ extension SigningView {
 				_certificateIssue = issue
 			} catch {
 				_nativeProgress = nil
-				_accountDiagnostics = ZagSigningDiagnostics.latest
-				_accountInstallMessage = error.localizedDescription
+				let phase = ZagNativeAccountInstall.failurePhase(error, fallback: _renewing == nil ? .signing : .refresh)
+				_accountDiagnostics = [ZagSigningDiagnostics.latest, ZagSigningDiagnostics.failureDetails(phase, error)].joined(separator: "\n")
+				if ZagFreeAppLimitReached.classify(error) != nil {
+					ZagNativeAccountInstall.showInlineFailure(error, fallback: phase)
+				} else {
+					_accountInstallMessage = phase.message
+				}
 			}
 		}
 	}
