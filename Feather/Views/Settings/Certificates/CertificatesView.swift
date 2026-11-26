@@ -10,6 +10,7 @@ import NimbleViews
 
 // MARK: - View
 struct CertificatesView: View {
+    @Environment(\.dismiss) private var dismiss
     @Environment(\.zagAccountClose) private var closeAccount
     @Environment(\.zagInsideAccountPopup) private var insideAccountPopup
 	@AppStorage(ZagSigningPreference.key) private var _signingPreference = ZagCertificateSelection.preference
@@ -140,8 +141,11 @@ struct CertificatesView: View {
 		_bindingSelectedCert ?? $_storedSelectedCert
 	}
 	
-	init(selectedCert: Binding<Int>? = nil) {
+	private let openedFromSettings: Bool
+
+	init(selectedCert: Binding<Int>? = nil, openedFromSettings: Bool = false) {
 		self._bindingSelectedCert = selectedCert
+		self.openedFromSettings = openedFromSettings
 	}
 	
 	// MARK: Body
@@ -258,13 +262,12 @@ struct CertificatesView: View {
 			}
 		}
 		.toolbar {
+            if openedFromSettings, !insideAccountPopup {
+                ToolbarItem(placement: .principal) { ZagLocalVPNToolbarStatus() }
+            }
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if insideAccountPopup, let closeAccount {
-                    Button(action: closeAccount) {
-                        Image(systemName: "xmark")
-                    }
-                    .tint(.primary)
-                    .accessibilityLabel("Close")
+                if openedFromSettings, !insideAccountPopup {
+                    ZagProfileToolbarButton().tint(.primary)
                 }
                 if _bindingSelectedCert == nil {
                     Button {
@@ -273,6 +276,19 @@ struct CertificatesView: View {
                         Image(systemName: "plus")
                     }
                     .accessibilityLabel("Import Certificate")
+                }
+                if insideAccountPopup || openedFromSettings {
+                    Button {
+                        if insideAccountPopup, let closeAccount {
+                            closeAccount()
+                        } else {
+                            dismiss()
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .tint(.primary)
+                    .accessibilityLabel("Close")
                 }
             }
 		}
