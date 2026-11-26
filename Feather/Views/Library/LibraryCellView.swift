@@ -40,6 +40,7 @@ struct LibraryCellView: View {
 	var runningHasUpdate = false
 	var onRunningUpdate: (() -> Void)? = nil
 
+	@State private var showingRunningDetails = false
 	@State private var isDeleteConfirmationPresented = false
 	@State private var confirmSeparateSigning = false
 	@State private var choosingSigningMethod = false
@@ -231,8 +232,12 @@ struct LibraryCellView: View {
 			if isEditing {
 				if runningInstallation == nil { _toggleSelection() }
 			} else {
-				selectedInfoAppPresenting = AnyApp(base: app)
+				if runningInstallation != nil { showingRunningDetails = true }
+				else { selectedInfoAppPresenting = AnyApp(base: app) }
 			}
+		}
+		.sheet(isPresented: $showingRunningDetails) {
+			if let runningInstallation { ZagRunningDetailsSheet(installation: runningInstallation) }
 		}
 		.swipeActions {
 			if !isEditing, runningInstallation == nil {
@@ -392,7 +397,8 @@ extension LibraryCellView {
 			.localized("Get Info"),
 			systemImage: "info.circle"
 		) {
-			selectedInfoAppPresenting = AnyApp(base: app)
+			if runningInstallation != nil { showingRunningDetails = true }
+			else { selectedInfoAppPresenting = AnyApp(base: app) }
 		}
 	}
 
@@ -485,7 +491,9 @@ extension LibraryCellView {
 						if status == nil { _signedControlTap(update: update) }
 						else if jobs.job(_jobKey) == nil {
 							if runningHasUpdate { onRunningUpdate?() }
-							else if let id = app.identifier { UIApplication.openApp(with: id) }
+							else if ZagBatchCoordinator.shared.canRefreshRunning() {
+								Task { await ZagBatchCoordinator.shared.refreshRunning() }
+							} else { showingRunningDetails = true }
 						}
 					},
 					cancelAction: _canCancelFromControl ? _requestCancel : nil
@@ -543,8 +551,8 @@ extension LibraryCellView {
 	}
 
 	private var _runningControlMode: ZagInstallControlMode {
-		_runningMode ?? .pill(.init(title: runningHasUpdate ? "Update" : "Open",
-			accessibilityLabel: runningHasUpdate ? "Update Zag Store" : "Open Zag Store"))
+		let title = runningHasUpdate ? "Update" : ZagBatchCoordinator.shared.canRefreshRunning() ? "Refresh" : "Manage"
+		return _runningMode ?? .pill(.init(title: title, accessibilityLabel: "\(title) Zag Store"))
 	}
 
 	private var _runningMode: ZagInstallControlMode? {
@@ -1069,6 +1077,43 @@ private struct ZagLibraryRepositorySourceLabel: View {
 			.disabled(true)
 
 			Divider()
+		}
+	}
+}
+
+
+private struct ZagRunningDetailsSheet: View {
+	@ObservedObject var installation: ZagRunningInstallation
+	@Environment(\.dismiss) private var dismiss
+	var body: some View {
+		NavigationStack {
+			List {
+				Section {
+					HStack(spacing: 12) {
+						FRAppIconView(app: nil, size: 62)
+						VStack(alignment: .leading) {
+							Text("Zag Store").font(.headline)
+							Text("\(installation.runningApp.version ?? "Unknown") (\(installation.runningApp.build ?? "Unknown"))").foregroundStyle(.secondary)
+						}
+					}
+					LabeledContent("Signing Method", value: installation.method == .imported ? "Certificate" : installation.method == .personal ? "Apple ID" : installation.method == .certificate ? "Certificate" : "Unknown")
+					if let expiry = installation.expiry {
+						LabeledContent("Expiration", value: expiry.formatted(date: .abbreviated, time: .omitted))
+						LabeledContent("Validity") { Text(expiry.expirationInfo(from: Date()).formatted).foregroundStyle(expiry.expirationInfo(from: Date()).color) }
+					}
+				}
+				if let recovery = installation.recovery {
+					Section { Text(recovery).foregroundStyle(.secondary)
+						Button("Verify Installation") { Task { await installation.inspect(verifyPersonal: true, retry: true) } }.disabled(installation.inspecting)
+					}
+				}
+				if ZagBatchCoordinator.shared.canRefreshRunning() {
+					Section { Button("Refresh") { Task { await ZagBatchCoordinator.shared.refreshRunning() } } }
+				}
+			}
+			.navigationTitle("Zag Store")
+			.navigationBarTitleDisplayMode(.inline)
+			.toolbar { ToolbarItem(placement: .confirmationAction) { Button { dismiss() } label: { Image(systemName: "xmark") }.accessibilityLabel("Close") } }
 		}
 	}
 }
