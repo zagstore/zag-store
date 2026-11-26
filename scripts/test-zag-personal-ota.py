@@ -22,6 +22,13 @@ JOB = "a" * 32
 
 
 class StagingTests(unittest.TestCase):
+    def test_codesign_trust_failure_remains_fatal_and_does_not_expose_detail(self):
+        result = SimpleNamespace(returncode=1, stdout=b"", stderr=b"private path: CSSMERR_TP_NOT_TRUSTED")
+        with patch.object(ota.subprocess, "run", return_value=result), self.assertRaises(ValueError) as error:
+            ota.command("codesign", "--verify", "--deep", "--strict", "/private/artifact")
+        self.assertIn("CSSMERR_TP_NOT_TRUSTED", str(error.exception))
+        self.assertNotIn("private", str(error.exception))
+
     def test_actual_bundle_and_build(self):
         raw = io.BytesIO()
         with zipfile.ZipFile(raw, "w") as archive:

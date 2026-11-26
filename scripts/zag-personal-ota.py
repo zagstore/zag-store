@@ -48,8 +48,11 @@ def sha(path):
 
 def command(*args):
     result = subprocess.run(args, capture_output=True, check=False, timeout=120)
+    tool = Path(args[0]).name
     if result.returncode:
-        raise ValueError(f"{Path(args[0]).name} rejected the artifact")
+        if tool == "codesign" and b"CSSMERR_TP_NOT_TRUSTED" in result.stderr:
+            raise ValueError("codesign trust evaluation failed (CSSMERR_TP_NOT_TRUSTED); full artifact verification did not pass")
+        raise ValueError(f"{tool} rejected the artifact")
     return result.stdout
 
 
@@ -175,7 +178,9 @@ def validate(ipa, team, udid, root):
             profile = plistlib.loads(command("openssl", "smime", "-verify", "-inform", "DER", "-purpose", "any",
                                               "-CAfile", str(root), "-no-CApath",
                                               "-in", str(component / "embedded.mobileprovision")))
-            entitlements = plistlib.loads(command("codesign", "--display", "--xml", "--entitlements", "-", str(component)))
+            signed_xml = command("codesign", "--display", "--xml", "--entitlements", "-", str(component))
+            require(signed_xml, "codesign could not read the signed XML entitlements")
+            entitlements = plistlib.loads(signed_xml)
             expiry.append(min(certificate_expiry, validate_profile(profile, entitlements, signer, team, identifier, udid, now)))
         require(sha(ipa) == original_digest, "IPA changed during verification")
     return {"sha256": original_digest, "bundle_identifier": bundle, "build": build,

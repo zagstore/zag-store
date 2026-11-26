@@ -78,6 +78,16 @@ rm -f -- "$REPORT"
 
 The delivery cleanup validates the job, SHA-256 and exact mapped app identifier for the supplied team before removing its private files. Delete the local exported copy according to the experiment's retention policy. Remove the test app manually if desired, preserving the original.
 
+## Interpreting a Mac trust failure
+
+`CSSMERR_TP_NOT_TRUSTED` from full `codesign` verification stops this workflow. As a separate diagnostic, an operator may verify the exported leaf and intermediate using the pinned Apple Root CA supplied explicitly per invocation:
+
+```sh
+security verify-cert -L -N -p codeSign -c "$LEAF_DER" -c "$WWDR_INTERMEDIATE_DER" -r "$APPLE_ROOT"
+```
+
+This checks certificate trust without changing the Mac trust store. A passing result does not establish that the application, framework or entitlement encoding passes platform verification. In particular, if `codesign` reports an invalid entitlement blob or returns empty signed XML, stop and compare the XML and DER signing slots against the authenticated provisioning profile. Link publication still requires full artifact verification, a target UDID confirmed independently of the exported profile, and a review of the live preview policy.
+
 ## Beyond Phase 1
 
 A clean-phone flow needs a supported browser or system authentication handoff, explicit consent for device registration and a reliable device identity channel, account-scoped provisioning and signing that keep credentials and private keys out of the web service, a safe signing-identity handover to the installed app, and computer-free pairing on stock iOS. Prove the launch and handover independently of the Safari result. Browser-based authentication and provisioning need separate design and validation. A public Apple credential endpoint and a desktop companion are outside this plan.
