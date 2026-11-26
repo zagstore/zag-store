@@ -17,6 +17,7 @@ import NimbleJSON
 @main
 struct FeatherApp: App {
     @StateObject private var launch = ZagPairingLaunchCoordinator()
+	@Environment(\.scenePhase) private var scenePhase
 	@UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 	
 	let heartbeat = HeartbeatManager.shared
@@ -58,6 +59,7 @@ struct FeatherApp: App {
                 launch.startIfNeeded()
                 await ZagLaunchGate.shared.waitUntilSplashFinishes()
                 launch.finishSplash()
+				ZagBatchQuickActions.shared.setMainReady(launch.policy.canEnterMain)
                 drainPendingURLs()
             }
             // Connection status refreshes on its own; a reconnect re-checks
@@ -65,7 +67,11 @@ struct FeatherApp: App {
             .onReceive(ZagLocalVPNMonitor.shared.$model.map(\.tunnel).removeDuplicates()) { tunnel in
                 if tunnel == .operational { launch.connectionAvailable() }
             }
-            .onChange(of: launch.policy.canEnterMain) { _ in
+            .onChange(of: scenePhase) { phase in
+				if phase == .active { ZagBatchQuickActions.shared.drain() }
+			}
+            .onChange(of: launch.policy.canEnterMain) { ready in
+				ZagBatchQuickActions.shared.setMainReady(ready && launch.policy.splashFinished)
                 Task { @MainActor in
                     await Task.yield()
                     drainPendingURLs()
@@ -394,6 +400,25 @@ private struct ZagAnimatedLaunchOverlay: View {
 class AppDelegate: NSObject, UIApplicationDelegate {
 	func application(
 		_ application: UIApplication,
+		configurationForConnecting session: UISceneSession,
+		options: UIScene.ConnectionOptions
+	) -> UISceneConfiguration {
+		if let shortcut = options.shortcutItem { _ = ZagBatchQuickActions.shared.receive(shortcut) }
+		let configuration = session.configuration
+		configuration.delegateClass = ZagBatchSceneDelegate.self
+		return configuration
+	}
+
+	func application(
+		_ application: UIApplication,
+		performActionFor shortcutItem: UIApplicationShortcutItem,
+		completionHandler: @escaping (Bool) -> Void
+	) {
+		completionHandler(ZagBatchQuickActions.shared.receive(shortcutItem))
+	}
+
+	func application(
+		_ application: UIApplication,
 		didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
 	) -> Bool {
 		// This is the earliest stable app-delegate milestone. Store the
@@ -403,6 +428,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 			Task { @MainActor in
 				ZagPerformanceMonitor.shared.markLaunchStarted(at: launchStarted)
 			}
+		}
+		let shortcut = launchOptions?[.shortcutItem] as? UIApplicationShortcutItem
+		if let shortcut { _ = ZagBatchQuickActions.shared.receive(shortcut) }
+		application.shortcutItems = [ZagBatchOperation.update, .refresh].map {
+			UIApplicationShortcutItem(type: $0.shortcutType, localizedTitle: $0.title,
+				localizedSubtitle: nil, icon: UIApplicationShortcutIcon(systemImageName: $0.icon), userInfo: nil)
 		}
 		_createPipeline()
 		_createDocumentsDirectories()
@@ -514,6 +545,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 	}
 
 	func applicationDidBecomeActive(_ application: UIApplication) {
+		ZagBatchQuickActions.shared.drain()
 		if ZagRPPairingCore.shared.isRunning {
 			ZagRPPairingCore.shared.refreshPairingBackgroundTime()
 		}

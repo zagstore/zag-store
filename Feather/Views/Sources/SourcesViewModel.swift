@@ -41,12 +41,12 @@ final class SourcesViewModel: ObservableObject {
 	}
 
 	@MainActor
-	func fetchSources(
-		_ sources: FetchedResults<AltSource>,
+	func fetchSources<Records: Collection>(
+		_ sources: Records,
 		refresh: Bool = false,
 		batchSize: Int = 4,
 		diagnosticSkipReconciliation: Bool = false
-	) async {
+	) async where Records.Element == AltSource {
 		guard isFinished else { return }
 		let snapshotStartedAt = Date()
 		let diagnosticStart = CFAbsoluteTimeGetCurrent()

@@ -152,6 +152,7 @@ final class ZagMobileDataInstallCoordinator: ObservableObject {
 	}
 
 	private func requestConsent() async -> ZagMobileDataConsent {
+		guard ZagBatchCoordinator.allowsForegroundInteraction else { return .disabled }
 		switch automaticHandling {
 		case true?: return .allowed
 		case false?: return .disabled
@@ -232,7 +233,8 @@ final class ZagMobileDataInstallCoordinator: ObservableObject {
 			},
 			tunnelPresent: { Self.tunnelPresent() },
 			shortcutReady: {
-				ZagMobileDataToggle.canRunAutomatically(ZagMobileDataToggleController.shared.record)
+				ZagBatchCoordinator.allowsForegroundInteraction
+					&& ZagMobileDataToggle.canRunAutomatically(ZagMobileDataToggleController.shared.record)
 					&& !ZagMobileDataToggleController.shared.isBusy
 			},
 			consent: { [unowned self] in await self.requestConsent() },
