@@ -16,8 +16,8 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location("ota", Path(__file__).with_name("zag-personal-ota.py"))
 ota = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ota)
-TEAM = "ABCDE12345"
-BUNDLE = ota.ORIGINAL + "." + TEAM
+TEAM = "FTB8PRW638"
+BUNDLE = "app.zagstore.ios.FTB8PRW638"
 JOB = "a" * 32
 
 
@@ -26,16 +26,17 @@ class StagingTests(unittest.TestCase):
         raw = io.BytesIO()
         with zipfile.ZipFile(raw, "w") as archive:
             archive.writestr("Payload/Zag.app/Info.plist", plistlib.dumps({
-                "CFBundleIdentifier": BUNDLE, "CFBundleVersion": "12.1",
+                "CFBundleIdentifier": BUNDLE, "CFBundleShortVersionString": "1.0.0", "CFBundleVersion": "3",
             }))
         with zipfile.ZipFile(raw) as archive, tempfile.TemporaryDirectory() as directory:
             path, info = ota.main_bundle(archive)
-            self.assertEqual(ota.verify_identity(info, TEAM), (BUNDLE, "12.1"))
+            self.assertEqual(ota.verify_identity(info, TEAM), (BUNDLE, "3"))
             ota.extract(archive, Path(directory))
             self.assertTrue((Path(directory) / path / "Info.plist").is_file())
-        info["CFBundleIdentifier"] = ota.ORIGINAL
-        with self.assertRaises(ValueError):
-            ota.verify_identity(info, TEAM)
+        for rejected in ("app.zagstore.ios", "com.cwd43.gu29", "com.cwd43.gu29." + TEAM,
+                         "app.zagstore.ios.ABCDE12345", BUNDLE + ".extra"):
+            with self.subTest(identifier=rejected), self.assertRaises(ValueError):
+                ota.verify_identity(dict(info, CFBundleIdentifier=rejected), TEAM)
 
     def test_profile_binds_target_team_signer_and_entitlements(self):
         now = dt.datetime.now(dt.timezone.utc)
@@ -111,6 +112,25 @@ class StagingTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "expires before"):
                     ota.publish(args)
                 self.assertEqual(len(calls), 1)
+
+    def test_cleanup_requires_exact_team_scoped_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            delivery = Path(directory)
+            record = delivery / (JOB + ".json")
+            digest = "a" * 64
+            ipa = delivery / (JOB + ".signed.ipa")
+            ipa.write_bytes(b"fixture")
+            simulated = SimpleNamespace(delivery_lock=lambda _: nullcontext())
+            with patch.object(ota.os, "geteuid", return_value=0), patch.object(ota, "DELIVERY", delivery), \
+                    patch.dict(sys.modules, {"byoc_private_byoc_delivery": simulated}):
+                for refused in ("com.cwd43.gu29", "com.cwd43.gu29." + TEAM, "app.zagstore.ios.ABCDE12345"):
+                    record.write_text(ota.json.dumps({"bundle_id": refused, "job_id": JOB, "sha256": digest}))
+                    with self.assertRaises(ValueError):
+                        ota.cleanup(JOB, digest, TEAM)
+                    self.assertTrue(ipa.is_file())
+                record.write_text(ota.json.dumps({"bundle_id": BUNDLE, "job_id": JOB, "sha256": digest}))
+                self.assertEqual(ota.cleanup(JOB, digest, TEAM), {"removed": JOB})
+                self.assertFalse(ipa.exists())
 
 
 if __name__ == "__main__":

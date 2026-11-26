@@ -17,9 +17,9 @@ The checked-in publisher and worker do not invoke a distribution-purpose classif
 ### 1. Sign and export
 
 1. On the already paired signing iPhone, choose a signed-in free Apple ID with a Personal Team. The pairing target must be the phone whose UDID will be in the profiles.
-2. Import the standard Zag Store source IPA with bundle identifier `com.cwd43.gu29`. In Signing Options disable **Install After Signing** and sign with **Apple ID**. Use the production signing flow.
+2. Import the official unsigned Beta 3 IPA with bundle identifier `app.zagstore.ios`. In Signing Options disable **Install After Signing** and sign with **Apple ID**. Use the production signing flow.
 3. In Apps, open the pending signed row's context menu and choose **Export IPA**. Save to Files or AirDrop to the private staging operator. The row should still say **Install**. Do not tap it.
-4. The signed artifact must have bundle ID `com.cwd43.gu29.<TEAM>`, with the actual Personal Team ID. Preserve the installed AppTesters app. Record the exact iOS version, the signed build, and whether Developer Mode was already enabled.
+4. The signed artifact must have bundle ID `app.zagstore.ios.<TEAM>`, with the actual Personal Team ID. For the inspected Beta 3 artifact this is `app.zagstore.ios.FTB8PRW638`, version `1.0.0`, build `3`. The installed AppTesters app uses `com.cwd43.gu29` and is explicitly refused. Record the exact iOS version, the signed build, and whether Developer Mode was already enabled.
 
 ### 2. Verify the exported bytes on the operator's Mac
 
@@ -71,12 +71,12 @@ Keep the printed job ID and open its `safari_url` privately within ten minutes. 
 
 ```sh
 JOB='REPLACE_WITH_PUBLISHED_JOB_ID'
-ssh -t "$HOST" "sudo python3 '$REMOTE/zag-personal-ota.py' cleanup --job '$JOB' --sha256 '$SHA'"
+ssh -t "$HOST" "sudo python3 '$REMOTE/zag-personal-ota.py' cleanup --job '$JOB' --sha256 '$SHA' --team '$TEAM'"
 ssh "$HOST" "rm -f -- '$REMOTE/ZagStore-Signed.ipa' '$REMOTE/zag-personal-ota.py' && rmdir -- '$REMOTE'"
 rm -f -- "$REPORT"
 ```
 
-The delivery cleanup validates the job, SHA-256 and mapped app identifier before removing its private files. Delete the local exported copy according to the experiment's retention policy. Remove the test app manually if desired, preserving the original.
+The delivery cleanup validates the job, SHA-256 and exact mapped app identifier for the supplied team before removing its private files. Delete the local exported copy according to the experiment's retention policy. Remove the test app manually if desired, preserving the original.
 
 ## Beyond Phase 1
 

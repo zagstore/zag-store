@@ -18,7 +18,8 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlsplit, urlencode
 
 APPLE_ROOT = "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
-ORIGINAL = "com.cwd43.gu29"
+ORIGINAL = "app.zagstore.ios"
+APPTESTERS_BUNDLE = "com.cwd43.gu29"
 PREVIEW = "preview.zagstore.app"
 DELIVERY = Path("/var/www/zagstore-preview/zag-ota-jobs")
 SERVICES = Path("/opt/zagstore/signing-engine/services")
@@ -59,12 +60,18 @@ def main_bundle(archive):
     return PurePosixPath(names[0].filename).parent, metadata
 
 
-def verify_identity(metadata, team):
+def mapped_bundle(team):
     require(TEAM.fullmatch(team), "Invalid expected team")
+    return ORIGINAL + "." + team
+
+
+def verify_identity(metadata, team):
+    expected = mapped_bundle(team)
     identifier = metadata.get("CFBundleIdentifier")
     # Match ZagBundleIdentifierMapping. The installed AppTesters identifier
     # and all alternative identifiers are refused here.
-    require(identifier == ORIGINAL + "." + team, "IPA is not the distinct mapped Zag Store app")
+    require(identifier != APPTESTERS_BUNDLE, "Refusing the existing AppTesters bundle identifier")
+    require(identifier == expected, "IPA is not the distinct mapped Zag Store app")
     build = metadata.get("CFBundleVersion")
     require(isinstance(build, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", build), "Invalid signed build")
     return identifier, build
@@ -228,7 +235,8 @@ def publish(args):
     return result
 
 
-def cleanup(job, expected_sha):
+def cleanup(job, expected_sha, team):
+    expected_bundle = mapped_bundle(team)
     require(os.geteuid() == 0 and JOB.fullmatch(job) and SHA.fullmatch(expected_sha), "Invalid cleanup request")
     require(DELIVERY.is_dir() and not DELIVERY.is_symlink(), "Invalid preview delivery directory")
     sys.path.insert(0, str(SERVICES))
@@ -238,7 +246,7 @@ def cleanup(job, expected_sha):
         require(record_path.is_file() and not record_path.is_symlink(), "Delivery record unavailable")
         record = json.loads(record_path.read_text())
         require(record["job_id"] == job and record["sha256"] == expected_sha
-                and re.fullmatch(re.escape(ORIGINAL) + r"\.[A-Z0-9]{10}", record["bundle_id"]),
+                and record["bundle_id"] == expected_bundle,
                 "Delivery record does not match the experiment")
         for suffix in (".json", ".plist", ".signed.ipa"):
             (DELIVERY / (job + suffix)).unlink(missing_ok=True)
@@ -266,6 +274,7 @@ def main():
     clean = modes.add_parser("cleanup")
     clean.add_argument("--job", required=True)
     clean.add_argument("--sha256", required=True)
+    clean.add_argument("--team", required=True)
     args = cli.parse_args()
     try:
         if args.mode == "validate":
@@ -273,7 +282,7 @@ def main():
         elif args.mode == "publish":
             result = publish(args)
         else:
-            result = cleanup(args.job, args.sha256)
+            result = cleanup(args.job, args.sha256, args.team)
         print(json.dumps(result))
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(f"OTA preflight stopped: {type(error).__name__}: {error}", file=sys.stderr)
