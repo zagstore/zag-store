@@ -256,7 +256,7 @@ struct LibraryCellView: View {
 			Button("Choose Apple ID") { _signSeparateCopy() }
 			Button("Cancel", role: .cancel) {}
 		} message: {
-			Text("The new Apple ID signs a separate copy with different identifiers. The current app stays installed. Its app data and App Group access will stay with the original copy.")
+			Text("The new Apple ID signs a separate copy with different identifiers. The original stays installed. App data, App Groups and Keychain access may not carry over. iOS may require a free installation slot.")
 		}
 		.alert(.localized("Delete Stored Copy?"), isPresented: $isDeleteConfirmationPresented) {
 			Button(.localized("Delete"), role: .destructive) {
@@ -568,8 +568,7 @@ extension LibraryCellView {
 			defer { jobs.finish(_jobKey) }
 			do {
 				let account = try await ZagAppleIDSigningSelection.resolve(exclude: owner.scope.accountID)
-				_ = try await ZagNativeAccountInstall.signSeparateCopy(entry, using: account, job: _jobKey,
-					options: OptionsManager.shared.appleIDSigningDefaults)
+				_ = try await ZagNativeAccountInstall.signSeparateCopy(entry, using: account, job: _jobKey)
 			} catch is ZagInstallCancelled {
 			} catch { ZagNativeAccountInstall.showInlineFailure(error) }
 		}
@@ -594,7 +593,8 @@ extension LibraryCellView {
 				}
 			} catch is ZagInstallCancelled {
 			} catch {
-				ZagNativeAccountInstall.showInlineFailure(error, fallback: installSaved ? .installation : _isNativeAccountApp ? .refresh : .signing) { selectedSigningAppPresenting = AnyApp(base: app) }
+				ZagNativeAccountInstall.showInlineFailure(error, fallback: installSaved ? .installation : _isNativeAccountApp ? .refresh : .signing,
+					retry: { _startNative(installSaved: installSaved) }) { selectedSigningAppPresenting = AnyApp(base: app) }
 			}
 		}
 		#else

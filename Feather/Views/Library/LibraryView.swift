@@ -1362,6 +1362,7 @@ extension LibraryView {
 							_managedInstalledBundleIDsData = encoded
 						}
 						_updateRepositoryUpdates()
+						ZagAppleIDExpirationNotifications.shared.reconcile()
 						#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 						if !_checkedNativeReconciliation, ZagNativeAccountInstall.hasSession, !_importedApps.isEmpty {
 							_checkedNativeReconciliation = true

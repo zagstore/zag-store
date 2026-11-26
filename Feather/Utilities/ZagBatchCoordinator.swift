@@ -46,7 +46,7 @@ final class ZagBatchCoordinator: ObservableObject {
 		total = 0
 		defer { reservation.finish() }
 
-		let report = await Self.$allowsForegroundInteraction.withValue(origin != .shortcut) {
+		let report = await Self.$allowsForegroundInteraction.withValue(origin != .shortcut && origin != .automatic) {
 			await execute(operation, origin: origin)
 		}
 		if !report.diagnostics.isEmpty {
@@ -67,11 +67,14 @@ final class ZagBatchCoordinator: ObservableObject {
 	}
 
 	private func execute(_ operation: ZagBatchOperation, origin: ZagBatchOrigin) async -> Report {
+		if origin == .automatic, ZagNetworkPath.shared.summary == "Offline" {
+			return .attention(operation, "The network is unavailable.")
+		}
 		guard ZagRPPairingCore.shared.hasSavedPairing else {
 			return .attention(operation, "Set up installation pairing in Zag Store and try again.")
 		}
 		var remainingChecks = 60
-		while origin != .inApp, ZagRPPairingCore.shared.isTransportBusy, remainingChecks > 0, !isCancelled {
+		while origin != .inApp, origin != .automatic, ZagRPPairingCore.shared.isTransportBusy, remainingChecks > 0, !isCancelled {
 			try? await Task.sleep(for: .milliseconds(250))
 			remainingChecks -= 1
 		}
@@ -81,11 +84,11 @@ final class ZagBatchCoordinator: ObservableObject {
 			case .refresh:
 				let request = Signed.fetchRequest()
 				request.sortDescriptors = [NSSortDescriptor(keyPath: \Signed.date, ascending: false)]
-				let items = refreshItems(try Storage.shared.context.fetch(request))
+				let items = refreshItems(try Storage.shared.context.fetch(request), automatic: origin == .automatic)
 				guard !items.isEmpty else {
 					return .init(title: operation.title, message: "No eligible apps to refresh.", needsAttention: false)
 				}
-				return await refresh(items)
+				return await refresh(items, automatic: origin == .automatic)
 			case .update:
 				return try await update(origin: origin)
 			}
@@ -484,24 +487,41 @@ final class ZagBatchCoordinator: ObservableObject {
 		var errorDescription: String? { reason }
 	}
 
-	private func refreshItems(_ rows: [Signed]) -> [RefreshItem] {
+	private func refreshItems(_ rows: [Signed], automatic: Bool = false) -> [RefreshItem] {
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		let data = UserDefaults.standard.data(forKey: "zagStore.managedInstalledBundleIDs") ?? Data()
 		let installed = (try? JSONDecoder().decode(Set<String>.self, from: data)) ?? []
 		var seen: Set<String> = []
-		_certificateRefreshCache.update(records: Storage.shared.getAllCertificates())
+		if !automatic { _certificateRefreshCache.update(records: Storage.shared.getAllCertificates()) }
+		let now = Date()
 		return rows.compactMap { row in
-			guard let id = row.identifier, id != Bundle.main.bundleIdentifier, installed.contains(id),
-				  !ZagUpdateTransactionManager.shared.isPendingInstallationSigned(uuid: row.uuid),
-				  ZagNativeAppInventory.entry(row)?.pendingInstall == nil, seen.insert(id).inserted else { return nil }
+			guard let id = row.identifier, !ZagUpdateTransactionManager.shared.isPendingInstallationSigned(uuid: row.uuid)
+			else { return nil }
+			let selfApp = id == Bundle.main.bundleIdentifier
+			guard selfApp || installed.contains(id) else { return nil }
+			let entry = ZagNativeAppInventory.entry(row)
+			guard entry?.pendingInstall == nil, seen.insert(id).inserted else { return nil }
 			let eligibility = Result<RefreshMethod, RefreshSkip> { () throws(RefreshSkip) -> RefreshMethod in
 				guard ZagRPPairingCore.shared.hasSavedPairing else { throw RefreshSkip("Installation pairing is unavailable.") }
-				if let entry = ZagNativeAppInventory.entry(row) {
-					guard let scope = entry.installation.record.owner?.scope else { throw RefreshSkip("Signing ownership is unavailable.") }
+				if let entry {
+					let record = entry.installation.record
+					guard let owner = record.owner else { throw RefreshSkip("Signing ownership is unavailable.") }
+					if automatic || selfApp {
+						guard record.bundleIdentifier == id, record.expiryVerified == true, owner.teamKind == .personalFree,
+							  entry.installation.executableIdentity != nil else { throw RefreshSkip("Verified signing evidence is unavailable.") }
+					}
+					if automatic {
+						let retryAt = record.lastFailure.map {
+							ZagAppleIDMaintenancePolicy.retry(at: $0.at, afterAttempts: record.consecutiveFailures, transient: !$0.reason.needsUser)
+						}
+						guard ZagAppleIDMaintenancePolicy.isDue(expiry: record.expiresAt, now: now,
+							attempts: record.consecutiveFailures, retryAt: retryAt, lastSuccess: record.lastSuccessfulRefresh),
+							ZagNativeAccountInstall.hasConnectedAccount(owner.scope.accountID) else { throw RefreshSkip("Not due for automatic refresh.") }
+					}
 					guard entry.installation.executableIdentity != nil || ZagNativeAppInventory.hasSource(entry) else { throw RefreshSkip("Import its original IPA to restore signing evidence.") }
-					return .appleID(scope)
+					return .appleID(owner.scope)
 				}
-				guard let plan = _certificateRefreshCache.plan(row) else { throw RefreshSkip("No compatible later profile is available.") }
+				guard !automatic, !selfApp, let plan = _certificateRefreshCache.plan(row) else { throw RefreshSkip("No compatible later profile is available.") }
 				return .certificate(plan)
 			}
 			if case .failure = eligibility { return nil }
@@ -514,7 +534,7 @@ final class ZagBatchCoordinator: ObservableObject {
 
 	func refreshEligibleCount(_ rows: [Signed]) -> Int { refreshItems(rows).count }
 
-	private func refresh(_ items: [RefreshItem]) async -> Report {
+	private func refresh(_ items: [RefreshItem], automatic: Bool) async -> Report {
 		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 		guard ZagNativeAccountInstall.RefreshCoordinator.beginBatch() else { return .busy(.refresh) }
 		total = items.count
@@ -546,6 +566,7 @@ final class ZagBatchCoordinator: ObservableObject {
 						self.refreshJobs.remove(job)
 					}
 					let report = reports[index]
+					let original = automatic ? ZagNativeAppInventory.entry(item.app) : nil
 					return await ZagSigningDiagnostics.current.withValue(report) {
 						do {
 							try jobs.checkpoint(job)
@@ -556,7 +577,7 @@ final class ZagBatchCoordinator: ObservableObject {
 								}
 								guard case .verified = try await ZagNativeAccountInstall.runInline(item.app, job: job,
 									options: OptionsManager.shared.appleIDSigningDefaults, renew: true,
-									interactive: false, refreshCoordinator: coordinator) else {
+									interactive: false, refreshCoordinator: coordinator, profileOnly: automatic) else {
 									throw ZagNativeAppInventory.Failure.unverified
 								}
 							case .certificate(let plan): try await plan.renew(job: job)
@@ -570,6 +591,10 @@ final class ZagBatchCoordinator: ObservableObject {
 							return .skipped(skip.reason)
 						} catch {
 							ZagSigningDiagnostics.recordFailure(.refresh, error)
+							if let original {
+								ZagNativeAppInventory.recordAutomaticFailure(original,
+									reason: ZagNativeAccountInstall.automaticFailureReason(error))
+							}
 							return .failed(error.localizedDescription)
 						}
 					}
@@ -577,6 +602,9 @@ final class ZagBatchCoordinator: ObservableObject {
 			}
 			var diagnostics = ["Refresh All wall time: \(started.duration(to: .now))"]
 			diagnostics += reports.map(\.report).filter { !$0.isEmpty }
+			if automatic, results.contains(.refreshed) {
+				UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: ZagAppleIDMaintenancePolicy.lastSuccessKey)
+			}
 			let summary = ZagNativeSigningPipeline.RefreshSummary(results, cancelled: isCancelled)
 			for (item, result) in zip(items, results) {
 				switch result {

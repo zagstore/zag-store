@@ -208,6 +208,11 @@ check(ZagDeveloperServicesProtocol.fault(body: faultPlist(9999, "Identifier is n
 check(ZagDeveloperServicesProtocol.fault(body: Data("x".utf8), httpStatus: 200)?.classification == .malformed, "non-plist 2xx -> malformed")
 check(ZagDeveloperServicesProtocol.fault(body: Data(), httpStatus: 500)?.classification == .network, "HTTP 500 -> network")
 check(ZagDeveloperServicesProtocol.sanitizeMessage(String(repeating: "a", count: 300)).count <= 161, "message is length-bounded")
+let redactedCredentials = ZagDeveloperServicesProtocol.sanitizeMessage(
+	"verification code: 126421 x-apple-gs-token: secret123 x-apple-i-md-m: adi123 private key: material123")
+check(!["126421", "secret123", "adi123", "material123"].contains(where: redactedCredentials.contains),
+	  "credential labels and anisette headers are redacted even when values are short")
+
 // Classifier audit: resultCode 4 must no longer throw rateLimited.
 throws_(.malformedResponse, { try ZagDeveloperServicesProtocol.throwIfError(["resultCode": 4]) }, "throwIfError no longer maps 4 -> rateLimited")
 

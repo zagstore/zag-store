@@ -7,6 +7,12 @@ struct ZagAppleSigningSettingsView: View {
 	@ObservedObject private var pairing = ZagRPPairingCore.shared
 	@State private var catalog = ZagNativeAppleIDCatalog()
 	@State private var failure: String?
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	@State private var deviceCount: Int?
+	@State private var checkingDevice = false
+	@State private var checkingSelf = false
+	@State private var selfInventoryRevision = 0
+	#endif
 
 	var body: some View {
 		List {
@@ -29,13 +35,61 @@ struct ZagAppleSigningSettingsView: View {
 					Label(pairing.hasSavedPairing ? "Installation pairing saved" : "Set up installation pairing",
 						  systemImage: pairing.hasSavedPairing ? "checkmark.circle.fill" : "iphone")
 				}
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				Section {
+					let _ = selfInventoryRevision
+					let receipt = Bundle.main.bundleIdentifier.flatMap { ZagNativeAppInventory.entry(bundleIdentifier: $0) }
+					let expiry = receipt.flatMap { entry -> Date? in
+						let identity = entry.installation.executableIdentity
+						guard entry.pendingInstall == nil, entry.installation.record.expiryVerified == true,
+							  identity?.version == Bundle.main.version,
+							  identity?.build == Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else { return nil }
+						return entry.installation.record.expiresAt
+					}
+					LabeledContent("Verified expiration", value: expiry?.formatted() ?? "Unknown")
+					Button(checkingSelf ? "Verifying" : "Verify This Installation") {
+						checkingSelf = true
+						Task {
+							defer { checkingSelf = false; selfInventoryRevision += 1 }
+							do { try await ZagNativeAccountInstall.verifyRunningInstallation() }
+							catch { failure = "Zag Store could not verify this installation. Check pairing and sign in with the original Apple ID." }
+						}
+					}
+					.disabled(checkingSelf || !pairing.hasSavedPairing)
+				} header: {
+					Text("Zag Store Renewal")
+				} footer: {
+					Text("Verified Personal Team installations can renew through Refresh All. If Zag Store has expired, use the original signer and bundle identifier to recover access. A different signing identity may affect local data and Keychain access.")
+				}
+				Section {
+					LabeledContent("Verified free-profile apps", value: deviceCount.map(String.init) ?? "Unknown")
+					LabeledContent("Installation capacity", value: "Unknown")
+					LabeledContent("Available slots", value: "Unknown")
+					Button(checkingDevice ? "Checking" : "Check Device") {
+						checkingDevice = true
+						Task {
+							defer { checkingDevice = false }
+							do { deviceCount = try await ZagAppleIDCapacity.synchronizeDevice() }
+							catch { deviceCount = nil; failure = "Check installation pairing and the device connection, then try again." }
+						}
+					}
+					.disabled(checkingDevice || !pairing.hasSavedPairing)
+				} header: {
+					Text("Device Capacity")
+				} footer: {
+					Text("This count covers apps Zag Store can verify. iOS decides whether another app can be installed.")
+				}
+				#endif
 			} else {
 				Label("Apple ID signing requires an iPhone build with the native engine.", systemImage: "info.circle")
 			}
 		}
-		.navigationTitle("Apple IDs & Signing")
+		.navigationTitle("Apple IDs")
 		.tint(Color(hex: themeColorHex))
 		.onAppear { reload() }
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		.onReceive(ZagNativeAppInventory.changes) { _ in selfInventoryRevision += 1; deviceCount = nil }
+		#endif
 		.alert("Apple ID", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
 			Button("OK", role: .cancel) {}
 		} message: { Text(failure ?? "") }
@@ -89,7 +143,7 @@ private struct ZagAppleIDAccountDetail: View {
 						catch { failure = error.localizedDescription }
 					}
 				}
-				NavigationLink("Authentication") {
+				NavigationLink(ZagNativeAppleIDs.shared.connectedToken(account.id) == nil ? "Sign In Again" : "Authentication") {
 					ZagAppleIDAuthenticationView(account: catalog.accounts.first(where: { $0.id == account.id }) ?? account)
 						.onDisappear { reload() }
 				}
@@ -107,6 +161,9 @@ private struct ZagAppleIDAccountDetail: View {
 						}
 					}
 				}
+				ForEach(current.teams, id: \.identifier) { team in
+					ZagAppleIDTeamCapacity(account: account.id, team: team)
+				}
 			}
 			#endif
 			Section {
@@ -118,7 +175,11 @@ private struct ZagAppleIDAccountDetail: View {
 		.onAppear { reload() }
 		.alert("Sign Out?", isPresented: $confirmingSignOut) {
 			Button("Sign Out", role: .destructive) {
-				do { try ZagNativeAppleIDs.shared.signOut(account.id); dismiss() }
+				do {
+					try ZagNativeAppleIDs.shared.signOut(account.id)
+					ZagAppleIDExpirationNotifications.shared.reconcile()
+					dismiss()
+				}
 				catch { failure = error.localizedDescription }
 			}
 			Button("Cancel", role: .cancel) {}
@@ -131,6 +192,58 @@ private struct ZagAppleIDAccountDetail: View {
 		catch { failure = error.localizedDescription }
 	}
 }
+
+#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+private struct ZagAppleIDTeamCapacity: View {
+	let account: UUID
+	let team: ZagDeveloperTeam
+	@State private var snapshot: ZagAppleIDCapacity.TeamSnapshot?
+	@State private var syncing = false
+	@State private var failure: String?
+
+	private var scope: ZagSigningScope { .init(accountID: account, teamID: team.identifier) }
+
+	var body: some View {
+		Section {
+			if let snapshot {
+				LabeledContent("Registered App IDs", value: String(snapshot.activeAppIDCount))
+				if team.kind == .personalFree, let capacity = ZagTeamLimits.free.appIDs {
+					LabeledContent("App ID capacity", value: String(capacity))
+					ProgressView(value: Double(min(snapshot.activeAppIDCount, capacity)), total: Double(capacity))
+						.accessibilityLabel("App ID capacity used")
+				} else {
+					LabeledContent("App ID capacity", value: "Unknown")
+				}
+				LabeledContent("Next App ID expiry", value: snapshot.nextAppIDExpiry?.formatted() ?? "Unknown")
+				LabeledContent("Registered devices", value: String(snapshot.deviceCount))
+				LabeledContent("Development certificates", value: String(snapshot.certificateExpirations.count))
+				ForEach(Array(snapshot.certificateExpirations.enumerated()), id: \.offset) { _, expiry in
+					LabeledContent("Certificate expiry", value: expiry.formatted())
+				}
+				LabeledContent("Last synchronized", value: snapshot.synchronizedAt.formatted())
+			} else {
+				LabeledContent("Developer inventory", value: "Unknown")
+			}
+			LabeledContent("Associated apps", value: String(
+				ZagNativeAppInventory.verifiedInstalledEntries().filter { $0.installation.record.owner?.scope == scope }.count))
+			Button(syncing ? "Synchronizing" : "Refresh Capacity") {
+				syncing = true
+				Task {
+					defer { syncing = false }
+					do { snapshot = try await ZagAppleIDCapacity.synchronize(scope); failure = nil }
+					catch { failure = (error as? ZagPortalOperationFailure)?.underlying == .sessionRejected
+						? "Sign in again to refresh this team." : "Couldn’t refresh this team. Try again later." }
+				}
+			}
+			.disabled(syncing)
+			if let failure { Text(failure).font(.footnote).foregroundStyle(.secondary) }
+		} header: {
+			Text("\(team.name) Capacity")
+		}
+		.onAppear { snapshot = ZagAppleIDCapacity.cached(scope) }
+	}
+}
+#endif
 
 struct ZagAppleIDAuthenticationView: View {
 	@StateObject private var model: ZagNativeSignInModel
@@ -204,7 +317,10 @@ enum ZagAppleIDSigningSelection {
 		guard interactive, let presenter = await availablePresenter() else {
 			throw ZagNativeAppleIDs.Failure.unavailable
 		}
-		let available = catalog.accounts.filter { $0.id != exclude }
+		let available = catalog.accounts.filter {
+			$0.id != exclude && (exclude == nil || directory.connectedToken($0.id) != nil)
+		}
+		guard exclude == nil || !available.isEmpty else { throw ZagNativeAppleIDs.Failure.unavailable }
 		let account = try required.map { try directory.accountForAuthentication($0) }
 		return try await withCheckedThrowingContinuation { continuation in
 			var finished = false
@@ -271,8 +387,10 @@ private struct ZagAppleIDSelectionView: View {
 								}
 							}
 						}
-						NavigationLink("Add Apple ID") {
-							ZagAppleIDAuthenticationView(account: nil, onAuthenticated: finish)
+						if !forceChoice {
+							NavigationLink("Add Apple ID") {
+								ZagAppleIDAuthenticationView(account: nil, onAuthenticated: finish)
+							}
 						}
 					}
 					.navigationTitle("Choose Apple ID")

@@ -1095,7 +1095,7 @@ final class ZagRPPairingCore: ObservableObject {
 			intentIdentifiers: [],
 			options: []
 		)
-		UNUserNotificationCenter.current().setNotificationCategories([category])
+		ZagAppleIDExpirationNotifications.shared.registerCategory(category)
 		advertiser.stop()
 		beginPairingBackgroundTime()
 		state = .starting

@@ -21,7 +21,7 @@ final class ZagSigningDiagnostics: @unchecked Sendable {
 	func record(_ event: String) {
 		lock.lock()
 		defer { lock.unlock() }
-		lines.append(event)
+		lines.append(ZagDeveloperServicesProtocol.sanitizeMessage(event, limit: 1_000))
 		if lines.count > 100 { lines.removeFirst() }
 		defaults.set(lines.joined(separator: "\n"), forKey: Self.key)
 	}

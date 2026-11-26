@@ -68,7 +68,10 @@ struct FeatherApp: App {
                 if tunnel == .operational { launch.connectionAvailable() }
             }
             .onChange(of: scenePhase) { phase in
-				if phase == .active { ZagBatchQuickActions.shared.drain() }
+				if phase == .active {
+					ZagBatchQuickActions.shared.drain()
+					ZagAppleIDExpirationNotifications.shared.reconcile()
+				}
 			}
             .onChange(of: launch.policy.canEnterMain) { ready in
 				ZagBatchQuickActions.shared.setMainReady(ready && launch.policy.splashFinished)
@@ -439,6 +442,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 		_createDocumentsDirectories()
 		ResetView.clearWorkCache()
 		_addDefaultCertificates()
+		ZagAppleIDExpirationNotifications.shared.register()
 		ZagBackgroundUpdateRefresh.shared.register()
 		ZagBackgroundUpdateRefresh.shared.applySchedulingPreference()
 		application.isIdleTimerDisabled = UserDefaults.standard.bool(
@@ -546,6 +550,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
 	func applicationDidBecomeActive(_ application: UIApplication) {
 		ZagBatchQuickActions.shared.drain()
+		ZagAppleIDExpirationNotifications.shared.reconcile()
 		if ZagRPPairingCore.shared.isRunning {
 			ZagRPPairingCore.shared.refreshPairingBackgroundTime()
 		}
@@ -568,6 +573,11 @@ final class ZagBackgroundUpdateRefresh {
 
 	private init() {}
 
+	private var schedulingEnabled: Bool {
+		UserDefaults.standard.bool(forKey: Self.enabledKey) ||
+		UserDefaults.standard.bool(forKey: ZagAppleIDMaintenancePolicy.automaticKey)
+	}
+
 	func register() {
 		BGTaskScheduler.shared.register(
 			forTaskWithIdentifier: taskIdentifier,
@@ -582,7 +592,7 @@ final class ZagBackgroundUpdateRefresh {
 	}
 
 	func applySchedulingPreference() {
-		if UserDefaults.standard.bool(forKey: Self.enabledKey) {
+		if schedulingEnabled {
 			schedule()
 		} else {
 			cancel()
@@ -597,7 +607,7 @@ final class ZagBackgroundUpdateRefresh {
 	}
 
 	func schedule() {
-		guard UserDefaults.standard.bool(forKey: Self.enabledKey) else {
+		guard schedulingEnabled else {
 			cancel()
 			return
 		}
@@ -637,8 +647,19 @@ final class ZagBackgroundUpdateRefresh {
 		}
 
 		let work = Task {
-			let success = await refreshRepositoriesAndUpdates()
-			completion.complete(success: success && !Task.isCancelled)
+			let defaults = UserDefaults.standard
+			var refreshSucceeded = true
+			if defaults.bool(forKey: ZagAppleIDMaintenancePolicy.automaticKey), !Task.isCancelled {
+				let result = await ZagBatchCoordinator.shared.run(.refresh, origin: .automatic)
+				refreshSucceeded = !result.needsAttention
+			}
+			let success: Bool
+			if defaults.bool(forKey: Self.enabledKey), !Task.isCancelled {
+				success = await refreshRepositoriesAndUpdates()
+			} else {
+				success = true
+			}
+			completion.complete(success: success && refreshSucceeded && !Task.isCancelled)
 		}
 
 		task.expirationHandler = {

@@ -6,17 +6,18 @@ import UIKit
 @MainActor
 enum ZagNativeAccountInstall {
 	enum Failure: LocalizedError, Equatable {
-		case busy, signIn, personalTeam, pairing, invalidApp
+		case busy, signIn, personalTeam, pairing, invalidApp, separateCopyConflict
 		case unsupportedOptions([String])
 
 		var errorDescription: String? {
 			switch self {
 			case .busy: "An Apple Account installation is already in progress."
-			case .signIn: "Sign in under Settings › Apple Accounts & Signing."
+			case .signIn: "Sign in under Settings › Apple IDs."
 			case .personalTeam: "No active Personal Team was found for this Apple Account."
 			case .pairing: "Pair this iPhone in Settings before signing and installing."
 			case .unsupportedOptions(let changes): "Use Certificate to apply these customisations: \(changes.joined(separator: ", "))."
 			case .invalidApp: "Zag Store could not read the app or one of its extensions."
+			case .separateCopyConflict: "The destination bundle identifier is already in use or could not be verified. Choose a different Apple ID."
 			}
 		}
 	}
@@ -100,9 +101,15 @@ enum ZagNativeAccountInstall {
 	static func portal(token: ZagPersistedDeveloperToken, consent: ZagAccountMutationConsent, maxRequests: Int? = nil) -> ZagNativeDeveloperPortal {
 		let machine = ZagAppleAuthMachine.nativeAccount(accountID: token.nativeAccountID)
 		return ZagNativeDeveloperPortal(transport: ZagNativeDeveloperPortal.transport(), headers: {
-			guard await ZagNativeAppleIDs.shared.connectedToken(token.nativeAccountID) == token,
-				  let headers = await machine.developerHeaders(expectedAccountID: token.accountID),
-				  await ZagNativeAppleIDs.shared.connectedToken(token.nativeAccountID) == token else {
+			guard await ZagNativeAppleIDs.shared.connectedToken(token.nativeAccountID) == token else {
+				throw ZagPortalError.sessionRejected
+			}
+			// Local ADI or protected-data failures do not establish that Apple
+			// rejected the scoped token. Keep it for the next healthy attempt.
+			guard let headers = await machine.developerHeaders(expectedAccountID: token.accountID) else {
+				throw ZagPortalError.network
+			}
+			guard await ZagNativeAppleIDs.shared.connectedToken(token.nativeAccountID) == token else {
 				throw ZagPortalError.sessionRejected
 			}
 			return headers
@@ -301,6 +308,17 @@ enum ZagNativeAccountInstall {
 			guard certificate.serialNumber == owner.certificateSerial else { throw requiresResign("certificate serial mismatch") }
 			guard certificate.organizationalUnit == owner.scope.teamID else { throw requiresResign("certificate team mismatch") }
 			guard certificate.expiresAt > Date() else { throw requiresResign("certificate expired") }
+			if receipt.record.bundleIdentifier == Bundle.main.bundleIdentifier {
+				let components = try await Task.detached(priority: .utility) {
+					try runningComponents(certificate: identity.certificate)
+				}.value
+				guard components.count == receipt.profiles.count, components.allSatisfy({ id, evidence in
+					guard let bytes = receipt.profiles.first(where: { $0.bundleIdentifier == id })?.signedEntitlements,
+						  let signed = try? PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any],
+						  let observed = try? PropertyListSerialization.propertyList(from: evidence, format: nil) as? [String: Any] else { return false }
+					return NSDictionary(dictionary: signed).isEqual(to: observed)
+				}) else { throw requiresResign("running app does not match the signing receipt") }
+			}
 			guard receipt.profiles.allSatisfy({ $0.signedEntitlements != nil }) else { throw requiresResign("missing signed component entitlements") }
 			let jobs = ZagInstallJobs.shared
 			try jobs.checkpoint(job)
@@ -498,8 +516,10 @@ enum ZagNativeAccountInstall {
 				: ZagBundleIdentifierMapping.mappedExtension(id, appOriginal: main.originalBundleIdentifier, team: scope.teamID)
 		})
 		let mappedMain = ZagBundleIdentifierMapping.mapped(main.originalBundleIdentifier, team: scope.teamID)
-		if let forbiddenInstalledIdentifier, forbiddenInstalledIdentifier == mappedMain {
-			throw ZagNativeSigningPipeline.Failure.changedIdentity
+		if let forbiddenInstalledIdentifier {
+			guard let mappedMain, forbiddenInstalledIdentifier != mappedMain,
+				  installed[mappedMain] == nil, ZagNativeAppInventory.entry(bundleIdentifier: mappedMain) == nil
+			else { throw Failure.separateCopyConflict }
 		}
 		if let requiredInstalledIdentifier, requiredInstalledIdentifier != mappedMain {
 			throw ZagNativeSigningPipeline.Failure.changedIdentity
@@ -676,6 +696,102 @@ enum ZagNativeAccountInstall {
 		}
 	}
 
+	enum SelfRenewalFailure: LocalizedError {
+		case ownership
+		var errorDescription: String? {
+			"Zag Store could not verify a Personal Team signing identity for this installation."
+		}
+	}
+
+	nonisolated private static func runningComponents(certificate: Data) throws -> [String: Data] {
+		let root = Bundle.main.bundleURL
+		let components = [root] + ZagFreeAccountSigningAdapter.nestedBundles(in: root).map { root.appendingPathComponent($0) }
+		var evidence: [String: Data] = [:]
+		for component in components {
+			guard let bundle = Bundle(url: component), let id = bundle.bundleIdentifier,
+				  evidence[id] == nil, let executable = bundle.executableURL,
+				  let binary = try? Data(contentsOf: executable, options: .mappedIfSafe),
+				  ZagCodeSignatureInspection.matchesSigner(certificate, in: binary) else {
+				throw SelfRenewalFailure.ownership
+			}
+			evidence[id] = try ZagEntitlementSet(ZagMachOSignatureInspector.entitlements(at: executable)).data
+		}
+		return evidence
+	}
+
+	static func verifyRunningInstallation() async throws {
+		try await withExclusiveOperation {
+			guard let identifier = Bundle.main.bundleIdentifier,
+				  let executable = Bundle.main.executableURL else { throw SelfRenewalFailure.ownership }
+			let original = ZagNativeAppInventory.entry(bundleIdentifier: identifier)
+			if let original { try RefreshCoordinator.reserve(original.uuid) }
+			defer { if let original { RefreshCoordinator.release(original.uuid) } }
+			let signer = try await Task.detached(priority: .utility) {
+				let data = try Data(contentsOf: executable, options: .mappedIfSafe)
+				guard let signers = ZagCodeSignatureInspection.signerCertificates(in: data),
+					  let signer = signers.first, signers.allSatisfy({ $0 == signer }) else {
+					throw SelfRenewalFailure.ownership
+				}
+				return signer
+			}.value
+			guard let cert = ZagCertificateInspection(der: signer), let teamID = cert.organizationalUnit,
+				  cert.expiresAt > .now else { throw SelfRenewalFailure.ownership }
+			let accounts = try ZagNativeAppleIDs.shared.catalog().accounts
+			let candidates = accounts.compactMap { account -> ZagSigningScope? in
+				guard account.teams.contains(where: { $0.identifier == teamID && $0.kind == .personalFree }),
+					  hasConnectedAccount(account.id),
+					  let data = try? secrets.load(.signingPrivateKey, account: account.id, team: teamID),
+					  let identity = try? JSONDecoder().decode(ZagSigningIdentity.self, from: data),
+					  identity.certificate == signer else { return nil }
+				return .init(accountID: account.id, teamID: teamID)
+			}
+			guard candidates.count == 1, let scope = candidates.first else { throw SelfRenewalFailure.ownership }
+			let pairing = ZagRPPairingCore.shared
+			let (device, installed) = try await pairing.signingDeviceInventory()
+			guard let app = installed[identifier], app.version == Bundle.main.version,
+				  app.build == Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+				  cert.commonName == app.signerIdentity else { throw SelfRenewalFailure.ownership }
+			let readback = try await ZagRPPairingFreeAccountInstaller.readProfiles().get()
+			let verified = try await Task.detached(priority: .utility) {
+				let evidence = try runningComponents(certificate: signer)
+				let indexed = readback.compactMap { bytes -> (String, Data)? in
+					guard let profile = try? ZagIssuedProfile(profileData: bytes),
+						  profile.teamIdentifier == teamID else { return nil }
+					return (profile.bundleIdentifier, bytes)
+				}
+				var components: [ZagNativeInstalledProfiles.Component] = []
+				var main: ZagIssuedProfile?
+				for (id, entitlements) in evidence {
+					var component = ZagNativeInstalledProfiles.Component(originalBundleIdentifier: id,
+						bundleIdentifier: id, uuid: "", expiresAt: .distantPast, signedEntitlements: entitlements)
+					let matches = indexed.filter { $0.0 == id }.compactMap {
+						try? ZagProfileOnlyRenewal.validate($0.1, component: component, team: teamID,
+							certificate: signer, udid: device.udid)
+					}
+					guard let profile = matches.max(by: { $0.expiresAt < $1.expiresAt }) else { throw SelfRenewalFailure.ownership }
+					if id == identifier { main = profile }
+					component.uuid = profile.uuid
+					component.expiresAt = profile.expiresAt
+					components.append(component)
+				}
+				guard let main, let expiry = components.map(\.expiresAt).min() else { throw SelfRenewalFailure.ownership }
+				let record = ZagSignedAppRecord(bundleIdentifier: identifier, originalBundleIdentifier: identifier,
+					signedAt: main.createdAt, profileExpiresAt: expiry, certificateExpiresAt: cert.expiresAt,
+					owner: .init(scope: scope, teamKind: .personalFree, certificateSerial: cert.serialNumber, profileUUID: main.uuid),
+					expiryVerified: true)
+				return ZagNativeInstalledProfiles(record: record, profiles: components,
+					executableIdentity: .init(certificate: signer, version: app.version, build: app.build))
+			}.value
+			guard pairing.pairedIdentity == device, hasConnectedAccount(scope.accountID) else { throw SelfRenewalFailure.ownership }
+			let previous = ZagNativeAppInventory.entry(bundleIdentifier: identifier)
+			guard previous?.uuid == original?.uuid, previous?.installation == original?.installation,
+				  previous == nil || (previous?.pendingInstall == nil && previous?.installation.record.owner?.scope == scope)
+			else { throw SelfRenewalFailure.ownership }
+			try await ZagNativeAppInventory.save(verified, source: Bundle.main.bundleURL, name: "Zag Store",
+				renewing: previous, retainSource: false)
+		}
+	}
+
 	private static func reconcileProfiles(source: URL, original: String, mapped: String, scope: ZagSigningScope,
 		auth: ZagSigningAuthorization, identity: ZagSigningIdentity, cache: ProfileCache, installed: [Data]) throws -> ZagNativeInstalledProfiles? {
 		var identifiers = [(original, mapped)]
@@ -732,7 +848,7 @@ extension ZagInstallJobs {
 extension ZagNativeAccountInstall {
 	static func runInline(_ app: AppInfoPresentable, job: String, options: ZagAppleIDSigningOptions, renew: Bool = false,
 		requiredInstalledIdentifier: String? = nil, requiredScope: ZagSigningScope? = nil,
-		interactive: Bool = true, refreshCoordinator: RefreshCoordinator? = nil,
+		interactive: Bool = true, refreshCoordinator: RefreshCoordinator? = nil, profileOnly: Bool = false,
 		onSaved: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ZagInstallVerification {
 		let entry = ZagNativeAppInventory.entry(app)
 		if renew {
@@ -750,6 +866,10 @@ extension ZagNativeAccountInstall {
 				}
 			} catch where (error as? ZagProfileOnlyRenewal.Failure) == .needsResign
 				|| error.localizedDescription.localizedCaseInsensitiveContains("misagent over RSD failed: service not found") {
+				if !ZagAppleIDMaintenancePolicy.allowsFullResign(profileOnly: profileOnly,
+					target: entry.installation.record.bundleIdentifier, runningApp: Bundle.main.bundleIdentifier) {
+					throw ZagProfileOnlyRenewal.Failure.needsResign
+				}
 				ZagSigningDiagnostics.record("Renewal strategy: full re-sign fallback")
 				if (error as? ZagProfileOnlyRenewal.Failure) != .needsResign {
 					ZagSigningDiagnostics.record("Fallback reason: misagent service unavailable")
@@ -778,14 +898,34 @@ extension ZagNativeAccountInstall {
 			requiredScope: requiredScope, interactive: interactive, onSaved: onSaved)
 	}
 
-	static func signSeparateCopy(_ entry: ZagNativeAppInventory.Entry, using accountID: UUID, job: String,
-		options: ZagAppleIDSigningOptions) async throws -> ZagInstallVerification {
+	static func automaticFailureReason(_ error: Error) -> ZagRefreshFailureReason {
+		let underlying = (error as? ZagStagedSigningFailure)?.underlying ?? error
+		if let portal = (underlying as? ZagPortalOperationFailure)?.underlying ?? (underlying as? ZagPortalError) {
+			switch portal {
+			case .network, .rateLimited: return .network
+			case .sessionRejected: return .signedOut
+			default: return .manualRecovery
+			}
+		}
+		if (underlying as? Failure) == .signIn || underlying is ZagNativeAppleIDs.Failure { return .signedOut }
+		if (underlying as? ZagProfileOnlyRenewal.Failure) == .readback { return .deviceUnreachable }
+		if let network = underlying as? URLError {
+			return [.timedOut, .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost,
+					.cannotFindHost, .dnsLookupFailed].contains(network.code) ? .network : .manualRecovery
+		}
+		if let transport = underlying as? ZagTransportError, transport == .offline || transport == .timedOut { return .network }
+		let detail = underlying.localizedDescription.lowercased()
+		return ["broken pipe", "channel closed", "connection reset", "timed out", "already running", "socket io failed"]
+			.contains { detail.contains($0) } ? .deviceUnreachable : .manualRecovery
+	}
+
+	static func signSeparateCopy(_ entry: ZagNativeAppInventory.Entry, using accountID: UUID, job: String) async throws -> ZagInstallVerification {
 		guard let owner = entry.installation.record.owner, owner.scope.accountID != accountID else {
 			throw ZagNativeAppleIDs.Failure.wrongAccount
 		}
 		return try await ZagNativeAppInventory.withSource(entry) { source in
 			try await runInlineSource(source, name: entry.name, accountID: accountID, job: job,
-				installAfterSigning: options.installAfterSigning, forbiddenInstalledIdentifier: entry.installation.record.bundleIdentifier)
+				installAfterSigning: true, forbiddenInstalledIdentifier: entry.installation.record.bundleIdentifier)
 		}
 	}
 
@@ -859,7 +999,8 @@ extension ZagNativeAccountInstall {
 		return fallback
 	}
 
-	static func showInlineFailure(_ error: Error, fallback: ZagSigningFailurePhase = .signing, customise: (() -> Void)? = nil) {
+	static func showInlineFailure(_ error: Error, fallback: ZagSigningFailurePhase = .signing,
+		retry: (() -> Void)? = nil, customise: (() -> Void)? = nil) {
 		let phase = failurePhase(error, fallback: fallback)
 		let limit = ZagFreeAppLimitReached.classify(error)
 		let report = [ZagSigningDiagnostics.latest, ZagSigningDiagnostics.failureDetails(phase, error)].filter { !$0.isEmpty }.joined(separator: "\n")
@@ -874,8 +1015,34 @@ extension ZagNativeAccountInstall {
 		} else if phase == .signing, let customise {
 			actions.append(UIAlertAction(title: "Customise App", style: .default) { _ in customise() })
 		}
+		if limit == nil {
+			let reason = automaticFailureReason(error)
+			if let retry, phase == .authentication || reason == .signedOut {
+				actions.append(UIAlertAction(title: "Sign In Again", style: .default) { _ in retry() })
+			} else if let retry, reason == .network || reason == .deviceUnreachable {
+				actions.append(UIAlertAction(title: "Retry", style: .default) { _ in retry() })
+			}
+			if reason == .deviceUnreachable || (error as? Failure) == .pairing {
+				actions.append(UIAlertAction(title: "Repair Connection", style: .default) { _ in
+					_ = ZagStoreRouter.open(ZagStoreRoute.installation.url)
+				})
+			}
+		}
 		let expiredRefresh = ((error as? ZagStagedSigningFailure)?.underlying ?? error) as? ZagNativeSigningPipeline.Failure
-		let message = expiredRefresh == .expiryNotExtended ? "Apple did not issue a profile with a later expiration." : phase.message
+		let cause = (error as? ZagStagedSigningFailure)?.underlying ?? error
+		let message: String
+		switch cause {
+		case is SelfRenewalFailure:
+			message = "Zag Store could not verify the signing identity of this installation."
+		case ZagProfileOnlyRenewal.Failure.needsResign:
+			message = "This installation needs new signing credentials. Verify its original Apple ID and certificate before trying again."
+		case Failure.separateCopyConflict:
+			message = Failure.separateCopyConflict.localizedDescription
+		case Failure.pairing:
+			message = "Check LocalDevVPN and installation pairing, then try again."
+		default:
+			message = expiredRefresh == .expiryNotExtended ? "Apple did not issue a profile with a later expiration." : phase.message
+		}
 		UIAlertController.showAlert(title: limit == nil ? phase.title : ZagFreeAppLimitReached.title,
 			message: limit == nil ? message : ZagFreeAppLimitReached.message, actions: actions)
 	}

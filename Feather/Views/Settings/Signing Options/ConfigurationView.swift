@@ -13,6 +13,10 @@ struct ConfigurationView: View {
 	@StateObject private var _optionsManager = OptionsManager.shared
 	@State var isRandomAlertPresenting = false
 	@State var randomString = ""
+	@AppStorage(ZagAppleIDMaintenancePolicy.automaticKey) private var automaticRefresh = false
+	@AppStorage(ZagAppleIDMaintenancePolicy.notificationsKey) private var expirationNotifications = false
+	@AppStorage(ZagAppleIDMaintenancePolicy.lastSuccessKey) private var lastAutomaticRefresh = 0.0
+	@State private var notificationPermissionDenied = false
 	@AppStorage("Feather.userTintColor") private var themeColorHex = "#0090FF"
 	
 	// MARK: Body
@@ -21,7 +25,31 @@ struct ConfigurationView: View {
 			if ZagSigningMethodAvailability.freeAccountEnabled {
 				Section {
 					Toggle("Delete Imported App After Signing", isOn: $_optionsManager.appleIDOptions.deleteImportAfterSigning)
-				} header: { ZagSigningMethodLabel(title: ZagSigningMethod.freeAppleAccount.title, appleID: true) }
+					Toggle("Automatic Refresh", isOn: $automaticRefresh)
+						.onChange(of: automaticRefresh) { _ in ZagBackgroundUpdateRefresh.shared.applySchedulingPreference() }
+					Toggle("Expiration Notifications", isOn: $expirationNotifications)
+						.onChange(of: expirationNotifications) { enabled in
+							Task {
+								if enabled {
+									let allowed = await ZagAppleIDExpirationNotifications.shared.enable()
+									guard expirationNotifications else { return }
+									notificationPermissionDenied = !allowed
+									if !allowed { expirationNotifications = false }
+								}
+								ZagAppleIDExpirationNotifications.shared.reconcile()
+							}
+						}
+				} header: {
+					ZagSigningMethodLabel(title: ZagSigningMethod.freeAppleAccount.title, appleID: true)
+				} footer: {
+					Text("Automatic Refresh starts when 48 hours or less remain. iOS decides when background work can run.")
+					if lastAutomaticRefresh > 0 {
+						Text("Last automatic refresh: \(Date(timeIntervalSince1970: lastAutomaticRefresh).formatted())")
+					}
+					if notificationPermissionDenied {
+						Text("Allow notifications for Zag Store in iOS Settings to receive expiration reminders.")
+					}
+				}
 			}
 			Section {
 				NavigationLink(destination: ConfigurationDictView(

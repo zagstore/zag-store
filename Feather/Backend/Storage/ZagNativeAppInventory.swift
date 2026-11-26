@@ -74,6 +74,48 @@ enum ZagNativeAppInventory {
 		return matches.count == 1 ? matches.first : nil
 	}
 
+	static func verifiedInstalledEntries() -> [Entry] {
+		let data = UserDefaults.standard.data(forKey: "zagStore.managedInstalledBundleIDs") ?? Data()
+		let installed = (try? JSONDecoder().decode(Set<String>.self, from: data)) ?? []
+		let rows = (try? Storage.shared.context.fetch(Signed.fetchRequest())) ?? []
+		var seen: Set<String> = []
+		return rows.compactMap { row in
+			guard let value = entry(row), value.pendingInstall == nil,
+				  value.installation.record.expiryVerified == true,
+				  value.installation.record.owner != nil else { return nil }
+			let id = value.installation.record.bundleIdentifier
+			let isSelf = id == Bundle.main.bundleIdentifier
+			if isSelf {
+				let identity = value.installation.executableIdentity
+				guard identity?.version == Bundle.main.version,
+					  identity?.build == Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else { return nil }
+			}
+			guard id == row.identifier, installed.contains(id) || isSelf,
+				  seen.insert(id).inserted else { return nil }
+			return value
+		}
+	}
+
+	static func recordAutomaticFailure(_ original: Entry, reason: ZagRefreshFailureReason) {
+		guard var current = entry(original.uuid), current.pendingInstall == nil,
+			  current.installation == original.installation else { return }
+		let now = Date()
+		current.installation.record.consecutiveFailures += 1
+		current.installation.record.lastFailure = .init(at: now, reason: reason)
+		try? JSONEncoder().encode(current).write(to: folder(current.uuid).appendingPathComponent("installation.json"),
+			options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+	}
+
+	static func resolveAuthenticationFailure(account: UUID) {
+		for var entry in verifiedInstalledEntries() where entry.installation.record.owner?.scope.accountID == account
+			&& entry.installation.record.lastFailure?.reason == .signedOut {
+			entry.installation.record.lastFailure = nil
+			entry.installation.record.consecutiveFailures = 0
+			try? JSONEncoder().encode(entry).write(to: folder(entry.uuid).appendingPathComponent("installation.json"),
+				options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		}
+	}
+
 	static func iconURL(_ app: AppInfoPresentable) -> URL? {
 		guard app.isSigned, let id = app.uuid, UUID(uuidString: id) != nil else { return nil }
 		let url = folder(id).appendingPathComponent("icon.png")
@@ -83,11 +125,12 @@ enum ZagNativeAppInventory {
 	static func forget(_ app: AppInfoPresentable) {
 		guard app.isSigned, let id = app.uuid, UUID(uuidString: id) != nil else { return }
 		try? FileManager.default.removeItem(at: folder(id))
+		changes.send(id)
 	}
 
 	static func save(
 		_ verified: ZagNativeInstalledProfiles, source: URL, name: String, renewing: Entry?,
-		signedOnly: (ZagInstallExpectation, URL)? = nil
+		signedOnly: (ZagInstallExpectation, URL)? = nil, retainSource: Bool = true
 	) async throws {
 		let storage = Storage.shared
 		let request = Signed.fetchRequest()
@@ -109,7 +152,7 @@ enum ZagNativeAppInventory {
 		values.isExcludedFromBackup = true
 		try excluded.setResourceValues(values)
 
-		if !manager.fileExists(atPath: archive.path) || renewing == nil {
+		if retainSource, !manager.fileExists(atPath: archive.path) || renewing == nil {
 			defer { try? manager.removeItem(at: replacements) }
 			let newArchive = try await Task.detached(priority: .utility) {
 				try ZagRPPairingFreeAccountInstaller.package(source, in: replacements)
@@ -183,6 +226,8 @@ enum ZagNativeAppInventory {
 		current.installation.record.owner?.profileUUID = main.uuid
 		current.installation.record.profileExpiresAt = earliest
 		current.installation.record.lastSuccessfulRefresh = Date()
+		current.installation.record.lastFailure = nil
+		current.installation.record.consecutiveFailures = 0
 		current.installation.record.expiryVerified = true
 		current.installation = .init(record: current.installation.record, profiles: updated,
 			executableIdentity: current.installation.executableIdentity)
@@ -239,7 +284,9 @@ enum ZagNativeAppInventory {
 		defer { try? FileManager.default.removeItem(at: directory) }
 		try await Task.detached(priority: .utility) {
 			Zip.addCustomFileExtension("ipa")
-			try Zip.unzipFile(folder(entry.uuid).appendingPathComponent("Archive.ipa"), destination: directory,
+			let archive = folder(entry.uuid).appendingPathComponent("Archive.ipa")
+			try ZagIPAArchiveSafety.validate(archive)
+			try Zip.unzipFile(archive, destination: directory,
 				overwrite: false, password: nil)
 		}.value
 		guard let app = FileManager.default.getPath(in: directory.appendingPathComponent("Payload"), for: "app") else {

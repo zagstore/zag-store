@@ -30,13 +30,13 @@ enum ZagBatchOperation: String {
 }
 
 enum ZagBatchOrigin {
-	case inApp, quickAction, shortcut
+	case inApp, quickAction, shortcut, automatic
 
 	enum Presentation { case none, attention, details }
 
 	func presentation(unlocked: Bool, needsAttention: Bool) -> Presentation {
 		switch self {
-		case .shortcut: return .none
+		case .shortcut, .automatic: return .none
 		case .inApp, .quickAction:
 			if unlocked { return .details }
 			return needsAttention ? .attention : .none

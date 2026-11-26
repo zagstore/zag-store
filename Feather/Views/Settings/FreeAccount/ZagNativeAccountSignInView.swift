@@ -225,6 +225,10 @@ final class ZagNativeSignInModel: ObservableObject {
 			finish(failure: .init(message: error.localizedDescription, recovery: .retry))
 			return
 		}
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let accountID { ZagNativeAppInventory.resolveAuthenticationFailure(account: accountID) }
+		#endif
+		ZagAppleIDExpirationNotifications.shared.reconcile()
 		await refreshInventory()
 		finishSignedIn()
 	}

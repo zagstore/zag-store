@@ -10,9 +10,13 @@ final class ZagBatchQuickActions {
 
 	func receive(_ shortcut: UIApplicationShortcutItem) -> Bool {
 		guard let operation = ZagBatchOperation(shortcutType: shortcut.type) else { return false }
+		enqueue(operation)
+		return true
+	}
+
+	func enqueue(_ operation: ZagBatchOperation) {
 		request.enqueue(operation)
 		drain()
-		return true
 	}
 
 	func setMainReady(_ ready: Bool) {

@@ -145,11 +145,12 @@ enum ZagRefreshFailureReason: String, Codable, Sendable {
 	case accountRemoved
 	/// The account no longer belongs to the team that signed the app.
 	case teamUnavailable
+	case manualRecovery
 
 	/// Retrying cannot help until the user acts.
 	var needsUser: Bool {
 		switch self {
-		case .signedOut, .appIDCapacity, .installSlots, .cancelled, .noOwner, .accountRemoved, .teamUnavailable: return true
+		case .signedOut, .appIDCapacity, .installSlots, .cancelled, .noOwner, .accountRemoved, .teamUnavailable, .manualRecovery: return true
 		default: return false
 		}
 	}

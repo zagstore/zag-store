@@ -72,6 +72,7 @@ final class AppFileHandler: NSObject, @unchecked Sendable {
 				// stall the UI. Report in 1 % steps (and the final value).
 				var lastReported = -1.0
 				do {
+					try ZagIPAArchiveSafety.validate(self._ipa)
 					try Zip.unzipFile(
 						self._ipa,
 						destination: self._uniqueWorkDir,

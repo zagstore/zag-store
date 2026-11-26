@@ -225,7 +225,7 @@ enum ZagDeveloperServicesProtocol {
 	/// the length. Never returns credentials, identifiers or long opaque tokens.
 	static func sanitizeMessage(_ text: String, limit: Int = 160) -> String {
 		var s = text.replacingOccurrences(of: #"(?is)-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----"#, with: "[redacted]", options: .regularExpression)
-		s = s.replacingOccurrences(of: #"(?i)\b(?:password|passcode|token|secret)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)"#,
+		s = s.replacingOccurrences(of: #"(?i)\b(?:password|passcode|verification[ _-]?code|(?:x-apple-gs-)?token|session[ _-]?key|private[ _-]?key|secret|x-apple-i-md(?:-m|-rinfo)?)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)"#,
 			with: "[redacted]", options: .regularExpression)
 		for pattern in ["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[A-Za-z0-9+/_-]{24,}={0,2}", "\\b[A-Z0-9]{10}\\b", "\\b(?:[A-Za-z0-9_-]+\\.){2,}[A-Za-z0-9_-]+\\b"] {
 			s = s.replacingOccurrences(of: pattern, with: "[redacted]", options: .regularExpression)
