@@ -1,0 +1,11 @@
+[package]
+name = "zag-usb"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+idevice = { path = "../../../IDeviceKitten/idevice", default-features = false, features = ["aws-lc", "usbmuxd", "installation_proxy", "amfi"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+serde_json = "1"
