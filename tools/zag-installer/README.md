@@ -31,6 +31,12 @@ The desktop helper uses the app's v2 verifier, production trust anchors, expiry 
 
 Upgrades reuse an Apple-listed, unexpired certificate matching the authenticated account and team's existing Keychain private key. An installation receipt, when present, also pins the exact signing leaf for the connected device. An earlier install has no desktop receipt, so the installer can confirm local key ownership and the mapped destination while CoreDevice and iOS enforce in-place signing compatibility. Upgrades never request a new key or certificate and never uninstall the existing copy. App launch and application-data continuity still need a physical Beta 4 upgrade test.
 
+## Developer-only local candidate upgrade
+
+`upgrade-local-candidate` accepts a locally packaged IPA, an independently obtained SHA-256, and the exact expected version and build. It upgrades only the existing experimental `app.zagstore.ios.FTB8PRW638` copy. Use the Mac and Apple Account that hold its existing desktop signing identity. The installer requires the same in-place upgrade checks and typed confirmation as a channel upgrade, including an active Apple certificate matching the local key. It does not create a replacement signing identity.
+
+The local IPA is read into private staging and verified before sign-in. This command does not read or update production manifest state. The regular `install` and `prepare` commands continue to require signed v2 release metadata.
+
 ## Desktop workflow and boundaries
 
 - The Rust desktop process uses the existing GrandSlam, SMS and trusted-device 2FA, and developer-session code. Apple receives sign-in traffic directly over the existing Apple host allowlist. Passwords and verification codes come from hidden Terminal prompts and travel to that process over local pipes. The ADI helper receives no credentials. The developer session is used in memory for one run. Start a new invocation if Apple expires or rejects it.

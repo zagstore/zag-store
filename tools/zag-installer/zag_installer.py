@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import desktop
 import releases
 
 ROOT = Path(__file__).resolve().parents[2]
+LOCAL_UPGRADE_TEAM = "FTB8PRW638"
 spec = importlib.util.spec_from_file_location("artifact_validation", ROOT / "scripts/zag-personal-ota.py")
 artifact = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(artifact)
@@ -99,7 +101,8 @@ def check_destination(installed, release, upgrade):
     artifact.require(candidate > current, "Signed release is not newer than the installed build")
 
 
-def validate_and_install(signed, release, team, apple_root, scratch, device, target, udid, approve, certificate, installed=None):
+def validate_and_install(signed, release, team, apple_root, scratch, device, target, udid, approve, certificate,
+                         installed=None, check_authorization=releases.check_fresh):
     expected = artifact.mapped_bundle(team)
     evidence = artifact.validate(signed, team, udid, apple_root, expected_signer=certificate)
     artifact.require(evidence["bundle_identifier"] == expected and evidence["build"] == release["build"],
@@ -116,14 +119,14 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     label = f"{expected} {release['version']} ({release['build']})"
     confirmation = f"UPGRADE {expected}" if installed is not None else "INSTALL"
     operation = "Upgrade in place" if installed is not None else "Install as a separate app"
-    releases.check_fresh(release)
+    check_authorization(release)
     artifact.require(approve(f"{operation} {label}? Type {confirmation}: ") == confirmation,
                      "Installation cancelled")
     artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
     device.check_compatibility(info)
     artifact.require(installed_app(device, target, expected) == installed,
                      "Destination inventory changed. Installation cancelled.")
-    releases.check_fresh(release)
+    check_authorization(release)
     device.install(target, staged / relative)
     observed = installed_app(device, target, expected)
     artifact.require(observed and observed.get("bundleVersion") == release["build"]
@@ -133,11 +136,17 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
 
 
 def install_release(release, release_helper, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input):
+    local_source = scratch / "official.ipa"
+    releases.acquire(artifact, release, release_helper, local_source)
+    return install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
+                            approve, releases.check_fresh)
+
+
+def install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
+                     approve, check_authorization):
     endpoint = desktop.provider_origin(endpoint) if endpoint else None
     if upgrade_team is not None:
         artifact.mapped_bundle(upgrade_team)
-    local_source = scratch / "official.ipa"
-    releases.acquire(artifact, release, release_helper, local_source)
     root = scratch / "apple-root.pem"
     desktop.prepare_profile_root(artifact, ROOT, root, apple_root)
 
@@ -170,7 +179,7 @@ def install_release(release, release_helper, apple_root, endpoint, upgrade_team,
         current = installed_app(device, target, artifact.mapped_bundle(team))
         check_destination(current, release, upgrade)
         artifact.require(current == installed, "Destination inventory changed before provisioning")
-        releases.check_fresh(release)
+        check_authorization(release)
         artifact.require(approve(f"Use {team} as your Personal Team and allow Apple provisioning? Type PROVISION: ")
                          == "PROVISION", "Apple provisioning cancelled")
         return team
@@ -180,12 +189,56 @@ def install_release(release, release_helper, apple_root, endpoint, upgrade_team,
     portal = desktop.Provisioning(endpoint, udid, store, openssl, choose_team, approve, anisette, upgrade, components)
     team, identity, profiles = portal.run(auth)
     signed = desktop.sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch)
-    result = validate_and_install(signed, release, team, root, scratch, device, target, udid, approve, identity.certificate, installed)
+    result = validate_and_install(signed, release, team, root, scratch, device, target, udid,
+                                  approve, identity.certificate, installed, check_authorization)
     try:
         store.write(portal.receipt_item, hashlib.sha256(identity.certificate).hexdigest().encode("ascii"))
     except (OSError, ValueError, subprocess.SubprocessError):
         result["signing_receipt_saved"] = False
     return result
+
+
+def stage_local_candidate(source, candidate, expected_sha, version, build):
+    artifact.require(re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha), "Supply a 64-digit SHA-256")
+    version_number(version)
+    version_number(build)
+    digest = hashlib.sha256()
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        artifact.require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= releases.MAX_IPA,
+                         "Local candidate must be a nonempty regular IPA within the size limit")
+        size = 0
+        with candidate.open("xb") as output:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                size += len(chunk)
+                artifact.require(size <= releases.MAX_IPA, "Local candidate exceeded the size limit")
+                digest.update(chunk)
+                output.write(chunk)
+    artifact.require(digest.hexdigest() == expected_sha.lower(), "Local candidate SHA-256 does not match")
+    with zipfile.ZipFile(candidate) as archive:
+        relative, info = artifact.main_bundle(archive)
+        artifact.require(info.get("CFBundleIdentifier") == artifact.ORIGINAL
+                         and info.get("CFBundleShortVersionString") == version
+                         and info.get("CFBundleVersion") == build,
+                         "Local candidate bundle identifier, version or build does not match")
+        artifact.require(not any(name.startswith(str(relative) + "/") and name.endswith("/embedded.mobileprovision")
+                                 for name in archive.namelist()),
+                         "Local candidate must not contain a provisioning profile")
+        minimum_os = info.get("MinimumOSVersion")
+        version_number(minimum_os)
+    return {"version": version, "build": build, "minimum_os": minimum_os, "sha256": expected_sha.lower()}
+
+
+def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch, device, cache, approve=input):
+    candidate = scratch / "local-candidate.ipa"
+    release = stage_local_candidate(source, candidate, sha256, version, build)
+
+    def check_digest(authorized):
+        artifact.require(artifact.sha(candidate) == authorized["sha256"], "Local candidate changed after verification")
+
+    return install_verified(release, candidate, apple_root, None, LOCAL_UPGRADE_TEAM,
+                            scratch, device, cache, approve, check_digest)
 
 
 def main():
@@ -196,13 +249,26 @@ def main():
     install = modes.add_parser("install", help="Provision, sign, validate and install the latest authorized release")
     install.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
     install.add_argument("--upgrade", metavar="TEAM", help="Require an existing copy for this Personal Team")
+    local = modes.add_parser("upgrade-local-candidate", help="Developer-only upgrade of the experimental Personal Team copy")
+    local.add_argument("ipa", type=Path)
+    local.add_argument("--sha256", required=True, help="Expected SHA-256 obtained independently of the IPA")
+    local.add_argument("--version", required=True)
+    local.add_argument("--build", required=True)
+    local.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
     for mode in (prepare, install):
         mode.add_argument("--expect-tag", help="Require this exact release tag in the signed channel")
     args = parser.parse_args()
     try:
         artifact.require(sys.platform == "darwin", "Use macOS Terminal")
-        artifact.require(args.mode != "install" or sys.stdin.isatty(), "Use interactive macOS Terminal")
+        artifact.require(args.mode == "prepare" or sys.stdin.isatty(), "Use interactive macOS Terminal")
         with desktop.locked_cache() as cache:
+            if args.mode == "upgrade-local-candidate":
+                with tempfile.TemporaryDirectory(prefix="zag-installer-") as directory:
+                    scratch = Path(directory)
+                    result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
+                                                     args.apple_root, scratch, CoreDevice(scratch), cache)
+                print(json.dumps(result))
+                return 0
             release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
             if args.mode == "prepare":
                 with tempfile.TemporaryDirectory(prefix=".zag-release-", dir=args.destination.parent) as directory:
