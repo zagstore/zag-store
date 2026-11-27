@@ -9,7 +9,7 @@ private struct InstallerPrompt: Identifiable {
 }
 
 @MainActor
-private final class InstallerController: ObservableObject {
+final class InstallerController: ObservableObject {
     @Published var busy = false
     @Published var prompt: InstallerPrompt?
     @Published var log = "Connect and unlock your iPhone, trust this Mac and enable Developer Mode.\n"
@@ -305,7 +305,7 @@ private struct InstallerView: View {
         guard let url = Bundle.main.url(forResource: name, withExtension: "png") else { return nil }
         return NSImage(contentsOf: url)
     }
-    @StateObject private var installer = InstallerController()
+    @ObservedObject var installer: InstallerController
     @State private var upgrade = false
     @State private var team = ""
     @State private var reply = ""
@@ -453,10 +453,26 @@ private struct InstallerView: View {
 
 @main
 struct ZagInstallerApp: App {
+    @StateObject private var installer = InstallerController()
+    @StateObject private var updates = InstallerUpdates()
+
     var body: some Scene {
         WindowGroup {
-            InstallerView()
+            InstallerView(installer: installer)
+                .onAppear { updates.checkOnLaunchIfAllowed(installerBusy: installer.busy) }
         }
         .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updates.checkNow(installerBusy: installer.busy)
+                }
+                .disabled(!updates.canCheckForUpdates || installer.busy)
+            }
+        }
+
+        Settings {
+            InstallerUpdateSettingsView(updates: updates, installer: installer)
+        }
     }
 }

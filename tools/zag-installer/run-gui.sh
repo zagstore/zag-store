@@ -8,6 +8,8 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 SOURCE="$ROOT/tools/zag-installer/ZagInstallerApp.swift"
+UPDATE_SOURCE="$ROOT/tools/zag-installer/InstallerUpdates.swift"
+SPARKLE_ROOT="$HOME/Library/Caches/app.zagstore.desktop-installer-ui/sparkle/2.10.1"
 CACHE="$HOME/Library/Caches/app.zagstore.desktop-installer-ui"
 mkdir -p "$CACHE"
 chmod 700 "$CACHE"
@@ -17,15 +19,23 @@ command -v xcrun >/dev/null || {
     exit 1
 }
 
-xcrun swiftc -parse "$SOURCE"
+[[ -d "$SPARKLE_ROOT/Sparkle.framework" ]] || {
+    echo "Run bash tools/zag-installer/bootstrap-sparkle.sh first." >&2
+    exit 1
+}
+
+xcrun swiftc -parse "$SOURCE" "$UPDATE_SOURCE"
 xcrun swiftc -parse-as-library -O -framework SwiftUI -framework AppKit \
-    "$SOURCE" -o "$CACHE/ZagInstaller"
+    -F "$SPARKLE_ROOT" -framework Sparkle \
+    -Xlinker -rpath -Xlinker "@executable_path/../Frameworks" \
+    "$SOURCE" "$UPDATE_SOURCE" -o "$CACHE/ZagInstaller"
 
 APP="$HOME/Applications/Zag Installer.app"
 if [[ -d "/Applications/Zag Installer.app" ]]; then
     APP="/Applications/Zag Installer.app"
 fi
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+/usr/bin/ditto "$SPARKLE_ROOT/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 ASSETS="$ROOT/Feather/Resources/Assets.xcassets/AppIcon.appiconset"
 cp "$ASSETS/zagstore.png" "$ASSETS/zagstore_dark.png" "$APP/Contents/Resources/"
 for variant in zagstore zagstore_dark; do
@@ -65,8 +75,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>ZagInstaller</string>
     <key>CFBundleIconName</key><string>ZagInstaller</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleShortVersionString</key><string>0.2.0</string>
+    <key>CFBundleVersion</key><string>5</string>
+    <key>SUEnableAutomaticChecks</key><true/>
+    <key>SUScheduledCheckInterval</key><integer>86400</integer>
+    <key>SUAutomaticallyUpdate</key><false/>
+    <key>ZagUpdatesReady</key><false/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>LSUIElement</key><false/>
     <key>LSBackgroundOnly</key><false/>
@@ -76,6 +90,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 plutil -lint "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP"
+codesign --verify --deep --strict "$APP"
+otool -L "$APP/Contents/MacOS/ZagInstaller" | grep "Sparkle.framework"
 touch "$APP"
 open -n --env "ZAG_INSTALLER_ROOT=$ROOT" "$APP"
 echo "Launched $APP"
