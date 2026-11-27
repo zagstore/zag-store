@@ -368,7 +368,7 @@ def sign(artifact, app, relative, team, udid, identity, profiles, components, ro
 
 
 @contextmanager
-def locked_cache():
+def locked_cache(precompiled=None):
     import fcntl  # macOS adapter
     cache = Path.home() / "Library/Caches/app.zagstore.desktop-installer"
     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -381,7 +381,7 @@ def locked_cache():
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("Another desktop installer session is active") from error
-        yield BuildCache(cache)
+        yield PrecompiledCache(precompiled) if precompiled is not None else BuildCache(cache)
     finally:
         os.close(descriptor)
 
@@ -390,13 +390,40 @@ class PrecompiledCache:
     """Explicit prebuilt helper adapter; never falls back to compilation."""
 
     def __init__(self, directory):
-        self.directory = Path(directory).resolve(strict=True)
-        require(self.directory.is_dir(), "Precompiled helper directory is missing")
+        original = Path(directory)
+        require(original.is_dir() and not original.is_symlink(), "Precompiled helper directory is missing")
+        self.directory = original.resolve(strict=True)
+        info = self.directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and info.st_mode & 0o022 == 0,
+                "Precompiled helper directory must be user-owned and not writable by others")
+        self._validate_inventory()
+
+    def _validate_inventory(self):
+        # Reject incomplete packages before starting release discovery or Apple sign-in.
+        for name in ("release", "handoff", "zag_desktop", "zag-desktop-signer",
+                     "zag-desktop-anisette", "openssl"):
+            self.executable(name)
+        lib = self.directory / "lib"
+        require(lib.is_dir() and not lib.is_symlink(),
+                "Packaged OpenSSL dependency directory is missing")
+        for name in ("libssl.3.dylib", "libcrypto.3.dylib"):
+            path = lib / name
+            require(path.is_file() and not path.is_symlink(),
+                    f"Missing packaged OpenSSL dependency: {name}")
+            info = path.stat()
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                    and info.st_mode & 0o022 == 0,
+                    f"Packaged OpenSSL dependency has insecure permissions: {name}")
 
     def executable(self, name):
         path = self.directory / name
         require(path.is_file() and not path.is_symlink() and os.access(path, os.X_OK),
                 f"Required precompiled helper is unavailable: {name}")
+        info = path.stat()
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                and info.st_mode & 0o022 == 0,
+                f"Packaged helper has insecure ownership or permissions: {name}")
         return path
 
     def build_swift(self, name, sources):

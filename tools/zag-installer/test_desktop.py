@@ -186,3 +186,55 @@ class DesktopTests(unittest.TestCase):
             info.write_bytes(plistlib.dumps({"CFBundleIdentifier": "another.app.widget"}))
             with self.assertRaisesRegex(ValueError, "does not belong"):
                 desktop.signing_components(app, "app.zagstore.ios")
+
+
+class PrecompiledHelpersTests(unittest.TestCase):
+    def create_inventory(self, folder):
+        root = Path(folder)
+        (root / "lib").mkdir()
+        for name in ("release", "handoff", "zag_desktop", "zag-desktop-signer",
+                     "zag-desktop-anisette", "openssl"):
+            path = root / name
+            path.write_bytes(b"test helper fixture")
+            path.chmod(0o700)
+        for name in ("libssl.3.dylib", "libcrypto.3.dylib"):
+            (root / "lib" / name).write_bytes(b"test library fixture")
+        return root
+
+    def test_missing_helpers_fail_closed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(ValueError, "Required precompiled helper"):
+                desktop.PrecompiledCache(folder)
+
+    def test_precompiled_adapter_reuses_exact_binaries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = self.create_inventory(folder)
+            adapter = desktop.PrecompiledCache(root)
+            self.assertEqual(adapter.build_swift("release", []), root / "release")
+            self.assertEqual(adapter.build_swift("handoff", []), root / "handoff")
+            self.assertEqual(adapter.signer_tools(None),
+                             (root / "zag-desktop-signer", root / "openssl"))
+            self.assertEqual(adapter.installer_tools(None, native=True),
+                             (root / "zag_desktop", root / "zag-desktop-signer",
+                              root / "openssl", root / "zag-desktop-anisette"))
+            with self.assertRaisesRegex(ValueError, "Unknown precompiled"):
+                adapter.build_swift("unexpected", [])
+
+    def test_writable_or_symlinked_executable_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = self.create_inventory(folder)
+            (root / "openssl").chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "insecure ownership or permissions"):
+                desktop.PrecompiledCache(root)
+            (root / "openssl").unlink()
+            (root / "openssl").symlink_to(root / "release")
+            with self.assertRaisesRegex(ValueError, "Required precompiled helper"):
+                desktop.PrecompiledCache(root)
+
+    def test_missing_library_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = self.create_inventory(folder)
+            (root / "lib" / "libcrypto.3.dylib").unlink()
+            with self.assertRaisesRegex(ValueError, "Missing packaged OpenSSL dependency"):
+                desktop.PrecompiledCache(root)
+

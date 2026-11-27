@@ -72,6 +72,25 @@ cd "$HOME/Documents/ZagStore-claude"
 bash tools/zag-installer/run-gui.sh
 ```
 
+## Precompiled native-helper staging
+
+Six precompiled helpers have been staged on Intel macOS, and the relocated
+OpenSSL 3.5.9 links only to the package-local `libssl.3.dylib` and
+`libcrypto.3.dylib`. The native executables also pass the existing
+macOS system-library dependency audit.
+
+A separate, opt-in `--precompiled-helpers DIRECTORY` CLI flag now selects
+the staged binaries under the same private process lock as normal desktop
+installation. The adapter validates the full inventory and disallows runtime
+compilation or fallback. This is a development capability only; the GUI
+continues to use the original BuildCache unless explicitly changed later.
+Do not use this flag with an arbitrary directory or binaries from another
+person: the executable files must come from a trusted local build.
+
+**Pending:** package a private Python runtime, program resources, and
+Xcode-independent USB transport, then add standalone app bundle verification.
+The staging package is not yet a distributable or notarized installer.
+
 ## Install or upgrade
 
 Use interactive macOS Terminal with Python 3.9+, stable Rust/Cargo supporting edition 2024, the pinned Zsign submodule, Xcode selected for `xcrun devicectl`, and Homebrew OpenSSL 3. Connect and unlock exactly one trusted iPhone or iPad with Developer Mode enabled. First run needs GitHub access to compile desktop dependencies.

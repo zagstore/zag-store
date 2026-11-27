@@ -288,6 +288,8 @@ def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ui-pipe", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--precompiled-helpers", type=Path, metavar="DIRECTORY",
+                        help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode", required=True)
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
@@ -320,7 +322,7 @@ def main():
         else:
             artifact.require(args.mode == "prepare" or sys.stdin.isatty(), "Use interactive macOS Terminal")
             approve = input
-        with desktop.locked_cache() as cache:
+        with desktop.locked_cache(precompiled=args.precompiled_helpers) as cache:
             if args.mode == "prepare":
                 release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                 with tempfile.TemporaryDirectory(prefix=".zag-release-", dir=args.destination.parent) as directory:
