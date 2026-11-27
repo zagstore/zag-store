@@ -17,6 +17,7 @@ import zipfile
 import desktop
 import handoff
 import releases
+import ui_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCAL_UPGRADE_TEAM = "FTB8PRW638"
@@ -286,6 +287,7 @@ def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ui-pipe", action="store_true", help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode", required=True)
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
@@ -307,9 +309,17 @@ def main():
     for mode in (prepare, install):
         mode.add_argument("--expect-tag", help="Require this exact release tag in the signed channel")
     args = parser.parse_args()
+    channel = None
     try:
-        artifact.require(sys.platform == "darwin", "Use macOS Terminal")
-        artifact.require(args.mode == "prepare" or sys.stdin.isatty(), "Use interactive macOS Terminal")
+        artifact.require(sys.platform == "darwin", "Use macOS")
+        if args.ui_pipe:
+            artifact.require(args.mode in ("install",), "Graphical transport only supports official installation")
+            channel = ui_protocol.Channel()
+            desktop.secret = lambda prompt: channel.ask(prompt, secret=True)
+            approve = channel.ask
+        else:
+            artifact.require(args.mode == "prepare" or sys.stdin.isatty(), "Use interactive macOS Terminal")
+            approve = input
         with desktop.locked_cache() as cache:
             if args.mode == "prepare":
                 release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
@@ -334,15 +344,22 @@ def main():
                         else:
                             release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                             result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
-                                                     args.upgrade, scratch, device, cache)
-        print(json.dumps(result))
+                                                     args.upgrade, scratch, device, cache, approve=approve)
+        if channel is not None:
+            channel.send({"type": "finished", "result": result})
+        else:
+            print(json.dumps(result))
         if result.get("signing_setup") == "incomplete":
             return 1
     except KeyboardInterrupt:
+        if channel is not None:
+            channel.send({"type": "error", "message": "Zag Installer cancelled."})
         print("Zag Installer cancelled.", file=sys.stderr)
         return 130
     except (OSError, ValueError, KeyError, TypeError, EOFError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         message = str(error) if type(error) is ValueError else type(error).__name__
+        if channel is not None:
+            channel.send({"type": "error", "message": f"Zag Installer stopped. {message}"})
         print(f"Zag Installer stopped. {message}", file=sys.stderr)
         return 1
     return 0
