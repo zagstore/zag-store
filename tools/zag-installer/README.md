@@ -8,6 +8,42 @@ CoreDevice confirmed bundle `app.zagstore.ios.FTB8PRW638`, version `1.0.0`, buil
 
 The operator subsequently confirmed a successful standalone end-to-end macOS installation with the clean-room anisette integration. This records a physical result for desktop Apple authentication, provisioning, signing, validation and USB installation. The operator also reported successful experimental upgrade testing. The follow-up reports did not specify the installed bundle, version, build, app-data continuity or launch result. The identifiers above belong to the earlier installation-only check.
 
+## Native macOS graphical preview (development only)
+
+The native SwiftUI window now uses the existing verified desktop installer and a
+dedicated local, bounded JSON prompt channel. Apple passwords and 2FA codes
+are entered through a secure prompt, not logged or sent through the website.
+The normal Terminal workflow remains unchanged. The GUI deliberately offers
+only official signed-channel installation and explicit in-place upgrade;
+developer-only local candidates and recovery stay in the CLI.
+
+From the existing checked-out repository, run:
+
+```sh
+cd "$HOME/Documents/ZagStore-claude"
+bash tools/zag-installer/run-gui.sh
+```
+
+Prerequisites are the same as the CLI: macOS, Xcode, working Python 3,
+Cargo/Rust, Homebrew OpenSSL 3, a trusted wired iPhone/iPad, and Apple sign-in.
+The launcher compiles a private local macOS executable. It does not build a
+self-contained, notarized, redistributable app. The graphical window resolves
+the verified repository from `ZAG_INSTALLER_ROOT`; no source is fetched at
+runtime.
+
+Offline protocol tests:
+
+```sh
+cd tools/zag-installer
+python3 -m unittest -v test_ui_protocol
+```
+
+**Acceptance pending:** the SwiftUI target must compile on the operator's
+Mac, the official Beta 5 channel must be installed or upgraded through the
+window, and fresh on-device Signing Setup must be verified independently.
+Do not advertise this as a public release until those tests pass. Windows
+USB, credential/key storage and installer packaging are not implemented.
+
 ## Install or upgrade
 
 Use interactive macOS Terminal with Python 3.9+, stable Rust/Cargo supporting edition 2024, the pinned Zsign submodule, Xcode selected for `xcrun devicectl`, and Homebrew OpenSSL 3. Connect and unlock exactly one trusted iPhone or iPad with Developer Mode enabled. First run needs GitHub access to compile desktop dependencies.
