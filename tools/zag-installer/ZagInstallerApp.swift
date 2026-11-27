@@ -300,6 +300,14 @@ private struct InstallerView: View {
     @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
     @State private var showDiagnostics = false
 
+    private func updateDockIcon() {
+        let name = dark ? "zagstore_dark_installer" : "zagstore_installer"
+        if let url = Bundle.main.url(forResource: name, withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            NSApplication.shared.applicationIconImage = image
+        }
+    }
+
     private var brandImage: NSImage? {
         let name = colorScheme == .dark ? "zagstore_dark" : "zagstore"
         guard let url = Bundle.main.url(forResource: name, withExtension: "png") else { return nil }
@@ -404,6 +412,8 @@ private struct InstallerView: View {
             }
             Spacer(minLength: 0)
         }
+        .onAppear { updateDockIcon() }
+        .onChange(of: colorScheme) { _ in updateDockIcon() }
         .task {
             while !Task.isCancelled {
                 if !installer.busy {
