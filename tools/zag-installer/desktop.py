@@ -386,6 +386,32 @@ def locked_cache():
         os.close(descriptor)
 
 
+class PrecompiledCache:
+    """Explicit prebuilt helper adapter; never falls back to compilation."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve(strict=True)
+        require(self.directory.is_dir(), "Precompiled helper directory is missing")
+
+    def executable(self, name):
+        path = self.directory / name
+        require(path.is_file() and not path.is_symlink() and os.access(path, os.X_OK),
+                f"Required precompiled helper is unavailable: {name}")
+        return path
+
+    def build_swift(self, name, sources):
+        require(name in ("release", "handoff"), "Unknown precompiled Swift helper")
+        return self.executable(name)
+
+    def signer_tools(self, repo):
+        return self.executable("zag-desktop-signer"), self.executable("openssl")
+
+    def installer_tools(self, repo, native):
+        signer, openssl = self.signer_tools(repo)
+        return (self.executable("zag_desktop"), signer, openssl,
+                self.executable("zag-desktop-anisette") if native else None)
+
+
 class BuildCache:
     def __init__(self, path):
         self.path = path
