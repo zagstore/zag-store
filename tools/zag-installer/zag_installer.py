@@ -106,7 +106,7 @@ class StandaloneUSB:
             bundle = app.get("bundleIdentifier")
             artifact.require(isinstance(bundle, str) and
                              (bundle == artifact.ORIGINAL or
-                              re.fullmatch(re.escape(artifact.ORIGINAL) + r"\\.[A-Z0-9]{10}", bundle))
+                              re.fullmatch(re.escape(artifact.ORIGINAL) + r"\.[A-Z0-9]{10}", bundle))
                              and bundle not in known,
                              "Unexpected or duplicate application identifier")
             known.add(bundle)
