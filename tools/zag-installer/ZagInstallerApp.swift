@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 
 private struct InstallerPrompt: Identifiable {
     let id = UUID()
@@ -210,7 +211,61 @@ private final class InstallerController: ObservableObject {
     }
 }
 
+private struct WiredDevice: Sendable {
+    let title: String
+    let detail: String
+    let ready: Bool
+
+    static func inspect() -> WiredDevice {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            let report = directory.appendingPathComponent("devices.json")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            process.arguments = ["devicectl", "list", "devices", "--timeout", "5", "--json-output", report.path]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  let root = try JSONSerialization.jsonObject(with: Data(contentsOf: report)) as? [String: Any],
+                  let result = root["result"] as? [String: Any],
+                  let devices = result["devices"] as? [[String: Any]] else { throw CocoaError(.fileReadCorruptFile) }
+            let wired = devices.filter {
+                ($0["connectionProperties"] as? [String: Any])?["transportType"] as? String == "wired"
+            }
+            guard wired.count == 1, let device = wired.first else {
+                return WiredDevice(title: wired.isEmpty ? "No wired device detected" : "Multiple devices connected",
+                                   detail: "Connect one iPhone or iPad using USB.", ready: false)
+            }
+            let properties = device["deviceProperties"] as? [String: Any] ?? [:]
+            let hardware = device["hardwareProperties"] as? [String: Any] ?? [:]
+            let connection = device["connectionProperties"] as? [String: Any] ?? [:]
+            let paired = connection["pairingState"] as? String == "paired"
+            let developer = properties["developerModeStatus"] as? String
+            let ready = paired && hardware["platform"] as? String == "iOS" && developer != "disabled"
+            let name = properties["name"] as? String ?? "Connected device"
+            let model = hardware["marketingName"] as? String ?? hardware["productType"] as? String ?? "iPhone or iPad"
+            let version = properties["osVersionNumber"] as? String
+            return WiredDevice(title: name, detail: [model, version.map { "iOS \($0)" }, ready ? "USB connected" : "Unlock, trust this Mac and enable Developer Mode"].compactMap { $0 }.joined(separator: " · "), ready: ready)
+        } catch {
+            return WiredDevice(title: "Device detection unavailable", detail: "Check Xcode device services and USB trust.", ready: false)
+        }
+    }
+}
+
 private struct InstallerView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
+    @State private var showDiagnostics = false
+
+    private var brandImage: NSImage? {
+        let name = colorScheme == .dark ? "zagstore_dark" : "zagstore"
+        guard let url = Bundle.main.url(forResource: name, withExtension: "png") else { return nil }
+        return NSImage(contentsOf: url)
+    }
     @StateObject private var installer = InstallerController()
     @State private var upgrade = false
     @State private var team = ""
@@ -219,9 +274,13 @@ private struct InstallerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 12) {
-                Image(systemName: "square.and.arrow.down.on.square.fill")
-                    .font(.system(size: 32, weight: .medium))
-                    .foregroundStyle(.blue)
+                if let image = brandImage {
+                    Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
+                        .frame(width: 64, height: 64)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                } else {
+                    Text("Z").font(.largeTitle.bold()).frame(width: 64, height: 64)
+                }
                 VStack(alignment: .leading) {
                     Text("Zag Installer").font(.largeTitle.bold())
                     Text("Install Zag Store using your own Apple ID")
@@ -232,7 +291,17 @@ private struct InstallerView: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 Label("Your Apple ID stays between this Mac and Apple.", systemImage: "lock.shield")
-                Label("Connect one trusted iPhone or iPad by USB.", systemImage: "cable.connector")
+                HStack(spacing: 12) {
+                    Image(systemName: "iphone").font(.system(size: 28))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(device.title).font(.headline)
+                        Text(device.detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Circle().fill(device.ready ? Color.green : Color.orange).frame(width: 9, height: 9)
+                }
+                .padding(12)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
                 Label("Signing Setup prepares on-device renewal.", systemImage: "arrow.triangle.2.circlepath")
             }
             .font(.callout)
@@ -250,7 +319,7 @@ private struct InstallerView: View {
                     installer.begin(upgrade: upgrade, team: team)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(installer.busy)
+                .disabled(installer.busy || !device.ready)
                 if installer.busy {
                     ProgressView().controlSize(.small)
                     Button("Cancel") { installer.cancel() }
@@ -270,6 +339,7 @@ private struct InstallerView: View {
                 Text(installer.installedBundle).font(.caption.monospaced())
                     .textSelection(.enabled)
             }
+            DisclosureGroup("Diagnostics", isExpanded: $showDiagnostics) {
             ScrollView {
                 Text(installer.log.isEmpty ? "Installer diagnostics appear here." : installer.log)
                     .font(.system(.caption, design: .monospaced))
@@ -279,6 +349,16 @@ private struct InstallerView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(12)
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            }
+            Spacer(minLength: 0)
+        }
+        .task {
+            while !Task.isCancelled {
+                if !installer.busy {
+                    device = await Task.detached(priority: .utility) { WiredDevice.inspect() }.value
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
         }
         .padding(24)
         .frame(minWidth: 700, minHeight: 565)
