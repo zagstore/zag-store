@@ -212,7 +212,7 @@ class NativeUSBAdapterTests(unittest.TestCase):
         with patch.object(installer.sys, "platform", "darwin"), \
              patch.object(installer.sys, "argv",
                           ["zag_installer.py", "--usb-transport", "standalone", "install"]), \
-             patch.object(installer.sys.stdin, "isatty", return_value=True), \
+             patch.object(installer.sys, "stdin", Mock(isatty=Mock(return_value=True))), \
              patch.object(installer.desktop, "locked_cache") as locked, \
              patch.object(installer.releases, "discover") as release, \
              patch.object(installer.desktop.Provisioning, "run") as provision:
