@@ -322,7 +322,6 @@ private struct InstallerView: View {
                 }
                 VStack(alignment: .leading) {
                     Text("Zag Installer").font(.largeTitle.bold())
-                    Capsule().fill(ZagPalette.spectrum).frame(width: 110, height: 3)
                     Text("Install Zag Store using your own Apple ID")
                         .foregroundStyle(muted)
                 }
