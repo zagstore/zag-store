@@ -44,6 +44,34 @@ window, and fresh on-device Signing Setup must be verified independently.
 Do not advertise this as a public release until those tests pass. Windows
 USB, credential/key storage and installer packaging are not implemented.
 
+## macOS updater integration (0.2.0 development)
+
+The native GUI embeds the pinned official Sparkle 2.10.1 framework (downloaded by
+`bootstrap-sparkle.sh`, SHA-256 checked against the official release). The
+application has an Updates settings pane and a Check for Updates menu action.
+The default scheduled interval is 24 hours; settings are delegated to Sparkle.
+
+**Fail-closed release gate:** the current local launcher sets
+`ZagUpdatesReady=false` and deliberately does not include `SUFeedURL` or
+`SUPublicEDKey`. The updater does not start and cannot download/replace code.
+A redistributable, complete app, dedicated Ed25519 public key, HTTPS desktop
+appcast, stable Developer ID signing and update/archive tests are required
+before enabling it. Update archive signing private keys must remain in the
+operator's macOS Keychain and must never be committed to the repository or
+copied to the website. The iOS Beta 5 update feed is unrelated.
+
+The current local installer is ad-hoc signed for development only, still
+invokes a source checkout, and is not a distributable desktop package. Do not
+publish it or turn on Sparkle based only on a successful GUI launch. In the
+current preview, Settings correctly explains why update checks are disabled.
+
+To launch the updated GUI after bootstrapping Sparkle:
+
+```sh
+cd "$HOME/Documents/ZagStore-claude"
+bash tools/zag-installer/run-gui.sh
+```
+
 ## Install or upgrade
 
 Use interactive macOS Terminal with Python 3.9+, stable Rust/Cargo supporting edition 2024, the pinned Zsign submodule, Xcode selected for `xcrun devicectl`, and Homebrew OpenSSL 3. Connect and unlock exactly one trusted iPhone or iPad with Developer Mode enabled. First run needs GitHub access to compile desktop dependencies.
