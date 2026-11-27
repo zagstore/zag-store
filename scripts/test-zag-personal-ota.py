@@ -53,6 +53,19 @@ class StagingTests(unittest.TestCase):
             self.assertEqual([item["job"] for item in matches], ["a" * 32])
             self.assertNotIn("private", repr(matches))
 
+    def test_delivery_audit_matches_exact_job_and_ignores_head(self):
+        spec = importlib.util.spec_from_file_location("audit", Path(__file__).with_name("zag-ota-delivery-audit.py"))
+        audit = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(audit)
+        path = f"/wp-json/zag-byoc/v1/ota/{JOB}/ipa?token=private"
+        rows = audit.audit([f'"GET {path} HTTP/2.0" 200 25404 "-"',
+                            f'"HEAD {path} HTTP/2.0" 200 0 "-"',
+                            f'"GET {path} HTTP/2.0" 200 100 "-"',
+                            f'"GET {path.replace(JOB, "b" * 32)} HTTP/2.0" 200 25404 "-"'], JOB, 25404)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(sum(row["full_ipa_response"] for row in rows), 1)
+        self.assertNotIn("private", repr(rows))
+
     def test_diagnostics_keeps_codes_without_exporting_sensitive_messages(self):
         spec = importlib.util.spec_from_file_location("diagnostics", Path(__file__).with_name("zag-ota-diagnostics.py"))
         diagnostics = importlib.util.module_from_spec(spec)

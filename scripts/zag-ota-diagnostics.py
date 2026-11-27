@@ -11,8 +11,8 @@ PROCESSES = ("appstored", "appstoreagent", "installd", "installcoordinationd", "
 ERROR = re.compile(
     r"\b(ASDErrorDomain|MIInstallerErrorDomain|IXUserPresentableErrorDomain|IXErrorDomain|"
     r"MIContainerManagerErrorDomain|NSURLErrorDomain|NSPOSIXErrorDomain|"
-    r"LSApplicationWorkspaceErrorDomain|ApplicationVerificationFailed)\b"
-    r"(?:\s*(?:Code\s*=\s*|[:=]\s*)(-?\d{1,10})\b)?"
+    r"LSApplicationWorkspaceErrorDomain|ApplicationVerificationFailed|MIFreeProfileValidatedAppTracker)\b"
+    r"(?:\s*(?:Code\s*=\s*|[:=]\s*)(-?\d{1,10}|0x[0-9a-fA-F]{1,8})\b)?"
 )
 BUNDLE = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 
@@ -26,12 +26,18 @@ def extract(records, bundle):
             continue
         message = record.get("eventMessage") or ""
         scope = "bundle-linked" if marker.search(message) else "same-window"
-        for error in set(ERROR.findall(message)):
+        matches = set(ERROR.findall(message))
+        folded = message.casefold()
+        if "maximum number" in folded and any(
+            marker in folded for marker in ("free developer profile", "free development profile")
+        ):
+            matches.add(("FreeProfileLimitMessage", ""))
+        for error in matches:
             key = (scope, process, *error)
             counts[key] = counts.get(key, 0) + 1
     return [
         {"scope": scope, "process": process, "domain": domain,
-         "code": int(code) if code else None, "events": count}
+         "code": int(code, 16 if code.startswith("0x") else 10) if code else None, "events": count}
         for (scope, process, domain, code), count in sorted(counts.items())
     ]
 

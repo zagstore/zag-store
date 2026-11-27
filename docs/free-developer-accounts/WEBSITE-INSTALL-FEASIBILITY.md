@@ -119,3 +119,32 @@ The source mirror generates a single `software-package` asset and `software` met
 For records from the prior experiment, run `expired-jobs --sha256 "$SHA" --team "$TEAM" --start "$START" --end "$END"` via `ssh zagstore` using the updated script copied into the private operator directory. Supply timezone-qualified timestamps bracketing publication. Match the first known job and identify the second only by an unambiguous match with the operator's publication time and access records. Run the existing exact `cleanup` command only for the independently identified jobs. If records are absent, leave other records untouched. If several candidates remain, retain them until attribution is clear. Remove only the operator files from this experiment after the probe or control work is done.
 
 Apple's separately authorized, notarized EU Web Distribution can meet a direct website experience for eligible publishers and devices without requiring the visitor to buy a certificate. It has publisher and jurisdiction requirements and does not use the visitor's free signing identity. TestFlight can be linked from a website and has publisher membership and TestFlight requirements. A web app can be installed from Safari without signing but cannot deliver Zag Store's native signing and pairing features. None is a verified replacement for the full free Apple ID objective. [Web Distribution](https://developer.apple.com/support/web-distribution-eu/) · [Apple beta distribution](https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases)
+
+## Failed minimal probe follow-up
+
+On iPhone 15 Pro Max with reported iOS 27.2.1 and Developer Mode enabled, the independently validated Personal Team probe failed with the same generic Safari alert. Its signed IPA is 25,404 bytes. This removes most Zag Store-specific factors from the test. A free slot and a matching installer rejection still need evidence. Do not repeat the test just to obtain streaming logs.
+
+Connect and unlock the already paired phone. Run this one command in normal macOS Terminal from the repository root, replacing the device name and the local-time window with the actual attempt time. The collector checks the installed Xcode command's options, requests device-only sysdiagnose, collects read-only app inventory, extracts only the system log archive and prints a sanitized report. Use Python 3.12 or newer. If the incident has aged out of the device's retained logs, an already captured archive can be supplied with `--archive`.
+
+```sh
+python3 scripts/zag-ota-collect.py --device 'PAIRED IPHONE NAME' \
+  --start 'YYYY-MM-DD HH:MM:SS' --end 'YYYY-MM-DD HH:MM:SS'
+```
+
+Share only `shareable-codes.json`. Keep the raw archive, `apps.json` and command logs private. The CoreDevice roster can identify inventoried installed apps and may include useful signing metadata. Developer-signed, a team ID or a debug entitlement alone cannot distinguish free versus paid development. A profile resident on the device can outlive an install. For capacity proof, match authenticated free-profile evidence to installed bundle IDs and signers, exclude placeholders and paid variants, and record whether every candidate was classifiable. Three reliably matched apps are evidence of saturation under the standard limit. Fewer matches in an incomplete inventory leave availability unknown. A bundle-linked free-profile tracker event or maximum-count error is stronger evidence of actual enforcement.
+
+From normal Terminal, inspect the probe delivery and immediately invalidate its disclosed token by deleting only the digest- and team-bound job. The first command filters the preview Nginx records to method, asset, status and bytes. Use the actual preview access log path if it differs, and include its rotated file if necessary. An empty report means no matching standard combined-log record was read. A complete response means the server accounted for the expected body length.
+
+```sh
+JOB=c1a7d19524af4bd0e050024732db59d6
+SHA=f8e5e1c77465b0906d0e3ff881e4e25902fcaabb6a0caebaa21a52b9b83e57d3
+TEAM=FTB8PRW638
+ssh zagstore 'sudo -n cat /var/log/nginx/preview.zagstore.app.access.log' |
+  python3 scripts/zag-ota-delivery-audit.py --job "$JOB" --ipa-size 25404
+ssh -t zagstore "sudo python3 /tmp/zag-ota-probe.VOMqkn/zag-personal-ota.py cleanup \
+  --probe --job '$JOB' --sha256 '$SHA' --team '$TEAM'"
+```
+
+The audit pipeline handles private log records locally and prints no raw records. If sudo requires a password, use the Mac's normal private SSH session to run the audit on the server, with a copy of the audit script. Cleanup can proceed even if audit log access fails because it leaves Nginx logs intact. After cleanup, inspect only the exact private operator directory and remove its known probe files when no longer needed. The prior Zag Store attempts still require the runbook's exact expired-record matching step.
+
+If iOS explicitly rejects Personal Team OTA, no examined supported system route consumes a visitor's Personal Team IPA directly from Safari. Managed installation requires enrollment and Apple documents App Store and enterprise packages for managed iOS distribution. Developer device installation uses a paired developer host. App Store links and eligible notarized Web Distribution can start from a website without visitor-side signing, with publisher eligibility and platform requirements. Enterprise OTA is for authorized in-house distribution. [Apple device management](https://developer.apple.com/documentation/devicemanagement/installing-managing-updating-and-removing-apps) · [Registered-device distribution](https://developer.apple.com/documentation/xcode/distributing-your-app-to-registered-devices) · [Web Distribution](https://developer.apple.com/support/web-distribution-eu/)
