@@ -320,7 +320,7 @@ private struct InstallerView: View {
                 } else {
                     Text("Z").font(.largeTitle.bold()).frame(width: 64, height: 64)
                 }
-                VStack(alignment: .leading) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text("Zag Installer").font(.largeTitle.bold())
                     Text("Install Zag Store using your own Apple ID")
                         .foregroundStyle(muted)
@@ -355,16 +355,27 @@ private struct InstallerView: View {
                     .disabled(installer.busy)
             }
             HStack {
-                Button(installer.busy ? "Installing…" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store")) {
+                Button {
                     installer.begin(upgrade: upgrade, team: team)
+                } label: {
+                    Text(installer.busy ? "Installing…" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store"))
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .frame(maxWidth: .infinity, minHeight: 54)
+                        .background {
+                            Capsule().fill(ZagPalette.rgb(0x0090ff))
+                        }
+                        .contentShape(Capsule())
+                        .opacity(installer.busy || !device.ready ? 0.45 : 1)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
                 .disabled(installer.busy || !device.ready)
                 if installer.busy {
                     ProgressView().controlSize(.small)
                     Button("Cancel") { installer.cancel() }
                 }
-                Spacer()
             }
             Divider()
             HStack {
