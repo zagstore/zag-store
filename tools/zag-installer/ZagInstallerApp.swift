@@ -73,7 +73,7 @@ final class InstallerController: ObservableObject {
             }
             process.executableURL = URL(fileURLWithPath: privatePython)
             process.arguments = [script, "--ui-pipe", "--precompiled-helpers",
-                                 root + "/helpers", "install"]
+                                 root + "/helpers", "--usb-transport", "standalone", "install"]
                 + (upgrade ? ["--upgrade", selectedTeam] : [])
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
