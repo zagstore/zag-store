@@ -1,5 +1,6 @@
 mod transfer;
 mod installation;
+mod inventory;
 use idevice::{IdeviceService, lockdown::LockdownClient, provider::{IdeviceProvider, UsbmuxdProvider}, usbmuxd::{Connection, UsbmuxdAddr}, installation_proxy::InstallationProxyClient, amfi::AmfiClient};
 use serde_json::json;
 use std::time::Duration;
@@ -31,24 +32,17 @@ async fn inspect(mode: &str) -> Result<serde_json::Value, Box<dyn std::error::Er
     // Lightweight authenticated status for the GUI poller. No app enumeration.
     if mode == "status" { return Ok(result); }
     let mut proxy = InstallationProxyClient::connect(&provider).await?;
-    let apps = proxy.get_apps(Some("User"), None).await?;
-    result["user_app_count"] = json!(apps.len());
-    if mode == "inventory" {
-        let mut zag_apps = Vec::new();
-        for (bundle, data) in &apps {
-            let owned = bundle == "app.zagstore.ios" ||
-                bundle.strip_prefix("app.zagstore.ios.").is_some_and(|suffix|
-                    suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()));
-            if !owned { continue; }
-            let dict = data.as_dictionary();
-            let version = dict.and_then(|d| d.get("CFBundleShortVersionString"))
-                              .and_then(|v| v.as_string());
-            let build = dict.and_then(|d| d.get("CFBundleVersion"))
-                            .and_then(|v| v.as_string());
-            zag_apps.push(json!({"bundleIdentifier":bundle, "version":version, "bundleVersion":build}));
-        }
-        zag_apps.sort_by(|a,b| a["bundleIdentifier"].as_str().cmp(&b["bundleIdentifier"].as_str()));
-        result["zag_apps"] = json!(zag_apps);
+    if mode == "inspect" {
+        // Keep the original low-cost inspection contract.
+        let apps = proxy.get_apps(Some("User"), None).await?;
+        result["user_app_count"] = json!(apps.len());
+    } else {
+        let snapshot = inventory::inspect(&mut proxy).await?;
+        result["user_app_count"] = json!(snapshot.user_count);
+        let diagnostics = snapshot.as_json();
+        result["zag_apps"] = diagnostics["zag_apps"].clone();
+        result["inventory_sources"] = diagnostics["inventory_sources"].clone();
+        result["inventory_note"] = diagnostics["inventory_note"].clone();
     }
     Ok(result)
 }

@@ -6,7 +6,7 @@
 //! No install command is exported by the current zag-usb CLI.
 use std::{error::Error, path::Path};
 use idevice::{IdeviceService, installation_proxy::InstallationProxyClient, provider::IdeviceProvider};
-use plist::Value;
+use crate::inventory;
 
 use crate::transfer;
 
@@ -32,27 +32,15 @@ pub fn is_personal_team_bundle(bundle: &str) -> bool {
     team.len() == 10 && team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-fn version_stamp(info: &Value) -> Result<VersionStamp, Box<dyn Error>> {
-    let data = info.as_dictionary().ok_or("Invalid app inventory record")?;
-    let version = data.get("CFBundleShortVersionString")
-        .and_then(Value::as_string).ok_or("Missing installed version")?;
-    let build = data.get("CFBundleVersion")
-        .and_then(Value::as_string).ok_or("Missing installed build")?;
-    if version.is_empty() || build.is_empty() || version.len() > 64 || build.len() > 64 {
-        return Err("Invalid installed version or build".into());
-    }
-    Ok(VersionStamp { version: version.into(), build: build.into() })
-}
-
 async fn installed(
     proxy: &mut InstallationProxyClient,
     bundle: &str,
 ) -> Result<Option<VersionStamp>, Box<dyn Error>> {
-    let apps = proxy.get_apps(Some("User"), Some(vec![bundle.to_owned()])).await?;
-    if apps.keys().any(|id| id != bundle) {
-        return Err("Unexpected app inventory identifier".into());
-    }
-    apps.get(bundle).map(version_stamp).transpose()
+    let snapshot = inventory::inspect(proxy).await?;
+    // This union is cross-checked across Lookup(User), Lookup(Any), and Browse.
+    Ok(snapshot.apps.get(bundle).map(|app| VersionStamp {
+        version: app.version.clone(), build: app.build.clone()
+    }))
 }
 
 /// Verified IPA staging, exact destination checks, install/upgrade, and
@@ -112,14 +100,5 @@ mod tests {
             "app.zagstore.ios.0123456789/", "com.other.app.FTB8PRW638", "app.zagstore.ios.abcdefghij"] {
             assert!(!is_personal_team_bundle(bad));
         }
-    }
-    #[test]
-    fn installed_version_requires_two_strings() {
-        let mut info = plist::Dictionary::new();
-        info.insert("CFBundleShortVersionString".into(), Value::String("1.0.0".into()));
-        assert!(version_stamp(&Value::Dictionary(info.clone())).is_err());
-        info.insert("CFBundleVersion".into(), Value::String("5".into()));
-        assert_eq!(version_stamp(&Value::Dictionary(info)).unwrap(),
-            VersionStamp {version:"1.0.0".into(),build:"5".into()});
     }
 }
