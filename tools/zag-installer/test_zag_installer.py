@@ -207,3 +207,16 @@ class NativeUSBAdapterTests(unittest.TestCase):
                                 (dev.copy_from_app, (self.UDID, DESTINATION, "Documents/key", Path("out")))):
             with self.assertRaisesRegex(ValueError, "disabled|not.*validated"):
                 operation(*args)
+
+    def test_standalone_cli_blocks_before_provisioning_or_download(self):
+        with patch.object(installer.sys, "platform", "darwin"), \
+             patch.object(installer.sys, "argv",
+                          ["zag_installer.py", "--usb-transport", "standalone", "install"]), \
+             patch.object(installer.sys.stdin, "isatty", return_value=True), \
+             patch.object(installer.desktop, "locked_cache") as locked, \
+             patch.object(installer.releases, "discover") as release, \
+             patch.object(installer.desktop.Provisioning, "run") as provision:
+            self.assertEqual(installer.main(), 1)
+            locked.assert_not_called()
+            release.assert_not_called()
+            provision.assert_not_called()

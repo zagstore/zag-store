@@ -431,6 +431,10 @@ def main():
         else:
             artifact.require(args.mode == "prepare" or sys.stdin.isatty(), "Use interactive macOS Terminal")
             approve = input
+        # In standalone preview, no Apple sign-in, certificate issuance, profile
+        # registration or download may begin while device writes are disabled.
+        artifact.require(args.usb_transport != "standalone" or args.mode == "prepare",
+                         "Native USB installation and signing handoff are not yet enabled")
         with desktop.locked_cache(precompiled=args.precompiled_helpers) as cache:
             if args.mode == "prepare":
                 release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
