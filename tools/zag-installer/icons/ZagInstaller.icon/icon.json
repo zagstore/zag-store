@@ -1,0 +1,32 @@
+{
+  "groups": [
+    {
+      "layers": [
+        {
+          "name": "Zag Installer",
+          "image-name-specializations": [
+            {
+              "value": "zagstore_installer.png"
+            },
+            {
+              "appearance": "dark",
+              "value": "zagstore_dark_installer.png"
+            }
+          ],
+          "specular": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

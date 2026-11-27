@@ -33,25 +33,25 @@ for variant in zagstore zagstore_dark; do
     [[ -s "$source" ]] || { echo "Missing approved installer artwork: $source" >&2; exit 1; }
     cp "$source" "$APP/Contents/Resources/${variant}_installer.png"
 done
-for variant in light dark; do
-    name=ZagInstaller
-    artwork=zagstore_installer
-    if [[ "$variant" == dark ]]; then
-        name=ZagInstallerDark
-        artwork=zagstore_dark_installer
-    fi
-    ICONSET="$CACHE/$name.iconset"
-    rm -rf "$ICONSET"
-    mkdir -p "$ICONSET"
-    xcrun swift "$ROOT/tools/zag-installer/MakeDockIcon.swift" \
-        "$APP/Contents/Resources/$artwork.png" "$CACHE/$name.png"
-    for size in 16 32 128 256 512; do
-        sips -z "$size" "$size" "$CACHE/$name.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-        double=$((size * 2))
-        sips -z "$double" "$double" "$CACHE/$name.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-    done
-    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/$name.icns"
-done
+ICON_OUTPUT="$(mktemp -d "$CACHE/native-icon.XXXXXXXX")"
+trap 'rm -rf "$ICON_OUTPUT"' EXIT
+
+xcrun actool "$ROOT/tools/zag-installer/icons/ZagInstaller.icon" \
+    --compile "$ICON_OUTPUT" \
+    --platform macosx \
+    --minimum-deployment-target 26.0 \
+    --app-icon ZagInstaller \
+    --output-partial-info-plist "$ICON_OUTPUT/IconInfo.plist" \
+    --output-format human-readable-text \
+    --notices --warnings --errors
+
+test -s "$ICON_OUTPUT/Assets.car"
+test -s "$ICON_OUTPUT/ZagInstaller.icns"
+
+cp "$ICON_OUTPUT/Assets.car" "$APP/Contents/Resources/"
+cp "$ICON_OUTPUT/ZagInstaller.icns" "$APP/Contents/Resources/"
+rm -f "$APP/Contents/Resources/ZagInstallerDark.icns"
+
 install -m 755 "$CACHE/ZagInstaller" "$APP/Contents/MacOS/ZagInstaller"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -63,9 +63,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>app.zagstore.installer</string>
     <key>CFBundleExecutable</key><string>ZagInstaller</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleIconFile</key><string>ZagInstaller.icns</string>
+    <key>CFBundleIconFile</key><string>ZagInstaller</string>
+    <key>CFBundleIconName</key><string>ZagInstaller</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleVersion</key><string>4</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>LSUIElement</key><false/>
     <key>LSBackgroundOnly</key><false/>
