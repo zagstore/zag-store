@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 
-private struct InstallerPrompt: Identifiable {
+struct InstallerPrompt: Identifiable {
     let id = UUID()
     let message: String
     let secure: Bool
