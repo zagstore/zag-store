@@ -48,7 +48,7 @@ final class InstallerUpdates: ObservableObject {
     }
 }
 
-private struct InstallerUpdateSettingsView: View {
+struct InstallerUpdateSettingsView: View {
     @ObservedObject var updates: InstallerUpdates
     @ObservedObject var installer: InstallerController
     @State private var automaticChecks: Bool
