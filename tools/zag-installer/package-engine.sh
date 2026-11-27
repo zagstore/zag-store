@@ -22,6 +22,14 @@ cp "$ROOT/scripts/zag-personal-ota.py" "$TEMP/package/scripts/zag-personal-ota.p
 cp "$ROOT/AppleAuthCore/zag-isideload/src/assets/apple_root.cer" \
    "$TEMP/package/AppleAuthCore/zag-isideload/src/assets/apple_root.cer"
 /usr/bin/ditto "$INPUT" "$TEMP/package/helpers"
+USB_HELPER="${ZAG_INSTALLER_USB_HELPER:-}"
+if [[ -n "$USB_HELPER" ]]; then
+    [[ -f "$USB_HELPER" && -x "$USB_HELPER" && ! -L "$USB_HELPER" ]] || {
+        echo "Missing compiled native USB helper." >&2; exit 1;
+    }
+    cp -p "$USB_HELPER" "$TEMP/package/helpers/zag-usb"
+    /usr/bin/otool -L "$TEMP/package/helpers/zag-usb"
+fi
 
 # Verify the copied artifact validator and desktop modules without executing the
 # installation CLI, performing network requests, or contacting an iPhone.
@@ -70,4 +78,4 @@ print("PASS: staged package has no symlink dependencies")
 PY
 mv "$TEMP/package" "$DEST"
 printf 'PASS: staged desktop engine at %s\n' "$DEST"
-echo "NOTE: local Python and CoreDevice still required; this is not distributable."
+echo "NOTE: USB discovery is read-only; installation and production distribution are not enabled."

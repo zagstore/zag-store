@@ -259,41 +259,50 @@ private struct WiredDevice: Sendable {
     let ready: Bool
 
     static func inspect() -> WiredDevice {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: directory) }
+        let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
+        let helper: URL?
+        if bundled {
+            helper = Bundle.main.resourceURL?.appendingPathComponent("DesktopEngine/helpers/zag-usb")
+        } else {
+            let root = ProcessInfo.processInfo.environment["ZAG_INSTALLER_ROOT"]
+                ?? NSHomeDirectory() + "/Documents/ZagStore-claude"
+            helper = URL(fileURLWithPath: root).appendingPathComponent("tools/zag-installer/native-usb/target/release/zag-usb")
+        }
+        guard let helper, FileManager.default.isExecutableFile(atPath: helper.path) else {
+            return WiredDevice(title: "Native USB helper unavailable",
+                               detail: "Zag Installer requires its bundled USB helper.", ready: false)
+        }
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-            let report = directory.appendingPathComponent("devices.json")
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            process.arguments = ["devicectl", "list", "devices", "--timeout", "5", "--json-output", report.path]
-            process.standardOutput = FileHandle.nullDevice
+            let stdout = Pipe()
+            process.executableURL = helper
+            process.arguments = ["status"]
+            process.standardOutput = stdout
             process.standardError = FileHandle.nullDevice
             try process.run()
+            let data = stdout.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            guard process.terminationStatus == 0,
-                  let root = try JSONSerialization.jsonObject(with: Data(contentsOf: report)) as? [String: Any],
-                  let result = root["result"] as? [String: Any],
-                  let devices = result["devices"] as? [[String: Any]] else { throw CocoaError(.fileReadCorruptFile) }
-            let wired = devices.filter {
-                ($0["connectionProperties"] as? [String: Any])?["transportType"] as? String == "wired"
+            guard process.terminationStatus == 0, data.count <= 8192,
+                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  root["transport"] as? String == "system-usbmuxd",
+                  root["trust_verified"] as? Bool == true,
+                  let info = root["device"] as? [String: Any],
+                  info["DeviceClass"] as? String == "iPhone",
+                  let version = info["ProductVersion"] as? String,
+                  let model = info["ProductType"] as? String,
+                  let name = info["DeviceName"] as? String else {
+                throw CocoaError(.fileReadCorruptFile)
             }
-            guard wired.count == 1, let device = wired.first else {
-                return WiredDevice(title: wired.isEmpty ? "No wired device detected" : "Multiple devices connected",
-                                   detail: "Connect one iPhone or iPad using USB.", ready: false)
-            }
-            let properties = device["deviceProperties"] as? [String: Any] ?? [:]
-            let hardware = device["hardwareProperties"] as? [String: Any] ?? [:]
-            let connection = device["connectionProperties"] as? [String: Any] ?? [:]
-            let paired = connection["pairingState"] as? String == "paired"
-            let developer = properties["developerModeStatus"] as? String
-            let ready = paired && hardware["platform"] as? String == "iOS" && developer != "disabled"
-            let name = properties["name"] as? String ?? "Connected device"
-            let model = hardware["marketingName"] as? String ?? hardware["productType"] as? String ?? "iPhone or iPad"
-            let version = properties["osVersionNumber"] as? String
-            return WiredDevice(title: name, detail: [model, version.map { "iOS \($0)" }, ready ? "USB connected" : "Unlock, trust this Mac and enable Developer Mode"].compactMap { $0 }.joined(separator: " · "), ready: ready)
+            let ready = root["developer_mode"] as? Bool == true
+            return WiredDevice(title: name,
+                               detail: [model, "iOS \(version)",
+                                        ready ? "Trusted USB connection" : "Developer Mode required"]
+                                   .joined(separator: " · "),
+                               ready: ready)
         } catch {
-            return WiredDevice(title: "Device detection unavailable", detail: "Check Xcode device services and USB trust.", ready: false)
+            return WiredDevice(title: "No trusted wired iPhone",
+                               detail: "Connect and unlock one iPhone; confirm Trust and Developer Mode.",
+                               ready: false)
         }
     }
 }
@@ -315,6 +324,7 @@ private enum ZagPalette {
 private struct InstallerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var dark: Bool { colorScheme == .dark }
+    private var nativeUSBPreview: Bool { Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true }
     private var surface: Color { ZagPalette.rgb(dark ? 0x141e33 : 0xffffff) }
     private var border: Color { ZagPalette.rgb(dark ? 0x29374e : 0xdcdcde) }
     private var muted: Color { dark ? ZagPalette.rgb(0xa6b5d2) : Color.secondary }
@@ -385,6 +395,10 @@ private struct InstallerView: View {
                 .background(surface, in: RoundedRectangle(cornerRadius: 12))
                 .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
                 Label("Signing Setup prepares on-device renewal.", systemImage: "arrow.triangle.2.circlepath")
+                if nativeUSBPreview {
+                    Label("Native USB verified. Installation remains disabled until the USB transfer path is validated.", systemImage: "wrench.and.screwdriver")
+                        .foregroundStyle(attention)
+                }
             }
             .font(.callout)
             .foregroundStyle(muted)
@@ -410,10 +424,10 @@ private struct InstallerView: View {
                             Capsule().fill(ZagPalette.rgb(0x0090ff))
                         }
                         .contentShape(Capsule())
-                        .opacity(installer.busy || !device.ready ? 0.45 : 1)
+                        .opacity(installer.busy || !device.ready || nativeUSBPreview ? 0.45 : 1)
                 }
                 .buttonStyle(.plain)
-                .disabled(installer.busy || !device.ready)
+                .disabled(installer.busy || !device.ready || nativeUSBPreview)
                 if installer.busy {
                     ProgressView().controlSize(.small)
                     Button("Cancel") { installer.cancel() }
@@ -451,7 +465,7 @@ private struct InstallerView: View {
                 if !installer.busy {
                     device = await Task.detached(priority: .utility) { WiredDevice.inspect() }.value
                 }
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
         .padding(24)

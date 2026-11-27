@@ -75,7 +75,7 @@ if [[ -n "$ENGINE_STAGE" ]]; then
     ENGINE_STAGE="$(cd "$ENGINE_STAGE" && pwd -P)"
     for source in tools/zag-installer/zag_installer.py scripts/zag-personal-ota.py \
                   AppleAuthCore/zag-isideload/src/assets/apple_root.cer \
-                  helpers/release helpers/handoff helpers/zag_desktop \
+                  helpers/release helpers/handoff helpers/zag_desktop helpers/zag-usb \
                   helpers/zag-desktop-anisette helpers/zag-desktop-signer helpers/openssl \
                   helpers/lib/libssl.3.dylib helpers/lib/libcrypto.3.dylib; do
         [[ -f "$ENGINE_STAGE/$source" && ! -L "$ENGINE_STAGE/$source" ]] || {
@@ -84,6 +84,7 @@ if [[ -n "$ENGINE_STAGE" ]]; then
     done
     ENGINE_NEXT="$APP/Contents/Resources/.DesktopEngine.next"
     rm -rf "$ENGINE_NEXT"
+    [[ -x "$ENGINE_STAGE/helpers/zag-usb" ]] || { echo "Native USB helper is not executable." >&2; exit 1; }
     /usr/bin/ditto "$ENGINE_STAGE" "$ENGINE_NEXT"
     PYTHON_STAGE="${ZAG_INSTALLER_PYTHON_STAGE:-}"
     [[ -d "$PYTHON_STAGE" && ! -L "$PYTHON_STAGE" && -x "$PYTHON_STAGE/bin/python3" ]] || {
