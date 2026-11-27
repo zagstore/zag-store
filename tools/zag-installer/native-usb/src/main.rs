@@ -1,4 +1,5 @@
 mod transfer;
+mod installation;
 use idevice::{IdeviceService, lockdown::LockdownClient, provider::{IdeviceProvider, UsbmuxdProvider}, usbmuxd::{Connection, UsbmuxdAddr}, installation_proxy::InstallationProxyClient, amfi::AmfiClient};
 use serde_json::json;
 use std::time::Duration;

@@ -21,6 +21,11 @@ pub async fn stage_and_verify(provider: &dyn IdeviceProvider, local: &Path,
     }
     let mut source = tokio::fs::File::open(local).await?;
     let mut afc = AfcClient::connect(provider).await?;
+    // Create AFC's public staging root only when absent. This must be
+    // provisioned separately from our per-job exclusive directory.
+    if afc.get_file_info("PublicStaging").await.is_err() {
+        afc.mk_dir("PublicStaging").await?;
+    }
     let directory = format!("PublicStaging/zag-{token}");
     // Exclusive directory creation; never overwrite an existing staging job.
     afc.mk_dir(&directory).await?;
@@ -70,6 +75,27 @@ pub async fn stage_and_verify(provider: &dyn IdeviceProvider, local: &Path,
         return Err(error);
     }
     Ok(remote)
+}
+
+/// Clean up only our job-specific directory, never the global PublicStaging root.
+/// The installation service may already have removed the package; both cases
+/// are accepted. Caller uses an unguessable 32-digit random staging token.
+#[allow(dead_code)]
+pub async fn cleanup_stage(
+    provider: &dyn IdeviceProvider,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !valid_token(token) { return Err("Invalid staging token".into()); }
+    let mut afc = AfcClient::connect(provider).await?;
+    let directory = format!("PublicStaging/zag-{token}");
+    let file = format!("{directory}/package.ipa");
+    if afc.get_file_info(&file).await.is_ok() {
+        afc.remove(&file).await?;
+    }
+    if afc.get_file_info(&directory).await.is_ok() {
+        afc.remove(&directory).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
