@@ -86,3 +86,92 @@ class HandoffTests(unittest.TestCase):
             self.send(raw, replies=[hashlib.sha256(raw).hexdigest()[:24], "cancel"])
         self.assertNotIn(self.scope, [call.args[0] for call in self.store.read.call_args_list])
         self.device.copy_to_app.assert_not_called()
+
+
+    def test_automatic_setup_authenticates_request_response_and_completion(self):
+        from types import SimpleNamespace
+        state = SimpleNamespace(sent=False, delivery_attempts=0)
+
+        def copy_to(target, bundle, local, remote):
+            self.assertEqual((target, bundle), ("target", BUNDLE))
+            if remote == handoff.BOOTSTRAP:
+                state.bootstrap = json.loads(local.read_bytes())
+                state.secret = base64.b64decode(state.bootstrap["secret"])
+                state.request = self.request_bytes(expires=state.bootstrap["expires"] - 10)
+            elif remote == handoff.SETUP_RESPONSE:
+                state.delivery_attempts += 1
+                if state.delivery_attempts == 1:
+                    raise ValueError("USB disconnected")
+                self.assertEqual(handoff.unwrap(state.secret, state.bootstrap["id"], "response", local.read_bytes()),
+                                 b"ciphertext")
+                state.sent = True
+
+        def copy_from(target, bundle, remote, local):
+            self.assertEqual((target, bundle), ("target", BUNDLE))
+            if remote == handoff.SETUP_REQUEST:
+                local.write_bytes(handoff.wrap(state.secret, state.bootstrap["id"], "request", state.request))
+            elif remote == handoff.ACKNOWLEDGEMENT:
+                self.assertTrue(state.sent)
+                digest = hashlib.sha256(state.request).digest()
+                local.write_bytes(handoff.wrap(state.secret, state.bootstrap["id"], "verified", digest))
+
+        self.device.copy_to_app.side_effect = copy_to
+        self.device.copy_from_app.side_effect = copy_from
+        with patch.object(handoff, "encrypt", return_value=b"ciphertext") as encrypt, \
+             patch.object(handoff.time, "sleep") as wait:
+            result = handoff.automatic(Path("."), self.cache, self.scratch, self.device, "target", UDID, TEAM,
+                                       self.scope, self.leaf, b"existing-key", "openssl",
+                                       {"bundleIdentifier": BUNDLE}, notify=Mock())
+        self.assertEqual(result, {"signing_setup": "verified"})
+        self.device.launch_app.assert_called_once_with("target", BUNDLE)
+        self.assertFalse((self.scratch / "setup-bootstrap.json").exists())
+        encrypt.assert_called_once()
+        wait.assert_called_once_with(2)
+        self.assertEqual(state.delivery_attempts, 2)
+
+    def test_automatic_wire_rejects_tampering_replay_and_unrelated_phase(self):
+        secret = b"1" * 32
+        wire = handoff.wrap(secret, "original", "request", b"payload")
+        changed = json.loads(wire)
+        changed["payload"] = base64.b64encode(b"changed").decode()
+        for transaction, phase, candidate in (
+            ("original", "request", json.dumps(changed).encode()),
+            ("different", "request", wire),
+            ("original", "verified", wire),
+        ):
+            with self.subTest(transaction=transaction, phase=phase), self.assertRaisesRegex(ValueError, "authentication"):
+                handoff.unwrap(secret, transaction, phase, candidate)
+
+    def test_existing_and_cancelled_setup_skip_private_key_delivery(self):
+        from types import SimpleNamespace
+        for label in ("existing", "cancelled"):
+            with self.subTest(label=label):
+                state = SimpleNamespace()
+
+                def copy_to(_target, _bundle, local, remote):
+                    self.assertEqual(remote, handoff.BOOTSTRAP)
+                    state.bootstrap = json.loads(local.read_bytes())
+                    state.secret = base64.b64decode(state.bootstrap["secret"])
+
+                def copy_from(_target, _bundle, remote, local):
+                    if remote == handoff.SETUP_REQUEST:
+                        raise ValueError("No new request")
+                    self.assertEqual(remote, handoff.ACKNOWLEDGEMENT)
+                    digest = hashlib.sha256(self.leaf).digest() if label == "existing" else b""
+                    local.write_bytes(handoff.wrap(state.secret, state.bootstrap["id"], label, digest))
+
+                self.device.copy_to_app.side_effect = copy_to
+                self.device.copy_from_app.side_effect = copy_from
+
+                def setup():
+                    return handoff.automatic(Path("."), self.cache, self.scratch, self.device, "target", UDID, TEAM,
+                                             self.scope, self.leaf, b"existing-key", "openssl",
+                                             {"bundleIdentifier": BUNDLE}, notify=Mock())
+
+                with patch.object(handoff, "encrypt") as encrypt:
+                    if label == "existing":
+                        self.assertEqual(setup(), {"signing_setup": "verified"})
+                    else:
+                        with self.assertRaisesRegex(ValueError, "cancelled on the iPhone"):
+                            setup()
+                    encrypt.assert_not_called()

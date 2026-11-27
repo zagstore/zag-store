@@ -24,11 +24,11 @@ class LocalCandidateTests(unittest.TestCase):
         self.device.usb_device.return_value = ("usb-device", "device-udid")
         self.cache = Mock()
 
-    def make_ipa(self, path, bundle="app.zagstore.ios", version="1.0.0", build="5", profile=False):
+    def make_ipa(self, path, bundle="app.zagstore.ios", version="1.0.0", build="5", profile=False, setup=False):
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("Payload/Zag.app/Info.plist", plistlib.dumps({
                 "CFBundleIdentifier": bundle, "CFBundleShortVersionString": version,
-                "CFBundleVersion": build, "MinimumOSVersion": "16.4",
+                "CFBundleVersion": build, "MinimumOSVersion": "16.4", "ZagAutomaticSigningSetup": setup,
             }))
             if profile:
                 archive.writestr("Payload/Zag.app/embedded.mobileprovision", b"profile")
@@ -88,15 +88,18 @@ class LocalCandidateTests(unittest.TestCase):
         self.cache.installer_tools.assert_not_called()
         self.device.install.assert_not_called()
 
-    def assert_install_uses_existing_identity(self, *, replace_same_build):
-        digest = self.make_ipa(self.source)
+    def test_setup_capable_candidate_runs_automatic_setup_without_flag(self):
+        self.assert_install_uses_existing_identity(replace_same_build=True, setup=True)
+
+    def assert_install_uses_existing_identity(self, *, replace_same_build, setup=False):
+        digest = self.make_ipa(self.source, setup=setup)
         signed = self.scratch / "signed.ipa"
         self.make_ipa(signed, bundle=BUNDLE)
         newest = {**INSTALLED, "bundleVersion": "5"}
         prior = newest if replace_same_build else INSTALLED
-        self.device.apps.side_effect = [[APPTESTERS, prior]] * 3 + [[APPTESTERS, newest]]
+        self.device.apps.side_effect = [[APPTESTERS, prior]] * 3 + [[APPTESTERS, newest]] * (2 if setup else 1)
         self.cache.installer_tools.return_value = ("auth", "signer", "openssl", "anisette")
-        identity = Mock(certificate=b"existing-leaf")
+        identity = Mock(certificate=b"existing-leaf", key=b"existing-key", key_item="a" * 64)
 
         def provision(portal, _):
             self.assertTrue(portal.upgrade)
@@ -115,11 +118,19 @@ class LocalCandidateTests(unittest.TestCase):
              patch.object(installer.desktop, "sign", return_value=signed), \
              patch.object(installer.artifact, "validate", return_value={"bundle_identifier": BUNDLE, "build": "5"}) as verify, \
              patch.object(installer.releases, "acquire") as download, \
-             patch.object(installer.releases, "check_fresh") as production_check:
+             patch.object(installer.releases, "check_fresh") as production_check, \
+             patch.object(installer.handoff, "automatic", return_value={"signing_setup": "verified"}) as automatic:
             result = self.upgrade(digest, approve=lambda _: next(steps), replace_same_build=replace_same_build)
         expected = {"installed_bundle": BUNDLE, "version": "1.0.0", "build": "5"}
         if replace_same_build:
             expected["replaced_same_build"] = True
+        if setup:
+            expected["signing_setup"] = "verified"
+            automatic.assert_called_once()
+            self.assertEqual(automatic.call_args.args[6:], (TEAM, identity.key_item, identity.certificate,
+                                                            identity.key, "openssl", newest))
+        else:
+            automatic.assert_not_called()
         self.assertEqual(result, expected)
         self.assertEqual(verify.call_args.kwargs["expected_signer"], b"existing-leaf")
         self.device.install.assert_called_once_with("usb-device", self.scratch / "staged/Payload/Zag.app")

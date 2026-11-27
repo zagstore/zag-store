@@ -52,6 +52,17 @@ struct HandoffTests {
                                   request: bytes, recipient: recipient, now: now)
         }
         reject("partial response") { _ = try Envelope.open(response.prefix(12), request: bytes, recipient: recipient, now: now) }
+        let setup = Envelope.Bootstrap(id: UUID().uuidString, expires: request.expires,
+            secret: Data(repeating: 0x42, count: 32), udid: identifier, bundle: bundle,
+            team: team, keyScope: scope, certificate: certificate)
+        let wire = try setup.wrap(bytes, label: "request")
+        precondition(try! setup.unwrap(wire, label: "request") == bytes)
+        reject("USB setup message in the wrong phase") { _ = try setup.unwrap(wire, label: "verified") }
+        let otherSetup = Envelope.Bootstrap(id: UUID().uuidString, expires: setup.expires,
+            secret: setup.secret, udid: identifier, bundle: bundle, team: team, keyScope: scope, certificate: certificate)
+        reject("USB setup replay in a different transaction") { _ = try otherSetup.unwrap(wire, label: "request") }
+        let proof = try setup.wrap(Data(SHA256.hash(data: bytes)), label: "verified")
+        precondition(try! setup.unwrap(proof, label: "verified") == Data(SHA256.hash(data: bytes)))
         print("PASS: authenticated round trip and desktop-compatible scope")
     }
 }

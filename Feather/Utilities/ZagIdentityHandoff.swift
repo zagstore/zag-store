@@ -41,17 +41,39 @@ final class ZagIdentityHandoff: ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var message: String?
 
-    private func file(_ path: String) throws -> URL {
-        try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-            .appendingPathComponent(String(path.dropFirst("Documents/".count)))
+    static func file(_ path: String) throws -> URL {
+        let directories: [(String, FileManager.SearchPathDirectory)] = [
+            ("Documents/", .documentDirectory), ("Library/Caches/", .cachesDirectory),
+        ]
+        guard let (prefix, directory) = directories.first(where: { path.hasPrefix($0.0) }) else { throw Envelope.Failure.invalid }
+        return try FileManager.default.url(for: directory, in: .userDomainMask, appropriateFor: nil, create: false)
+            .appendingPathComponent(String(path.dropFirst(prefix.count)))
+    }
+
+    static func read(_ path: String, limit: Int) throws -> Data {
+        let input = try FileHandle(forReadingFrom: file(path))
+        defer { try? input.close() }
+        let bytes = try input.read(upToCount: limit + 1) ?? Data()
+        guard bytes.count <= limit else { throw Envelope.Failure.invalid }
+        return bytes
+    }
+
+    static func takeBootstrap() -> Envelope.Bootstrap? {
+        guard let bundle = Bundle.main.bundleIdentifier, bundle.hasPrefix("app.zagstore.ios."),
+              let url = try? file(Envelope.bootstrapPath),
+              let data = try? read(Envelope.bootstrapPath, limit: Envelope.maxSize),
+              let setup = try? JSONDecoder().decode(Envelope.Bootstrap.self, from: data),
+              (try? FileManager.default.removeItem(at: url)) != nil,
+              setup.bundle == bundle, (try? setup.validate()) != nil else { return nil }
+        return setup
     }
 
     func cancel() {
         generation = UUID()
         pending = nil
         code = nil
-        for path in [Envelope.requestPath, Envelope.responsePath] {
-            if let url = try? file(path) { try? FileManager.default.removeItem(at: url) }
+        for path in [Envelope.requestPath, Envelope.responsePath, Envelope.setupRequestPath, Envelope.setupResponsePath] {
+            if let url = try? Self.file(path) { try? FileManager.default.removeItem(at: url) }
         }
     }
 
@@ -86,8 +108,48 @@ final class ZagIdentityHandoff: ObservableObject {
                        serial: evidence.2, certificateExpiry: evidence.3)
     }
 
-    func prepare() async {
-        guard !busy else { return }
+    func verifyExisting(_ bootstrap: Envelope.Bootstrap) async -> Bool {
+        do {
+            let attempt = generation
+            guard let account = try ZagNativeAppleIDs.shared.catalog().activeID,
+                  let token = ZagNativeAppleIDs.shared.connectedToken(account),
+                  try Envelope.scope(account: token.accountID, team: bootstrap.team) == bootstrap.keyScope,
+                  let raw = try ZagNativeAccountInstall.secrets.load(.signingPrivateKey, account: account, team: bootstrap.team)
+            else { return false }
+            let identity = try JSONDecoder().decode(ZagSigningIdentity.self, from: raw)
+            let keys = ZagKeychainSigningKeyFactory(keys: .init(namespace: ZagNativeAccountInstall.namespace))
+            guard identity.certificate == bootstrap.certificate,
+                  keys.check(certificate: identity.certificate, privateKey: identity.privateKey,
+                             account: account, team: bootstrap.team, keySlot: identity.keySlot) != .mismatch
+            else { return false }
+            let context = try await context()
+            guard generation == attempt, context.token == token,
+                  context.device.udid.caseInsensitiveCompare(bootstrap.udid) == .orderedSame,
+                  context.bundle == bootstrap.bundle, context.team == bootstrap.team, context.signer == bootstrap.certificate
+            else { return false }
+            try await ZagNativeAccountInstall.verifyRunningInstallation()
+            guard generation == attempt, ZagNativeAppleIDs.shared.connectedToken(account) == token,
+                  ZagRPPairingCore.shared.pairedIdentity == context.device else { return false }
+            let proof = try bootstrap.wrap(Data(SHA256.hash(data: bootstrap.certificate)), label: "existing")
+            try proof.write(to: Self.file(Envelope.acknowledgementPath), options: [.atomic, .completeFileProtection])
+            message = "Signing identity is already verified for this installation."
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func cancelSetup(_ bootstrap: Envelope.Bootstrap) {
+        cancel()
+        if let proof = try? bootstrap.wrap(Data(), label: "cancelled"),
+           let url = try? Self.file(Envelope.acknowledgementPath) {
+            try? proof.write(to: url, options: [.atomic, .completeFileProtection])
+        }
+    }
+
+    @discardableResult
+    func prepare(bootstrap: Envelope.Bootstrap? = nil) async -> Bool {
+        guard !busy else { return false }
         busy = true
         defer { busy = false }
         cancel()
@@ -95,41 +157,52 @@ final class ZagIdentityHandoff: ObservableObject {
         message = nil
         do {
             let context = try await context()
-            guard generation == attempt else { return }
+            guard generation == attempt else { return false }
             let key = Curve25519.KeyAgreement.PrivateKey()
-            let request = Envelope.Request(protocolVersion: 1, nonce: UUID(), expires: Date().timeIntervalSince1970 + Envelope.lifetime,
+            let request = Envelope.Request(protocolVersion: 1, nonce: UUID(),
+                expires: min(bootstrap?.expires ?? .infinity, Date().timeIntervalSince1970 + Envelope.lifetime),
                 recipient: key.publicKey.rawRepresentation, udid: context.device.udid, bundle: context.bundle, team: context.team,
                 keyScope: try Envelope.scope(account: context.token.accountID, team: context.team), certificate: context.signer)
             try request.validate()
             let bytes = try JSONEncoder().encode(request)
-            let url = try file(Envelope.requestPath)
-            try bytes.write(to: url, options: [.atomic, .completeFileProtection])
+            if let bootstrap {
+                try bootstrap.check(request)
+                try bootstrap.wrap(bytes, label: "request").write(to: Self.file(Envelope.setupRequestPath),
+                                                                  options: [.atomic, .completeFileProtection])
+            } else {
+                try bytes.write(to: Self.file(Envelope.requestPath), options: [.atomic, .completeFileProtection])
+                code = Envelope.code(bytes)
+            }
             pending = Pending(key: key, bytes: bytes, token: context.token)
-            code = Envelope.code(bytes)
+            return true
         } catch {
             message = (error as? Failure)?.localizedDescription ?? Failure.context.localizedDescription
+            return false
         }
     }
 
-    func accept() async {
+    func accept(bootstrap: Envelope.Bootstrap? = nil, authenticatedResponse: Data? = nil) async {
         guard !busy, let pending else { return }
         busy = true
         defer { busy = false }
         message = nil
         do {
-            let url = try file(Envelope.responsePath)
-            guard FileManager.default.fileExists(atPath: url.path) else { throw Failure.responseMissing }
-            // Consume the challenge before any suspension or attempted import.
-            // A partial or rejected response requires a fresh request.
-            let input = try FileHandle(forReadingFrom: url)
-            defer { try? input.close() }
-            let response = try input.read(upToCount: Envelope.maxSize + 1) ?? Data()
+            let response: Data
+            if let bootstrap, let authenticatedResponse {
+                response = try bootstrap.unwrap(authenticatedResponse, label: "response")
+            } else {
+                let url = try Self.file(Envelope.responsePath)
+                guard FileManager.default.fileExists(atPath: url.path) else { throw Failure.responseMissing }
+                response = try Self.read(Envelope.responsePath, limit: Envelope.maxSize)
+            }
+            // Consume before import. Interrupted transfers need a new challenge.
             cancel()
             let attempt = generation
             try await ZagNativeAccountInstall.withExclusiveOperation {
                 let context = try await context()
                 guard context.token == pending.token else { throw Failure.context }
                 let request = try Envelope.decodeRequest(pending.bytes)
+                try bootstrap?.check(request)
                 try request.checkBinding(device: context.device.udid, bundle: context.bundle, team: context.team,
                     scope: Envelope.scope(account: context.token.accountID, team: context.team), certificate: context.signer)
                 let account = context.token.nativeAccountID
@@ -161,10 +234,22 @@ final class ZagIdentityHandoff: ObservableObject {
             }
             // This independently verifies paired inventory, existing ownership
             // and profile readback before publishing a renewable receipt.
-            await ZagRunningInstallation.shared.inspect(verifyPersonal: true, retry: true)
-            message = ZagRunningInstallation.shared.nativeUUID == nil
-                ? "Signing identity received. Retry installation verification to enable self-renewal."
-                : "Signing identity received and this installation is verified for renewal."
+            if let bootstrap {
+                do {
+                    try await ZagNativeAccountInstall.verifyRunningInstallation()
+                    guard generation == attempt else { return }
+                    let proof = try bootstrap.wrap(Data(SHA256.hash(data: pending.bytes)), label: "verified")
+                    try proof.write(to: Self.file(Envelope.acknowledgementPath), options: [.atomic, .completeFileProtection])
+                    message = "Signing identity received and this installation is verified for renewal."
+                } catch {
+                    message = "Signing identity received. Installation ownership could not be confirmed. Reconnect and retry Signing Setup."
+                }
+            } else {
+                await ZagRunningInstallation.shared.inspect(verifyPersonal: true, retry: true)
+                message = ZagRunningInstallation.shared.nativeUUID == nil
+                    ? "Signing identity received. Retry installation verification to enable self-renewal."
+                    : "Signing identity received and this installation is verified for renewal."
+            }
         } catch {
             message = (error as? Failure)?.localizedDescription
                 ?? (error as? Envelope.Failure)?.localizedDescription ?? Failure.storage.localizedDescription
@@ -199,4 +284,130 @@ struct ZagIdentityHandoffView: View {
         .onDisappear { handoff.cancel() }
     }
 }
+
+struct ZagAutomaticIdentitySetupModifier: ViewModifier {
+    let ready: Bool
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var bootstrap: ZagIdentityHandoffEnvelope.Bootstrap?
+
+    func body(content: Content) -> some View {
+        content
+            .task(id: ready && scenePhase == .active) {
+                guard ready, scenePhase == .active,
+                      Bundle.main.bundleIdentifier?.hasPrefix("app.zagstore.ios.") == true else { return }
+                while !Task.isCancelled {
+                    if let next = ZagIdentityHandoff.takeBootstrap() { bootstrap = next }
+                    do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                }
+            }
+            .sheet(isPresented: Binding(get: { bootstrap != nil }, set: { if !$0 { bootstrap = nil } })) {
+                if let bootstrap { ZagAutomaticIdentitySetupView(bootstrap: bootstrap).id(bootstrap.id) }
+            }
+    }
+}
+
+private struct ZagAutomaticIdentitySetupView: View {
+    typealias Envelope = ZagIdentityHandoffEnvelope
+    let bootstrap: Envelope.Bootstrap
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var pairing = ZagRPPairingCore.shared
+    @StateObject private var handoff = ZagIdentityHandoff()
+    @State private var selectedAccount: UUID?
+    @State private var signingIn = false
+    @State private var authorised = false
+    @State private var checkingExisting = true
+    @State private var verifiedExisting = false
+    @State private var notice: String?
+
+    private func matchingAccount(_ id: UUID) -> Bool {
+        guard let token = ZagNativeAppleIDs.shared.connectedToken(id) else { return false }
+        return (try? Envelope.scope(account: token.accountID, team: bootstrap.team)) == bootstrap.keyScope
+    }
+
+    private func selectAccount(_ id: UUID) {
+        guard matchingAccount(id) else {
+            notice = "Use the same Apple ID that signed this copy on the Mac."
+            return
+        }
+        selectedAccount = id
+        notice = nil
+    }
+
+    private func authorize() {
+        guard let selectedAccount, matchingAccount(selectedAccount) else {
+            self.selectedAccount = nil
+            notice = "Sign in with the original Apple ID before authorizing setup."
+            return
+        }
+        do {
+            try ZagNativeAppleIDs.shared.activate(selectedAccount)
+            notice = nil
+            authorised = true
+        } catch {
+            notice = "Zag Store could not activate the original Apple ID."
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Text("Use the signing identity from your trusted USB connection. This copy will keep the certificate it was installed with.")
+                if !pairing.hasSavedPairing {
+                    NavigationLink("Set Up Installation Pairing") { InstallationView() }
+                }
+                if selectedAccount == nil {
+                    Button("Sign In with the Original Apple ID") { signingIn = true }
+                }
+                if checkingExisting {
+                    ProgressView("Checking existing signing identity…")
+                } else if !authorised && !verifiedExisting {
+                    Button("Authorize Signing Identity") { authorize() }
+                        .disabled(selectedAccount == nil || !pairing.hasSavedPairing)
+                } else if handoff.message == nil && notice == nil {
+                    ProgressView("Verifying signing setup…")
+                }
+                if let notice = notice ?? handoff.message { Text(notice) }
+            }
+            .navigationTitle("Signing Setup")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(verifiedExisting || (authorised && handoff.message != nil) ? "Done" : "Close") {
+                        if !verifiedExisting && handoff.message == nil { handoff.cancelSetup(bootstrap) }
+                        dismiss()
+                    }
+                }
+            }
+            .navigationDestination(isPresented: $signingIn) {
+                ZagAppleIDAuthenticationView(account: nil) { id in
+                    selectAccount(id)
+                    signingIn = false
+                }
+            }
+        }
+        .onAppear {
+            if let account = try? ZagNativeAppleIDs.shared.catalog().accounts.first(where: { matchingAccount($0.id) }) {
+                selectAccount(account.id)
+            }
+        }
+        .task {
+            verifiedExisting = await handoff.verifyExisting(bootstrap)
+            checkingExisting = false
+        }
+        .task(id: authorised) {
+            guard authorised, await handoff.prepare(bootstrap: bootstrap) else { return }
+            while !Task.isCancelled, (try? bootstrap.validate()) != nil {
+                if let wire = try? ZagIdentityHandoff.read(Envelope.setupResponsePath, limit: Envelope.maxWireSize),
+                   (try? bootstrap.unwrap(wire, label: "response")) != nil {
+                    await handoff.accept(bootstrap: bootstrap, authenticatedResponse: wire)
+                    return
+                }
+                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+            }
+            handoff.cancel()
+            notice = "Signing Setup expired. Reconnect the iPhone and retry setup on the Mac."
+        }
+        .onDisappear { handoff.cancel() }
+    }
+}
+
 #endif

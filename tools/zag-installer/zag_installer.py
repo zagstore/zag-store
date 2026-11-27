@@ -29,12 +29,12 @@ class CoreDevice:
     def __init__(self, scratch):
         self.scratch = scratch
 
-    def run(self, stage, *args):
+    def run(self, stage, *args, timeout=180):
         report = self.scratch / "coredevice.json"
         report.unlink(missing_ok=True)
         result = subprocess.run(
             ["xcrun", "devicectl", *args, "--json-output", str(report)],
-            capture_output=True, timeout=180,
+            capture_output=True, timeout=timeout,
         )
         if result.returncode:
             raise ValueError(f"{stage}: CoreDevice exited {result.returncode}. Check USB trust and Developer Mode.")
@@ -79,15 +79,18 @@ class CoreDevice:
         self.run("Installation", "device", "install", "app", "--device", identifier, str(path))
 
 
+    def launch_app(self, identifier, bundle):
+        self.run("Open Signing Setup", "device", "process", "launch", "--device", identifier, bundle, timeout=15)
+
     def copy_from_app(self, identifier, bundle, remote, destination):
         self.run("Read the iPhone handoff request (prepare it in Zag Store first)", "device", "copy", "from",
                  "--device", identifier, "--domain-type", "appDataContainer", "--domain-identifier", bundle,
-                 "--source", remote, "--destination", str(destination))
+                 "--source", remote, "--destination", str(destination), timeout=10)
 
     def copy_to_app(self, identifier, bundle, source, remote):
-        self.run("Deliver encrypted signing identity", "device", "copy", "to",
+        self.run("Deliver private signing setup message", "device", "copy", "to",
                  "--device", identifier, "--domain-type", "appDataContainer", "--domain-identifier", bundle,
-                 "--source", str(source), "--destination", remote)
+                 "--source", str(source), "--destination", remote, timeout=15)
 
 
 def version_number(value):
@@ -219,8 +222,21 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
                                   replace_same_build=replace_same_build)
     try:
         store.write(portal.receipt_item, hashlib.sha256(identity.certificate).hexdigest().encode("ascii"))
+        if info.get("ZagAutomaticSigningSetup") is True:
+            handoff.save_receipt(store, udid, team, identity.key_item, identity.certificate, result)
     except (OSError, ValueError, subprocess.SubprocessError):
         result["signing_receipt_saved"] = False
+    if info.get("ZagAutomaticSigningSetup") is True:
+        print(f"Installed {result['installed_bundle']}. Starting Signing Setup.", flush=True)
+        try:
+            observed = installed_app(device, target, result["installed_bundle"])
+            artifact.require(observed and observed.get("version") == result["version"]
+                             and observed.get("bundleVersion") == result["build"], "The installed Personal Team copy changed")
+            result.update(handoff.automatic(ROOT, cache, scratch, device, target, udid, team, identity.key_item,
+                                            identity.certificate, identity.key, openssl, observed))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"Signing Setup is incomplete. {error if type(error) is ValueError else 'Check USB and retry.'}", file=sys.stderr)
+            result["signing_setup"] = "incomplete"
     return result
 
 
@@ -284,8 +300,8 @@ def main():
     local.add_argument("--replace-same-build", action="store_true",
                        help="Explicitly replace the experimental copy at the exact installed version and build")
     local.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
-    for mode in (install, local):
-        mode.add_argument("--handoff", action="store_true", help="Offer the USB signing identity handoff after installation")
+    setup = modes.add_parser("setup", help="Retry automatic signing setup without reinstalling")
+    setup.add_argument("--team", required=True)
     recovery = modes.add_parser("handoff", help="Send the existing signing identity to an installed Personal Team copy")
     recovery.add_argument("--team", required=True)
     for mode in (prepare, install):
@@ -306,9 +322,10 @@ def main():
                 with tempfile.TemporaryDirectory(prefix="zag-installer-") as directory:
                     scratch = Path(directory)
                     device = CoreDevice(scratch)
-                    if args.mode == "handoff":
+                    if args.mode in ("handoff", "setup"):
                         artifact.mapped_bundle(args.team)
-                        result = handoff.send(ROOT, cache, scratch, device, args.team)
+                        command = handoff.send if args.mode == "handoff" else handoff.retry
+                        result = command(ROOT, cache, scratch, device, args.team)
                     else:
                         if args.mode == "upgrade-local-candidate":
                             result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
@@ -318,12 +335,9 @@ def main():
                             release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                             result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
                                                      args.upgrade, scratch, device, cache)
-                        if args.handoff:
-                            team = result["installed_bundle"].rsplit(".", 1)[1]
-                            print(json.dumps(result), flush=True)
-                            print("Open the installed app, activate the original Apple ID and prepare a transfer in Apple IDs.")
-                            result = handoff.send(ROOT, cache, scratch, device, team)
         print(json.dumps(result))
+        if result.get("signing_setup") == "incomplete":
+            return 1
     except KeyboardInterrupt:
         print("Zag Installer cancelled.", file=sys.stderr)
         return 130

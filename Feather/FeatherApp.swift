@@ -49,6 +49,9 @@ struct FeatherApp: App {
                 }
 				ZagAnimatedLaunchOverlay()
 			}
+            #if os(iOS) && canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+            .modifier(ZagAutomaticIdentitySetupModifier(ready: launch.policy.splashFinished))
+            #endif
             .onOpenURL { url in
                 guard url.absoluteString.utf8.count <= 4 * 1024 * 1024 else { return }
                 if ZagMobileDataToggleController.shared.handle(url) { return }

@@ -56,38 +56,48 @@ The desktop transport permits only the Apple HTTPS ADI lookup, start and finish 
 
 ## Desktop signing identity handoff
 
-The operator confirmed that the desktop installed and upgraded the experimental Personal Team copy for `FTB8PRW638`. On that copy, iOS signed in with the same Apple ID but failed at certificate provisioning with Apple code `7460`. The Mac held the existing certificate's private key. iOS had a separate signing Keychain slot.
+The operator confirmed Apple error `7460` on the experimental `FTB8PRW638` copy when its certificate's private key existed only on the Mac. The operator later confirmed that the revised Beta 5 manually received and imported that key, then refreshed itself on the iPhone. Automatic setup reuses that import and ownership flow.
 
-Zag Store now asks the active Apple ID to prepare a one-time transfer under **Apple IDs → Zag Store Installation → Receive Desktop Signing Identity**. The target must be a mapped Personal Team installation with a valid profile and working on-device installation pairing. The Mac uses USB CoreDevice app-container copies for two named files. The iPhone displays a 24-hex-character fingerprint of the request for the operator to type on the Mac before authorizing the transfer. No credentials, tokens, anisette state or pairing records are transferred. [CoreDevice file transfer](https://developer.apple.com/documentation/xcode/interacting-with-devices-using-the-command-line)
+The manual recovery command asks the active Apple ID to prepare a one-time transfer under **Apple IDs → Zag Store Installation → Receive Desktop Signing Identity**. The target must be a mapped Personal Team installation with a valid profile and working on-device installation pairing. The Mac uses USB CoreDevice app-container copies for two named files. The iPhone displays a 24-hex-character fingerprint of the request for the operator to type on the Mac before authorizing the transfer. No credentials, tokens, anisette state or pairing records are transferred. [CoreDevice file transfer](https://developer.apple.com/documentation/xcode/interacting-with-devices-using-the-command-line)
 
 The request binds an ephemeral X25519 public key, nonce and ten-minute expiry to the connected device UDID, exact running bundle, Personal Team, certificate DER and opaque account-scoped desktop key lookup. The Mac verifies the entered fingerprint, checks the installed destination and signing receipt if available, and proves the available desktop key matches the running certificate. The sender uses X25519, HKDF-SHA256 and AES-GCM with the exact request bytes as authenticated data. Only ciphertext is written for delivery. The phone keeps the recipient key in memory, consumes each request on attempted import, and refuses ciphertext from expired, interrupted or superseded requests.
 
 On import, iOS checks the same active authenticated account, live Personal Team and exact certificate in Apple's read-only inventory, paired device and running signer. It proves key possession, imports into a scoped Keychain key item, then commits the certificate reference for the existing signing and renewal pipeline. It preserves other accounts, different existing identities and pending issuance journals. A confirmed 7460 refusal journal is compatible with reuse. Unknown or issued-but-unreconciled pending requests fail closed. Duplicate imports of the same identity and interrupted metadata commits reuse the same scoped key slot. The existing running-installation verification independently checks paired readback and ownership before enabling profile-only renewal.
 
-### Recover the experimental installation
+### Automatic first-launch setup
 
-The original Beta 5 binary has no native handoff receiver. CoreDevice can place a file in the app's data container, and iOS Keychain isolation prevents it from installing the key on the app's behalf. Use a revised local Beta 5 IPA with the handoff receiver, version `1.0.0` and build `5`, signed in place by the same desktop identity.
+After installing a package that declares the new setup receiver, both the signed-channel and local-candidate commands start Signing Setup automatically. CoreDevice launches the exact installed app. If iOS refuses the launch, unlock the phone and open that copy manually. Zag Store detects the pending setup on launch or foreground entry, checks for an already verified identity, and presents setup when needed. A new import requires one **Authorize Signing Identity** tap. [Apple CoreDevice launch and transfer](https://developer.apple.com/documentation/xcode/interacting-with-devices-using-the-command-line)
 
-Supply the revised IPA's independently recorded SHA-256. `--replace-same-build` applies only to the local experimental copy, requires an exact match to its installed version and build, and prompts for `REPLACE app.zagstore.ios.FTB8PRW638`. Production channel upgrades still require a newer release. After CoreDevice accepts the replacement and inventory confirms the destination metadata, open the app and check for **Receive Desktop Signing Identity**. Inventory cannot distinguish the bytes of two builds with the same version and build number.
+The trusted, paired USB CoreDevice service delivers a one-time 256-bit bootstrap secret to the exact app's private Caches directory. The app consumes the file and the Mac deletes its staging copy after delivery. The protocol trusts the paired developer connection and the installed app's sandbox. Finder-visible Documents files do not carry the automatic bootstrap secret. Separate HMAC-SHA256 labels authenticate the request, encrypted response, cancellation, and acknowledgement for this transaction. The request still binds the active authenticated account, UDID, bundle, Personal Team and exact certificate. The response still uses X25519, HKDF-SHA256 and AES-GCM. A stale or partial message cannot trigger delivery or acknowledge completion.
+
+The Mac displays `"signing_setup":"verified"` only after an authenticated acknowledgement bound to the transfer request or an independently reverified existing scoped key. On the phone that requires matching key possession and the existing running-installation ownership and profile readback checks. A disconnect can be retried without reinstalling. A cancelled or expired setup cannot be reused.
+
+**Apple sign-in and pairing prerequisites.** Setup reuses a connected iPhone session for the same Apple account. On a fresh phone installation, the Rust installer holds an in-memory Xcode developer token with its desktop anisette identity. The iOS account store expects a native app-owned apple-auth session and its associated local device state. This implementation has no supported conversion or Apple session continuation between them. The iPhone therefore presents its existing Apple sign-in and verification when no matching session is connected. Developer Mode and iOS USB trust still need system approval when required. Zag Store also needs its own installation pairing for inventory and profile readback. Setup provides a direct link to that flow. It does not move pairing records, passwords, sessions or anisette state.
+
+### Physical acceptance for the experimental copy
+
+Use an independently hashed, automation-enabled local Beta 5 IPA from this commit. The release configuration stays at `1.0.0`, Beta, build `5`. This command requires the experimental copy already installed and the same desktop signing identity:
 
 ```sh
 cd "$HOME/Documents/ZagStore-claude" &&
-printf 'Verified revised Beta 5 SHA-256: ' && IFS= read -r zag_handoff_sha &&
+printf 'Verified automation-enabled Beta 5 SHA-256: ' && IFS= read -r zag_setup_sha &&
 PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
 python3 tools/zag-installer/zag_installer.py upgrade-local-candidate \
-  "$HOME/Downloads/ZagStore-1.0.0-beta.5-revised.ipa" \
-  --sha256 "$zag_handoff_sha" --version 1.0.0 --build 5 --replace-same-build --handoff
+  "$HOME/Downloads/ZagStore-1.0.0-beta.5-automatic-setup.ipa" \
+  --sha256 "$zag_setup_sha" --version 1.0.0 --build 5 --replace-same-build
 ```
 
-When the CLI waits, open the upgraded copy, activate the original Apple ID, complete installation pairing if needed, and prepare the transfer in Apple IDs. Enter its fingerprint on the Mac and type `HANDOFF`. On the phone, tap **Import Desktop Signing Identity**. To retry delivery or recover a handoff-enabled copy already installed, start a fresh request and run:
+Approve `REPLACE app.zagstore.ios.FTB8PRW638`. Complete the phone prerequisites if prompted. For a new import, tap **Authorize Signing Identity** once. Confirm the CLI reports verified, with no code entry. To test first import independently from the previously validated manual setup, use an eligible test device or account that has not received the desktop key. The existing experimental copy may correctly skip transfer after its exact identity and ownership are reverified. Test signing and Refresh All with the same original Apple ID, verify profile-only readback when Apple issues a later expiry, and confirm the AppTesters copy still launches. A same-build device inventory cannot distinguish binary bytes, so confirm the new Signing Setup UI appears.
+
+If setup is interrupted after installation, reconnect the same iPhone and retry using its saved setup receipt:
 
 ```sh
 cd "$HOME/Documents/ZagStore-claude" &&
 PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
-python3 tools/zag-installer/zag_installer.py handoff --team FTB8PRW638
+python3 tools/zag-installer/zag_installer.py setup --team FTB8PRW638
 ```
 
-The normal signed-channel installation command also accepts `--handoff` for releases that contain the receiver. The desktop command reports delivery only. Confirm receipt and ownership in the app. Then sign and install a small app with the same Apple ID, check that no CSR was requested, and use Refresh All when Apple can issue a later profile. Verify profile-only renewal for the new app and Zag Store by reading back a later expiry with an unchanged executable signer, and verify the AppTesters copy still launches. The handoff, Keychain import and subsequent renewal require physical validation.
+The advanced manual recovery command remains `python3 tools/zag-installer/zag_installer.py handoff --team FTB8PRW638`, with the Homebrew OpenSSL 3 directory on PATH. It uses the existing Settings screen and code verification. Automatic setup exposes its device operations through an adapter, so a future graphical installer can reuse the orchestration. The automatic CoreDevice launch, transfer and acknowledgement still require physical acceptance.
 
 ## Profile-only on-device adoption design
 

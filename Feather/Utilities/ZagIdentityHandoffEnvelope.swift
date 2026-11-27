@@ -7,6 +7,62 @@ enum ZagIdentityHandoffEnvelope {
     static let requestPath = "Documents/ZagIdentityHandoffRequest.json"
     static let responsePath = "Documents/ZagIdentityHandoffResponse.json"
 
+    static let bootstrapPath = "Library/Caches/ZagSetupBootstrap.json"
+    static let setupRequestPath = "Library/Caches/ZagSetupRequest.json"
+    static let setupResponsePath = "Library/Caches/ZagSetupResponse.json"
+    static let acknowledgementPath = "Library/Caches/ZagSetupAcknowledgement.json"
+    static let maxWireSize = 24 * 1024
+
+    struct Bootstrap: Decodable, Equatable {
+        let id: String
+        let expires: TimeInterval
+        let secret: Data
+        let udid: String
+        let bundle: String
+        let team: String
+        let keyScope: String
+        let certificate: Data
+
+        func validate(now: Date = .now) throws {
+            guard UUID(uuidString: id) != nil, secret.count == 32 else { throw Failure.invalid }
+            try Request(protocolVersion: 1, nonce: UUID(), expires: expires, recipient: Data(count: 32),
+                        udid: udid, bundle: bundle, team: team, keyScope: keyScope, certificate: certificate).validate(now: now)
+        }
+
+        private struct Wire: Codable {
+            let payload: Data
+            let tag: Data
+        }
+
+        private func authenticationInput(_ payload: Data, label: String) -> Data {
+            Data("Zag Store USB setup v1\n\(id)\n\(label)\n".utf8) + payload
+        }
+
+        func wrap(_ payload: Data, label: String) throws -> Data {
+            try validate()
+            guard payload.count <= maxSize else { throw Failure.invalid }
+            let tag = HMAC<SHA256>.authenticationCode(for: authenticationInput(payload, label: label),
+                                                     using: SymmetricKey(data: secret))
+            return try JSONEncoder().encode(Wire(payload: payload, tag: Data(tag)))
+        }
+
+        func unwrap(_ bytes: Data, label: String) throws -> Data {
+            try validate()
+            guard bytes.count <= maxWireSize else { throw Failure.invalid }
+            let wire = try JSONDecoder().decode(Wire.self, from: bytes)
+            guard wire.payload.count <= maxSize,
+                  HMAC<SHA256>.isValidAuthenticationCode(wire.tag, authenticating: authenticationInput(wire.payload, label: label),
+                                                         using: SymmetricKey(data: secret)) else { throw Failure.binding }
+            return wire.payload
+        }
+
+        func check(_ request: Request) throws {
+            try validate()
+            try request.checkBinding(device: udid, bundle: bundle, team: team, scope: keyScope, certificate: certificate)
+            guard request.expires <= expires else { throw Failure.binding }
+        }
+    }
+
     enum Failure: LocalizedError {
         case invalid, expired, binding
         var errorDescription: String? {

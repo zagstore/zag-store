@@ -6,13 +6,21 @@ import hmac
 import json
 from pathlib import Path
 import re
+import secrets
 import time
+import uuid
+import subprocess
 
 import desktop
 
 MAX_SIZE = 16 * 1024
 REQUEST = "Documents/ZagIdentityHandoffRequest.json"
 RESPONSE = "Documents/ZagIdentityHandoffResponse.json"
+BOOTSTRAP = "Library/Caches/ZagSetupBootstrap.json"
+SETUP_REQUEST = "Library/Caches/ZagSetupRequest.json"
+SETUP_RESPONSE = "Library/Caches/ZagSetupResponse.json"
+ACKNOWLEDGEMENT = "Library/Caches/ZagSetupAcknowledgement.json"
+MAX_WIRE_SIZE = 24 * 1024
 
 
 def read_request(path, code, udid, bundle, team):
@@ -21,6 +29,10 @@ def read_request(path, code, udid, bundle, team):
     desktop.require(0 < len(raw) <= MAX_SIZE, "Invalid iPhone handoff request size")
     expected_code = hashlib.sha256(raw).hexdigest()[:24]
     desktop.require(hmac.compare_digest(code, expected_code), "The iPhone verification code does not match this request")
+    return validate_request(raw, udid, bundle, team)
+
+
+def validate_request(raw, udid, bundle, team):
     request = json.loads(raw)
     desktop.require(request["protocolVersion"] == 1 and request["udid"].casefold() == udid.casefold()
                     and request["bundle"] == bundle and request["team"] == team,
@@ -59,22 +71,167 @@ def send(repo, cache, scratch, device, team, approve=input):
     read_request(request, code, udid, bundle, team)
     key = keychain.read(item)
     desktop.require(key, "The existing desktop signing key is unavailable or cannot be exported")
-    public = desktop.command([openssl, "pkey", "-pubout"], key, "Check desktop signing key")
-    certificate_public = desktop.command([openssl, "x509", "-inform", "DER", "-pubkey", "-noout"],
-                                         certificate, "Check the iPhone signing certificate")
-    desktop.require(public == certificate_public, "The desktop private key does not match the iPhone certificate")
-    helper = cache.build_swift("handoff", [
-        Path(__file__).with_name("DesktopHandoff.swift"),
-        repo / "Feather/Utilities/ZagIdentityHandoffEnvelope.swift",
-    ])
-    # The RSA key travels through local pipes only. Only ciphertext is staged.
-    der = desktop.command([openssl, "rsa", "-traditional", "-outform", "DER"], key, "Encode desktop RSA key")
+    verify_key(openssl, key, certificate)
+    ciphertext = encrypt(repo, cache, openssl, request, key)
     del key
-    ciphertext = desktop.command([helper, request], der, "Encrypt signing identity for the iPhone")
-    del der
     response = scratch / "handoff-response.json"
     response.write_bytes(ciphertext)
     desktop.require(check_destination() == installed, "Destination inventory changed")
     read_request(request, code, udid, bundle, team)
     device.copy_to_app(target, bundle, response, RESPONSE)
     return {"handoff_delivered": bundle, "next": "Tap Import Desktop Signing Identity in Zag Store"}
+
+
+def verify_key(openssl, key, certificate):
+    public = desktop.command([openssl, "pkey", "-pubout"], key, "Check desktop signing key")
+    certificate_public = desktop.command([openssl, "x509", "-inform", "DER", "-pubkey", "-noout"],
+                                         certificate, "Check the iPhone signing certificate")
+    desktop.require(public == certificate_public, "The desktop private key does not match the iPhone certificate")
+
+def encrypt(repo, cache, openssl, request, key):
+    helper = cache.build_swift("handoff", [
+        Path(__file__).with_name("DesktopHandoff.swift"),
+        repo / "Feather/Utilities/ZagIdentityHandoffEnvelope.swift",
+    ])
+    # The RSA key travels through local pipes only. Only ciphertext is staged.
+    der = desktop.command([openssl, "rsa", "-traditional", "-outform", "DER"], key, "Encode desktop RSA key")
+    ciphertext = desktop.command([helper, request], der, "Encrypt signing identity for the iPhone")
+    del der
+    return ciphertext
+
+
+def mac(secret, transaction, label, payload):
+    domain = f"Zag Store USB setup v1\n{transaction}\n{label}\n".encode()
+    return hmac.digest(secret, domain + payload, "sha256")
+
+
+def wrap(secret, transaction, label, payload):
+    return json.dumps({"payload": base64.b64encode(payload).decode(),
+                       "tag": base64.b64encode(mac(secret, transaction, label, payload)).decode()}).encode()
+
+
+def unwrap(secret, transaction, label, wire):
+    desktop.require(len(wire) <= MAX_WIRE_SIZE, "Setup message exceeds size limit")
+    message = json.loads(wire)
+    payload = base64.b64decode(message["payload"], validate=True)
+    tag = base64.b64decode(message["tag"], validate=True)
+    desktop.require(len(payload) <= MAX_SIZE and hmac.compare_digest(tag, mac(secret, transaction, label, payload)),
+                    "Setup message authentication failed")
+    return payload
+
+
+def receipt_scope(udid, team):
+    return desktop.scope("automatic-setup-v1", udid.casefold(), team)
+
+
+def save_receipt(store, udid, team, item, certificate, result):
+    store.write(receipt_scope(udid, team), json.dumps({
+        "scope": item, "certificate": base64.b64encode(certificate).decode(),
+        "version": result["version"], "build": result["build"],
+    }).encode())
+
+
+def retry(repo, cache, scratch, device, team):
+    target, udid = device.usb_device()
+    bundle = "app.zagstore.ios." + team
+    installed = [app for app in device.apps(target) if app.get("bundleIdentifier") == bundle]
+    desktop.require(len(installed) == 1, "The selected Personal Team copy is not installed on the USB device")
+    signer, openssl = cache.signer_tools(repo)
+    store = desktop.Keychain(signer)
+    saved = store.read(receipt_scope(udid, team))
+    desktop.require(saved is not None, "No automatic setup receipt. Use the manual handoff recovery command.")
+    receipt = json.loads(saved)
+    desktop.require(re.fullmatch(r"[a-f0-9]{64}", receipt["scope"]) and installed[0].get("version") == receipt["version"]
+                    and installed[0].get("bundleVersion") == receipt["build"], "The installed app does not match the setup receipt")
+    certificate = base64.b64decode(receipt["certificate"], validate=True)
+    leaf = store.read(desktop.scope("installed-leaf", udid.casefold(), team))
+    desktop.require(leaf == hashlib.sha256(certificate).hexdigest().encode(), "The original signing receipt does not match")
+    key = store.read(receipt["scope"])
+    desktop.require(key, "The existing desktop signing key is unavailable")
+    verify_key(openssl, key, certificate)
+    return automatic(repo, cache, scratch, device, target, udid, team, receipt["scope"], certificate, key, openssl, installed[0])
+
+
+def automatic(repo, cache, scratch, device, target, udid, team, item, certificate, key, openssl,
+              installed, notify=print):
+    """Shared desktop rendezvous. The device adapter supplies paired USB I/O."""
+    bundle = "app.zagstore.ios." + team
+
+    def check_target():
+        desktop.require(device.usb_device() == (target, udid), "Reconnect the original trusted iPhone")
+        matches = [app for app in device.apps(target) if app.get("bundleIdentifier") == bundle]
+        desktop.require(matches == [installed], "The installed Personal Team copy changed")
+
+    def poll(paths):
+        local = scratch / "setup-inbound"
+        while time.monotonic() < deadline:
+            for remote, labels in paths:
+                local.unlink(missing_ok=True)
+                try:
+                    device.copy_from_app(target, bundle, remote, local)
+                    with local.open("rb") as stream:
+                        wire = stream.read(MAX_WIRE_SIZE + 1)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    continue
+                for label in labels:
+                    try:
+                        payload = unwrap(secret, transaction, label, wire)
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if label == "cancelled":
+                        raise ValueError("Signing Setup was cancelled on the iPhone.")
+                    return label, payload
+            # Stale and incomplete messages permit no key transfer.
+            time.sleep(2)
+        raise ValueError("iPhone setup did not complete. Reconnect and use setup to retry.")
+
+    secret = secrets.token_bytes(32)
+    transaction = str(uuid.uuid4())
+    deadline = time.monotonic() + 600
+    bootstrap = scratch / "setup-bootstrap.json"
+    try:
+        check_target()
+        bootstrap.write_text(json.dumps({
+            "id": transaction, "expires": time.time() + 600, "secret": base64.b64encode(secret).decode(),
+            "udid": udid, "bundle": bundle, "team": team, "keyScope": item,
+            "certificate": base64.b64encode(certificate).decode(),
+        }))
+        device.copy_to_app(target, bundle, bootstrap, BOOTSTRAP)
+    finally:
+        bootstrap.unlink(missing_ok=True)
+    try:
+        device.launch_app(target, bundle)
+    except (ValueError, subprocess.SubprocessError):
+        notify("Unlock the iPhone and open the newly installed Zag Store.")
+    notify("Complete any prerequisites on the iPhone and authorize Signing Setup there.")
+    phase, request_bytes = poll([(SETUP_REQUEST, ("request",)), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
+    if phase == "existing":
+        desktop.require(hmac.compare_digest(request_bytes, hashlib.sha256(certificate).digest()),
+                        "Existing setup acknowledgement does not match the installed certificate")
+        check_target()
+        return {"signing_setup": "verified"}
+    scope, leaf = validate_request(request_bytes, udid, bundle, team)
+    desktop.require(scope == item and leaf == certificate, "Setup request does not match the installed signing identity")
+    check_target()
+    request = scratch / "setup-request.json"
+    request.write_bytes(request_bytes)
+    response = scratch / "setup-response.json"
+    response.write_bytes(wrap(secret, transaction, "response", encrypt(repo, cache, openssl, request, key)))
+
+    # Retry delivery after a transient disconnect, using the same authenticated
+    # response. The iPhone consumes the request before importing it.
+    while time.monotonic() < deadline:
+        try:
+            check_target()
+            device.copy_to_app(target, bundle, response, SETUP_RESPONSE)
+            break
+        except (OSError, ValueError, subprocess.SubprocessError):
+            time.sleep(2)
+    else:
+        raise ValueError("Could not deliver the signing identity. Reconnect and use setup to retry.")
+
+    _, acknowledgement = poll([(ACKNOWLEDGEMENT, ("verified", "cancelled"))])
+    desktop.require(hmac.compare_digest(acknowledgement, hashlib.sha256(request_bytes).digest()),
+                    "The completion acknowledgement is for a different request")
+    check_target()
+    return {"signing_setup": "verified"}
