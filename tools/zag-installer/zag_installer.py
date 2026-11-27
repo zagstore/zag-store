@@ -27,19 +27,110 @@ spec.loader.exec_module(artifact)
 
 
 class StandaloneUSB:
-    """Fail-closed boundary for the future bundled iDevice transport.
+    """Read-only native transport adapter for the verified standalone package.
 
-    The desktop UI must not automatically fall back to Xcode or silently
-    attempt a partially implemented installation. No device writes here.
+    Device identity and app inventory are acquired over paired usbmuxd and
+    Lockdown, with no Xcode/compilation fallback. Installation and handoff
+    deliberately remain disabled until their native transport is validated.
     """
     def __init__(self, scratch, executable):
         self.scratch = scratch
         self.executable = Path(executable)
-        if not self.executable.is_file() or not os.access(self.executable, os.X_OK):
+        if self.executable.is_symlink() or not self.executable.is_file() or not os.access(self.executable, os.X_OK):
             raise ValueError("Standalone USB helper is missing from Zag Installer")
+        mode = self.executable.stat()
+        if not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid() or mode.st_mode & 0o022:
+            raise ValueError("Standalone USB helper has insecure ownership or permissions")
+        self.identity = None
+        self.device_info = None
+
+    def _run(self, mode):
+        artifact.require(mode in ("status", "inventory"), "Only native USB read operations are available")
+        try:
+            result = subprocess.run([str(self.executable), mode], capture_output=True, timeout=36, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("Native USB inspection timed out") from error
+        artifact.require(result.returncode == 0 and len(result.stdout) <= 65536,
+                         "Trusted USB inspection failed. Unlock the iPhone and confirm trust.")
+        try:
+            record = json.loads(result.stdout)
+        except (ValueError, UnicodeError) as error:
+            raise ValueError("Native USB helper returned an invalid response") from error
+        artifact.require(isinstance(record, dict) and record.get("transport") == "system-usbmuxd"
+                         and record.get("trust_verified") is True
+                         and record.get("developer_mode") is True,
+                         "USB trust or Developer Mode is unavailable")
+        udid = record.get("udid")
+        artifact.require(isinstance(udid, str) and
+                         re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})", udid),
+                         "Native USB identity is invalid")
+        info = record.get("device")
+        artifact.require(isinstance(info, dict) and info.get("DeviceClass") == "iPhone"
+                         and isinstance(info.get("ProductType"), str)
+                         and info["ProductType"].startswith("iPhone")
+                         and isinstance(info.get("ProductVersion"), str),
+                         "Native USB device metadata is invalid")
+        if self.identity is not None:
+            artifact.require(udid.casefold() == self.identity.casefold(),
+                             "The trusted USB device changed")
+        return udid, info, record
 
     def usb_device(self):
-        raise ValueError("Standalone USB transport has not passed device verification; installation is disabled")
+        udid, info, _ = self._run("status")
+        if self.identity is None:
+            self.identity = udid
+        self.device_info = info
+        return udid, udid
+
+    def check_compatibility(self, info):
+        artifact.require(self.device_info is not None, "Discover the trusted USB device first")
+        artifact.require(version_number(self.device_info["ProductVersion"]) >=
+                         version_number(info["MinimumOSVersion"]),
+                         "Device iOS version is below the release minimum")
+        families = info.get("UIDeviceFamily")
+        if families is not None:
+            artifact.require(isinstance(families, list) and 1 in families,
+                             "Release does not support the connected iPhone")
+
+    def apps(self, identifier):
+        artifact.require(self.identity is not None and identifier.casefold() == self.identity.casefold(),
+                         "The trusted USB device changed")
+        _, _, record = self._run("inventory")
+        apps = record.get("zag_apps")
+        artifact.require(isinstance(apps, list) and len(apps) <= 32,
+                         "Native app inventory is missing or too large")
+        result = []
+        known = set()
+        for app in apps:
+            artifact.require(isinstance(app, dict), "Invalid native application record")
+            bundle = app.get("bundleIdentifier")
+            artifact.require(isinstance(bundle, str) and
+                             (bundle == artifact.ORIGINAL or
+                              re.fullmatch(re.escape(artifact.ORIGINAL) + r"\\.[A-Z0-9]{10}", bundle))
+                             and bundle not in known,
+                             "Unexpected or duplicate application identifier")
+            known.add(bundle)
+            version = app.get("version")
+            build = app.get("bundleVersion")
+            artifact.require(isinstance(version, str) and isinstance(build, str),
+                             "Native installed app has no version and build")
+            version_number(version)
+            version_number(build)
+            result.append({"bundleIdentifier": bundle, "version": version, "bundleVersion": build})
+        return result
+
+    def install(self, identifier, path):
+        raise ValueError("Native USB installation is disabled pending validated release-to-transfer integration")
+
+    def launch_app(self, identifier, bundle):
+        raise ValueError("Native app launch has not been validated")
+
+    def copy_from_app(self, identifier, bundle, remote, destination):
+        raise ValueError("Native signing handoff is not yet validated")
+
+    def copy_to_app(self, identifier, bundle, source, remote):
+        raise ValueError("Native signing handoff is not yet validated")
+
 
 
 class CoreDevice:
@@ -351,8 +442,10 @@ def main():
             else:
                 with tempfile.TemporaryDirectory(prefix="zag-installer-") as directory:
                     scratch = Path(directory)
+                    helper_root = (args.precompiled_helpers if args.precompiled_helpers is not None
+                                   else ROOT / "tools/zag-installer/native-usb/target/release")
                     device = (CoreDevice(scratch) if args.usb_transport == "coredevice"
-                              else StandaloneUSB(scratch, ROOT / "helpers/zag-usb"))
+                              else StandaloneUSB(scratch, helper_root / "zag-usb"))
                     if args.mode in ("handoff", "setup"):
                         artifact.mapped_bundle(args.team)
                         command = handoff.send if args.mode == "handoff" else handoff.retry

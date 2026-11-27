@@ -27,7 +27,7 @@ async fn inspect(mode: &str) -> Result<serde_json::Value, Box<dyn std::error::Er
     let mut amfi = AmfiClient::connect(&provider).await?;
     let developer_mode = amfi.get_developer_mode_status().await?;
     let mut result = json!({"transport":"system-usbmuxd","trust_verified":true,
-        "developer_mode":developer_mode,"device":info});
+        "developer_mode":developer_mode,"udid":d.udid,"device":info});
     // Lightweight authenticated status for the GUI poller. No app enumeration.
     if mode == "status" { return Ok(result); }
     let mut proxy = InstallationProxyClient::connect(&provider).await?;

@@ -136,3 +136,74 @@ class ReleaseTests(unittest.TestCase):
             release = {**RELEASE, "url": URL, "sha256": hashlib.sha256(b"expected").hexdigest()}
             with self.assertRaisesRegex(ValueError, "digest"):
                 releases.acquire(installer.artifact, release, "helper", Path(tmp) / "candidate.ipa")
+
+
+class NativeUSBAdapterTests(unittest.TestCase):
+    """Offline transport-boundary checks. No actual device or write calls."""
+
+    UDID = "00000000-0000000000000000"
+    INFO = {"DeviceClass": "iPhone", "ProductType": "iPhone16,2",
+            "ProductVersion": "27.2.1", "DeviceName": "Test iPhone"}
+
+    def make_adapter(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        helper = Path(directory.name) / "zag-usb"
+        helper.write_bytes(b"offline mock")
+        helper.chmod(0o700)
+        return installer.StandaloneUSB(Path(directory.name), helper)
+
+    def reply(self, *, udid=None, mode="status", apps=None, developer=True):
+        doc = {"transport": "system-usbmuxd", "trust_verified": True,
+               "developer_mode": developer, "udid": udid or self.UDID,
+               "device": self.INFO}
+        if mode == "inventory":
+            doc["zag_apps"] = apps if apps is not None else []
+        return subprocess.CompletedProcess([], 0, __import__("json").dumps(doc).encode(), b"")
+
+    def test_identity_compatibility_and_inventory(self):
+        dev = self.make_adapter()
+        with patch.object(installer.subprocess, "run") as run:
+            run.side_effect = [self.reply(), self.reply(mode="inventory", apps=[
+                {"bundleIdentifier": DESTINATION, "version": "1.0.0", "bundleVersion": "5"}
+            ])]
+            self.assertEqual(dev.usb_device(), (self.UDID, self.UDID))
+            dev.check_compatibility({"MinimumOSVersion": "16.4", "UIDeviceFamily": [1]})
+            self.assertEqual(dev.apps(self.UDID), [{
+                "bundleIdentifier": DESTINATION, "version": "1.0.0", "bundleVersion": "5"
+            }])
+            self.assertEqual([call.args[0][-1] for call in run.call_args_list],
+                             ["status", "inventory"])
+
+    def test_disconnected_or_untrusted_device_fails(self):
+        dev = self.make_adapter()
+        with patch.object(installer.subprocess, "run", return_value=self.reply(developer=False)):
+            with self.assertRaisesRegex(ValueError, "Developer Mode"):
+                dev.usb_device()
+
+    def test_identity_change_rejected_across_calls(self):
+        dev = self.make_adapter()
+        with patch.object(installer.subprocess, "run") as run:
+            run.side_effect = [self.reply(), self.reply(udid="11111111-1111111111111111")]
+            dev.usb_device()
+            with self.assertRaisesRegex(ValueError, "device changed"):
+                dev.apps(self.UDID)
+
+    def test_unexpected_app_and_duplicate_inventory_are_rejected(self):
+        dev = self.make_adapter()
+        with patch.object(installer.subprocess, "run") as run:
+            run.side_effect = [self.reply(), self.reply(mode="inventory", apps=[
+                {"bundleIdentifier": "com.other.app", "version": "1.0.0", "bundleVersion": "5"}
+            ])]
+            dev.usb_device()
+            with self.assertRaisesRegex(ValueError, "application identifier"):
+                dev.apps(self.UDID)
+
+    def test_usb_adapter_does_not_expose_device_writes(self):
+        dev = self.make_adapter()
+        for operation, args in ((dev.install, (self.UDID, Path("signed.app"))),
+                                (dev.launch_app, (self.UDID, DESTINATION)),
+                                (dev.copy_to_app, (self.UDID, DESTINATION, Path("secret"), "Documents/key")),
+                                (dev.copy_from_app, (self.UDID, DESTINATION, "Documents/key", Path("out")))):
+            with self.assertRaisesRegex(ValueError, "disabled|not.*validated"):
+                operation(*args)
