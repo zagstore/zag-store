@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zag Installer macOS prototype. Verify Beta 3 or install a verified signed copy."""
+"""Verify, sign and install Zag Store Beta 3 over trusted macOS USB."""
 
 import argparse
 import importlib.util
@@ -14,6 +14,8 @@ import tempfile
 import urllib.request
 from urllib.parse import urlsplit
 import zipfile
+
+import desktop
 
 SOURCE = (
     "https://github.com/zagstore/zag-store-releases/releases/download/"
@@ -109,16 +111,13 @@ class CoreDevice:
         self.run("Installation", "device", "install", "app", "--device", identifier, str(path))
 
 
-def install_signed(source, team, apple_root, scratch, device, approve=input):
-    target, udid = device.usb_device()
+def destination_present(device, target, expected):
+    return any(app.get("bundleIdentifier") == expected for app in device.apps(target))
+
+
+def validate_and_install(signed, team, apple_root, scratch, device, target, udid, approve,
+                         replacing=False):
     expected = artifact.mapped_bundle(team)
-    artifact.require(not any(app.get("bundleIdentifier") == expected for app in device.apps(target)),
-                     "Destination is already installed. This prototype only performs fresh installs.")
-    signed = scratch / "signed.ipa"
-    artifact.require(source.is_file() and 0 < source.stat().st_size <= 512 * 1024**2, "Invalid signed IPA")
-    shutil.copyfile(source, signed)
-    artifact.require(artifact.sha(signed) == SIGNED_TEST_DIGEST,
-                     "Signed IPA does not match the verified Beta 3 prototype artifact")
     evidence = artifact.validate(signed, team, udid, apple_root)
     artifact.require(evidence["bundle_identifier"] == expected and evidence["build"] == "3",
                      "Expected the distinct team-mapped Zag Store build 3")
@@ -128,17 +127,85 @@ def install_signed(source, team, apple_root, scratch, device, approve=input):
         relative, info = artifact.main_bundle(archive)
         artifact.require(info.get("CFBundleShortVersionString") == "1.0.0", "Unexpected signed Zag Store version")
         artifact.extract(archive, staged)
-    artifact.require(approve(f"Install {expected} as a separate app? Type INSTALL to approve: ") == "INSTALL",
-                     "Installation cancelled")
+    confirmation = f"REPLACE {expected}" if replacing else "INSTALL"
+    prompt = (f"Replace the existing {expected}? Type {confirmation}: " if replacing
+              else f"Install {expected} as a separate app? Type INSTALL to approve: ")
+    artifact.require(approve(prompt) == confirmation, "Installation cancelled")
     artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
-    artifact.require(not any(app.get("bundleIdentifier") == expected for app in device.apps(target)),
-                     "Destination became occupied. Installation cancelled.")
+    artifact.require(destination_present(device, target, expected) == replacing,
+                     "Destination inventory changed. Installation cancelled.")
     device.install(target, staged / relative)
     apps = device.apps(target)
     artifact.require(any(app.get("bundleIdentifier") == expected and app.get("bundleVersion") == "3"
                          and app.get("version") == "1.0.0" for app in apps),
                      "Installer returned success but inventory did not verify the app and build")
     return {"installed_bundle": expected, "version": "1.0.0", "build": "3"}
+
+
+def install_signed(source, team, apple_root, scratch, device, approve=input):
+    target, udid = device.usb_device()
+    expected = artifact.mapped_bundle(team)
+    artifact.require(not destination_present(device, target, expected),
+                     "Destination is already installed. install-signed only performs fresh installs.")
+    signed = scratch / "signed.ipa"
+    artifact.require(source.is_file() and 0 < source.stat().st_size <= 512 * 1024**2, "Invalid signed IPA")
+    shutil.copyfile(source, signed)
+    artifact.require(artifact.sha(signed) == SIGNED_TEST_DIGEST,
+                     "Signed IPA does not match the verified Beta 3 prototype artifact")
+    return validate_and_install(signed, team, apple_root, scratch, device, target, udid, approve)
+
+
+def install_unsigned(source, apple_root, endpoint, replace_team, scratch, device, approve=input):
+    endpoint = desktop.provider_origin(endpoint)
+    if replace_team is not None:
+        artifact.mapped_bundle(replace_team)
+    local_source = scratch / "official.ipa"
+    artifact.require(source.is_file() and source.stat().st_size == SOURCE_SIZE, "Invalid official Beta 3 IPA")
+    shutil.copyfile(source, local_source)
+    verify_source(local_source)
+    root = scratch / "apple-root.pem"
+    artifact.require(apple_root.is_file() and 0 < apple_root.stat().st_size < 65536, "Invalid Apple root PEM")
+    shutil.copyfile(apple_root, root)
+    desktop.verify_root(artifact, root)
+
+    unsigned = scratch / "unsigned"
+    unsigned.mkdir()
+    with zipfile.ZipFile(local_source) as archive:
+        relative, _ = artifact.main_bundle(archive)
+        artifact.extract(archive, unsigned)
+    app = unsigned / relative
+    artifact.require(not any(path.is_dir() and path.suffix in (".app", ".appex", ".xpc")
+                             for path in app.rglob("*")),
+                     "Expected the single-app official Beta 3 layout")
+    target, udid = device.usb_device()
+    replacing = False
+
+    def choose_team(teams):
+        nonlocal replacing
+        teams = [team for team in teams if isinstance(team["id"], str) and artifact.TEAM.fullmatch(team["id"])]
+        artifact.require(teams, "Apple returned no selectable teams")
+        for index, team in enumerate(teams, 1):
+            # JSON escaping prevents names supplied by the account from changing Terminal state.
+            print(f"  {index}. {json.dumps(team['name'])} ({team['id']})")
+        choice = approve("Select your Personal Team by number, or Enter to cancel: ").strip()
+        artifact.require(re.fullmatch(r"[0-9]{1,5}", choice) and 1 <= int(choice) <= len(teams),
+                         "Team selection cancelled")
+        team = teams[int(choice) - 1]["id"]
+        expected = artifact.mapped_bundle(team)
+        artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
+        replacing = destination_present(device, target, expected)
+        artifact.require(not replacing or replace_team == team, "Destination is already installed")
+        artifact.require(replace_team is None or (replace_team == team and replacing),
+                         "Requested replacement team and occupied destination must match")
+        artifact.require(approve(f"Use {team} as your Personal Team and allow Apple provisioning? Type PROVISION: ")
+                         == "PROVISION", "Apple provisioning cancelled")
+        return team
+
+    with desktop.tools_for_install(ROOT) as (auth, helper, openssl):
+        portal = desktop.Provisioning(endpoint, udid, desktop.Keychain(helper), openssl, choose_team, approve)
+        team, identity, profile = portal.run(auth)
+        signed = desktop.sign(artifact, app, relative, team, udid, identity, profile, root, helper, scratch)
+        return validate_and_install(signed, team, root, scratch, device, target, udid, approve, replacing)
 
 
 def main():
@@ -150,6 +217,10 @@ def main():
     install.add_argument("signed", type=Path)
     install.add_argument("--team", required=True)
     install.add_argument("--apple-root", type=Path, required=True)
+    unsigned = modes.add_parser("install", help="Provision, sign, validate and install official Beta 3")
+    unsigned.add_argument("source", type=Path)
+    unsigned.add_argument("--apple-root", type=Path, required=True)
+    unsigned.add_argument("--replace", metavar="TEAM", help="Allow an explicit replacement prompt for this team")
     args = parser.parse_args()
     try:
         if args.mode == "prepare":
@@ -158,8 +229,15 @@ def main():
             artifact.require(sys.platform == "darwin" and sys.stdin.isatty(), "Use interactive macOS Terminal")
             with tempfile.TemporaryDirectory(prefix="zag-installer-") as scratch:
                 scratch = Path(scratch)
-                result = install_signed(args.signed, args.team, args.apple_root, scratch, CoreDevice(scratch))
+                if args.mode == "install":
+                    result = install_unsigned(args.source, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
+                                              args.replace, scratch, CoreDevice(scratch))
+                else:
+                    result = install_signed(args.signed, args.team, args.apple_root, scratch, CoreDevice(scratch))
         print(json.dumps(result))
+    except KeyboardInterrupt:
+        print("Zag Installer cancelled.", file=sys.stderr)
+        return 130
     except (OSError, ValueError, KeyError, TypeError, EOFError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         message = str(error) if type(error) is ValueError else type(error).__name__
         print(f"Zag Installer stopped. {message}", file=sys.stderr)
