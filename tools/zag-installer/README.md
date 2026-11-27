@@ -6,11 +6,11 @@ On 27 November 2026 the operator ran all seven original installer tests, verifie
 
 CoreDevice confirmed bundle `app.zagstore.ios.FTB8PRW638`, version `1.0.0`, build `3`. This physically verifies the USB developer installation and inventory readback path. Launch confirmation is a separate test and remains unrecorded. The successful install occupied that mapped destination.
 
-The operator subsequently confirmed a successful standalone end-to-end macOS installation with the clean-room anisette integration. This records a physical result for desktop Apple authentication, provisioning, signing, validation and USB installation. The follow-up report did not specify the installed bundle, version, build or launch result. The identifiers above belong to the earlier installation-only check.
+The operator subsequently confirmed a successful standalone end-to-end macOS installation with the clean-room anisette integration. This records a physical result for desktop Apple authentication, provisioning, signing, validation and USB installation. The operator also reported successful experimental upgrade testing. The follow-up reports did not specify the installed bundle, version, build, app-data continuity or launch result. The identifiers above belong to the earlier installation-only check.
 
 ## Install or upgrade
 
-Use interactive macOS Terminal with Python 3.9+, stable Rust/Cargo supporting edition 2024, the pinned Zsign submodule, Xcode selected for `xcrun devicectl`, Homebrew OpenSSL 3, and the Apple Root CA PEM used for the original check. Connect and unlock exactly one trusted iPhone or iPad with Developer Mode enabled. First run needs GitHub access to compile desktop dependencies.
+Use interactive macOS Terminal with Python 3.9+, stable Rust/Cargo supporting edition 2024, the pinned Zsign submodule, Xcode selected for `xcrun devicectl`, and Homebrew OpenSSL 3. Connect and unlock exactly one trusted iPhone or iPad with Developer Mode enabled. First run needs GitHub access to compile desktop dependencies.
 
 `install` automatically discovers the latest authorized Beta release, downloads its unsigned IPA, and verifies it against the signed manifest before Apple Account sign-in. For a fresh installation, omit `--upgrade` and choose a Personal Team with a vacant destination. `prepare DESTINATION` downloads and verifies the same release without a device or Apple Account sign-in. The original Beta 3 fixture is used only by regression tests.
 
@@ -20,10 +20,12 @@ To upgrade the experimental `FTB8PRW638` copy, use the same Mac, Apple Account a
 cd "$HOME/Documents/ZagStore-claude" && \
 ZAG_ANISETTE_URL= PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
 python3 tools/zag-installer/zag_installer.py install --upgrade FTB8PRW638 \
-  --expect-tag v1.0.0-beta.4 --apple-root "$HOME/Downloads/AppleRootCA.pem"
+  --expect-tag v1.0.0-beta.4
 ```
 
 **Release check, 27 November 2026.** The production Beta v2 manifest has a valid signature and identifies sequence 10, Beta 4, version `1.0.0`, build `4`, minimum iOS `16.4`. The public GitHub asset was downloaded and its SHA-256 matched the signed value. The manifest expired at `2026-11-24T00:44:40Z`, so the command stops until a fresh signed manifest authorizes Beta 4. [Official Beta channel](https://raw.githubusercontent.com/zagorskey/zag-store-releases/main/releases/v2/beta.json)
+
+HTTPS discovery and downloads use the macOS trust store through URLSession. No Python CA file is needed. The installer derives the separate profile CMS trust anchor from the repository's pinned Apple Root CA. An explicit `--apple-root` override must match that pin. Network diagnostics report the failing stage and a fixed DNS, connectivity, TLS, timeout, or HTTP message without showing URLs or response content.
 
 The desktop helper uses the app's v2 verifier, production trust anchors, expiry policy and rollback/equal-sequence checks, with a separate desktop Keychain service. The installer checks the downloaded IPA digest, canonical bundle, version, build, minimum OS and absence of an embedded profile. The device inventory supplies the current build, iOS version and device family.
 

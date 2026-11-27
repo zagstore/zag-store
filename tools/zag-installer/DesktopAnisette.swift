@@ -10,6 +10,7 @@ let identity = [
 final class ProvisioningTransport: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     let allowed: Bool
     private(set) var count = 0
+    private(set) var networkHint: String?
     init(allowed: Bool) { self.allowed = allowed }
 
     private lazy var session: URLSession = {
@@ -46,12 +47,15 @@ final class ProvisioningTransport: NSObject, URLSessionTaskDelegate, @unchecked 
         let semaphore = DispatchSemaphore(value: 0)
         session.dataTask(with: request) { data, response, error in
             defer { semaphore.signal() }
-            guard error == nil, let response = response as? HTTPURLResponse, let data,
+            if let error { pending.failure = DesktopNetworkError.transportMessage(error); return }
+            guard let response = response as? HTTPURLResponse, let data,
                   data.count <= 1024 * 1024 else { return }
+            if response.statusCode != 200 { pending.failure = DesktopNetworkError.httpMessage(response.statusCode, release: false) }
             let headers = response.allHeaderFields.map { [String(describing: $0.key), String(describing: $0.value)] }
             pending.value = (response.statusCode, data, headers)
         }.resume()
         semaphore.wait()
+        networkHint = pending.failure
         return pending.value
     }
 }
@@ -59,6 +63,7 @@ final class ProvisioningTransport: NSObject, URLSessionTaskDelegate, @unchecked 
 private final class Response: @unchecked Sendable {
     // Written by the completion handler and read only after the semaphore is signaled.
     var value: (Int, Data, [[String]])?
+    var failure: String?
 }
 
 func copy(_ data: Data, into buffer: inout aauth_client_buffer) -> Bool {
@@ -122,7 +127,9 @@ func run() throws -> Bool {
     }
     let status = aauth_client_provision(client)
     guard status == AAUTH_OK else {
-        try output(["status": status.rawValue, "requests": transport.count])
+        var failure: [String: Any] = ["status": status.rawValue, "requests": transport.count]
+        if let hint = transport.networkHint { failure["network_hint"] = hint }
+        try output(failure)
         return true
     }
     var headers = aauth_client_buffer()

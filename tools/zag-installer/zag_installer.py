@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -133,16 +132,14 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     return {"installed_bundle": expected, "version": release["version"], "build": release["build"]}
 
 
-def install_release(release, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input):
+def install_release(release, release_helper, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input):
     endpoint = desktop.provider_origin(endpoint) if endpoint else None
     if upgrade_team is not None:
         artifact.mapped_bundle(upgrade_team)
     local_source = scratch / "official.ipa"
-    releases.acquire(artifact, release, local_source)
+    releases.acquire(artifact, release, release_helper, local_source)
     root = scratch / "apple-root.pem"
-    artifact.require(apple_root.is_file() and 0 < apple_root.stat().st_size < 65536, "Invalid Apple root PEM")
-    shutil.copyfile(apple_root, root)
-    desktop.verify_root(artifact, root)
+    desktop.prepare_profile_root(artifact, ROOT, root, apple_root)
 
     unsigned = scratch / "unsigned"
     unsigned.mkdir()
@@ -197,7 +194,7 @@ def main():
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
     install = modes.add_parser("install", help="Provision, sign, validate and install the latest authorized release")
-    install.add_argument("--apple-root", type=Path, required=True)
+    install.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
     install.add_argument("--upgrade", metavar="TEAM", help="Require an existing copy for this Personal Team")
     for mode in (prepare, install):
         mode.add_argument("--expect-tag", help="Require this exact release tag in the signed channel")
@@ -206,17 +203,17 @@ def main():
         artifact.require(sys.platform == "darwin", "Use macOS Terminal")
         artifact.require(args.mode != "install" or sys.stdin.isatty(), "Use interactive macOS Terminal")
         with desktop.locked_cache() as cache:
-            release = releases.discover(ROOT, cache, args.expect_tag)
+            release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
             if args.mode == "prepare":
                 with tempfile.TemporaryDirectory(prefix=".zag-release-", dir=args.destination.parent) as directory:
                     candidate = Path(directory) / "release.ipa"
-                    result = releases.acquire(artifact, release, candidate)
+                    result = releases.acquire(artifact, release, release_helper, candidate)
                     candidate.chmod(0o600)
                     os.link(candidate, args.destination)
             else:
                 with tempfile.TemporaryDirectory(prefix="zag-installer-") as directory:
                     scratch = Path(directory)
-                    result = install_release(release, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
+                    result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
                                              args.upgrade, scratch, CoreDevice(scratch), cache)
         print(json.dumps(result))
     except KeyboardInterrupt:

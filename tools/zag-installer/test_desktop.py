@@ -53,6 +53,14 @@ class IdentityTests(unittest.TestCase):
 
 
 class DesktopTests(unittest.TestCase):
+    def test_bundled_profile_root_matches_existing_pin(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "apple-root.pem"
+            desktop.prepare_profile_root(installer.artifact, installer.ROOT, root)
+            der = base64.b64decode("".join(root.read_text().splitlines()[1:-1]), validate=True)
+            import hashlib
+            self.assertEqual(hashlib.sha256(der).hexdigest(), installer.artifact.APPLE_ROOT)
+
     def test_provider_origin_requires_verified_https_origin(self):
         self.assertEqual(desktop.provider_origin("https://ani.example/"), "https://ani.example")
         for bad in ("", "http://ani.example", "https://user:password@ani.example",
@@ -136,14 +144,14 @@ class DesktopTests(unittest.TestCase):
 
             cache = Mock()
             cache.installer_tools.return_value = ("auth", "signer", "openssl", None)
-            def acquire(_, _release, destination):
+            def acquire(_, _release, _helper, destination):
                 shutil.copyfile(source, destination)
 
             with patch.object(installer.releases, "acquire", side_effect=acquire), \
-                 patch.object(desktop, "verify_root"), patch.object(desktop.Provisioning, "run", run_portal), \
+                 patch.object(desktop, "prepare_profile_root"), patch.object(desktop.Provisioning, "run", run_portal), \
                  patch.object(desktop, "sign") as sign:
                 with self.assertRaisesRegex(ValueError, "already installed"):
-                    installer.install_release(RELEASE, root, "https://ani.example", None, scratch, device, cache,
+                    installer.install_release(RELEASE, "release-helper", root, "https://ani.example", None, scratch, device, cache,
                                               approve=lambda _: "1")
                 device.install.assert_not_called()
                 sign.assert_not_called()

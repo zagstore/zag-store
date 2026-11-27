@@ -189,7 +189,9 @@ class NativeAnisette:
         if "status" in result:
             status, count = result["status"], result["requests"]
             require(type(status) is int and type(count) is int, "Invalid local ADI status")
-            raise ValueError(f"Apple ADI failed with status {status} after {count} Apple requests")
+            hint = result.get("network_hint")
+            detail = f" {hint}" if isinstance(hint, str) else ""
+            raise ValueError(f"Apple ADI failed with status {status} after {count} Apple requests.{detail}")
         if mode == "provision":
             state = base64.b64decode(result["state"], validate=True)
             require(state and len(state) <= 1024 * 1024, "Invalid local ADI state")
@@ -260,7 +262,9 @@ class Provisioning:
         if event == "failure":
             code = message.get("code")
             suffix = f" (Apple code {code})" if type(code) is int else ""
-            raise ValueError(f"{message['stage']} failed{suffix}. Existing certificates were preserved.")
+            hint = message.get("network_hint")
+            detail = f" {hint}" if isinstance(hint, str) else ""
+            raise ValueError(f"{message['stage']} failed{suffix}.{detail} Existing certificates were preserved.")
         require(self.identity is not None, "Missing authenticated signing identity")
         if event == "certificate":
             return self.identity.select(message["certificates"])
@@ -309,8 +313,12 @@ def personal_entitlements(artifact, profile, certificate, team, udid, suffix="")
     return entitlements
 
 
-def verify_root(artifact, root):
-    pinned = artifact.command("openssl", "x509", "-in", str(root), "-outform", "DER")
+def prepare_profile_root(artifact, repo, root, supplied=None):
+    if supplied is None:
+        pinned = (repo / "AppleAuthCore/zag-isideload/src/assets/apple_root.cer").read_bytes()
+    else:
+        require(supplied.is_file() and 0 < supplied.stat().st_size < 65536, "Invalid Apple root PEM")
+        pinned = artifact.command("openssl", "x509", "-in", str(supplied), "-outform", "DER")
     require(hashlib.sha256(pinned).hexdigest() == artifact.APPLE_ROOT, "Unexpected profile trust anchor")
     root.write_text("-----BEGIN CERTIFICATE-----\n" + base64.encodebytes(pinned).decode("ascii")
                     + "-----END CERTIFICATE-----\n", encoding="ascii")
@@ -418,7 +426,7 @@ class BuildCache:
         anisette = None
         if native:
             anisette_sources = [repo / "tools/zag-installer" / name
-                                for name in ("DesktopAnisette.swift", "build-anisette.sh")]
+                                for name in ("DesktopAnisette.swift", "DesktopNetwork.swift", "build-anisette.sh")]
             anisette_dir = repo / "AppleAuthCore/apple-auth"
             anisette_sources += [anisette_dir / "build-apple-auth.sh", *sorted((anisette_dir / "patches").glob("*.patch"))]
             tag = hashlib.sha256(b"".join(path.read_bytes() for path in anisette_sources)).hexdigest()

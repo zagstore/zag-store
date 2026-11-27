@@ -1,10 +1,11 @@
 import hashlib
 from pathlib import Path
 import plistlib
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
-import urllib.request
 import zipfile
 
 import releases
@@ -87,19 +88,32 @@ class InstallTests(unittest.TestCase):
 
 
 class ReleaseTests(unittest.TestCase):
-    def test_redirect_safety(self):
-        redirect = releases.ReleaseRedirect()
-        request = urllib.request.Request(URL)
-        for bad in ("http://github.com/file", "https://evil.example/file",
-                    URL.replace("/test/", "/other/"), "https://name@release-assets.githubusercontent.com/file"):
-            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "redirect"):
-                redirect.redirect_request(request, None, 302, "", {}, bad)
+    def test_download_origin_is_restricted_to_release_assets(self):
+        self.assertEqual(releases.release_tag(URL), "test")
+        for bad in ("http://github.com/file", "https://evil.example/file", URL + "?token=redacted",
+                    "https://name@release-assets.githubusercontent.com/file"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "release"):
+                releases.release_tag(bad)
+
+    def test_only_structured_helper_diagnostics_are_displayed(self):
+        with patch.object(releases.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 1, b"",
+                b'{"message":"Official IPA download: TLS verification failed."}')
+            with self.assertRaisesRegex(ValueError, "TLS verification failed"):
+                releases.run_helper(["helper"], 5, "Official IPA download")
+            run.return_value = subprocess.CompletedProcess([], 1, b"", b"raw URL and server credentials")
+            with self.assertRaisesRegex(ValueError, "^Official IPA download failed$"):
+                releases.run_helper(["helper"], 5, "Official IPA download")
+            run.side_effect = subprocess.TimeoutExpired(["helper", "private URL"], 5)
+            with self.assertRaisesRegex(ValueError, "^Official IPA download timed out"):
+                releases.run_helper(["helper"], 5, "Official IPA download")
 
     def test_expired_release_is_refused_before_download(self):
-        with patch.object(releases.urllib.request, "build_opener") as opener:
+        with patch.object(releases, "run_helper") as transfer:
             with self.assertRaisesRegex(ValueError, "expired"):
-                releases.acquire(installer.artifact, {**RELEASE, "expires": "2000-01-01T00:00:00Z"}, Path("unused"))
-            opener.assert_not_called()
+                releases.acquire(installer.artifact, {**RELEASE, "expires": "2000-01-01T00:00:00Z"},
+                                 "helper", Path("unused"))
+            transfer.assert_not_called()
 
     def test_published_beta3_binary_fixture_if_available(self):
         # Original Phase 1 fixture pins are kept for regression only.
@@ -109,17 +123,16 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(source.stat().st_size, 60_803_467)
         digest = "da743f30f32723ab2bb16051734caa109fd75d1fdaa292cdcb70c968d582f741"
         self.assertEqual(installer.artifact.sha(source), digest)
-        with tempfile.TemporaryDirectory() as tmp, patch.object(releases.urllib.request, "build_opener") as opener:
-            opener.return_value.open.side_effect = lambda *_args, **_kw: source.open("rb")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(releases, "run_helper") as transfer:
+            transfer.side_effect = lambda args, *_: shutil.copyfile(source, args[-1])
             target = Path(tmp) / "verified.ipa"
             release = {**RELEASE, "url": URL, "sha256": digest, "build": "3"}
-            releases.acquire(installer.artifact, release, target)
+            releases.acquire(installer.artifact, release, "helper", target)
             self.assertEqual(installer.artifact.sha(target), digest)
 
     def test_payload_digest_mismatch_blocks_before_archive_parsing(self):
-        import io
-        with tempfile.TemporaryDirectory() as tmp, patch.object(releases.urllib.request, "build_opener") as opener:
-            opener.return_value.open.return_value = io.BytesIO(b"wrong bytes")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(releases, "run_helper") as transfer:
+            transfer.side_effect = lambda args, *_: args[-1].write_bytes(b"wrong bytes")
             release = {**RELEASE, "url": URL, "sha256": hashlib.sha256(b"expected").hexdigest()}
             with self.assertRaisesRegex(ValueError, "digest"):
-                releases.acquire(installer.artifact, release, Path(tmp) / "candidate.ipa")
+                releases.acquire(installer.artifact, release, "helper", Path(tmp) / "candidate.ipa")

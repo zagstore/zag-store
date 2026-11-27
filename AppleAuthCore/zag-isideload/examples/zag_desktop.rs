@@ -610,6 +610,51 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
     Ok(())
 }
 
+fn network_hint(report: &Report) -> Option<&'static str> {
+    use std::error::Error;
+    for node in report.iter_reports() {
+        let direct = node.downcast_current_context::<reqwest::Error>();
+        let wrapped = node
+            .downcast_current_context::<reqwest_middleware::Error>()
+            .and_then(|error| match error {
+                reqwest_middleware::Error::Reqwest(reqwest) => Some(reqwest),
+                _ => None,
+            });
+        let Some(error) = direct.or(wrapped) else {
+            continue;
+        };
+        if let Some(status) = error.status() {
+            return Some(match status.as_u16() {
+                401 | 403 => "The server rejected access. Check the provider or sign in again before retrying.",
+                429 => "The server is rate limiting requests. Wait and retry.",
+                500..=599 => "The server is temporarily unavailable. Try again later.",
+                _ => "The server returned an unexpected HTTP response.",
+            });
+        }
+        if error.is_timeout() {
+            return Some("The request timed out. Check connectivity and retry.");
+        }
+        let mut cause = error.source();
+        while let Some(source) = cause {
+            if source.is::<rustls::Error>() {
+                return Some(
+                    "TLS failed. Check the Mac's date, macOS trust settings, or an intercepting proxy.",
+                );
+            }
+            cause = source.source();
+        }
+        if error.is_connect() {
+            return Some(
+                "The server could not be reached. Check DNS, connectivity, and firewall settings.",
+            );
+        }
+        return Some(
+            "The network response could not be processed. Try again on a stable connection.",
+        );
+    }
+    None
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut stage = "installer configuration";
@@ -618,7 +663,7 @@ async fn main() {
         let _ = writeln!(
             io::stdout(),
             "{}",
-            json!({"event":"failure","stage":stage,"code":code})
+            json!({"event":"failure","stage":stage,"code":code,"network_hint":network_hint(&error)})
         );
         std::process::exit(1);
     }
