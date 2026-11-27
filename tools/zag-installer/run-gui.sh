@@ -22,7 +22,9 @@ xcrun swiftc -parse-as-library -O -framework SwiftUI -framework AppKit \
     "$SOURCE" -o "$CACHE/ZagInstaller"
 
 APP="$HOME/Applications/Zag Installer.app"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+ASSETS="$ROOT/Feather/Resources/Assets.xcassets/AppIcon.appiconset"
+cp "$ASSETS/zagstore.png" "$ASSETS/zagstore_dark.png" "$APP/Contents/Resources/"
 install -m 755 "$CACHE/ZagInstaller" "$APP/Contents/MacOS/ZagInstaller"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
