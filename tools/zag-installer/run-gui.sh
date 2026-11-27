@@ -80,6 +80,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>SUEnableAutomaticChecks</key><true/>
     <key>SUScheduledCheckInterval</key><integer>86400</integer>
     <key>SUAutomaticallyUpdate</key><false/>
+    <key>SUPublicEDKey</key><string>fJxMeEWbjDNHPzsWKgrJ83ymzKyh5u9Cx5Pi3HfEoWg=</string>
     <key>ZagUpdatesReady</key><false/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>LSUIElement</key><false/>
