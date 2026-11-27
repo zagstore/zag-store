@@ -39,7 +39,7 @@ EXPIRES="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["effe
 test "${#SHA}" -eq 64
 ```
 
-Stop if validation fails. It checks the signed bundle identity, codesign verification and Apple Development certificate purpose, the authenticated profile for every app and extension, the actual signer, target device membership, granted entitlements and the earliest expiration. Development credentials alone do not prove free membership. Confirm the team was a Personal Team in the signing app. The report contains a digest, build, expiry and mapped identifier, with no Apple ID credentials or UDID.
+Stop if validation fails. External verification failures report the stage, bundle-relative component, exit status and recognised stderr text. The validator uses the same signed XML entitlement invocation as the manual Mac check. It checks the signed bundle identity, codesign verification and Apple Development certificate purpose, the authenticated profile for every app and extension, the actual signer, target device membership, granted entitlements and the earliest expiration. Development credentials alone do not prove free membership. Confirm the team was a Personal Team in the signing app. The report contains a digest, build, expiry and mapped identifier, with no Apple ID credentials or UDID.
 
 ### 3. Publish one verified IPA to the private preview lane
 

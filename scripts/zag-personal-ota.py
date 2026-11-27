@@ -10,6 +10,7 @@ import plistlib
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,9 +29,21 @@ TEAM = re.compile(r"[A-Z0-9]{10}")
 SHA = re.compile(r"[a-f0-9]{64}")
 JOB = re.compile(r"[a-f0-9]{32}")
 DEVELOPMENT = "1.2.840.113635.100.6.1.2"
-MACHO_MAGICS = {bytes.fromhex(magic) for magic in (
-    "feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca",
-)}
+THIN_MAGICS = {bytes.fromhex(magic) for magic in ("feedface", "cefaedfe", "feedfacf", "cffaedfe")}
+FAT_MAGICS = {
+    bytes.fromhex(magic): (order, wide) for magic, order, wide in (
+        ("cafebabe", ">", False), ("bebafeca", "<", False),
+        ("cafebabf", ">", True), ("bfbafeca", "<", True),
+    )
+}
+SAFE_STDERR = re.compile(
+    r"CSSMERR_[A-Z0-9_]+|errSec[A-Za-z0-9_]+|"
+    r"In architecture: [a-zA-Z0-9_]+|"
+    r"invalid requirement specification|No such file or directory|"
+    r"code object is not signed at all|code or signature modified|"
+    r"a sealed resource is missing or invalid|binary contains an invalid entitlements blob",
+    re.IGNORECASE,
+)
 
 
 def require(condition, message):
@@ -46,14 +59,59 @@ def sha(path):
     return digest.hexdigest()
 
 
-def command(*args):
+def command(*args, stage=None, component=None):
     result = subprocess.run(args, capture_output=True, check=False, timeout=120)
     tool = Path(args[0]).name
     if result.returncode:
-        if tool == "codesign" and b"CSSMERR_TP_NOT_TRUSTED" in result.stderr:
-            raise ValueError("codesign trust evaluation failed (CSSMERR_TP_NOT_TRUSTED); full artifact verification did not pass")
-        raise ValueError(f"{tool} rejected the artifact")
+        context = stage or tool
+        if component is not None:
+            safe_path = re.sub(r"[^A-Za-z0-9._ /-]", "_", str(component))[:240]
+            context += f" [{safe_path}]"
+        details = list(dict.fromkeys(SAFE_STDERR.findall(result.stderr.decode("utf-8", "replace"))))[:8]
+        summary = "; ".join(details) if details else "unrecognised output redacted" if result.stderr else "empty"
+        raise ValueError(f"{context}: {tool} exited {result.returncode}; stderr: {summary}")
     return result.stdout
+
+
+def is_macho(path):
+    with path.open("rb") as stream:
+        header = stream.read(8)
+        magic = header[:4]
+        if magic in THIN_MAGICS:
+            return True
+        if magic not in FAT_MAGICS or len(header) != 8:
+            return False
+        order, wide = FAT_MAGICS[magic]
+        count, = struct.unpack(order + "I", header[4:])
+        if not 1 <= count <= 64:
+            return False
+        layout = order + ("IIQQII" if wide else "IIIII")
+        width = struct.calcsize(layout)
+        table = stream.read(count * width)
+        if len(table) != count * width:
+            return False
+        file_size = path.stat().st_size
+        for i in range(count):
+            _, _, offset, size, *_ = struct.unpack_from(layout, table, i * width)
+            if offset < 8 + len(table) or size < 4 or offset + size > file_size:
+                return False
+            stream.seek(offset)
+            if stream.read(4) not in THIN_MAGICS:
+                return False
+        return True
+
+
+def verify_development_certificate(component, relative):
+    requirement = f"anchor apple generic and certificate leaf[field.{DEVELOPMENT}] exists"
+    command("codesign", "--verify", "--strict", "-R=" + requirement, str(component),
+            stage="Apple Development certificate requirement", component=relative)
+
+
+def read_signed_entitlements(component, relative):
+    signed_xml = command("codesign", "--display", "--entitlements", ":-", str(component),
+                         stage="Read signed entitlements", component=relative)
+    require(signed_xml, f"Read signed entitlements [{relative}]: codesign returned no signed XML")
+    return plistlib.loads(signed_xml)
 
 
 def main_bundle(archive):
@@ -103,7 +161,13 @@ def extract(archive, destination):
             path.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(item) as source, path.open("xb") as target:
                 shutil.copyfileobj(source, target)
-            path.chmod(0o700 if item.external_attr >> 16 & 0o111 else 0o600)
+            # Match unzip's ordinary file modes. Keep the top-level scratch
+            # directory private and do not restore set-id or sticky bits.
+            archived_permissions = (item.external_attr >> 16) & 0o777
+            path.chmod(archived_permissions or 0o644)
+    for item in reversed(entries):
+        if item.is_dir() and (permissions := (item.external_attr >> 16) & 0o777):
+            (destination / item.filename).chmod(permissions)
 
 
 def grants(signed, profile):
@@ -149,13 +213,12 @@ def validate(ipa, team, udid, root):
             bundle, build = verify_identity(metadata, team)
             extract(archive, directory)
         app = directory / relative
-        command("codesign", "--verify", "--deep", "--strict", str(app))
-        for file in app.rglob("*"):
-            if file.is_file():
-                with file.open("rb") as stream:
-                    magic = stream.read(4)
-                if magic in MACHO_MAGICS:
-                    command("codesign", "--verify", "--strict", str(file))
+        command("codesign", "--verify", "--deep", "--strict", str(app),
+                stage="Verify signed bundle and nested code", component=relative)
+        for file in sorted(app.rglob("*")):
+            if file.is_file() and is_macho(file):
+                command("codesign", "--verify", "--strict", str(file),
+                        stage="Verify Mach-O executable", component=file.relative_to(directory))
         expiry = []
         components = [app] + sorted(p for p in app.rglob("*") if p.is_dir() and p.suffix in (".appex", ".app"))
         for index, component in enumerate(components):
@@ -163,11 +226,14 @@ def validate(ipa, team, udid, root):
             identifier = info.get("CFBundleIdentifier")
             require(identifier == bundle or (isinstance(identifier, str) and identifier.startswith(bundle + ".")),
                     "Unexpected signed component identifier")
-            command("codesign", "--verify", "--strict", "-R",
-                    f"anchor apple generic and certificate leaf[field.{DEVELOPMENT}] exists", str(component))
+            component_path = component.relative_to(directory)
+            verify_development_certificate(component, component_path)
             prefix = directory / f"certificate-{index}-"
-            command("codesign", "--display", "--extract-certificates", str(prefix), str(component))
-            signer = Path(str(prefix) + "0").read_bytes()
+            command("codesign", "--display", "--extract-certificates=" + str(prefix), str(component),
+                    stage="Extract signing certificate", component=component_path)
+            leaf = Path(str(prefix) + "0")
+            require(leaf.is_file(), f"Extract signing certificate [{component_path}]: codesign returned no leaf")
+            signer = leaf.read_bytes()
             if index == 0:
                 primary_signer = signer
             require(signer == primary_signer, "Component signer differs from the main app")
@@ -178,9 +244,7 @@ def validate(ipa, team, udid, root):
             profile = plistlib.loads(command("openssl", "smime", "-verify", "-inform", "DER", "-purpose", "any",
                                               "-CAfile", str(root), "-no-CApath",
                                               "-in", str(component / "embedded.mobileprovision")))
-            signed_xml = command("codesign", "--display", "--xml", "--entitlements", "-", str(component))
-            require(signed_xml, "codesign could not read the signed XML entitlements")
-            entitlements = plistlib.loads(signed_xml)
+            entitlements = read_signed_entitlements(component, component_path)
             expiry.append(min(certificate_expiry, validate_profile(profile, entitlements, signer, team, identifier, udid, now)))
         require(sha(ipa) == original_digest, "IPA changed during verification")
     return {"sha256": original_digest, "bundle_identifier": bundle, "build": build,

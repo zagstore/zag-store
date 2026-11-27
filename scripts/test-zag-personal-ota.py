@@ -6,6 +6,8 @@ import plistlib
 import tempfile
 import unittest
 import sys
+import stat
+import struct
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,6 +30,45 @@ class StagingTests(unittest.TestCase):
             ota.command("codesign", "--verify", "--deep", "--strict", "/private/artifact")
         self.assertIn("CSSMERR_TP_NOT_TRUSTED", str(error.exception))
         self.assertNotIn("private", str(error.exception))
+
+    def test_codesign_invocations_and_stage_diagnostics(self):
+        app = Path("/private/scratch/Payload/Test.app")
+        relative = Path("Payload/Test.app")
+        denied = SimpleNamespace(returncode=1, stdout=b"", stderr=b"/private/data: invalid requirement specification")
+        with patch.object(ota.subprocess, "run", return_value=denied) as run, self.assertRaisesRegex(
+            ValueError, r"Apple Development certificate requirement \[Payload/Test.app\]: codesign exited 1; stderr: invalid requirement specification",
+        ):
+            ota.verify_development_certificate(app, relative)
+        self.assertTrue(run.call_args.args[0][3].startswith("-R=anchor apple generic"))
+        xml = plistlib.dumps({"get-task-allow": True})
+        with patch.object(ota.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=xml)) as run:
+            self.assertEqual(ota.read_signed_entitlements(app, relative), {"get-task-allow": True})
+        self.assertEqual(run.call_args.args[0], ("codesign", "--display", "--entitlements", ":-", str(app)))
+
+    def test_extraction_preserves_executable_bits_and_zip_defaults(self):
+        raw = io.BytesIO()
+        with zipfile.ZipFile(raw, "w") as archive:
+            for name, mode in (("Executable", 0o100755), ("Resource", 0), ("Plain", 0o100640)):
+                entry = zipfile.ZipInfo(name)
+                entry.create_system = 3 if mode else 0
+                entry.external_attr = (mode << 16) or 0x20
+                archive.writestr(entry, b"same content")
+        with zipfile.ZipFile(raw) as archive, tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            ota.extract(archive, base)
+            for name, mode in (("Executable", 0o755), ("Resource", 0o644), ("Plain", 0o640)):
+                self.assertEqual(stat.S_IMODE((base / name).stat().st_mode), mode)
+                self.assertEqual((base / name).read_bytes(), b"same content")
+
+    def test_macho_detection_checks_fat_slice_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate"
+            thin = bytes.fromhex("cffaedfe") + bytes(28)
+            fat = struct.pack(">7I", 0xcafebabe, 1, 0x100000c, 0, 28, len(thin), 0) + thin
+            for data, expected in ((thin, True), (fat, True), (fat[:-1], False),
+                                   (bytes.fromhex("cafebabe0000003d0002000000"), False)):
+                path.write_bytes(data)
+                self.assertEqual(ota.is_macho(path), expected)
 
     def test_actual_bundle_and_build(self):
         raw = io.BytesIO()
