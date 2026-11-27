@@ -300,14 +300,6 @@ private struct InstallerView: View {
     @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
     @State private var showDiagnostics = false
 
-    private func updateDockIcon() {
-        let name = dark ? "zagstore_dark_installer" : "zagstore_installer"
-        if let url = Bundle.main.url(forResource: name, withExtension: "png"),
-           let image = NSImage(contentsOf: url) {
-            NSApplication.shared.applicationIconImage = image
-        }
-    }
-
     private var brandImage: NSImage? {
         let name = colorScheme == .dark ? "zagstore_dark" : "zagstore"
         guard let url = Bundle.main.url(forResource: name, withExtension: "png") else { return nil }
@@ -412,8 +404,6 @@ private struct InstallerView: View {
             }
             Spacer(minLength: 0)
         }
-        .onAppear { updateDockIcon() }
-        .onChange(of: colorScheme) { _ in updateDockIcon() }
         .task {
             while !Task.isCancelled {
                 if !installer.busy {
@@ -461,8 +451,36 @@ private struct InstallerView: View {
     }
 }
 
+@MainActor
+final class InstallerAppDelegate: NSObject, NSApplicationDelegate {
+    private var appearanceObservation: NSKeyValueObservation?
+    private var lastDark: Bool?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        appearanceObservation = NSApplication.shared.observe(\.effectiveAppearance, options: [.initial, .new]) { [weak self] _, _ in
+            Task { @MainActor in self?.refreshIcon() }
+        }
+        refreshIcon()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        refreshIcon()
+    }
+
+    private func refreshIcon() {
+        let dark = NSApplication.shared.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        guard lastDark != dark else { return }
+        let name = dark ? "ZagInstallerDark" : "ZagInstaller"
+        guard let url = Bundle.main.url(forResource: name, withExtension: "icns"),
+              let image = NSImage(contentsOf: url) else { return }
+        NSApplication.shared.applicationIconImage = image
+        lastDark = dark
+    }
+}
+
 @main
 struct ZagInstallerApp: App {
+    @NSApplicationDelegateAdaptor(InstallerAppDelegate.self) private var appDelegate
     var body: some Scene {
         WindowGroup {
             InstallerView()
