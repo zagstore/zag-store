@@ -53,6 +53,41 @@ class StagingTests(unittest.TestCase):
             self.assertEqual([item["job"] for item in matches], ["a" * 32])
             self.assertNotIn("private", repr(matches))
 
+    @unittest.skipUnless(hasattr(__import__("tarfile"), "data_filter"), "requires tar data filter")
+    def test_full_sysdiagnose_layout_and_resume(self):
+        import tarfile
+
+        spec = importlib.util.spec_from_file_location("collect", Path(__file__).with_name("zag-ota-collect.py"))
+        collect = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(collect)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "sysdiagnose.tar.gz"
+            with tarfile.open(source, "w:gz") as archive:
+                for name in ("capture/unrelated.txt", "capture/system_logs_full.logarchive/Persist/trace"):
+                    entry = tarfile.TarInfo(name)
+                    entry.size = 4
+                    archive.addfile(entry, io.BytesIO(b"data"))
+            output = base / "output"
+            output.mkdir()
+            args = SimpleNamespace(archive=base, device=None)
+            log = collect.collect(args, output)
+            self.assertEqual(log.name, "system_logs_full.logarchive")
+            self.assertEqual((log / "Persist" / "trace").read_bytes(), b"data")
+            self.assertFalse((output / "extracted" / "unrelated.txt").exists())
+            with patch.object(tarfile, "open", side_effect=AssertionError("must reuse extraction")):
+                self.assertEqual(collect.collect(args, output), log)
+            with tarfile.open(source, "w:gz") as archive:
+                entry = tarfile.TarInfo("capture/system_logs_full.logarchive/../escape")
+                archive.addfile(entry)
+            with self.assertRaisesRegex(collect.CollectionError, "Archive reuse"):
+                collect.collect(args, output)
+            fresh_output = base / "fresh"
+            fresh_output.mkdir()
+            with self.assertRaisesRegex(collect.CollectionError, "unsafe path"):
+                collect.collect(args, fresh_output)
+            self.assertFalse((fresh_output / "extracted").exists())
+
     def test_delivery_audit_matches_exact_job_and_ignores_head(self):
         spec = importlib.util.spec_from_file_location("audit", Path(__file__).with_name("zag-ota-delivery-audit.py"))
         audit = importlib.util.module_from_spec(spec)
@@ -83,6 +118,25 @@ class StagingTests(unittest.TestCase):
             {"scope": "same-window", "process": "appstored", "domain": "NSURLErrorDomain",
              "code": -1001, "events": 1},
         ])
+
+    def test_source_rejection_reason_requires_exact_domain_and_explicit_policy_text(self):
+        spec = importlib.util.spec_from_file_location("diagnostics", Path(__file__).with_name("zag-ota-diagnostics.py"))
+        diagnostics = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(diagnostics)
+        reason = "authorized by a free provisioning profile but apps are not allowed to be installed from this source"
+        records = [
+            {"processImagePath": "/usr/libexec/installd",
+             "eventMessage": f"{BUNDLE} MIInstallerErrorDomain Code=111 {reason} private-token"},
+            {"processImagePath": "/usr/libexec/installd",
+             "eventMessage": f"{BUNDLE}.other MIInstallerErrorDomain Code=111 some other failure"},
+            {"processImagePath": "/usr/libexec/installd",
+             "eventMessage": f"{BUNDLE} MIInstallerErrorDomain Code=112 {reason}"},
+        ]
+        result = diagnostics.extract(records, BUNDLE)
+        matches = [row for row in result if row["domain"] == "FreeProfileInstallSourceRejected"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual((matches[0]["scope"], matches[0]["events"]), ("bundle-linked", 1))
+        self.assertNotIn("private-token", repr(result))
 
     def test_codesign_trust_failure_remains_fatal_and_does_not_expose_detail(self):
         result = SimpleNamespace(returncode=1, stdout=b"", stderr=b"private path: CSSMERR_TP_NOT_TRUSTED")

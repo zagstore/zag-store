@@ -32,6 +32,10 @@ def extract(records, bundle):
             marker in folded for marker in ("free developer profile", "free development profile")
         ):
             matches.add(("FreeProfileLimitMessage", ""))
+        if (("MIInstallerErrorDomain", "111") in matches
+                and "authorized by a free provisioning profile" in folded
+                and "not allowed to be installed from this source" in folded):
+            matches.add(("FreeProfileInstallSourceRejected", ""))
         for error in matches:
             key = (scope, process, *error)
             counts[key] = counts.get(key, 0) + 1
@@ -59,8 +63,15 @@ def main():
             capture_output=True, check=True, timeout=120,
         )
         print(json.dumps(extract(json.loads(result.stdout), args.bundle), indent=2))
-    except (OSError, subprocess.SubprocessError, ValueError):
-        parser.exit(1, "Unable to read the archive in the specified time window. Check its path and timestamps.\n")
+    except subprocess.CalledProcessError as error:
+        hint = ("macOS log show cannot run while sandboxed. Reuse the extracted archive from normal macOS Terminal."
+                if b"Cannot run while sandboxed" in (error.stderr or b"") else
+                "Check that the extracted archive opens in Console and that the time window is valid.")
+        parser.exit(1, f"Unified log query: log show exited {error.returncode}. {hint}\n")
+    except subprocess.TimeoutExpired:
+        parser.exit(1, "Unified log query timed out. Reuse the extracted archive with a narrower time window.\n")
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"Unified log analysis: {type(error).__name__}. Check the archive format and readability.\n")
 
 
 if __name__ == "__main__":
