@@ -64,7 +64,7 @@ record = json.loads(current.read_text())
 old_sha = record["sha256"]
 
 def release_order(v, b):
-    if not re.fullmatch(r"[0-9]+\\.[0-9]+\\.[0-9]+", v):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", v):
         raise RuntimeError("Unsupported release version")
     return tuple(map(int, v.split("."))), int(b)
 

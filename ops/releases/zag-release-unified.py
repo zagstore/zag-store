@@ -280,7 +280,7 @@ with tempfile.TemporaryDirectory(prefix="zag-release-") as tmp:
     ).decode().strip()
 
     require(
-        re.fullmatch(r"/tmp/zag-release\\.[A-Za-z0-9]+", remote),
+        re.fullmatch(r"/tmp/zag-release\.[A-Za-z0-9]+", remote),
         "Unexpected remote staging path"
     )
 

@@ -59,9 +59,21 @@ Verified:
 - Already-deployed release handling.
 - Server utility installation and syntax validation.
 
+Isolated regression tests passed:
+- Successful synthetic Beta 6 activation.
+- Preview failure rollback.
+- Production failure rollback.
+- Signing worker restart failure rollback.
+- Busy signing worker rejection.
+- Downgrade rejection.
+- New version with reset build number.
+- Remote staging path validation.
+
+Run regression tests:
+python3 ops/releases/test-release-activation.py
+
 Outstanding:
 - End-to-end activation of a newer release.
-- Fault-injection and rollback regression tests.
 - Exclusive coordination with incoming signing jobs.
 - Independent server-side manifest signature verification.
 - Verification of all approved records during idempotency checks.
