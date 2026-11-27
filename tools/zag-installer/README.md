@@ -6,23 +6,28 @@ On 27 November 2026 the operator ran all seven original installer tests, verifie
 
 CoreDevice confirmed bundle `app.zagstore.ios.FTB8PRW638`, version `1.0.0`, build `3`. This physically verifies the USB developer installation and inventory readback path. Launch confirmation is a separate test and remains unrecorded. The successful install occupied that mapped destination.
 
-## Phase 2 physical acceptance
+The operator subsequently confirmed a successful standalone end-to-end macOS installation with the clean-room anisette integration. This records a physical result for desktop Apple authentication, provisioning, signing, validation and USB installation. The follow-up report did not specify the installed bundle, version, build or launch result. The identifiers above belong to the earlier installation-only check.
 
-Use interactive macOS Terminal from this checkout, with Python 3.9+, stable Rust/Cargo supporting edition 2024 and the locked dependencies, the pinned Zsign submodule, Xcode selected for `xcrun devicectl`, Homebrew OpenSSL 3, and the Apple Root CA PEM used for the original check. Connect and unlock exactly one trusted iPhone or iPad with Developer Mode enabled.
+## Install or upgrade
 
-The default provider builds the same pinned clean-room `apple-auth` library used by the iOS app, targeting macOS. The first run needs GitHub access to fetch its build dependencies. It asks for `ANISETTE` consent before establishing a fresh desktop machine profile directly with Apple. A previously provisioned desktop profile can generate headers locally. No `ZAG_ANISETTE_URL` is required.
-Run this command with the official unsigned IPA already in Downloads. Select a Personal Team with an unoccupied mapped destination and capacity for a desktop development certificate. The installer asks before portal mutations, asks separately before submitting a CSR, and validates the signed IPA before offering the final `INSTALL` prompt.
+Use interactive macOS Terminal with Python 3.9+, stable Rust/Cargo supporting edition 2024, the pinned Zsign submodule, Xcode selected for `xcrun devicectl`, Homebrew OpenSSL 3, and the Apple Root CA PEM used for the original check. Connect and unlock exactly one trusted iPhone or iPad with Developer Mode enabled. First run needs GitHub access to compile desktop dependencies.
+
+`install` automatically discovers the latest authorized Beta release, downloads its unsigned IPA, and verifies it against the signed manifest before Apple Account sign-in. For a fresh installation, omit `--upgrade` and choose a Personal Team with a vacant destination. `prepare DESTINATION` downloads and verifies the same release without a device or Apple Account sign-in. The original Beta 3 fixture is used only by regression tests.
+
+To upgrade the experimental `FTB8PRW638` copy, use the same Mac, Apple Account and signing identity. The flag requires that exact destination to exist and the authorized release to be newer. The CLI rechecks device and destination after final approval. The typed confirmation is `UPGRADE app.zagstore.ios.FTB8PRW638`.
 
 ```sh
 cd "$HOME/Documents/ZagStore-claude" && \
 ZAG_ANISETTE_URL= PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
-python3 tools/zag-installer/zag_installer.py install \
-  "$HOME/Downloads/ZagStore-1.0.0-beta.3.ipa" --apple-root "$HOME/Downloads/AppleRootCA.pem"
+python3 tools/zag-installer/zag_installer.py install --upgrade FTB8PRW638 \
+  --expect-tag v1.0.0-beta.4 --apple-root "$HOME/Downloads/AppleRootCA.pem"
 ```
 
-Record the exact installed bundle, version and build reported by the CLI. Confirm app launch separately. The occupied `FTB8PRW638` destination requires `--replace FTB8PRW638` and the final typed confirmation `REPLACE app.zagstore.ios.FTB8PRW638`. Use that mode only with operator approval and a desktop-owned certificate or available issuance capacity. The installer performs another USB identity and destination inventory check immediately before CoreDevice runs. CoreDevice does not offer an atomic conditional install, so avoid simultaneous installation from another tool.
+**Release check, 27 November 2026.** The production Beta v2 manifest has a valid signature and identifies sequence 10, Beta 4, version `1.0.0`, build `4`, minimum iOS `16.4`. The public GitHub asset was downloaded and its SHA-256 matched the signed value. The manifest expired at `2026-11-24T00:44:40Z`, so the command stops until a fresh signed manifest authorizes Beta 4. [Official Beta channel](https://raw.githubusercontent.com/zagorskey/zag-store-releases/main/releases/v2/beta.json)
 
-`prepare` still downloads or verifies the exact official release. `install-signed` remains the fresh-install-only path for the independently validated and digest-pinned Phase 1 artifact.
+The desktop helper uses the app's v2 verifier, production trust anchors, expiry policy and rollback/equal-sequence checks, with a separate desktop Keychain service. The installer checks the downloaded IPA digest, canonical bundle, version, build, minimum OS and absence of an embedded profile. The device inventory supplies the current build, iOS version and device family.
+
+Upgrades reuse an Apple-listed, unexpired certificate matching the authenticated account and team's existing Keychain private key. An installation receipt, when present, also pins the exact signing leaf for the connected device. An earlier install has no desktop receipt, so the installer can confirm local key ownership and the mapped destination while CoreDevice and iOS enforce in-place signing compatibility. Upgrades never request a new key or certificate and never uninstall the existing copy. App launch and application-data continuity still need a physical Beta 4 upgrade test.
 
 ## Desktop workflow and boundaries
 
@@ -30,7 +35,7 @@ Record the exact installed bundle, version and build reported by the CLI. Confir
 - Rust selects clean-room ADI or the existing v3 client through the same `AnisetteProvider` trait. There is no automatic provider fallback. For an independently authorized v3 service, explicitly set `ZAG_ANISETTE_URL` to its HTTPS origin and confirm the displayed origin. The CLI checks provider metadata and obtains a valid anisette response before requesting the password. Setting an origin is a separate choice from using the default local path.
 - The portal uses Apple's team membership evidence to select an active Personal Team. It uses the certificate inventory protocol already used by the native app, checks a candidate leaf against the local public key, and submits a public CSR only with consent. Apple capacity and pending-request failures preserve all existing certificates. The local issuance journal is written before submission. After an ambiguous result, a subsequent run reconciles against a matching leaf in authenticated inventory and refuses a second CSR while the first outcome is unresolved.
 - macOS Keychain holds nonsynchronizing records for anisette state, RSA key material and issuance state. Anisette state is scoped to the sign-in name and provider. Signing state is scoped to Apple's authenticated account identifier and the team. The key is handled locally in process memory and private pipes. The CLI never sends private keys, Apple credentials or pairing records to the Zag Store website.
-- The installer registers the USB device and exact team-mapped App ID if absent. It verifies Apple's profile CMS before signing and checks Personal Team status, device membership, signing leaf, expiration, and the exact entitlement grant. The adapter signs the single provisioned app in Beta 3, including its existing nested code, using the pinned strict Zsign implementation. The independently maintained validator checks the resulting IPA's Mach-O signatures, Apple Development identity, embedded profile and entitlements before installation.
+- The installer registers the USB device and exact team-mapped App ID if absent. It verifies Apple's profile CMS before signing and checks Personal Team status, device membership, signing leaf, expiration, and the exact entitlement grant. The adapter uses the pinned strict Zsign implementation for the app and its nested code, with individual profiles for supported extensions. The independently maintained validator checks the resulting IPA's Mach-O signatures, Apple Development identity, embedded profile and entitlements before installation.
 - The device and credential adapters are macOS-specific. The Rust Apple protocol code and archive/provisioning orchestration are separate from those adapters. A Windows credential, signer and USB integration remains future work.
 
 ## Why the iOS provider can run on desktop
@@ -39,7 +44,7 @@ The working `ZagNativeAccountSignInView` calls `ZagAppleAuthMachine.nativeLogin`
 
 The checked-in static library is an iOS arm64 slice and cannot link into a macOS process. Its C++ source and C ABI can be rebuilt for macOS without AuthKit or its entitlements. The desktop helper uses the same Mac ADI algorithm, legacy client-info and User-Agent, and the same in-memory provisioning API. It provisions a distinct desktop identity. The iPhone's state and credentials stay on the phone.
 
-The desktop transport permits only the Apple HTTPS ADI lookup, start and finish sequence, uses system TLS verification and refuses redirects. The Rust adapter checks consistent client identity and required anisette headers before asking for the password. The iOS result is evidence for the ADI implementation and identity, while acceptance of those headers with this desktop Rust sign-in and developer session still requires a physical test.
+The desktop transport permits only the Apple HTTPS ADI lookup, start and finish sequence, uses system TLS verification and refuses redirects. The Rust adapter checks consistent client identity and required anisette headers before asking for the password. The operator has confirmed acceptance of these headers in the standalone physical desktop workflow.
 
 ## Profile-only on-device adoption design
 
@@ -56,4 +61,4 @@ Test the design separately with a disposable artifact signed only on the Mac. Ac
 
 ## Test status
 
-The installer regression suite exercises offline source and installation guards, interactive 2FA choices, account isolation and certificate recovery, Personal Team profile binding, and failure before any device installation. Live desktop Apple sign-in, portal issuance, signing with the resulting Apple identity, installation of that newly signed IPA, and launch remain acceptance steps.
+The installer regression suite exercises offline source and installation guards, interactive 2FA choices, account isolation and certificate recovery, Personal Team profile binding, and failure before any device installation. The signed-manifest upgrade path has offline regression coverage. Physical upgrade and launch remain separate acceptance steps.

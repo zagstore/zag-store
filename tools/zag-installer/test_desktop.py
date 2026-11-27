@@ -1,5 +1,4 @@
 import base64
-from contextlib import nullcontext
 import datetime as dt
 from pathlib import Path
 import plistlib
@@ -11,6 +10,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 import desktop
+from test_zag_installer import RELEASE
 import zag_installer as installer
 
 TEAM = "FTB8PRW638"
@@ -134,13 +134,17 @@ class DesktopTests(unittest.TestCase):
                                "teams": [{"id": TEAM, "name": "Personal Team"}]})
                 self.fail("occupied destination was authorized")
 
-            with patch.object(installer, "SOURCE_SIZE", source.stat().st_size), \
-                 patch.object(installer, "verify_source"), patch.object(desktop, "verify_root"), \
-                 patch.object(desktop, "tools_for_install", return_value=nullcontext(("auth", "signer", "openssl", None))), \
-                 patch.object(desktop.Provisioning, "run", run_portal), patch.object(desktop, "sign") as sign:
+            cache = Mock()
+            cache.installer_tools.return_value = ("auth", "signer", "openssl", None)
+            def acquire(_, _release, destination):
+                shutil.copyfile(source, destination)
+
+            with patch.object(installer.releases, "acquire", side_effect=acquire), \
+                 patch.object(desktop, "verify_root"), patch.object(desktop.Provisioning, "run", run_portal), \
+                 patch.object(desktop, "sign") as sign:
                 with self.assertRaisesRegex(ValueError, "already installed"):
-                    installer.install_unsigned(source, root, "https://ani.example", None, scratch, device,
-                                               approve=lambda prompt: "ANISETTE" if "anisette" in prompt else "1")
+                    installer.install_release(RELEASE, root, "https://ani.example", None, scratch, device, cache,
+                                              approve=lambda _: "1")
                 device.install.assert_not_called()
                 sign.assert_not_called()
 
@@ -148,21 +152,29 @@ class DesktopTests(unittest.TestCase):
         device = Mock()
         with patch.object(installer.artifact, "validate", side_effect=ValueError("invalid signature")):
             with self.assertRaisesRegex(ValueError, "invalid signature"):
-                installer.validate_and_install(Path("signed"), TEAM, Path("root"), Path("."), device,
-                                               "target", "udid", Mock())
+                installer.validate_and_install(Path("signed"), RELEASE, TEAM, Path("root"), Path("."), device,
+                                               "target", "udid", Mock(), b"leaf")
         device.install.assert_not_called()
 
-    def test_replacement_requires_exact_bundle_confirmation(self):
-        device = Mock()
+    def test_upgrade_refuses_to_create_a_new_certificate(self):
+        store = Mock()
+        store.read.return_value = None
+        approve = Mock()
+        identity = desktop.Identity(store, "account", TEAM, "openssl", approve, upgrade=True)
+        with self.assertRaisesRegex(ValueError, "existing local signing key"):
+            identity.select([])
+        approve.assert_not_called()
+        store.write.assert_not_called()
+
+    def test_extensions_keep_their_identifier_suffix(self):
         with tempfile.TemporaryDirectory() as folder:
-            scratch = Path(folder)
-            signed = scratch / "signed.ipa"
-            with zipfile.ZipFile(signed, "w") as archive:
-                archive.writestr("Payload/Zag.app/Info.plist",
-                                 plistlib.dumps({"CFBundleShortVersionString": "1.0.0"}))
-            with patch.object(installer.artifact, "validate",
-                              return_value={"bundle_identifier": BUNDLE, "build": "3"}):
-                with self.assertRaisesRegex(ValueError, "cancelled"):
-                    installer.validate_and_install(signed, TEAM, Path("root"), scratch, device,
-                                                   "target", "udid", lambda _: "INSTALL", replacing=True)
-            device.install.assert_not_called()
+            app = Path(folder)
+            extension = app / "PlugIns/Widget.appex"
+            extension.mkdir(parents=True)
+            info = extension / "Info.plist"
+            info.write_bytes(plistlib.dumps({"CFBundleIdentifier": "app.zagstore.ios.widgets.home"}))
+            self.assertEqual(desktop.signing_components(app, "app.zagstore.ios"),
+                             {"": "", "PlugIns/Widget.appex": ".widgets.home"})
+            info.write_bytes(plistlib.dumps({"CFBundleIdentifier": "another.app.widget"}))
+            with self.assertRaisesRegex(ValueError, "does not belong"):
+                desktop.signing_components(app, "app.zagstore.ios")

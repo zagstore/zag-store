@@ -203,7 +203,7 @@ def validate_profile(profile, entitlements, signer, team, identifier, udid, now)
     return expires
 
 
-def validate(ipa, team, udid, root, probe=False):
+def validate(ipa, team, udid, root, probe=False, expected_signer=None):
     require(sys.platform == "darwin", "Run full artifact validation on macOS")
     pinned = command("openssl", "x509", "-in", str(root), "-outform", "DER")
     require(hashlib.sha256(pinned).hexdigest() == APPLE_ROOT, "Unexpected profile trust anchor")
@@ -242,6 +242,7 @@ def validate(ipa, team, udid, root, probe=False):
             require(leaf.is_file(), f"Extract signing certificate [{component_path}]: codesign returned no leaf")
             signer = leaf.read_bytes()
             if index == 0:
+                require(expected_signer is None or signer == expected_signer, "Signed IPA does not use the selected certificate")
                 primary_signer = signer
             require(signer == primary_signer, "Component signer differs from the main app")
             expiry_line = command("openssl", "x509", "-inform", "DER", "-in", str(prefix) + "0", "-noout", "-enddate")

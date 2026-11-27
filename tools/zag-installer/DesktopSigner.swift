@@ -42,17 +42,16 @@ if args[1] == "read" || args[1] == "write" {
     exit(0)
 }
 
-guard args[1] == "sign", args.count == 7 else { stop("Invalid desktop signing arguments") }
+guard args[1] == "sign", args.count == 6 else { stop("Invalid desktop signing arguments") }
 do {
     let certificate = try Data(contentsOf: URL(fileURLWithPath: args[4]))
-    let profile = try Data(contentsOf: URL(fileURLWithPath: args[5]))
-    let entitlements = try Data(contentsOf: URL(fileURLWithPath: args[6]))
+    let manifest = try Data(contentsOf: URL(fileURLWithPath: args[5]))
+    let components = try PropertyListDecoder().decode([String: [String: Data]].self, from: manifest)
     var key = FileHandle.standardInput.readDataToEndOfFile()
     defer { key.resetBytes(in: key.startIndex..<key.endIndex) }
     var error: NSString?
     guard ZagSignComponents(args[2], certificate, key, "", nil,
-                            ["": ["provision": profile, "entitlements": entitlements]],
-                            args[3], [], &error) else {
+                            components, args[3], [], &error) else {
         stop("Strict Zsign signing failed")
     }
 } catch {

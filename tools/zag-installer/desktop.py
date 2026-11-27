@@ -59,8 +59,10 @@ class Keychain:
 
 
 class Identity:
-    def __init__(self, store, account, team, openssl, approve):
+    def __init__(self, store, account, team, openssl, approve, upgrade=False, expected_leaf=None):
         self.store = store
+        self.upgrade = upgrade
+        self.expected_leaf = expected_leaf
         self.key_item = scope("signing-key", account, team)
         self.pending_item = scope("pending-csr", account, team)
         self.machine_item = scope("certificate-machine", account, team)
@@ -83,9 +85,18 @@ class Identity:
         return result.returncode == 0
 
     def select(self, certificates):
+        matches = {}
         for index, encoded in enumerate(certificates):
-            if self.matches(base64.b64decode(encoded, validate=True)):
-                return {"index": index}
+            leaf = base64.b64decode(encoded, validate=True)
+            fingerprint = hashlib.sha256(leaf).hexdigest()
+            if (self.expected_leaf is None or fingerprint == self.expected_leaf) and self.matches(leaf):
+                if not self.upgrade:
+                    return {"index": index}
+                matches[fingerprint] = index
+        require(len(matches) <= 1, "Several certificates match the existing key and the installed leaf is unknown")
+        if matches:
+            return {"index": next(iter(matches.values()))}
+        require(not self.upgrade, "Upgrade requires an active Apple certificate for the existing local signing key")
         require(self.store.read(self.pending_item) in (None, b""),
                 "Previous certificate issuance is unresolved. Check Apple certificate inventory before retrying.")
         require(self.approve("Create an Apple Development certificate if Apple has capacity? Type CREATE: ") == "CREATE",
@@ -108,6 +119,8 @@ class Identity:
     def bind(self, encoded):
         certificate = base64.b64decode(encoded, validate=True)
         require(self.matches(certificate), "Apple certificate does not match the account-scoped desktop key")
+        require(self.expected_leaf is None or hashlib.sha256(certificate).hexdigest() == self.expected_leaf,
+                "Apple certificate differs from the verified installation's signing identity")
         self.clear_request()
         self.certificate = certificate
         return True
@@ -186,7 +199,8 @@ class NativeAnisette:
 
 
 class Provisioning:
-    def __init__(self, endpoint, udid, store, openssl, choose_team, approve, native_helper=None):
+    def __init__(self, endpoint, udid, store, openssl, choose_team, approve, native_helper=None,
+                 upgrade=False, components=None):
         self.endpoint = endpoint
         self.native = NativeAnisette(native_helper, store, approve) if native_helper else None
         self.udid = udid
@@ -197,7 +211,9 @@ class Provisioning:
         self.anisette_scope = None
         self.identity = None
         self.team = None
-        self.profile = None
+        self.upgrade = upgrade
+        self.components = components if components is not None else {"": ""}
+        self.profiles = {}
 
     def handle(self, message):
         event = message["event"]
@@ -206,11 +222,12 @@ class Provisioning:
             require(email, "Apple ID is required")
             if self.native:
                 self.native.item = scope("anisette", "clean-room-mac-legacy-v1", email.casefold())
-                return {"provider": "native", "email": email, "udid": self.udid}
+                return {"provider": "native", "email": email, "udid": self.udid, "suffixes": list(self.components.values())}
             require(self.endpoint and self.approve(f"Use approved anisette service {self.endpoint}? Type ANISETTE: ")
                     == "ANISETTE", "Remote anisette cancelled")
             self.anisette_scope = scope("anisette", self.endpoint, email.casefold())
-            return {"provider": "remote", "endpoint": self.endpoint, "email": email, "udid": self.udid}
+            return {"provider": "remote", "endpoint": self.endpoint, "email": email, "udid": self.udid,
+                    "suffixes": list(self.components.values())}
         if event in ("native_identity", "native_headers"):
             require(self.native is not None, "Local anisette is not configured")
             if event == "native_identity":
@@ -232,7 +249,13 @@ class Provisioning:
             account = message["account"]
             require(isinstance(account, str) and account, "Missing authenticated Apple account ID")
             self.team = self.choose_team(message["teams"])
-            self.identity = Identity(self.store, account, self.team, self.openssl, self.approve)
+            self.receipt_item = scope("installed-leaf", self.udid.casefold(), self.team)
+            stored_leaf = self.store.read(self.receipt_item) if self.upgrade else None
+            expected = None
+            if stored_leaf is not None:
+                expected = stored_leaf.decode("ascii")
+                require(re.fullmatch(r"[0-9a-f]{64}", expected), "Installed signing receipt is unreadable")
+            self.identity = Identity(self.store, account, self.team, self.openssl, self.approve, self.upgrade, expected)
             return self.team
         if event == "failure":
             code = message.get("code")
@@ -248,7 +271,9 @@ class Provisioning:
             return self.identity.bind(message["der"])
         if event == "profile":
             require(self.identity.certificate is not None, "Missing verified certificate binding")
-            self.profile = base64.b64decode(message["data"], validate=True)
+            suffix = message["suffix"]
+            require(suffix in self.components.values() and suffix not in self.profiles, "Unexpected provisioned component")
+            self.profiles[suffix] = base64.b64decode(message["data"], validate=True)
             return True
         raise ValueError("Unknown desktop provisioning event")
 
@@ -260,17 +285,17 @@ class Provisioning:
                     response = self.handle(json.loads(line))
                     child.stdin.write(json.dumps(response) + "\n")
                     child.stdin.flush()
-                require(child.wait(timeout=10) == 0 and self.profile,
+                require(child.wait(timeout=10) == 0 and self.profiles.keys() == set(self.components.values()),
                         "Desktop Apple provisioning did not complete")
             finally:
                 if child.poll() is None:
                     child.kill()
                     child.wait()
-        return self.team, self.identity, self.profile
+        return self.team, self.identity, self.profiles
 
 
-def personal_entitlements(artifact, profile, certificate, team, udid):
-    identifier = artifact.mapped_bundle(team)
+def personal_entitlements(artifact, profile, certificate, team, udid, suffix=""):
+    identifier = artifact.mapped_bundle(team) + suffix
     qualified = f"{team}.{identifier}"
     require(profile.get("LocalProvision") is True, "Apple did not issue a Personal Team profile")
     entitlements = {
@@ -291,18 +316,40 @@ def verify_root(artifact, root):
                     + "-----END CERTIFICATE-----\n", encoding="ascii")
 
 
-def sign(artifact, app, relative, team, udid, identity, raw_profile, root, helper, scratch):
-    profile = scratch / "team.mobileprovision"
-    profile.write_bytes(raw_profile)
-    trusted = plistlib.loads(artifact.command("openssl", "smime", "-verify", "-inform", "DER",
-                                             "-purpose", "any", "-CAfile", str(root), "-no-CApath", "-no-CAstore",
-                                             "-in", str(profile)))
-    entitlements = personal_entitlements(artifact, trusted, identity.certificate, team, udid)
+def signing_components(app, original):
+    components = {"": ""}
+    for path in sorted(app.rglob("*")):
+        if not path.is_dir() or path.suffix not in (".app", ".appex", ".xpc"):
+            continue
+        relative = path.relative_to(app)
+        require(path.suffix == ".appex" and len(relative.parts) == 2 and relative.parts[0] == "PlugIns",
+                "Unsupported nested application or extension layout")
+        info = plistlib.loads((path / "Info.plist").read_bytes())
+        identifier = info.get("CFBundleIdentifier", "")
+        require(identifier.startswith(original + "."), "Extension identifier does not belong to Zag Store")
+        suffix = identifier[len(original):]
+        require(re.fullmatch(r"(?:\.[A-Za-z0-9-]+)+", suffix) and suffix not in components.values(),
+                "Invalid or repeated extension identifier")
+        components[str(relative)] = suffix
+    return components
+
+
+def sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch):
+    manifest = {}
+    for index, (path, suffix) in enumerate(components.items()):
+        profile = scratch / f"component-{index}.mobileprovision"
+        raw = profiles[suffix]
+        profile.write_bytes(raw)
+        trusted = plistlib.loads(artifact.command("openssl", "smime", "-verify", "-inform", "DER",
+                                                 "-purpose", "any", "-CAfile", str(root), "-no-CApath", "-no-CAstore",
+                                                 "-in", str(profile)))
+        entitlements = personal_entitlements(artifact, trusted, identity.certificate, team, udid, suffix)
+        manifest[path] = {"provision": raw, "entitlements": plistlib.dumps(entitlements)}
     leaf = scratch / "leaf.der"
     leaf.write_bytes(identity.certificate)
-    entitlement_file = scratch / "entitlements.plist"
-    entitlement_file.write_bytes(plistlib.dumps(entitlements))
-    command([helper, "sign", app, artifact.mapped_bundle(team), leaf, profile, entitlement_file],
+    component_file = scratch / "components.plist"
+    component_file.write_bytes(plistlib.dumps(manifest))
+    command([helper, "sign", app, artifact.mapped_bundle(team), leaf, component_file],
             identity.key, "Strict desktop Zsign signing")
     signed = scratch / "signed.ipa"
     with zipfile.ZipFile(signed, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
@@ -313,7 +360,7 @@ def sign(artifact, app, relative, team, udid, identity, raw_profile, root, helpe
 
 
 @contextmanager
-def tools_for_install(repo, native):
+def locked_cache():
     import fcntl  # macOS adapter
     cache = Path.home() / "Library/Caches/app.zagstore.desktop-installer"
     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -326,6 +373,29 @@ def tools_for_install(repo, native):
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("Another desktop installer session is active") from error
+        yield BuildCache(cache)
+    finally:
+        os.close(descriptor)
+
+
+class BuildCache:
+    def __init__(self, path):
+        self.path = path
+
+    def build_swift(self, name, sources):
+        tag = hashlib.sha256(b"".join(path.read_bytes() for path in sources)).hexdigest()
+        folder = self.path / tag
+        binary = folder / name
+        if not binary.is_file():
+            folder.mkdir(mode=0o700, exist_ok=True)
+            pending = folder / (name + ".pending")
+            subprocess.run(["swiftc", "-module-cache-path", folder / "module-cache", *sources, "-o", pending],
+                           check=True, timeout=120)
+            pending.replace(binary)
+        return binary
+
+    def installer_tools(self, repo, native):
+        cache = self.path
         openssl = shutil.which("openssl")
         require(openssl and command([openssl, "version"]).startswith(b"OpenSSL 3"),
                 "Put Homebrew OpenSSL 3 on PATH before starting")
@@ -358,6 +428,4 @@ def tools_for_install(repo, native):
                 build_dir.mkdir(mode=0o700, exist_ok=True)
                 subprocess.run(["bash", repo / "tools/zag-installer/build-anisette.sh", build_dir],
                                check=True, timeout=600)
-        yield cargo_target / "debug/examples/zag_desktop", signer, openssl, anisette
-    finally:
-        os.close(descriptor)
+        return cargo_target / "debug/examples/zag_desktop", signer, openssl, anisette

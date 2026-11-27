@@ -384,6 +384,26 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = relay(json!({"event":"configuration"}))?;
     let udid = field(&config, "udid")?;
+    let suffixes = config["suffixes"]
+        .as_array()
+        .filter(|v| !v.is_empty() && v.len() <= 32)
+        .ok_or_else(|| report!("Invalid component list"))?;
+    let suffixes: Vec<&str> = suffixes
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|s| {
+                    s.is_empty()
+                        || (s.len() <= 200
+                            && s.starts_with('.')
+                            && s[1..].split('.').all(|part| {
+                                !part.is_empty()
+                                    && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                            }))
+                })
+                .ok_or_else(|| report!("Invalid component identifier"))
+        })
+        .collect::<Result<_, Report>>()?;
     let email = field(&config, "email")?;
     let builder = AppleAccount::builder(email);
     *stage = "anisette preflight";
@@ -519,65 +539,74 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
     }
     *stage = "Apple app identifier registration";
     check_session()?;
-    let identifier = format!("app.zagstore.ios.{team_id}");
     let response = session
         .send_dev_request_no_response(
             &dev_url("listAppIds", Ios),
             plist!(dict {"teamId": team_id}),
         )
         .await?;
-    let mut app_id = None;
-    if let Some(list) = response.get("appIds") {
-        let rows = list
-            .as_array()
-            .ok_or_else(|| report!("Invalid App ID inventory"))?;
-        app_id = rows
-            .iter()
-            .filter_map(Plist::as_dictionary)
-            .find(|row| {
-                row.get("identifier").and_then(Plist::as_string) == Some(identifier.as_str())
-            })
-            .map(|row| {
-                row.get("appIdId")
-                    .or_else(|| row.get("appIdentifierId"))
-                    .and_then(Plist::as_string)
-                    .map(str::to_string)
-                    .ok_or_else(|| report!("Missing registered App ID"))
-            })
-            .transpose()?;
-    } else if response
-        .get("resultCode")
-        .and_then(Plist::as_signed_integer)
-        != Some(0)
-    {
-        bail!("Missing App ID inventory");
-    }
-    let app_id = if let Some(app_id) = app_id {
-        app_id
-    } else {
-        let app = session
-            .add_app_id(&team, "Zag Store", &identifier, Ios)
-            .await?;
-        if app.identifier != identifier {
-            bail!("Unexpected app identifier");
+    for suffix in suffixes {
+        *stage = "Apple app identifier registration";
+        check_session()?;
+        let identifier = format!("app.zagstore.ios.{team_id}{suffix}");
+        let mut app_id = None;
+        if let Some(list) = response.get("appIds") {
+            let rows = list
+                .as_array()
+                .ok_or_else(|| report!("Invalid App ID inventory"))?;
+            app_id = rows
+                .iter()
+                .filter_map(Plist::as_dictionary)
+                .find(|row| {
+                    row.get("identifier").and_then(Plist::as_string) == Some(identifier.as_str())
+                })
+                .map(|row| {
+                    row.get("appIdId")
+                        .or_else(|| row.get("appIdentifierId"))
+                        .and_then(Plist::as_string)
+                        .map(str::to_string)
+                        .ok_or_else(|| report!("Missing registered App ID"))
+                })
+                .transpose()?;
+        } else if response
+            .get("resultCode")
+            .and_then(Plist::as_signed_integer)
+            != Some(0)
+        {
+            bail!("Missing App ID inventory");
         }
-        app.app_id_id
-    };
-    *stage = "Apple Personal Team profile";
-    check_session()?;
-    let result = session
-        .send_dev_request_no_response(
-            &dev_url("downloadTeamProvisioningProfile", Ios),
-            plist!(dict {"teamId": team_id, "appIdId": &app_id}),
-        )
-        .await?;
-    let profile = result
-        .get("provisioningProfile")
-        .and_then(Plist::as_dictionary)
-        .ok_or_else(|| report!("Missing Apple provisioning profile"))?;
-    let profile = plist_blob(profile, "encodedProfile")
-        .ok_or_else(|| report!("Missing embedded profile data"))?;
-    let _: Value = relay(json!({"event":"profile", "data":BASE64_STANDARD.encode(profile)}))?;
+        let app_id = if let Some(app_id) = app_id {
+            app_id
+        } else {
+            let name = if suffix.is_empty() {
+                "Zag Store".to_string()
+            } else {
+                format!("Zag Store {}", suffix[1..].replace(['.', '-'], " "))
+            };
+            let app = session.add_app_id(&team, &name, &identifier, Ios).await?;
+            if app.identifier != identifier {
+                bail!("Unexpected app identifier");
+            }
+            app.app_id_id
+        };
+        *stage = "Apple Personal Team profile";
+        check_session()?;
+        let result = session
+            .send_dev_request_no_response(
+                &dev_url("downloadTeamProvisioningProfile", Ios),
+                plist!(dict {"teamId": team_id, "appIdId": &app_id}),
+            )
+            .await?;
+        let profile = result
+            .get("provisioningProfile")
+            .and_then(Plist::as_dictionary)
+            .ok_or_else(|| report!("Missing Apple provisioning profile"))?;
+        let profile = plist_blob(profile, "encodedProfile")
+            .ok_or_else(|| report!("Missing embedded profile data"))?;
+        let _: Value = relay(
+            json!({"event":"profile", "suffix":suffix, "data":BASE64_STANDARD.encode(profile)}),
+        )?;
+    }
     Ok(())
 }
 
