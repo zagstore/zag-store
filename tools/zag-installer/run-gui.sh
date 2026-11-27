@@ -22,6 +22,9 @@ xcrun swiftc -parse-as-library -O -framework SwiftUI -framework AppKit \
     "$SOURCE" -o "$CACHE/ZagInstaller"
 
 APP="$HOME/Applications/Zag Installer.app"
+if [[ -d "/Applications/Zag Installer.app" ]]; then
+    APP="/Applications/Zag Installer.app"
+fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ASSETS="$ROOT/Feather/Resources/Assets.xcassets/AppIcon.appiconset"
 cp "$ASSETS/zagstore.png" "$ASSETS/zagstore_dark.png" "$APP/Contents/Resources/"
@@ -30,15 +33,25 @@ for variant in zagstore zagstore_dark; do
     [[ -s "$source" ]] || { echo "Missing approved installer artwork: $source" >&2; exit 1; }
     cp "$source" "$APP/Contents/Resources/${variant}_installer.png"
 done
-ICONSET="$CACHE/ZagInstaller.iconset"
-rm -rf "$ICONSET"
-mkdir -p "$ICONSET"
-for size in 16 32 128 256 512; do
-    sips -z "$size" "$size" "$APP/Contents/Resources/zagstore_installer.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-    double=$((size * 2))
-    sips -z "$double" "$double" "$APP/Contents/Resources/zagstore_installer.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+for variant in light dark; do
+    name=ZagInstaller
+    artwork=zagstore_installer
+    if [[ "$variant" == dark ]]; then
+        name=ZagInstallerDark
+        artwork=zagstore_dark_installer
+    fi
+    ICONSET="$CACHE/$name.iconset"
+    rm -rf "$ICONSET"
+    mkdir -p "$ICONSET"
+    xcrun swift "$ROOT/tools/zag-installer/MakeDockIcon.swift" \
+        "$APP/Contents/Resources/$artwork.png" "$CACHE/$name.png"
+    for size in 16 32 128 256 512; do
+        sips -z "$size" "$size" "$CACHE/$name.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+        double=$((size * 2))
+        sips -z "$double" "$double" "$CACHE/$name.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/$name.icns"
 done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/ZagInstaller.icns"
 install -m 755 "$CACHE/ZagInstaller" "$APP/Contents/MacOS/ZagInstaller"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -52,7 +65,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>ZagInstaller.icns</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleVersion</key><string>3</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>LSUIElement</key><false/>
     <key>LSBackgroundOnly</key><false/>
