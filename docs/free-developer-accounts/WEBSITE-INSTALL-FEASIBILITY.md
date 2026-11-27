@@ -1,5 +1,7 @@
 # Direct website installation with a Personal Team
 
+See the [final zero-desktop bootstrap review](ZERO-DESKTOP-BOOTSTRAP-FEASIBILITY.md) for the confirmed source restriction, alternatives and release decision.
+
 Direct installation from zagstore.app is the primary research direction. Phase 1 isolates one question: will stock iOS install and launch a correctly Personal Team-signed copy of Zag Store from Safari using the private preview OTA manifest?
 
 Apple documents HTTPS manifests and `itms-services` for supported distribution workflows. That documentation does not establish support for Personal Team development signatures. [Apple deployment guide](https://support.apple.com/guide/deployment/distribute-proprietary-in-house-apps-depce7cefc4d/web)
