@@ -26,6 +26,22 @@ artifact = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(artifact)
 
 
+class StandaloneUSB:
+    """Fail-closed boundary for the future bundled iDevice transport.
+
+    The desktop UI must not automatically fall back to Xcode or silently
+    attempt a partially implemented installation. No device writes here.
+    """
+    def __init__(self, scratch, executable):
+        self.scratch = scratch
+        self.executable = Path(executable)
+        if not self.executable.is_file() or not os.access(self.executable, os.X_OK):
+            raise ValueError("Standalone USB helper is missing from Zag Installer")
+
+    def usb_device(self):
+        raise ValueError("Standalone USB transport has not passed device verification; installation is disabled")
+
+
 class CoreDevice:
     def __init__(self, scratch):
         self.scratch = scratch
@@ -290,6 +306,8 @@ def main():
     parser.add_argument("--ui-pipe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--precompiled-helpers", type=Path, metavar="DIRECTORY",
                         help=argparse.SUPPRESS)
+    parser.add_argument("--usb-transport", choices=("coredevice", "standalone"),
+                        default="coredevice", help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode", required=True)
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
@@ -333,7 +351,8 @@ def main():
             else:
                 with tempfile.TemporaryDirectory(prefix="zag-installer-") as directory:
                     scratch = Path(directory)
-                    device = CoreDevice(scratch)
+                    device = (CoreDevice(scratch) if args.usb_transport == "coredevice"
+                              else StandaloneUSB(scratch, ROOT / "helpers/zag-usb"))
                     if args.mode in ("handoff", "setup"):
                         artifact.mapped_bundle(args.team)
                         command = handoff.send if args.mode == "handoff" else handoff.retry
