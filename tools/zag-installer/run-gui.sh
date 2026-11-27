@@ -25,6 +25,18 @@ APP="$HOME/Applications/Zag Installer.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ASSETS="$ROOT/Feather/Resources/Assets.xcassets/AppIcon.appiconset"
 cp "$ASSETS/zagstore.png" "$ASSETS/zagstore_dark.png" "$APP/Contents/Resources/"
+for variant in zagstore zagstore_dark; do
+    xcrun swift "$ROOT/tools/zag-installer/MakeInstallerIcon.swift" \
+        "$ASSETS/$variant.png" "$APP/Contents/Resources/${variant}_installer.png"
+done
+ICONSET="$CACHE/ZagInstaller.iconset"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$APP/Contents/Resources/zagstore_installer.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+    double=$((size * 2))
+    sips -z "$double" "$double" "$APP/Contents/Resources/zagstore_installer.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/ZagInstaller.icns"
 install -m 755 "$CACHE/ZagInstaller" "$APP/Contents/MacOS/ZagInstaller"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -36,6 +48,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>app.zagstore.installer</string>
     <key>CFBundleExecutable</key><string>ZagInstaller</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>ZagInstaller.icns</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
