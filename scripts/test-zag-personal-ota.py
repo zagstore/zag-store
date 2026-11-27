@@ -24,6 +24,53 @@ JOB = "a" * 32
 
 
 class StagingTests(unittest.TestCase):
+    def test_probe_uses_separate_exact_allowlist(self):
+        metadata = {"CFBundleIdentifier": "app.zagstore.ota-probe." + TEAM,
+                    "CFBundleExecutable": "OTAProbe", "CFBundleShortVersionString": "1.0",
+                    "CFBundleVersion": "1"}
+        self.assertEqual(ota.verify_identity(metadata, TEAM, probe=True), (metadata["CFBundleIdentifier"], "1"))
+        for invalid, probe in ((metadata, False), (dict(metadata, CFBundleIdentifier=BUNDLE), True),
+                               (dict(metadata, CFBundleVersion="2"), True),
+                               (dict(metadata, CFBundleIdentifier=metadata["CFBundleIdentifier"] + ".extra"), True)):
+            with self.assertRaises(ValueError):
+                ota.verify_identity(invalid, TEAM, probe=probe)
+
+    def test_list_only_expired_jobs_bound_to_digest_team_and_window(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(ota, "DELIVERY", Path(directory)):
+            expiry = int(dt.datetime.now(dt.timezone.utc).timestamp()) - 60
+            digest = "b" * 64
+            base = {"sha256": digest, "bundle_id": BUNDLE, "expires_at": expiry, "token": "private"}
+            for label, changes in (("a", {}), ("b", {"sha256": "c" * 64}),
+                                   ("c", {"bundle_id": BUNDLE + ".other"}),
+                                   ("d", {"expires_at": expiry - 3600}),
+                                   ("e", {"expires_at": expiry + 120})):
+                job = label * 32
+                (Path(directory) / (job + ".json")).write_text(json.dumps({**base, "job_id": job, **changes}))
+            start, end = (dt.datetime.fromtimestamp(expiry + offset, dt.timezone.utc) for offset in (-900, 0))
+            matches = ota.expired_jobs(digest, TEAM, start, end)
+            self.assertEqual([item["job"] for item in matches], ["a" * 32])
+            self.assertNotIn("private", repr(matches))
+
+    def test_diagnostics_keeps_codes_without_exporting_sensitive_messages(self):
+        spec = importlib.util.spec_from_file_location("diagnostics", Path(__file__).with_name("zag-ota-diagnostics.py"))
+        diagnostics = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(diagnostics)
+        records = [
+            {"processImagePath": "/usr/libexec/installd",
+             "eventMessage": BUNDLE + " MIInstallerErrorDomain Code=13 secret=private-token"},
+            {"processImagePath": "/usr/libexec/appstored",
+             "eventMessage": BUNDLE + ".other NSURLErrorDomain Code=-1001"},
+            {"processImagePath": "/usr/libexec/unrelated", "eventMessage": "IXErrorDomain Code=42"},
+        ]
+        self.assertEqual(diagnostics.extract(records, BUNDLE), [
+            {"scope": "bundle-linked", "process": "installd", "domain": "MIInstallerErrorDomain",
+             "code": 13, "events": 1},
+            {"scope": "same-window", "process": "appstored", "domain": "NSURLErrorDomain",
+             "code": -1001, "events": 1},
+        ])
+
     def test_codesign_trust_failure_remains_fatal_and_does_not_expose_detail(self):
         result = SimpleNamespace(returncode=1, stdout=b"", stderr=b"private path: CSSMERR_TP_NOT_TRUSTED")
         with patch.object(ota.subprocess, "run", return_value=result), self.assertRaises(ValueError) as error:

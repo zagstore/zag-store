@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit, urlencode
 
 APPLE_ROOT = "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
 ORIGINAL = "app.zagstore.ios"
+PROBE = "app.zagstore.ota-probe"
 APPTESTERS_BUNDLE = "com.cwd43.gu29"
 PREVIEW = "preview.zagstore.app"
 DELIVERY = Path("/var/www/zagstore-preview/zag-ota-jobs")
@@ -121,18 +122,22 @@ def main_bundle(archive):
     return PurePosixPath(names[0].filename).parent, metadata
 
 
-def mapped_bundle(team):
+def mapped_bundle(team, probe=False):
     require(TEAM.fullmatch(team), "Invalid expected team")
-    return ORIGINAL + "." + team
+    return (PROBE if probe else ORIGINAL) + "." + team
 
 
-def verify_identity(metadata, team):
-    expected = mapped_bundle(team)
+def verify_identity(metadata, team, probe=False):
+    expected = mapped_bundle(team, probe)
     identifier = metadata.get("CFBundleIdentifier")
     # Match ZagBundleIdentifierMapping. The installed AppTesters identifier
     # and all alternative identifiers are refused here.
     require(identifier != APPTESTERS_BUNDLE, "Refusing the existing AppTesters bundle identifier")
-    require(identifier == expected, "IPA is not the distinct mapped Zag Store app")
+    require(identifier == expected, "IPA does not match the exact mapped experiment identifier")
+    if probe:
+        require(metadata.get("CFBundleExecutable") == "OTAProbe"
+                and metadata.get("CFBundleShortVersionString") == "1.0"
+                and metadata.get("CFBundleVersion") == "1", "Unexpected probe build metadata")
     build = metadata.get("CFBundleVersion")
     require(isinstance(build, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", build), "Invalid signed build")
     return identifier, build
@@ -198,7 +203,7 @@ def validate_profile(profile, entitlements, signer, team, identifier, udid, now)
     return expires
 
 
-def validate(ipa, team, udid, root):
+def validate(ipa, team, udid, root, probe=False):
     require(sys.platform == "darwin", "Run full artifact validation on macOS")
     pinned = command("openssl", "x509", "-in", str(root), "-outform", "DER")
     require(hashlib.sha256(pinned).hexdigest() == APPLE_ROOT, "Unexpected profile trust anchor")
@@ -210,7 +215,7 @@ def validate(ipa, team, udid, root):
         directory = Path(scratch)
         with zipfile.ZipFile(ipa) as archive:
             relative, metadata = main_bundle(archive)
-            bundle, build = verify_identity(metadata, team)
+            bundle, build = verify_identity(metadata, team, probe)
             extract(archive, directory)
         app = directory / relative
         command("codesign", "--verify", "--deep", "--strict", str(app),
@@ -221,6 +226,8 @@ def validate(ipa, team, udid, root):
                         stage="Verify Mach-O executable", component=file.relative_to(directory))
         expiry = []
         components = [app] + sorted(p for p in app.rglob("*") if p.is_dir() and p.suffix in (".appex", ".app"))
+        if probe:
+            require(len(components) == 1 and not any(app.rglob("*.framework")), "Unexpected nested probe code")
         for index, component in enumerate(components):
             info = plistlib.loads((component / "Info.plist").read_bytes())
             identifier = info.get("CFBundleIdentifier")
@@ -284,7 +291,7 @@ def publish(args):
         require(sha(source) == args.sha256, "Upload digest differs from the verified IPA")
         with zipfile.ZipFile(source) as archive:
             _, metadata = main_bundle(archive)
-            bundle, build = verify_identity(metadata, args.team)
+            bundle, build = verify_identity(metadata, args.team, getattr(args, "probe", False))
         result = existing_publish(job_id=job, quarantine_dir=quarantine, delivery_dir=args.delivery,
                                   secret_file=args.secret_file, uid=args.uid, gid=args.gid, ttl=600)
         try:
@@ -304,8 +311,34 @@ def publish(args):
     return result
 
 
-def cleanup(job, expected_sha, team):
+def expired_jobs(expected_sha, team, start, end):
     expected_bundle = mapped_bundle(team)
+    require(SHA.fullmatch(expected_sha) and start.tzinfo and end.tzinfo
+            and dt.timedelta() < end - start <= dt.timedelta(days=1),
+            "Provide an exact digest and a publication window of at most one day")
+    require(DELIVERY.is_dir() and not DELIVERY.is_symlink(), "Invalid preview delivery directory")
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    matches = []
+    for path in DELIVERY.glob("*.json"):
+        if not JOB.fullmatch(path.stem) or not path.is_file() or path.is_symlink():
+            continue
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        expires = record.get("expires_at")
+        if (record.get("job_id") == path.stem and record.get("sha256") == expected_sha
+                and record.get("bundle_id") == expected_bundle and type(expires) is int
+                and start.timestamp() <= expires - 600 <= end.timestamp() and expires <= now):
+            matches.append({"job": path.stem, "expires_at": dt.datetime.fromtimestamp(
+                expires, dt.timezone.utc).isoformat()})
+    return sorted(matches, key=lambda match: (match["expires_at"], match["job"]))
+
+
+def cleanup(job, expected_sha, team, probe=False):
+    expected_bundle = mapped_bundle(team, probe)
     require(os.geteuid() == 0 and JOB.fullmatch(job) and SHA.fullmatch(expected_sha), "Invalid cleanup request")
     require(DELIVERY.is_dir() and not DELIVERY.is_symlink(), "Invalid preview delivery directory")
     sys.path.insert(0, str(SERVICES))
@@ -329,6 +362,7 @@ def main():
         parser = modes.add_parser(mode)
         parser.add_argument("--ipa", type=Path, required=True)
         parser.add_argument("--team", required=True)
+        parser.add_argument("--probe", action="store_true", help="Use the isolated minimal probe identifier")
         if mode == "validate":
             parser.add_argument("--udid", required=True)
             parser.add_argument("--apple-root", type=Path, required=True)
@@ -344,14 +378,22 @@ def main():
     clean.add_argument("--job", required=True)
     clean.add_argument("--sha256", required=True)
     clean.add_argument("--team", required=True)
+    clean.add_argument("--probe", action="store_true")
+    listing = modes.add_parser("expired-jobs", help="List matching expired Zag Store experiment records without tokens")
+    listing.add_argument("--sha256", required=True)
+    listing.add_argument("--team", required=True)
+    listing.add_argument("--start", type=dt.datetime.fromisoformat, required=True)
+    listing.add_argument("--end", type=dt.datetime.fromisoformat, required=True)
     args = cli.parse_args()
     try:
         if args.mode == "validate":
-            result = validate(args.ipa, args.team, args.udid, args.apple_root)
+            result = validate(args.ipa, args.team, args.udid, args.apple_root, args.probe)
         elif args.mode == "publish":
             result = publish(args)
+        elif args.mode == "expired-jobs":
+            result = expired_jobs(args.sha256, args.team, args.start, args.end)
         else:
-            result = cleanup(args.job, args.sha256, args.team)
+            result = cleanup(args.job, args.sha256, args.team, args.probe)
         print(json.dumps(result))
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(f"OTA preflight stopped: {type(error).__name__}: {error}", file=sys.stderr)
