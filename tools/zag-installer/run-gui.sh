@@ -26,10 +26,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ASSETS="$ROOT/Feather/Resources/Assets.xcassets/AppIcon.appiconset"
 cp "$ASSETS/zagstore.png" "$ASSETS/zagstore_dark.png" "$APP/Contents/Resources/"
 for variant in zagstore zagstore_dark; do
-    xcrun swift "$ROOT/tools/zag-installer/MakeInstallerIcon.swift" \
-        "$ASSETS/$variant.png" "$APP/Contents/Resources/${variant}_installer.png"
+    source="$ROOT/tools/zag-installer/icons/${variant}_installer.png"
+    [[ -s "$source" ]] || { echo "Missing approved installer artwork: $source" >&2; exit 1; }
+    cp "$source" "$APP/Contents/Resources/${variant}_installer.png"
 done
 ICONSET="$CACHE/ZagInstaller.iconset"
+rm -rf "$ICONSET"
 mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
     sips -z "$size" "$size" "$APP/Contents/Resources/zagstore_installer.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
@@ -50,7 +52,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>ZagInstaller.icns</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleVersion</key><string>2</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>LSUIElement</key><false/>
     <key>LSBackgroundOnly</key><false/>
@@ -60,5 +62,6 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 plutil -lint "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP"
+touch "$APP"
 open -n --env "ZAG_INSTALLER_ROOT=$ROOT" "$APP"
 echo "Launched $APP"
