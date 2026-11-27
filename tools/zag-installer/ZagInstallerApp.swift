@@ -25,17 +25,35 @@ final class InstallerController: ObservableObject {
     func begin(upgrade: Bool, team: String) {
         guard !busy else { return }
         let environment = ProcessInfo.processInfo.environment
-        let roots = [
-            environment["ZAG_INSTALLER_ROOT"],
-            FileManager.default.currentDirectoryPath,
-            NSHomeDirectory() + "/Documents/ZagStore-claude"
-        ].compactMap { $0 }
-        guard let root = roots.first(where: {
-            FileManager.default.fileExists(atPath: $0 + "/tools/zag-installer/zag_installer.py")
-        }) else {
-            status = "Development checkout not found"
-            append("Set ZAG_INSTALLER_ROOT to the verified Zag Store checkout, or launch from that checkout.")
-            return
+        let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
+        let resource = Bundle.main.resourceURL?.appendingPathComponent("DesktopEngine", isDirectory: true)
+        let fileManager = FileManager.default
+        let root: String
+        if bundled {
+            guard let resource,
+                  fileManager.fileExists(atPath: resource.appendingPathComponent("tools/zag-installer/zag_installer.py").path),
+                  fileManager.fileExists(atPath: resource.appendingPathComponent("helpers/release").path),
+                  fileManager.fileExists(atPath: resource.appendingPathComponent("helpers/zag_desktop").path) else {
+                status = "Bundled installer engine is unavailable"
+                append("The signed installer bundle is incomplete. Reinstall Zag Installer from the official source.")
+                return
+            }
+            root = resource.path
+        } else {
+            // Development-only fallback. A distributed app sets ZagEngineBundled=true.
+            let roots = [
+                environment["ZAG_INSTALLER_ROOT"],
+                fileManager.currentDirectoryPath,
+                NSHomeDirectory() + "/Documents/ZagStore-claude"
+            ].compactMap { $0 }
+            guard let checkout = roots.first(where: {
+                fileManager.fileExists(atPath: $0 + "/tools/zag-installer/zag_installer.py")
+            }) else {
+                status = "Development checkout not found"
+                append("Set ZAG_INSTALLER_ROOT to the verified Zag Store checkout, or launch from that checkout.")
+                return
+            }
+            root = checkout
         }
         let selectedTeam = team.trimmingCharacters(in: .whitespacesAndNewlines)
         if upgrade && selectedTeam.range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil {
@@ -45,8 +63,9 @@ final class InstallerController: ObservableObject {
         let script = root + "/tools/zag-installer/zag_installer.py"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", script, "--ui-pipe", "install"]
-            + (upgrade ? ["--upgrade", selectedTeam] : [])
+        process.arguments = ["python3", script, "--ui-pipe"]
+            + (bundled ? ["--precompiled-helpers", root + "/helpers"] : [])
+            + ["install"] + (upgrade ? ["--upgrade", selectedTeam] : [])
         process.currentDirectoryURL = URL(fileURLWithPath: root, isDirectory: true)
         var env = environment
         let home = NSHomeDirectory()
@@ -105,7 +124,8 @@ final class InstallerController: ObservableObject {
             try process.run()
         } catch {
             status = "Unable to start the installer"
-            append("Check Python 3, Xcode, Cargo and the development checkout.")
+            append(bundled ? "Check the local Python runtime and USB support." :
+                   "Check Python 3, Xcode, Cargo and the development checkout.")
             close()
         }
     }

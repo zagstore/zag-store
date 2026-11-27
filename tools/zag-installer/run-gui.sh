@@ -63,6 +63,34 @@ cp "$ICON_OUTPUT/ZagInstaller.icns" "$APP/Contents/Resources/"
 rm -f "$APP/Contents/Resources/ZagInstallerDark.icns"
 
 install -m 755 "$CACHE/ZagInstaller" "$APP/Contents/MacOS/ZagInstaller"
+
+# Opt-in development packaging: bundle the already-verified isolated engine.
+# No source checkout or helper compilation is used by the GUI in this mode.
+ENGINE_STAGE="${ZAG_INSTALLER_ENGINE_STAGE:-}"
+ENGINE_DEST="$APP/Contents/Resources/DesktopEngine"
+if [[ -n "$ENGINE_STAGE" ]]; then
+    [[ -d "$ENGINE_STAGE" && ! -L "$ENGINE_STAGE" ]] || {
+        echo "Invalid staged installer engine." >&2; exit 1;
+    }
+    ENGINE_STAGE="$(cd "$ENGINE_STAGE" && pwd -P)"
+    for source in tools/zag-installer/zag_installer.py scripts/zag-personal-ota.py \
+                  helpers/release helpers/handoff helpers/zag_desktop \
+                  helpers/zag-desktop-anisette helpers/zag-desktop-signer helpers/openssl \
+                  helpers/lib/libssl.3.dylib helpers/lib/libcrypto.3.dylib; do
+        [[ -f "$ENGINE_STAGE/$source" && ! -L "$ENGINE_STAGE/$source" ]] || {
+            echo "Incomplete staged engine: $source" >&2; exit 1;
+        }
+    done
+    ENGINE_NEXT="$APP/Contents/Resources/.DesktopEngine.next"
+    rm -rf "$ENGINE_NEXT"
+    /usr/bin/ditto "$ENGINE_STAGE" "$ENGINE_NEXT"
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$ENGINE_NEXT/tools/zag-installer/zag_installer.py" --help >/dev/null
+    rm -rf "$ENGINE_DEST"
+    mv "$ENGINE_NEXT" "$ENGINE_DEST"
+else
+    rm -rf "$ENGINE_DEST"
+fi
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -82,6 +110,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>SUAutomaticallyUpdate</key><false/>
     <key>SUPublicEDKey</key><string>fJxMeEWbjDNHPzsWKgrJ83ymzKyh5u9Cx5Pi3HfEoWg=</string>
     <key>ZagUpdatesReady</key><false/>
+    <key>ZagEngineBundled</key><false/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>LSUIElement</key><false/>
     <key>LSBackgroundOnly</key><false/>
@@ -89,6 +118,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+if [[ -n "$ENGINE_STAGE" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :ZagEngineBundled true" "$APP/Contents/Info.plist"
+fi
 plutil -lint "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP"
