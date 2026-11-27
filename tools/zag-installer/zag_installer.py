@@ -15,6 +15,7 @@ import tempfile
 import zipfile
 
 import desktop
+import handoff
 import releases
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -76,6 +77,17 @@ class CoreDevice:
 
     def install(self, identifier, path):
         self.run("Installation", "device", "install", "app", "--device", identifier, str(path))
+
+
+    def copy_from_app(self, identifier, bundle, remote, destination):
+        self.run("Read the iPhone handoff request (prepare it in Zag Store first)", "device", "copy", "from",
+                 "--device", identifier, "--domain-type", "appDataContainer", "--domain-identifier", bundle,
+                 "--source", remote, "--destination", str(destination))
+
+    def copy_to_app(self, identifier, bundle, source, remote):
+        self.run("Deliver encrypted signing identity", "device", "copy", "to",
+                 "--device", identifier, "--domain-type", "appDataContainer", "--domain-identifier", bundle,
+                 "--source", str(source), "--destination", remote)
 
 
 def version_number(value):
@@ -255,6 +267,10 @@ def main():
     local.add_argument("--version", required=True)
     local.add_argument("--build", required=True)
     local.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
+    for mode in (install, local):
+        mode.add_argument("--handoff", action="store_true", help="Offer the USB signing identity handoff after installation")
+    recovery = modes.add_parser("handoff", help="Send the existing signing identity to an installed Personal Team copy")
+    recovery.add_argument("--team", required=True)
     for mode in (prepare, install):
         mode.add_argument("--expect-tag", help="Require this exact release tag in the signed channel")
     args = parser.parse_args()
@@ -262,15 +278,8 @@ def main():
         artifact.require(sys.platform == "darwin", "Use macOS Terminal")
         artifact.require(args.mode == "prepare" or sys.stdin.isatty(), "Use interactive macOS Terminal")
         with desktop.locked_cache() as cache:
-            if args.mode == "upgrade-local-candidate":
-                with tempfile.TemporaryDirectory(prefix="zag-installer-") as directory:
-                    scratch = Path(directory)
-                    result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
-                                                     args.apple_root, scratch, CoreDevice(scratch), cache)
-                print(json.dumps(result))
-                return 0
-            release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
             if args.mode == "prepare":
+                release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                 with tempfile.TemporaryDirectory(prefix=".zag-release-", dir=args.destination.parent) as directory:
                     candidate = Path(directory) / "release.ipa"
                     result = releases.acquire(artifact, release, release_helper, candidate)
@@ -279,8 +288,23 @@ def main():
             else:
                 with tempfile.TemporaryDirectory(prefix="zag-installer-") as directory:
                     scratch = Path(directory)
-                    result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
-                                             args.upgrade, scratch, CoreDevice(scratch), cache)
+                    device = CoreDevice(scratch)
+                    if args.mode == "handoff":
+                        artifact.mapped_bundle(args.team)
+                        result = handoff.send(ROOT, cache, scratch, device, args.team)
+                    else:
+                        if args.mode == "upgrade-local-candidate":
+                            result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
+                                                             args.apple_root, scratch, device, cache)
+                        else:
+                            release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
+                            result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
+                                                     args.upgrade, scratch, device, cache)
+                        if args.handoff:
+                            team = result["installed_bundle"].rsplit(".", 1)[1]
+                            print(json.dumps(result), flush=True)
+                            print("Open the installed app, activate the original Apple ID and prepare a transfer in Apple IDs.")
+                            result = handoff.send(ROOT, cache, scratch, device, team)
         print(json.dumps(result))
     except KeyboardInterrupt:
         print("Zag Installer cancelled.", file=sys.stderr)

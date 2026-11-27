@@ -54,9 +54,53 @@ The checked-in static library is an iOS arm64 slice and cannot link into a macOS
 
 The desktop transport permits only the Apple HTTPS ADI lookup, start and finish sequence, uses system TLS verification and refuses redirects. The Rust adapter checks consistent client identity and required anisette headers before asking for the password. The operator has confirmed acceptance of these headers in the standalone physical desktop workflow.
 
+## Desktop signing identity handoff
+
+The operator confirmed that the desktop installed and upgraded the experimental Personal Team copy for `FTB8PRW638`. On that copy, iOS signed in with the same Apple ID but failed at certificate provisioning with Apple code `7460`. The Mac held the existing certificate's private key. iOS had a separate signing Keychain slot.
+
+Zag Store now asks the active Apple ID to prepare a one-time transfer under **Apple IDs → Zag Store Installation → Receive Desktop Signing Identity**. The target must be a mapped Personal Team installation with a valid profile and working on-device installation pairing. The Mac uses USB CoreDevice app-container copies for two named files. The iPhone displays a 24-hex-character fingerprint of the request for the operator to type on the Mac before authorizing the transfer. No credentials, tokens, anisette state or pairing records are transferred. [CoreDevice file transfer](https://developer.apple.com/documentation/xcode/interacting-with-devices-using-the-command-line)
+
+The request binds an ephemeral X25519 public key, nonce and ten-minute expiry to the connected device UDID, exact running bundle, Personal Team, certificate DER and opaque account-scoped desktop key lookup. The Mac verifies the entered fingerprint, checks the installed destination and signing receipt if available, and proves the available desktop key matches the running certificate. The sender uses X25519, HKDF-SHA256 and AES-GCM with the exact request bytes as authenticated data. Only ciphertext is written for delivery. The phone keeps the recipient key in memory, consumes each request on attempted import, and refuses ciphertext from expired, interrupted or superseded requests.
+
+On import, iOS checks the same active authenticated account, live Personal Team and exact certificate in Apple's read-only inventory, paired device and running signer. It proves key possession, imports into a scoped Keychain key item, then commits the certificate reference for the existing signing and renewal pipeline. It preserves other accounts, different existing identities and pending issuance journals. A confirmed 7460 refusal journal is compatible with reuse. Unknown or issued-but-unreconciled pending requests fail closed. Duplicate imports of the same identity and interrupted metadata commits reuse the same scoped key slot. The existing running-installation verification independently checks paired readback and ownership before enabling profile-only renewal.
+
+### Recover the experimental installation
+
+The installed Beta 5 binary has no native handoff receiver. CoreDevice can place a file in the app's data container, and iOS Keychain isolation prevents it from installing the key on the app's behalf. First upgrade the existing experimental copy in place to a **local handoff-enabled build greater than 5**, signed by the same desktop identity. Use the same Mac, Apple ID and team. The following packages a local Build 6 without changing the repository's release build setting or publishing it:
+
+```sh
+cd "$HOME/Documents/ZagStore-claude" &&
+zag_handoff_work="$(mktemp -d /tmp/zag-handoff.XXXXXX)" &&
+printf 'CURRENT_PROJECT_VERSION = 6\n' > "$zag_handoff_work/handoff.xcconfig" &&
+XCODE_XCCONFIG_FILE="$zag_handoff_work/handoff.xcconfig" make iphoneos &&
+cp packages/ZagStore.ipa "$HOME/Downloads/ZagStore-1.0.0-handoff-build6.ipa" &&
+shasum -a 256 "$HOME/Downloads/ZagStore-1.0.0-handoff-build6.ipa"
+```
+
+After verifying that the local build is `1.0.0` (Build 6), supply its independently recorded SHA-256. The command verifies the candidate before authentication, keeps the existing destination, and offers handoff after device readback:
+
+```sh
+cd "$HOME/Documents/ZagStore-claude" &&
+printf 'Verified local Build 6 SHA-256: ' && IFS= read -r zag_handoff_sha &&
+PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
+python3 tools/zag-installer/zag_installer.py upgrade-local-candidate \
+  "$HOME/Downloads/ZagStore-1.0.0-handoff-build6.ipa" \
+  --sha256 "$zag_handoff_sha" --version 1.0.0 --build 6 --handoff
+```
+
+When the CLI waits, open the upgraded copy, activate the original Apple ID, complete installation pairing if needed, and prepare the transfer in Apple IDs. Enter its fingerprint on the Mac and type `HANDOFF`. On the phone, tap **Import Desktop Signing Identity**. To retry delivery or recover a handoff-enabled copy already installed, start a fresh request and run:
+
+```sh
+cd "$HOME/Documents/ZagStore-claude" &&
+PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
+python3 tools/zag-installer/zag_installer.py handoff --team FTB8PRW638
+```
+
+The normal signed-channel installation command also accepts `--handoff` for releases that contain the receiver. The desktop command reports delivery only. Confirm receipt and ownership in the app. Then sign and install a small app with the same Apple ID, check that no CSR was requested, and use Refresh All when Apple can issue a later profile. Verify profile-only renewal for the new app and Zag Store by reading back a later expiry with an unchanged executable signer, and verify the AppTesters copy still launches. The handoff, Keychain import and subsequent renewal require physical validation.
+
 ## Profile-only on-device adoption design
 
-A desktop-signed install can potentially renew its profile while its original Apple Development certificate remains valid and authorized on the team. The device would install a newly issued profile that grants the **existing** signature's certificate and entitlements. It would not generate a signature, so the protocol needs no transfer of the desktop key. The installer has no adoption or transfer operation.
+A desktop-signed install can potentially renew its profile while its original Apple Development certificate remains valid and authorized on the team. The device would install a newly issued profile that grants the **existing** signature's certificate and entitlements. It would not generate a signature, so the protocol needs no transfer of the desktop key. The implemented handoff uses the existing exact-leaf enrollment. Profile-only adoption without transferring a signing key remains a separate design.
 
 The current `ZagNativeAccountInstall.verifyRunningInstallation()` path binds ownership to a matching on-device account-scoped signing identity. Keep that path and its checks intact. A separate explicit profile-only enrollment would need all of the following:
 

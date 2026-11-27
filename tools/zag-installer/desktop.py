@@ -402,17 +402,11 @@ class BuildCache:
             pending.replace(binary)
         return binary
 
-    def installer_tools(self, repo, native):
+    def signer_tools(self, repo):
         cache = self.path
         openssl = shutil.which("openssl")
         require(openssl and command([openssl, "version"]).startswith(b"OpenSSL 3"),
                 "Put Homebrew OpenSSL 3 on PATH before starting")
-        print("Building the desktop helpers if needed.", flush=True)
-        auth = repo / "AppleAuthCore/zag-isideload/Cargo.toml"
-        cargo_target = cache / "cargo"
-        subprocess.run(["cargo", "build", "--locked", "--manifest-path", auth, "--features",
-                        "live-network", "--example", "zag_desktop", "--target-dir", cargo_target],
-                       check=True, timeout=600)
         signer_sources = [repo / "tools/zag-installer" / name for name in ("DesktopSigner.swift", "build-signer.sh")]
         signer_sources.append(repo / "scripts/zag-build-zsign-macos.sh")
         revision = command(["git", "-C", repo / "Zsign", "rev-parse", "HEAD"]).strip()
@@ -423,6 +417,17 @@ class BuildCache:
             signer_dir.mkdir(mode=0o700, exist_ok=True)
             subprocess.run(["bash", repo / "tools/zag-installer/build-signer.sh", signer_dir],
                            check=True, timeout=300)
+        return signer, openssl
+
+    def installer_tools(self, repo, native):
+        cache = self.path
+        print("Building the desktop helpers if needed.", flush=True)
+        auth = repo / "AppleAuthCore/zag-isideload/Cargo.toml"
+        cargo_target = cache / "cargo"
+        subprocess.run(["cargo", "build", "--locked", "--manifest-path", auth, "--features",
+                        "live-network", "--example", "zag_desktop", "--target-dir", cargo_target],
+                       check=True, timeout=600)
+        signer, openssl = self.signer_tools(repo)
         anisette = None
         if native:
             anisette_sources = [repo / "tools/zag-installer" / name

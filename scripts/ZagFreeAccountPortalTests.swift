@@ -119,6 +119,7 @@ extension Result where Failure == ZagProvisioningFailure {
 		await nativeAppIDsAcrossAccounts()
 		await firstProvisioning()
 		await reuseAndRefresh()
+		await handoffCertificateReuse()
 		await limitsCheckedBeforeChanges()
 		await certificates()
 		await profileChecks()
@@ -510,6 +511,52 @@ extension Result where Failure == ZagProvisioningFailure {
 		check(outcome.failure?.kind == .cancelled, "provisioning can be cancelled")
 		let step = await cancelled.provisioner.currentStep
 		check(step == nil, "the provisioner is idle after cancelling")
+	}
+
+	static func handoffCertificateReuse() async {
+		let h = await Harness.make()
+		_ = await h.run(request())
+		guard let issued = h.storedIdentity else {
+			check(false, "handoff test fixture has an Apple certificate")
+			return
+		}
+		do {
+			try h.secrets.delete(.signingPrivateKey, account: h.account, team: team)
+			let pending = ZagPendingSigningKey(request: Data([42]), privateKey: Data(), keySlot: "pending",
+				startedAt: h.clock.now, attempts: 1, certificate: nil, submissionUnconfirmed: false, preserveAfterConflict: true)
+			let journal = try JSONEncoder().encode(pending)
+			try h.secrets.save(journal, kind: .pendingSigningKey, account: h.account, team: team)
+			let other = UUID()
+			try h.secrets.save(Data([7]), kind: .signingPrivateKey, account: other, team: team)
+			var importedSlots: [String?] = []
+			func transfer() throws {
+				try ZagSigningIdentityHandoffImport.commit(certificate: issued.certificate, serial: issued.serialNumber,
+					expires: issued.expiresAt, scope: h.scope, store: h.secrets) { importedSlots.append($0) }
+			}
+			h.secrets.failSaves = true
+			do { try transfer(); check(false, "interrupted handoff must report storage failure") } catch {}
+			check(h.storedIdentity == nil, "interrupted handoff does not publish partial identity")
+			h.secrets.failSaves = false
+			try transfer()
+			try transfer()
+			check(importedSlots.count == 3 && Set(importedSlots).count == 1, "retry and duplicate use the same scoped key slot")
+			let otherValue = try h.secrets.load(.signingPrivateKey, account: other, team: team)
+			check(otherValue == Data([7]), "handoff does not modify another account")
+			let pendingValue = try h.secrets.load(.pendingSigningKey, account: h.account, team: team)
+			check(pendingValue == journal, "known 7460 refusal journal is preserved")
+			let refreshed = await h.run(request())
+			check(refreshed.value?.changes.createdCertificate == false && refreshed.value?.certificateSerial == issued.serialNumber,
+				"provisioning reuses the received certificate without submitting a new CSR")
+			do {
+				try ZagSigningIdentityHandoffImport.commit(certificate: Data([99]), serial: "other", expires: issued.expiresAt,
+					scope: h.scope, store: h.secrets) { _ in check(false, "conflicting handoff must not import a key") }
+				check(false, "conflicting handoff must be refused")
+			} catch ZagSigningIdentityHandoffImport.Failure.conflict {
+				check(true, "handoff cannot replace a different existing certificate")
+			}
+		} catch {
+			check(false, "handoff persistence test did not complete")
+		}
 	}
 
 	static func liveDisabled() async {

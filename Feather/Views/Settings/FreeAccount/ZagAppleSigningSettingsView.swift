@@ -38,6 +38,9 @@ struct ZagAppleSigningSettingsView: View {
 				}
 				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
 				Section("Zag Store Installation") {
+					if Bundle.main.bundleIdentifier?.hasPrefix("app.zagstore.ios.") == true {
+						NavigationLink("Receive Desktop Signing Identity") { ZagIdentityHandoffView() }
+					}
 					LabeledContent("Signing Method", value: runningInstallation.method == .imported ? "Certificate" : runningInstallation.method.rawValue)
 					LabeledContent("Expiration", value: runningInstallation.expiry?.formatted(date: .abbreviated, time: .omitted) ?? "Unknown")
 					if let pair = runningInstallation.importedCertificate,
