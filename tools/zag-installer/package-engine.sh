@@ -13,11 +13,14 @@ DEST="$PARENT/$(basename "$2")"
 TEMP="$(mktemp -d "$PARENT/.zag-engine.XXXXXXXX")"
 trap 'rm -rf "$TEMP"' EXIT
 
-mkdir -p "$TEMP/package/tools/zag-installer" "$TEMP/package/scripts" "$TEMP/package/helpers"
+mkdir -p "$TEMP/package/tools/zag-installer" "$TEMP/package/scripts" "$TEMP/package/helpers" \
+    "$TEMP/package/AppleAuthCore/zag-isideload/src/assets"
 for name in zag_installer.py desktop.py handoff.py releases.py ui_protocol.py; do
     cp "$ROOT/tools/zag-installer/$name" "$TEMP/package/tools/zag-installer/$name"
 done
 cp "$ROOT/scripts/zag-personal-ota.py" "$TEMP/package/scripts/zag-personal-ota.py"
+cp "$ROOT/AppleAuthCore/zag-isideload/src/assets/apple_root.cer" \
+   "$TEMP/package/AppleAuthCore/zag-isideload/src/assets/apple_root.cer"
 /usr/bin/ditto "$INPUT" "$TEMP/package/helpers"
 
 # Verify the copied artifact validator and desktop modules without executing the
@@ -46,6 +49,9 @@ assert spec is not None and spec.loader is not None
 artifact = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(artifact)
 assert artifact.ORIGINAL == "app.zagstore.ios"
+from hashlib import sha256
+certificate = root / "AppleAuthCore/zag-isideload/src/assets/apple_root.cer"
+assert sha256(certificate.read_bytes()).hexdigest() == artifact.APPLE_ROOT
 cache = desktop.PrecompiledCache(root / "helpers")
 assert cache.build_swift("release", []) == root / "helpers" / "release"
 assert cache.installer_tools(root, native=True)[0].is_file()

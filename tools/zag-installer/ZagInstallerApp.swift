@@ -62,10 +62,24 @@ final class InstallerController: ObservableObject {
         }
         let script = root + "/tools/zag-installer/zag_installer.py"
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", script, "--ui-pipe"]
-            + (bundled ? ["--precompiled-helpers", root + "/helpers"] : [])
-            + ["install"] + (upgrade ? ["--upgrade", selectedTeam] : [])
+        if bundled {
+            let privatePython = root + "/python/bin/python3"
+            let localOpenSSL = root + "/helpers/openssl"
+            guard fileManager.isExecutableFile(atPath: privatePython),
+                  fileManager.isExecutableFile(atPath: localOpenSSL) else {
+                status = "Private installer runtime is missing"
+                append("The installer package is incomplete. Reinstall Zag Installer from the official source.")
+                return
+            }
+            process.executableURL = URL(fileURLWithPath: privatePython)
+            process.arguments = [script, "--ui-pipe", "--precompiled-helpers",
+                                 root + "/helpers", "install"]
+                + (upgrade ? ["--upgrade", selectedTeam] : [])
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["python3", script, "--ui-pipe", "install"]
+                + (upgrade ? ["--upgrade", selectedTeam] : [])
+        }
         process.currentDirectoryURL = URL(fileURLWithPath: root, isDirectory: true)
         var env = environment
         let home = NSHomeDirectory()
@@ -76,8 +90,16 @@ final class InstallerController: ObservableObject {
             "/opt/homebrew/bin",
             "/usr/local/bin"
         ]
-        env["PATH"] = (extras + [environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"])
+        env["PATH"] = bundled ? [root + "/helpers", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
             .joined(separator: ":")
+            : (extras + [environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"])
+                .joined(separator: ":")
+        if bundled {
+            env.removeValue(forKey: "PYTHONHOME")
+            env.removeValue(forKey: "PYTHONPATH")
+            env.removeValue(forKey: "DYLD_LIBRARY_PATH")
+            env.removeValue(forKey: "DYLD_INSERT_LIBRARIES")
+        }
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["ZAG_ANISETTE_URL"] = "" // Native provider, never silently select a remote service
         process.environment = env

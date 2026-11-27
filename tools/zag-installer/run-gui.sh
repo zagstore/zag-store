@@ -74,6 +74,7 @@ if [[ -n "$ENGINE_STAGE" ]]; then
     }
     ENGINE_STAGE="$(cd "$ENGINE_STAGE" && pwd -P)"
     for source in tools/zag-installer/zag_installer.py scripts/zag-personal-ota.py \
+                  AppleAuthCore/zag-isideload/src/assets/apple_root.cer \
                   helpers/release helpers/handoff helpers/zag_desktop \
                   helpers/zag-desktop-anisette helpers/zag-desktop-signer helpers/openssl \
                   helpers/lib/libssl.3.dylib helpers/lib/libcrypto.3.dylib; do
@@ -84,7 +85,18 @@ if [[ -n "$ENGINE_STAGE" ]]; then
     ENGINE_NEXT="$APP/Contents/Resources/.DesktopEngine.next"
     rm -rf "$ENGINE_NEXT"
     /usr/bin/ditto "$ENGINE_STAGE" "$ENGINE_NEXT"
-    PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$ENGINE_NEXT/tools/zag-installer/zag_installer.py" --help >/dev/null
+    PYTHON_STAGE="${ZAG_INSTALLER_PYTHON_STAGE:-}"
+    [[ -d "$PYTHON_STAGE" && ! -L "$PYTHON_STAGE" && -x "$PYTHON_STAGE/bin/python3" ]] || {
+        echo "Bundled engine requires a verified private Python runtime via ZAG_INSTALLER_PYTHON_STAGE." >&2
+        exit 1
+    }
+    /usr/bin/ditto "$PYTHON_STAGE" "$ENGINE_NEXT/python"
+    env -i HOME="$HOME" PATH=/usr/bin:/bin \
+        "$ENGINE_NEXT/python/bin/python3" -I -B -c \
+        'import sys,ssl,hashlib,plistlib,zipfile; assert sys.version_info[:3] == (3,14,10)'
+    env -i HOME="$HOME" PATH="$ENGINE_NEXT/helpers:/usr/bin:/bin" \
+        "$ENGINE_NEXT/python/bin/python3" -B \
+        "$ENGINE_NEXT/tools/zag-installer/zag_installer.py" --help >/dev/null
     rm -rf "$ENGINE_DEST"
     mv "$ENGINE_NEXT" "$ENGINE_DEST"
 else
