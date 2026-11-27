@@ -256,7 +256,46 @@ private struct WiredDevice: Sendable {
     }
 }
 
+// Shared with the production WordPress Refraction theme and realtime analytics.
+private enum ZagPalette {
+    static func rgb(_ hex: UInt32) -> Color {
+        Color(red: Double((hex >> 16) & 255) / 255,
+              green: Double((hex >> 8) & 255) / 255,
+              blue: Double(hex & 255) / 255)
+    }
+    static let cyan = rgb(0x00e5ff)
+    static let blue = rgb(0x2979ff)
+    static let violet = rgb(0x8b5cf6)
+    static let magenta = rgb(0xff2bd6)
+    static let spectrum = LinearGradient(colors: [cyan, blue, violet, magenta], startPoint: .leading, endPoint: .trailing)
+}
+
 private struct InstallerView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var dark: Bool { colorScheme == .dark }
+    private var surface: Color { ZagPalette.rgb(dark ? 0x141e33 : 0xffffff) }
+    private var border: Color { ZagPalette.rgb(dark ? 0x29374e : 0xdcdcde) }
+    private var muted: Color { dark ? ZagPalette.rgb(0xa6b5d2) : Color.secondary }
+    private var success: Color { ZagPalette.rgb(dark ? 0x5eead4 : 0x087f75) }
+    private var attention: Color { ZagPalette.rgb(dark ? 0xf0b85c : 0x946000) }
+    private var atmosphere: some View {
+        ZStack {
+            ZagPalette.rgb(dark ? 0x0a1020 : 0xf7f9fd)
+            RadialGradient(colors: [ZagPalette.blue.opacity(dark ? 0.18 : 0.09), .clear], center: .topLeading, startRadius: 0, endRadius: 390)
+            RadialGradient(colors: [ZagPalette.magenta.opacity(dark ? 0.12 : 0.06), .clear], center: .bottomTrailing, startRadius: 0, endRadius: 350)
+        }
+    }
+    private var connectionLight: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 20, paused: reduceMotion || !device.ready)) { context in
+            let color = device.ready ? success : attention
+            let pulse = reduceMotion || !device.ready ? 0.0 : (sin(context.date.timeIntervalSinceReferenceDate * 2.5) + 1) / 2
+            ZStack {
+                Circle().fill(color.opacity(0.12 + pulse * 0.15)).frame(width: 19, height: 19)
+                Circle().fill(color).frame(width: 9, height: 9)
+            }
+        }
+        .accessibilityHidden(true)
+    }
     @Environment(\.colorScheme) private var colorScheme
     @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
     @State private var showDiagnostics = false
@@ -283,8 +322,9 @@ private struct InstallerView: View {
                 }
                 VStack(alignment: .leading) {
                     Text("Zag Installer").font(.largeTitle.bold())
+                    Capsule().fill(ZagPalette.spectrum).frame(width: 110, height: 3)
                     Text("Install Zag Store using your own Apple ID")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(muted)
                 }
                 Spacer()
             }
@@ -295,17 +335,18 @@ private struct InstallerView: View {
                     Image(systemName: "iphone").font(.system(size: 28))
                     VStack(alignment: .leading, spacing: 4) {
                         Text(device.title).font(.headline)
-                        Text(device.detail).font(.caption).foregroundStyle(.secondary)
+                        Text(device.detail).font(.caption).foregroundStyle(muted)
                     }
                     Spacer()
-                    Circle().fill(device.ready ? Color.green : Color.orange).frame(width: 9, height: 9)
+                    connectionLight
                 }
                 .padding(12)
-                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                .background(surface, in: RoundedRectangle(cornerRadius: 12))
+                .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
                 Label("Signing Setup prepares on-device renewal.", systemImage: "arrow.triangle.2.circlepath")
             }
             .font(.callout)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(muted)
 
             Toggle("Upgrade an existing Personal Team copy", isOn: $upgrade)
                 .disabled(installer.busy)
@@ -332,7 +373,7 @@ private struct InstallerView: View {
                 Spacer()
                 if !installer.installedBundle.isEmpty {
                     Label("Verified install", systemImage: "checkmark.seal.fill")
-                        .foregroundStyle(.green)
+                        .foregroundStyle(success)
                 }
             }
             if !installer.installedBundle.isEmpty {
@@ -348,7 +389,8 @@ private struct InstallerView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(12)
-            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            .background(surface, in: RoundedRectangle(cornerRadius: 10))
+            .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(border, lineWidth: 1) }
             }
             Spacer(minLength: 0)
         }
@@ -362,6 +404,8 @@ private struct InstallerView: View {
         }
         .padding(24)
         .frame(minWidth: 700, minHeight: 565)
+        .background { atmosphere.ignoresSafeArea() }
+        .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
             VStack(alignment: .leading, spacing: 20) {
                 Text(prompt.secure ? "Secure Apple Authentication" : "Confirm Installation")
