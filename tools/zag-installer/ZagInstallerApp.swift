@@ -278,7 +278,7 @@ private struct InstallerView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(12)
-            .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 10))
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
         }
         .padding(24)
         .frame(minWidth: 700, minHeight: 565)
