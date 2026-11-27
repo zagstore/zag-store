@@ -66,26 +66,17 @@ On import, iOS checks the same active authenticated account, live Personal Team 
 
 ### Recover the experimental installation
 
-The installed Beta 5 binary has no native handoff receiver. CoreDevice can place a file in the app's data container, and iOS Keychain isolation prevents it from installing the key on the app's behalf. First upgrade the existing experimental copy in place to a **local handoff-enabled build greater than 5**, signed by the same desktop identity. Use the same Mac, Apple ID and team. The following packages a local Build 6 without changing the repository's release build setting or publishing it:
+The original Beta 5 binary has no native handoff receiver. CoreDevice can place a file in the app's data container, and iOS Keychain isolation prevents it from installing the key on the app's behalf. Use a revised local Beta 5 IPA with the handoff receiver, version `1.0.0` and build `5`, signed in place by the same desktop identity.
+
+Supply the revised IPA's independently recorded SHA-256. `--replace-same-build` applies only to the local experimental copy, requires an exact match to its installed version and build, and prompts for `REPLACE app.zagstore.ios.FTB8PRW638`. Production channel upgrades still require a newer release. After CoreDevice accepts the replacement and inventory confirms the destination metadata, open the app and check for **Receive Desktop Signing Identity**. Inventory cannot distinguish the bytes of two builds with the same version and build number.
 
 ```sh
 cd "$HOME/Documents/ZagStore-claude" &&
-zag_handoff_work="$(mktemp -d /tmp/zag-handoff.XXXXXX)" &&
-printf 'CURRENT_PROJECT_VERSION = 6\n' > "$zag_handoff_work/handoff.xcconfig" &&
-XCODE_XCCONFIG_FILE="$zag_handoff_work/handoff.xcconfig" make iphoneos &&
-cp packages/ZagStore.ipa "$HOME/Downloads/ZagStore-1.0.0-handoff-build6.ipa" &&
-shasum -a 256 "$HOME/Downloads/ZagStore-1.0.0-handoff-build6.ipa"
-```
-
-After verifying that the local build is `1.0.0` (Build 6), supply its independently recorded SHA-256. The command verifies the candidate before authentication, keeps the existing destination, and offers handoff after device readback:
-
-```sh
-cd "$HOME/Documents/ZagStore-claude" &&
-printf 'Verified local Build 6 SHA-256: ' && IFS= read -r zag_handoff_sha &&
+printf 'Verified revised Beta 5 SHA-256: ' && IFS= read -r zag_handoff_sha &&
 PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
 python3 tools/zag-installer/zag_installer.py upgrade-local-candidate \
-  "$HOME/Downloads/ZagStore-1.0.0-handoff-build6.ipa" \
-  --sha256 "$zag_handoff_sha" --version 1.0.0 --build 6 --handoff
+  "$HOME/Downloads/ZagStore-1.0.0-beta.5-revised.ipa" \
+  --sha256 "$zag_handoff_sha" --version 1.0.0 --build 5 --replace-same-build --handoff
 ```
 
 When the CLI waits, open the upgraded copy, activate the original Apple ID, complete installation pairing if needed, and prepare the transfer in Apple IDs. Enter its fingerprint on the Mac and type `HANDOFF`. On the phone, tap **Import Desktop Signing Identity**. To retry delivery or recover a handoff-enabled copy already installed, start a fresh request and run:

@@ -103,18 +103,22 @@ def installed_app(device, target, expected):
     return matches[0] if matches else None
 
 
-def check_destination(installed, release, upgrade):
+def check_destination(installed, release, upgrade, *, replace_same_build=False):
     if not upgrade:
         artifact.require(installed is None, "Destination is already installed. Use --upgrade TEAM.")
         return
     artifact.require(installed is not None, "Upgrade destination is not installed")
     current = version_number(installed.get("version")), version_number(installed.get("bundleVersion"))
     candidate = version_number(release["version"]), version_number(release["build"])
-    artifact.require(candidate > current, "Signed release is not newer than the installed build")
+    if replace_same_build:
+        artifact.require(installed["version"] == release["version"] and installed["bundleVersion"] == release["build"],
+                         "Local same-build replacement requires the exact installed version and build")
+    else:
+        artifact.require(candidate > current, "Signed release is not newer than the installed build")
 
 
 def validate_and_install(signed, release, team, apple_root, scratch, device, target, udid, approve, certificate,
-                         installed=None, check_authorization=releases.check_fresh):
+                         installed=None, check_authorization=releases.check_fresh, *, replace_same_build=False):
     expected = artifact.mapped_bundle(team)
     evidence = artifact.validate(signed, team, udid, apple_root, expected_signer=certificate)
     artifact.require(evidence["bundle_identifier"] == expected and evidence["build"] == release["build"],
@@ -127,10 +131,14 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
                          and info.get("MinimumOSVersion") == release["minimum_os"],
                          "Signed artifact differs from the authorized version or minimum OS")
         artifact.extract(archive, staged)
-    check_destination(installed, release, installed is not None)
+    check_destination(installed, release, installed is not None, replace_same_build=replace_same_build)
     label = f"{expected} {release['version']} ({release['build']})"
-    confirmation = f"UPGRADE {expected}" if installed is not None else "INSTALL"
-    operation = "Upgrade in place" if installed is not None else "Install as a separate app"
+    if replace_same_build:
+        confirmation = f"REPLACE {expected}"
+        operation = "Replace with local same-build candidate"
+    else:
+        confirmation = f"UPGRADE {expected}" if installed is not None else "INSTALL"
+        operation = "Upgrade in place" if installed is not None else "Install as a separate app"
     check_authorization(release)
     artifact.require(approve(f"{operation} {label}? Type {confirmation}: ") == confirmation,
                      "Installation cancelled")
@@ -144,7 +152,10 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     artifact.require(observed and observed.get("bundleVersion") == release["build"]
                      and observed.get("version") == release["version"],
                      "Installer returned success but inventory did not verify the app and build")
-    return {"installed_bundle": expected, "version": release["version"], "build": release["build"]}
+    result = {"installed_bundle": expected, "version": release["version"], "build": release["build"]}
+    if replace_same_build:
+        result["replaced_same_build"] = True
+    return result
 
 
 def install_release(release, release_helper, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input):
@@ -155,7 +166,9 @@ def install_release(release, release_helper, apple_root, endpoint, upgrade_team,
 
 
 def install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
-                     approve, check_authorization):
+                     approve, check_authorization, *, replace_same_build=False):
+    artifact.require(not replace_same_build or upgrade_team == LOCAL_UPGRADE_TEAM,
+                     "Same-build replacement is restricted to the experimental Personal Team copy")
     endpoint = desktop.provider_origin(endpoint) if endpoint else None
     if upgrade_team is not None:
         artifact.mapped_bundle(upgrade_team)
@@ -175,7 +188,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     installed = None
     if upgrade:
         installed = installed_app(device, target, artifact.mapped_bundle(upgrade_team))
-        check_destination(installed, release, upgrade)
+        check_destination(installed, release, upgrade, replace_same_build=replace_same_build)
 
     def choose_team(teams):
         teams = [team for team in teams if isinstance(team["id"], str) and artifact.TEAM.fullmatch(team["id"])
@@ -189,7 +202,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
         team = teams[int(choice) - 1]["id"]
         artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
         current = installed_app(device, target, artifact.mapped_bundle(team))
-        check_destination(current, release, upgrade)
+        check_destination(current, release, upgrade, replace_same_build=replace_same_build)
         artifact.require(current == installed, "Destination inventory changed before provisioning")
         check_authorization(release)
         artifact.require(approve(f"Use {team} as your Personal Team and allow Apple provisioning? Type PROVISION: ")
@@ -202,7 +215,8 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     team, identity, profiles = portal.run(auth)
     signed = desktop.sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch)
     result = validate_and_install(signed, release, team, root, scratch, device, target, udid,
-                                  approve, identity.certificate, installed, check_authorization)
+                                  approve, identity.certificate, installed, check_authorization,
+                                  replace_same_build=replace_same_build)
     try:
         store.write(portal.receipt_item, hashlib.sha256(identity.certificate).hexdigest().encode("ascii"))
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -242,7 +256,8 @@ def stage_local_candidate(source, candidate, expected_sha, version, build):
     return {"version": version, "build": build, "minimum_os": minimum_os, "sha256": expected_sha.lower()}
 
 
-def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch, device, cache, approve=input):
+def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch, device, cache, approve=input,
+                            *, replace_same_build=False):
     candidate = scratch / "local-candidate.ipa"
     release = stage_local_candidate(source, candidate, sha256, version, build)
 
@@ -250,7 +265,7 @@ def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch,
         artifact.require(artifact.sha(candidate) == authorized["sha256"], "Local candidate changed after verification")
 
     return install_verified(release, candidate, apple_root, None, LOCAL_UPGRADE_TEAM,
-                            scratch, device, cache, approve, check_digest)
+                            scratch, device, cache, approve, check_digest, replace_same_build=replace_same_build)
 
 
 def main():
@@ -266,6 +281,8 @@ def main():
     local.add_argument("--sha256", required=True, help="Expected SHA-256 obtained independently of the IPA")
     local.add_argument("--version", required=True)
     local.add_argument("--build", required=True)
+    local.add_argument("--replace-same-build", action="store_true",
+                       help="Explicitly replace the experimental copy at the exact installed version and build")
     local.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
     for mode in (install, local):
         mode.add_argument("--handoff", action="store_true", help="Offer the USB signing identity handoff after installation")
@@ -295,7 +312,8 @@ def main():
                     else:
                         if args.mode == "upgrade-local-candidate":
                             result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
-                                                             args.apple_root, scratch, device, cache)
+                                                             args.apple_root, scratch, device, cache,
+                                                             replace_same_build=args.replace_same_build)
                         else:
                             release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                             result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),

@@ -34,9 +34,10 @@ class LocalCandidateTests(unittest.TestCase):
                 archive.writestr("Payload/Zag.app/embedded.mobileprovision", b"profile")
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def upgrade(self, digest, approve=lambda _: "1", version="1.0.0", build="5"):
+    def upgrade(self, digest, approve=lambda _: "1", version="1.0.0", build="5", *, replace_same_build=False):
         return installer.upgrade_local_candidate(self.source, digest, version, build, None,
-                                                self.scratch, self.device, self.cache, approve)
+                                                self.scratch, self.device, self.cache, approve,
+                                                replace_same_build=replace_same_build)
 
     def test_wrong_digest_stops_before_device_or_authentication(self):
         self.make_ipa(self.source)
@@ -68,11 +69,32 @@ class LocalCandidateTests(unittest.TestCase):
         self.cache.installer_tools.assert_not_called()
 
     def test_valid_candidate_uses_only_experimental_team_and_existing_identity(self):
+        self.assert_install_uses_existing_identity(replace_same_build=False)
+
+    def test_same_build_replacement_uses_existing_identity_and_distinct_confirmation(self):
+        self.assert_install_uses_existing_identity(replace_same_build=True)
+
+    def test_same_build_requires_opt_in_and_downgrade_is_refused_even_with_opt_in(self):
+        digest = self.make_ipa(self.source)
+        for installed_build, opt_in, message in (
+            ("5", False, "not newer"),
+            ("6", True, "exact installed version and build"),
+        ):
+            with self.subTest(installed_build=installed_build), tempfile.TemporaryDirectory() as directory:
+                self.scratch = Path(directory)
+                self.device.apps.return_value = [{**INSTALLED, "bundleVersion": installed_build}]
+                with self.assertRaisesRegex(ValueError, message):
+                    self.upgrade(digest, replace_same_build=opt_in)
+        self.cache.installer_tools.assert_not_called()
+        self.device.install.assert_not_called()
+
+    def assert_install_uses_existing_identity(self, *, replace_same_build):
         digest = self.make_ipa(self.source)
         signed = self.scratch / "signed.ipa"
         self.make_ipa(signed, bundle=BUNDLE)
         newest = {**INSTALLED, "bundleVersion": "5"}
-        self.device.apps.side_effect = [[APPTESTERS, INSTALLED]] * 3 + [[APPTESTERS, newest]]
+        prior = newest if replace_same_build else INSTALLED
+        self.device.apps.side_effect = [[APPTESTERS, prior]] * 3 + [[APPTESTERS, newest]]
         self.cache.installer_tools.return_value = ("auth", "signer", "openssl", "anisette")
         identity = Mock(certificate=b"existing-leaf")
 
@@ -86,10 +108,19 @@ class LocalCandidateTests(unittest.TestCase):
             portal.receipt_item = "receipt"
             return TEAM, identity, {"": b"profile"}
 
-        steps = iter(["1", "PROVISION", f"UPGRADE {BUNDLE}"])
-        with patch.object(installer.desktop, "Keychain"),              patch.object(installer.desktop.Provisioning, "run", provision),              patch.object(installer.desktop, "sign", return_value=signed),              patch.object(installer.artifact, "validate", return_value={"bundle_identifier": BUNDLE, "build": "5"}) as verify,              patch.object(installer.releases, "acquire") as download,              patch.object(installer.releases, "check_fresh") as production_check:
-            result = self.upgrade(digest, approve=lambda _: next(steps))
-        self.assertEqual(result, {"installed_bundle": BUNDLE, "version": "1.0.0", "build": "5"})
+        action = "REPLACE" if replace_same_build else "UPGRADE"
+        steps = iter(["1", "PROVISION", f"{action} {BUNDLE}"])
+        with patch.object(installer.desktop, "Keychain"), \
+             patch.object(installer.desktop.Provisioning, "run", provision), \
+             patch.object(installer.desktop, "sign", return_value=signed), \
+             patch.object(installer.artifact, "validate", return_value={"bundle_identifier": BUNDLE, "build": "5"}) as verify, \
+             patch.object(installer.releases, "acquire") as download, \
+             patch.object(installer.releases, "check_fresh") as production_check:
+            result = self.upgrade(digest, approve=lambda _: next(steps), replace_same_build=replace_same_build)
+        expected = {"installed_bundle": BUNDLE, "version": "1.0.0", "build": "5"}
+        if replace_same_build:
+            expected["replaced_same_build"] = True
+        self.assertEqual(result, expected)
         self.assertEqual(verify.call_args.kwargs["expected_signer"], b"existing-leaf")
         self.device.install.assert_called_once_with("usb-device", self.scratch / "staged/Payload/Zag.app")
         download.assert_not_called()
