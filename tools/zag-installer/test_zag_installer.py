@@ -199,6 +199,14 @@ class NativeUSBAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "application identifier"):
                 dev.apps(self.UDID)
 
+    def test_empty_native_inventory_remains_ambiguous(self):
+        dev = self.make_adapter()
+        with patch.object(installer.subprocess, "run") as run:
+            run.side_effect = [self.reply(), self.reply(mode="inventory")]
+            dev.usb_device()
+            with self.assertRaisesRegex(ValueError, "cannot confirm"):
+                dev.apps(self.UDID)
+
     def test_usb_adapter_does_not_expose_device_writes(self):
         dev = self.make_adapter()
         for operation, args in ((dev.install, (self.UDID, Path("signed.app"))),

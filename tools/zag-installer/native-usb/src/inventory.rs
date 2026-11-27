@@ -60,6 +60,10 @@ pub struct Snapshot {
     pub user_matches: usize,
     pub all_matches: usize,
     pub browse_matches: usize,
+    /// Only a targeted, affirmative response confirms an installed destination.
+    /// This is NOT inferred from a zero-match full-device scan.
+    pub targeted: BTreeMap<String, AppEntry>,
+    pub targeted_checked: bool,
 }
 
 impl Snapshot {
@@ -78,13 +82,39 @@ impl Snapshot {
                 "No Zag Store identifier reported by the three inventory queries; this does not independently establish absence"
             } else {
                 "At least one inventory source reported the listed Zag Store identifier"
-            }
+            },
+            "targeted_checked":self.targeted_checked,
+            "targeted_apps": self.targeted.values().map(|app|
+                json!({"bundleIdentifier":app.bundle,"version":app.version,"bundleVersion":app.build})
+            ).collect::<Vec<_>>()
         })
     }
 }
 
+/// A narrowly scoped, read-only lookup for the known Personal Team destination.
+/// The filter is advisory; the returned keys are independently validated.
+pub async fn targeted_lookup(
+    proxy: &mut InstallationProxyClient, team: &str
+) -> Result<BTreeMap<String, AppEntry>, Box<dyn Error>> {
+    if team.len() != 10 || !team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+        return Err("Invalid Personal Team identifier".into());
+    }
+    let bundle = format!("app.zagstore.ios.{team}");
+    let mut result = BTreeMap::new();
+    for kind in ["User", "Any"] {
+        let values = proxy.get_apps(Some(kind), Some(vec![bundle.clone()])).await?;
+        for (id, info) in &values {
+            if id != &bundle {
+                return Err("Targeted lookup returned an unrelated app".into());
+            }
+            merge(&mut result, id, info)?;
+        }
+    }
+    Ok(result)
+}
+
 /// All three queries must succeed; an error is not treated as an empty library.
-pub async fn inspect(proxy: &mut InstallationProxyClient) -> Result<Snapshot, Box<dyn Error>> {
+pub async fn inspect(proxy: &mut InstallationProxyClient, team: Option<&str>) -> Result<Snapshot, Box<dyn Error>> {
     let user = proxy.get_apps(Some("User"), None).await?;
     let all = proxy.get_apps(Some("Any"), None).await?;
     let browse = proxy.browse(None).await?;
@@ -103,9 +133,21 @@ pub async fn inspect(proxy: &mut InstallationProxyClient) -> Result<Snapshot, Bo
         if zag_bundle(bundle) { counts[2] += 1; }
         merge(&mut apps, bundle, info)?;
     }
+    let targeted = match team {
+        Some(value) => targeted_lookup(proxy, value).await?,
+        None => BTreeMap::new()
+    };
+    for (bundle, entry) in &targeted {
+        if let Some(existing) = apps.get(bundle) {
+            if existing != entry { return Err("Targeted and broad inventories conflict".into()); }
+        } else {
+            apps.insert(bundle.clone(), entry.clone());
+        }
+    }
     Ok(Snapshot {
         apps, user_count:user.len(), all_count:all.len(), browse_count:browse.len(),
-        user_matches:counts[0], all_matches:counts[1], browse_matches:counts[2]
+        user_matches:counts[0], all_matches:counts[1], browse_matches:counts[2],
+        targeted, targeted_checked: team.is_some()
     })
 }
 
@@ -135,6 +177,16 @@ mod tests {
         merge(&mut apps, "com.other.app", &info("1.0.0","1")).unwrap();
         assert_eq!(apps.len(), 1);
     }
+    #[test]
+    fn team_identifier_must_be_exactly_ten_ascii_characters() {
+        for valid in ["FTB8PRW638", "0123456789"] {
+            assert!(valid.len() == 10 && valid.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()));
+        }
+        for bad in ["", "abcdefghij", "../foo", "FTB8PRW638.extra"] {
+            assert!(!(bad.len() == 10 && bad.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())));
+        }
+    }
+
     #[test]
     fn conflicting_or_incomplete_versions_fail_closed() {
         let mut apps = BTreeMap::new();

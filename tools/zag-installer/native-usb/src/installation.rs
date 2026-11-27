@@ -36,10 +36,24 @@ async fn installed(
     proxy: &mut InstallationProxyClient,
     bundle: &str,
 ) -> Result<Option<VersionStamp>, Box<dyn Error>> {
-    let snapshot = inventory::inspect(proxy).await?;
-    // This union is cross-checked across Lookup(User), Lookup(Any), and Browse.
-    Ok(snapshot.apps.get(bundle).map(|app| VersionStamp {
-        version: app.version.clone(), build: app.build.clone()
+    let snapshot = inventory::inspect(proxy, None).await?;
+    // Broad inventory misses cannot authorise a fresh installation. An
+    // explicit targeted query is required, and still cannot prove absence.
+    let team = bundle.strip_prefix("app.zagstore.ios.")
+        .ok_or("Unexpected destination bundle")?;
+    let targeted = inventory::targeted_lookup(proxy, team).await?;
+    let broad = snapshot.apps.get(bundle);
+    let exact = targeted.get(bundle);
+    if let (Some(a), Some(b)) = (broad, exact) {
+        if a != b { return Err("Conflicting targeted and broad inventory".into()); }
+    }
+    // A missing record is ambiguous on iOS; do not turn that into permission
+    // to replace or collide with an existing app.
+    let found = exact.or(broad).ok_or(
+        "Zag Store destination not confirmed in native inventory; installation is disabled"
+    )?;
+    Ok(Some(VersionStamp {
+        version: found.version.clone(), build: found.build.clone()
     }))
 }
 

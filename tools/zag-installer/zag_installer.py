@@ -97,6 +97,8 @@ class StandaloneUSB:
                          "The trusted USB device changed")
         _, _, record = self._run("inventory")
         apps = record.get("zag_apps")
+        # Absence is ambiguous even after three successful Apple queries.
+        # Never treat it as an unoccupied destination in standalone mode.
         artifact.require(isinstance(apps, list) and len(apps) <= 32,
                          "Native app inventory is missing or too large")
         result = []
@@ -117,6 +119,8 @@ class StandaloneUSB:
             version_number(version)
             version_number(build)
             result.append({"bundleIdentifier": bundle, "version": version, "bundleVersion": build})
+        if not result:
+            raise ValueError("Native USB inventory cannot confirm a Zag Store installation or vacant destination")
         return result
 
     def install(self, identifier, path):

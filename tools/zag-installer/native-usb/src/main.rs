@@ -37,7 +37,7 @@ async fn inspect(mode: &str) -> Result<serde_json::Value, Box<dyn std::error::Er
         let apps = proxy.get_apps(Some("User"), None).await?;
         result["user_app_count"] = json!(apps.len());
     } else {
-        let snapshot = inventory::inspect(&mut proxy).await?;
+        let snapshot = inventory::inspect(&mut proxy, None).await?;
         result["user_app_count"] = json!(snapshot.user_count);
         let diagnostics = snapshot.as_json();
         result["zag_apps"] = diagnostics["zag_apps"].clone();
