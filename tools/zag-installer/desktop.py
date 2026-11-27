@@ -150,9 +150,45 @@ def two_factor(event, approve):
     return {"action": "abort"}
 
 
+class NativeAnisette:
+    def __init__(self, helper, store, approve):
+        self.helper = helper
+        self.store = store
+        self.approve = approve
+        self.item = None
+        self.state = None
+
+    def identity(self):
+        result = json.loads(command([self.helper, "identity"], b"", "Load clean-room Apple ADI provider"))
+        return result["identity"]
+
+    def headers(self, prepare):
+        require(self.item is not None, "Missing local anisette account scope")
+        if prepare:
+            self.state = self.store.read(self.item)
+        if self.state is None:
+            require(prepare and self.approve("Allow a new local ADI profile to provision with Apple? Type ANISETTE: ")
+                    == "ANISETTE", "Apple ADI provisioning cancelled")
+            mode = "provision"
+        else:
+            mode = "headers"
+        result = json.loads(command([self.helper, mode], self.state or b"", "Derive local anisette"))
+        if "status" in result:
+            status, count = result["status"], result["requests"]
+            require(type(status) is int and type(count) is int, "Invalid local ADI status")
+            raise ValueError(f"Apple ADI failed with status {status} after {count} Apple requests")
+        if mode == "provision":
+            state = base64.b64decode(result["state"], validate=True)
+            require(state and len(state) <= 1024 * 1024, "Invalid local ADI state")
+            self.store.write(self.item, state)
+            self.state = state
+        return result["headers"]
+
+
 class Provisioning:
-    def __init__(self, endpoint, udid, store, openssl, choose_team, approve):
+    def __init__(self, endpoint, udid, store, openssl, choose_team, approve, native_helper=None):
         self.endpoint = endpoint
+        self.native = NativeAnisette(native_helper, store, approve) if native_helper else None
         self.udid = udid
         self.store = store
         self.openssl = openssl
@@ -168,8 +204,18 @@ class Provisioning:
         if event == "configuration":
             email = self.approve("Apple ID: ").strip()
             require(email, "Apple ID is required")
+            if self.native:
+                self.native.item = scope("anisette", "clean-room-mac-legacy-v1", email.casefold())
+                return {"provider": "native", "email": email, "udid": self.udid}
+            require(self.endpoint and self.approve(f"Use approved anisette service {self.endpoint}? Type ANISETTE: ")
+                    == "ANISETTE", "Remote anisette cancelled")
             self.anisette_scope = scope("anisette", self.endpoint, email.casefold())
-            return {"endpoint": self.endpoint, "email": email, "udid": self.udid}
+            return {"provider": "remote", "endpoint": self.endpoint, "email": email, "udid": self.udid}
+        if event in ("native_identity", "native_headers"):
+            require(self.native is not None, "Local anisette is not configured")
+            if event == "native_identity":
+                return self.native.identity()
+            return self.native.headers(message["prepare"])
         if event == "password":
             return secret("Apple ID password: ")
         if event in ("state_read", "state_write"):
@@ -267,7 +313,7 @@ def sign(artifact, app, relative, team, udid, identity, raw_profile, root, helpe
 
 
 @contextmanager
-def tools_for_install(repo):
+def tools_for_install(repo, native):
     import fcntl  # macOS adapter
     cache = Path.home() / "Library/Caches/app.zagstore.desktop-installer"
     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -299,6 +345,19 @@ def tools_for_install(repo):
             signer_dir.mkdir(mode=0o700, exist_ok=True)
             subprocess.run(["bash", repo / "tools/zag-installer/build-signer.sh", signer_dir],
                            check=True, timeout=300)
-        yield cargo_target / "debug/examples/zag_desktop", signer, openssl
+        anisette = None
+        if native:
+            anisette_sources = [repo / "tools/zag-installer" / name
+                                for name in ("DesktopAnisette.swift", "build-anisette.sh")]
+            anisette_dir = repo / "AppleAuthCore/apple-auth"
+            anisette_sources += [anisette_dir / "build-apple-auth.sh", *sorted((anisette_dir / "patches").glob("*.patch"))]
+            tag = hashlib.sha256(b"".join(path.read_bytes() for path in anisette_sources)).hexdigest()
+            build_dir = cache / tag
+            anisette = build_dir / "zag-desktop-anisette"
+            if not anisette.is_file():
+                build_dir.mkdir(mode=0o700, exist_ok=True)
+                subprocess.run(["bash", repo / "tools/zag-installer/build-anisette.sh", build_dir],
+                               check=True, timeout=600)
+        yield cargo_target / "debug/examples/zag_desktop", signer, openssl, anisette
     finally:
         os.close(descriptor)

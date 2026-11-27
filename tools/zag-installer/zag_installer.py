@@ -156,7 +156,7 @@ def install_signed(source, team, apple_root, scratch, device, approve=input):
 
 
 def install_unsigned(source, apple_root, endpoint, replace_team, scratch, device, approve=input):
-    endpoint = desktop.provider_origin(endpoint)
+    endpoint = desktop.provider_origin(endpoint) if endpoint else None
     if replace_team is not None:
         artifact.mapped_bundle(replace_team)
     local_source = scratch / "official.ipa"
@@ -201,8 +201,8 @@ def install_unsigned(source, apple_root, endpoint, replace_team, scratch, device
                          == "PROVISION", "Apple provisioning cancelled")
         return team
 
-    with desktop.tools_for_install(ROOT) as (auth, helper, openssl):
-        portal = desktop.Provisioning(endpoint, udid, desktop.Keychain(helper), openssl, choose_team, approve)
+    with desktop.tools_for_install(ROOT, native=endpoint is None) as (auth, helper, openssl, anisette):
+        portal = desktop.Provisioning(endpoint, udid, desktop.Keychain(helper), openssl, choose_team, approve, anisette)
         team, identity, profile = portal.run(auth)
         signed = desktop.sign(artifact, app, relative, team, udid, identity, profile, root, helper, scratch)
         return validate_and_install(signed, team, root, scratch, device, target, udid, approve, replacing)

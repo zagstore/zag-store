@@ -1,13 +1,19 @@
 //! Desktop transport for the installer. JSON Lines over private parent/child pipes.
 use std::{
+    collections::HashMap,
     io::{self, Write},
+    sync::Arc,
     time::SystemTime,
 };
 
 use base64::prelude::*;
 use isideload::{
-    anisette::remote_v3::RemoteV3AnisetteProvider,
+    anisette::{
+        AnisetteClientInfo, AnisetteData, AnisetteDataResponse, AnisetteProvider,
+        remote_v3::RemoteV3AnisetteProvider,
+    },
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
+    auth::grandslam::GrandSlam,
     dev::{
         app_ids::AppIdsApi,
         developer_session::DeveloperSession,
@@ -63,6 +69,57 @@ impl SideloadingStorage for AnisetteStorage {
                 .ok_or_else(|| report!("Invalid anisette state"))?
                 .into(),
         ))
+    }
+}
+
+struct NativeAnisette {
+    identity: AnisetteClientInfo,
+}
+
+impl NativeAnisette {
+    fn new() -> Result<Self, Report> {
+        let identity = relay(json!({"event":"native_identity"}))?;
+        Ok(Self {
+            identity: AnisetteClientInfo {
+                client_info: field(&identity, "X-MMe-Client-Info")?.to_string(),
+                user_agent: field(&identity, "User-Agent")?.to_string(),
+            },
+        })
+    }
+
+    fn read(&self, prepare: bool) -> Result<AnisetteDataResponse, Report> {
+        let headers: HashMap<String, String> =
+            serde_json::from_value(relay(json!({"event":"native_headers","prepare":prepare}))?)
+                .map_err(|_| report!("Invalid local anisette headers"))?;
+        for (name, expected) in [
+            ("X-MMe-Client-Info", &self.identity.client_info),
+            ("User-Agent", &self.identity.user_agent),
+        ] {
+            if !headers
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case(name) && value == expected)
+            {
+                bail!("Local anisette identity changed");
+            }
+        }
+        Ok(AnisetteDataResponse::Data(
+            AnisetteData::from_local_headers(&headers)?,
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl AnisetteProvider for NativeAnisette {
+    async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
+        self.read(false)
+    }
+
+    async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
+        Ok(self.identity.clone())
+    }
+
+    async fn provision(&mut self, _: &Arc<GrandSlam>, _: bool) -> Result<(), Report> {
+        bail!("Local anisette must be prepared before sign-in")
     }
 }
 
@@ -326,19 +383,35 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = relay(json!({"event":"configuration"}))?;
-    let endpoint = field(&config, "endpoint")?;
-    let url = reqwest::Url::parse(endpoint)?;
-    net_policy::check_url(&url, &[net_policy::host_of(endpoint)?], "https")?;
-    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-        bail!("Expected an anisette HTTPS origin");
-    }
     let udid = field(&config, "udid")?;
     let email = field(&config, "email")?;
-    let provider = RemoteV3AnisetteProvider::new(endpoint, Box::new(AnisetteStorage), "".into())?;
-    *stage = "Apple sign-in setup";
-    let mut account = AppleAccount::builder(email)
-        .anisette_provider(provider)
-        .build()
+    let builder = AppleAccount::builder(email);
+    *stage = "anisette preflight";
+    let builder = match field(&config, "provider")? {
+        "native" => {
+            let native = NativeAnisette::new()?;
+            native.read(true)?;
+            builder.anisette_provider(native)
+        }
+        "remote" => {
+            let endpoint = field(&config, "endpoint")?;
+            let url = reqwest::Url::parse(endpoint)?;
+            net_policy::check_url(&url, &[net_policy::host_of(endpoint)?], "https")?;
+            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                bail!("Expected an anisette HTTPS origin");
+            }
+            builder.anisette_provider(RemoteV3AnisetteProvider::new(
+                endpoint,
+                Box::new(AnisetteStorage),
+                "".into(),
+            )?)
+        }
+        _ => bail!("Unknown anisette provider"),
+    };
+    let mut account = builder.build().await?;
+    account
+        .anisette_generator
+        .get_anisette_data(account.grandslam_client.clone())
         .await?;
     *stage = "Apple sign-in or verification";
     let password = Zeroizing::new(

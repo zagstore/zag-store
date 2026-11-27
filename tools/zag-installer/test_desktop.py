@@ -60,6 +60,30 @@ class DesktopTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 desktop.provider_origin(bad)
 
+    def test_native_provision_requires_consent_and_reuses_account_state_offline(self):
+        store = Mock()
+        store.read.return_value = None
+        approve = Mock(side_effect=["no", "ANISETTE"])
+        native = desktop.NativeAnisette("helper", store, approve)
+        native.item = desktop.scope("native", "one-account")
+        with patch.object(desktop, "command") as command:
+            with self.assertRaisesRegex(ValueError, "cancelled"):
+                native.headers(prepare=True)
+            command.assert_not_called()
+            command.side_effect = [b'{"state":"c3RhdGU=","headers":{"source":"new"}}',
+                                   b'{"headers":{"source":"offline"}}']
+            self.assertEqual(native.headers(prepare=True), {"source": "new"})
+            self.assertEqual(native.headers(prepare=False), {"source": "offline"})
+            self.assertEqual(command.call_args.args[:2], (["helper", "headers"], b"state"))
+        store.write.assert_called_once_with(native.item, b"state")
+
+    def test_remote_selection_requires_explicit_approval_before_provider_exchange(self):
+        portal = desktop.Provisioning("https://ani.example", "udid", Mock(), "openssl", Mock(),
+                                      Mock(side_effect=["apple@example.invalid", "no"]))
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            portal.handle({"event": "configuration"})
+        self.assertIsNone(portal.anisette_scope)
+
     def test_unknown_second_factor_requires_a_delivery_method(self):
         event = {"retry": False, "unknown": True, "sms": False,
                  "numbers": [{"id": 77, "last_two": "12"}]}
@@ -112,11 +136,11 @@ class DesktopTests(unittest.TestCase):
 
             with patch.object(installer, "SOURCE_SIZE", source.stat().st_size), \
                  patch.object(installer, "verify_source"), patch.object(desktop, "verify_root"), \
-                 patch.object(desktop, "tools_for_install", return_value=nullcontext(("auth", "signer", "openssl"))), \
+                 patch.object(desktop, "tools_for_install", return_value=nullcontext(("auth", "signer", "openssl", None))), \
                  patch.object(desktop.Provisioning, "run", run_portal), patch.object(desktop, "sign") as sign:
                 with self.assertRaisesRegex(ValueError, "already installed"):
                     installer.install_unsigned(source, root, "https://ani.example", None, scratch, device,
-                                               approve=lambda _: "1")
+                                               approve=lambda prompt: "ANISETTE" if "anisette" in prompt else "1")
                 device.install.assert_not_called()
                 sign.assert_not_called()
 

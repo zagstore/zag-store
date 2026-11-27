@@ -11,9 +11,21 @@ set -euo pipefail
 here="${0:A:h}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
-cc="$(xcrun --sdk iphoneos --find clang)"; cxx="$(xcrun --sdk iphoneos --find clang++)"
-flags=(-arch arm64 -isysroot "$sdk" -miphoneos-version-min=16.0 -Os)
+desktop=""
+if [[ ${1:-} == --macos-library && $# == 2 ]]; then
+  desktop="$2"
+  sdk_name=macosx
+  target=(-arch "$(uname -m)" -mmacosx-version-min=13.0)
+elif (( $# == 0 )); then
+  sdk_name=iphoneos
+  target=(-arch arm64 -miphoneos-version-min=16.0)
+else
+  print -u2 "Usage: $0 [--macos-library OUTPUT_DIRECTORY]"
+  exit 2
+fi
+sdk="$(xcrun --sdk "$sdk_name" --show-sdk-path)"
+cc="$(xcrun --sdk "$sdk_name" --find clang)"; cxx="$(xcrun --sdk "$sdk_name" --find clang++)"
+flags=("${target[@]}" -isysroot "$sdk" -Os)
 
 git clone --depth 1 --branch v3.6.2 https://github.com/Mbed-TLS/mbedtls "$work/mbedtls"
 git clone https://github.com/apple-auth/apple-auth "$work/aa"
@@ -25,8 +37,14 @@ for p in "$here"/patches/*.patch; do
   echo "applied patch $(basename "$p")"
 done
 mkdir -p "$work/gen/apple_auth/nlohmann" "$work/obj"
-curl -fsSL -o "$work/gen/nlohmann/json.hpp" --create-dirs \
-  https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+if [[ -n "$desktop" ]]; then
+  git clone --depth 1 --branch v3.11.3 https://github.com/nlohmann/json "$work/json"
+  mkdir -p "$work/gen/nlohmann"
+  cp "$work/json/single_include/nlohmann/json.hpp" "$work/gen/nlohmann/"
+else
+  curl -fsSL -o "$work/gen/nlohmann/json.hpp" --create-dirs \
+    https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+fi
 
 # static-build export headers (empty visibility macros)
 cat > "$work/gen/apple_auth/export.h" <<'H'
@@ -86,6 +104,13 @@ mkdir -p "$work/headers/apple_auth"
 cp "$work/aa/include/apple_auth/c_api.h" "$work/aa/include/apple_auth/client_c_api.h" "$work/headers/apple_auth/"
 cp "$work/gen/apple_auth/export.h" "$work/gen/apple_auth/client_export.h" "$work/headers/apple_auth/"
 cp "$here/include/ZagAppleAuth/module.modulemap" "$here/include/ZagAppleAuth/shim.h" "$work/headers/"
+
+if [[ -n "$desktop" ]]; then
+  mkdir -p "$desktop/include"
+  cp -R "$work/headers/." "$desktop/include/"
+  cp "$work/libZagAppleAuth.a" "$desktop/"
+  exit 0
+fi
 
 rm -rf "$here/ZagAppleAuth.xcframework"
 xcodebuild -create-xcframework -library "$work/libZagAppleAuth.a" -headers "$work/headers" \
