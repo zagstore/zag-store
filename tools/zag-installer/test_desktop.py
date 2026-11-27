@@ -210,13 +210,14 @@ class PrecompiledHelpersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = self.create_inventory(folder)
             adapter = desktop.PrecompiledCache(root)
-            self.assertEqual(adapter.build_swift("release", []), root / "release")
-            self.assertEqual(adapter.build_swift("handoff", []), root / "handoff")
+            canonical = root.resolve()
+            self.assertEqual(adapter.build_swift("release", []), canonical / "release")
+            self.assertEqual(adapter.build_swift("handoff", []), canonical / "handoff")
             self.assertEqual(adapter.signer_tools(None),
-                             (root / "zag-desktop-signer", root / "openssl"))
+                             (canonical / "zag-desktop-signer", canonical / "openssl"))
             self.assertEqual(adapter.installer_tools(None, native=True),
-                             (root / "zag_desktop", root / "zag-desktop-signer",
-                              root / "openssl", root / "zag-desktop-anisette"))
+                             (canonical / "zag_desktop", canonical / "zag-desktop-signer",
+                              canonical / "openssl", canonical / "zag-desktop-anisette"))
             with self.assertRaisesRegex(ValueError, "Unknown precompiled"):
                 adapter.build_swift("unexpected", [])
 
