@@ -536,7 +536,7 @@ private struct InstallerView: View {
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Loader").font(.largeTitle.bold()).accessibilityLabel("zLoader")
-                    Text("Install Zag Store using your own Apple ID")
+                    Text("Your device. Your apps.")
                         .foregroundStyle(muted)
                 }
                 Spacer()
