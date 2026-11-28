@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -21,6 +22,26 @@ SETUP_REQUEST = "Library/Caches/ZagSetupRequest.json"
 SETUP_RESPONSE = "Library/Caches/ZagSetupResponse.json"
 ACKNOWLEDGEMENT = "Library/Caches/ZagSetupAcknowledgement.json"
 MAX_WIRE_SIZE = 24 * 1024
+
+
+def private_write(path, content):
+    """Create an exclusive mode-0600 message file before invoking native AFC.
+
+    The automatic bootstrap contains a 32-byte transaction secret. It must
+    never be staged with default 0644 file permissions.
+    """
+    if not isinstance(content, bytes) or not 0 < len(content) <= MAX_WIRE_SIZE:
+        raise ValueError("Invalid private setup message size")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as destination:
+            destination.write(content)
+            destination.flush()
+            os.fsync(destination.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
 
 
 def read_request(path, code, udid, bundle, team):
@@ -75,7 +96,7 @@ def send(repo, cache, scratch, device, team, approve=input):
     ciphertext = encrypt(repo, cache, openssl, request, key)
     del key
     response = scratch / "handoff-response.json"
-    response.write_bytes(ciphertext)
+    private_write(response, ciphertext)
     desktop.require(check_destination() == installed, "Destination inventory changed")
     read_request(request, code, udid, bundle, team)
     device.copy_to_app(target, bundle, response, RESPONSE)
@@ -191,11 +212,11 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
     bootstrap = scratch / "setup-bootstrap.json"
     try:
         check_target()
-        bootstrap.write_text(json.dumps({
+        private_write(bootstrap, json.dumps({
             "id": transaction, "expires": time.time() + 600, "secret": base64.b64encode(secret).decode(),
             "udid": udid, "bundle": bundle, "team": team, "keyScope": item,
             "certificate": base64.b64encode(certificate).decode(),
-        }))
+        }).encode())
         device.copy_to_app(target, bundle, bootstrap, BOOTSTRAP)
     finally:
         bootstrap.unlink(missing_ok=True)
@@ -214,9 +235,9 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
     desktop.require(scope == item and leaf == certificate, "Setup request does not match the installed signing identity")
     check_target()
     request = scratch / "setup-request.json"
-    request.write_bytes(request_bytes)
+    private_write(request, request_bytes)
     response = scratch / "setup-response.json"
-    response.write_bytes(wrap(secret, transaction, "response", encrypt(repo, cache, openssl, request, key)))
+    private_write(response, wrap(secret, transaction, "response", encrypt(repo, cache, openssl, request, key)))
 
     # Retry delivery after a transient disconnect, using the same authenticated
     # response. The iPhone consumes the request before importing it.
