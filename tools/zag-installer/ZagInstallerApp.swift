@@ -291,6 +291,7 @@ private struct WiredDevice: Sendable {
     let title: String
     let detail: String
     let ready: Bool
+    var developerModeRequired = false
 
     static func inspect() -> WiredDevice {
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
@@ -332,7 +333,7 @@ private struct WiredDevice: Sendable {
                                detail: [model, "iOS \(version)",
                                         ready ? "Trusted USB connection" : "Developer Mode required"]
                                    .joined(separator: " · "),
-                               ready: ready)
+                               ready: ready, developerModeRequired: !ready)
         } catch {
             return WiredDevice(title: "No trusted wired iPhone",
                                detail: "Connect and unlock one iPhone; confirm Trust and Developer Mode.",
@@ -436,6 +437,19 @@ private struct InstallerView: View {
                 .padding(12)
                 .background(surface, in: RoundedRectangle(cornerRadius: 12))
                 .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
+                if device.developerModeRequired {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Enable Developer Mode", systemImage: "exclamationmark.triangle")
+                            .font(.headline).foregroundStyle(attention)
+                        Text("On your iPhone, open Settings → Privacy & Security → Developer Mode. Enable it, restart your iPhone and confirm when prompted.")
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Keep your iPhone unlocked and connected. If Developer Mode is missing, reconnect to Xcode and check again.")
+                            .font(.caption)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(surface, in: RoundedRectangle(cornerRadius: 12))
+                }
                 Label("Pairing can be configured later in Zag Store for local installation and renewal.", systemImage: "arrow.triangle.2.circlepath")
                 if nativeUSBPreview {
                     Label("Native USB verified. Installation remains disabled until the USB transfer path is validated.", systemImage: "wrench.and.screwdriver")
@@ -493,7 +507,7 @@ private struct InstallerView: View {
                 Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
                 if installer.identityImported {
                     Label("Signing identity ready", systemImage: "checkmark.circle.fill").foregroundStyle(success)
-                    Label(installer.setupVerified ? "Local installation verified" : "Pairing can be configured later", systemImage: installer.setupVerified ? "checkmark.circle.fill" : "shield")
+                    Label(installer.setupVerified ? "Signing Setup verified" : "Pairing can be configured later", systemImage: installer.setupVerified ? "checkmark.circle.fill" : "shield")
                         .foregroundStyle(installer.setupVerified ? success : muted)
                 } else {
                     Text(installer.status).foregroundStyle(muted)
