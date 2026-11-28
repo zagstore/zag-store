@@ -202,7 +202,7 @@ class NativeAnisette:
 
 class Provisioning:
     def __init__(self, endpoint, udid, store, openssl, choose_team, approve, native_helper=None,
-                 upgrade=False, components=None):
+                 upgrade=False, components=None, *, imported_bundle=None):
         self.endpoint = endpoint
         self.native = NativeAnisette(native_helper, store, approve) if native_helper else None
         self.udid = udid
@@ -215,6 +215,14 @@ class Provisioning:
         self.team = None
         self.upgrade = upgrade
         self.components = components if components is not None else {"": ""}
+        self.imported_bundle = imported_bundle
+        if imported_bundle is not None:
+            from ipa_preview import mapped_import_bundle
+            mapped_import_bundle(imported_bundle, "AAAAAAAAAA")
+            require(not upgrade and self.components == {"": ""},
+                    "Imported provisioning currently supports fresh single-app installs only")
+            require(self.native is not None and endpoint is None,
+                    "Imported provisioning requires native anisette")
         self.profiles = {}
         self.account_bootstrap = False
         self.account_credential = None
@@ -237,6 +245,10 @@ class Provisioning:
             if self.native:
                 self.native.item = scope("anisette", "clean-room-mac-legacy-v1", email.casefold())
                 config = {"provider": "native", "email": email, "udid": self.udid, "suffixes": list(self.components.values())}
+                if self.imported_bundle is not None:
+                    from ipa_preview import mapped_import_bundle
+                    require(not self.account_bootstrap, "Imported apps cannot receive account bootstrap")
+                    config["imported_prefix"] = mapped_import_bundle(self.imported_bundle, "AAAAAAAAAA").rsplit(".", 1)[0]
                 if self.account_bootstrap:
                     config["account_bootstrap"] = True
                 return config
@@ -274,7 +286,12 @@ class Provisioning:
             require(isinstance(account, str) and account, "Missing authenticated Apple account ID")
             self.account_id = account
             self.team = self.choose_team(message["teams"])
-            self.receipt_item = scope("installed-leaf", self.udid.casefold(), self.team)
+            if self.imported_bundle is None:
+                self.receipt_item = scope("installed-leaf", self.udid.casefold(), self.team)
+            else:
+                from ipa_preview import mapped_import_bundle
+                self.receipt_item = scope("imported-installed-leaf", self.udid.casefold(),
+                                          mapped_import_bundle(self.imported_bundle, self.team))
             stored_leaf = self.store.read(self.receipt_item) if self.upgrade else None
             expected = None
             if stored_leaf is not None:

@@ -404,6 +404,20 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
                 .ok_or_else(|| report!("Invalid component identifier"))
         })
         .collect::<Result<_, Report>>()?;
+    let imported_prefix = if config.get("imported_prefix").is_some() {
+        let prefix = field(&config, "imported_prefix")?;
+        let digest = prefix.strip_prefix("app.zloader.imported.")
+            .ok_or_else(|| report!("Invalid imported namespace"))?;
+        if digest.len() != 32 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || suffixes.len() != 1 || !suffixes[0].is_empty()
+            || config["provider"] != "native" || config["account_bootstrap"] == true
+        {
+            bail!("Invalid imported provisioning configuration");
+        }
+        Some(prefix)
+    } else {
+        None
+    };
     let email = field(&config, "email")?;
     let builder = AppleAccount::builder(email);
     *stage = "anisette preflight";
@@ -561,7 +575,7 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
     for suffix in suffixes {
         *stage = "Apple app identifier registration";
         check_session()?;
-        let identifier = format!("app.zagstore.ios.{team_id}{suffix}");
+        let identifier = format!("{}.{team_id}{suffix}", imported_prefix.unwrap_or("app.zagstore.ios"));
         let mut app_id = None;
         if let Some(list) = response.get("appIds") {
             let rows = list
@@ -591,7 +605,9 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
         let app_id = if let Some(app_id) = app_id {
             app_id
         } else {
-            let name = if suffix.is_empty() {
+            let name = if let Some(prefix) = imported_prefix {
+                format!("zLoader {}", &prefix[prefix.len() - 12..])
+            } else if suffix.is_empty() {
                 "Zag Store".to_string()
             } else {
                 format!("Zag Store {}", suffix[1..].replace(['.', '-'], " "))

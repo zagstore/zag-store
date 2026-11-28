@@ -115,6 +115,29 @@ class CredentialLifecycleTests(unittest.TestCase):
 
 
 class DesktopTests(unittest.TestCase):
+    def test_imported_provisioning_is_native_fresh_and_isolated(self):
+        import ipa_preview
+        with self.assertRaises(ValueError):
+            desktop.Provisioning(None, "udid", Mock(), "openssl", Mock(), Mock(),
+                                 imported_bundle="com.example.app")
+        with self.assertRaises(ValueError):
+            desktop.Provisioning(None, "udid", Mock(), "openssl", Mock(), Mock(),
+                                 native_helper="native", imported_bundle="app.zagstore.ios")
+        with self.assertRaises(ValueError):
+            desktop.Provisioning(None, "udid", Mock(), "openssl", Mock(), Mock(),
+                                 native_helper="native", upgrade=True, imported_bundle="com.example.app")
+        portal = desktop.Provisioning(None, "udid", Mock(), "openssl", lambda _: TEAM,
+                                      lambda _: "test@example.com", native_helper="native",
+                                      imported_bundle="com.example.app")
+        config = portal.handle({"event": "configuration"})
+        self.assertEqual(config["imported_prefix"] + "." + TEAM,
+                         ipa_preview.mapped_import_bundle("com.example.app", TEAM))
+        self.assertEqual(config["suffixes"], [""])
+        self.assertNotIn("account_bootstrap", config)
+        portal.handle({"event": "team", "account": "test-account", "teams": []})
+        self.assertNotEqual(portal.receipt_item, desktop.scope("installed-leaf", "udid", TEAM))
+
+
     def test_bundled_profile_root_matches_existing_pin(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder) / "apple-root.pem"
