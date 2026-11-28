@@ -25,6 +25,9 @@ pub struct AuthorizedInstall<'a> {
     pub expected: VersionStamp,
     /// None -> fresh install. Some -> upgrade exact prior version/build.
     pub previous: Option<VersionStamp>,
+    /// A separately signed release authorization is required by the caller.
+    /// This value alone is not an authorization credential.
+    pub authorization_verified: bool,
 }
 
 pub fn is_personal_team_bundle(bundle: &str) -> bool {
@@ -68,6 +71,9 @@ pub async fn install_authorized(
     if !is_personal_team_bundle(request.bundle) {
         return Err("Only a mapped Zag Store Personal Team bundle is allowed".into());
     }
+    if !request.authorization_verified {
+        return Err("Signed release authorization has not been verified".into());
+    }
     let valid_version = |value: &str| !value.is_empty() && value.len() <= 64 &&
         value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
     if !valid_version(&request.expected.version) || !valid_version(&request.expected.build) {
@@ -107,6 +113,21 @@ pub async fn install_authorized(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_install_request_requires_explicit_verified_authorization() {
+        // An arbitrary IPA path and checksum are not sufficient evidence
+        // of a verified signed release or a valid Apple signing profile.
+        let request = AuthorizedInstall {
+            ipa: std::path::Path::new("/tmp/unsigned.ipa"),
+            sha256: [0; 32],
+            job_token: "0123456789abcdef0123456789abcdef",
+            bundle: "app.zagstore.ios.FTB8PRW638",
+            expected: VersionStamp {version:"1.0.0".into(), build:"4".into()},
+            previous: None,
+            authorization_verified: false,
+        };
+        assert!(!request.authorization_verified);
+    }
     #[test]
     fn bundle_identifier_restricted_to_zag_personal_team() {
         assert!(is_personal_team_bundle("app.zagstore.ios.FTB8PRW638"));
