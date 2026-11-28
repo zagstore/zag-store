@@ -621,6 +621,7 @@ def main():
                         default="coredevice", help=argparse.SUPPRESS)
     parser.add_argument("--native-install-dev", action="store_true",
                         help=argparse.SUPPRESS)
+    parser.add_argument("--native-dev-helper", type=Path, help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode", required=True)
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
@@ -664,6 +665,14 @@ def main():
                          "Native USB installation and signing handoff are not yet enabled")
         artifact.require(not args.native_install_dev or developer_native,
                          "Native installation developer mode requires interactive standalone install")
+        artifact.require(args.native_dev_helper is None or developer_native,
+                         "Native developer helper requires interactive standalone install")
+        if developer_native:
+            helper = args.native_dev_helper
+            artifact.require(helper is not None and helper.is_absolute()
+                             and not helper.is_symlink() and helper.is_file()
+                             and os.access(helper, os.X_OK),
+                             "Native developer mode requires an absolute executable --native-dev-helper")
         with desktop.locked_cache(precompiled=args.precompiled_helpers) as cache:
             if args.mode == "prepare":
                 release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
@@ -678,7 +687,7 @@ def main():
                     helper_root = (args.precompiled_helpers if args.precompiled_helpers is not None
                                    else ROOT / "tools/zag-installer/native-usb/target/release")
                     device = (CoreDevice(scratch) if args.usb_transport == "coredevice"
-                              else StandaloneUSB(scratch, helper_root / "zag-usb",
+                              else StandaloneUSB(scratch, args.native_dev_helper if developer_native else helper_root / "zag-usb",
                                                  native_install_dev=developer_native))
                     if args.mode in ("handoff", "setup"):
                         artifact.mapped_bundle(args.team)
