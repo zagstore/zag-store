@@ -30,6 +30,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(channel.ask("Confirm Apple provisioning"), "PROVISION")
         self.assertFalse(json.loads(output.getvalue())["secure"])
 
+    def test_button_confirmation_contract(self):
+        channel, output = self.make_channel(b'{"value":"INSTALL"}\n')
+        self.assertEqual(channel.confirm("Install exact destination?", "INSTALL", "Install"), "INSTALL")
+        self.assertEqual(json.loads(output.getvalue())["confirmation"], "INSTALL")
+        self.assertEqual(json.loads(output.getvalue())["action"], "Install")
+        for wire in (b'{"value":"wrong"}\n', b'{"cancel":true}\n'):
+            channel, _ = self.make_channel(wire)
+            with self.assertRaises(ValueError):
+                channel.confirm("Install exact destination?", "INSTALL", "Install")
+
     def test_cancelled_and_broken_connection_fail_closed(self):
         for wire in (b'{"cancel":true}\n', b""):
             channel, _ = self.make_channel(wire)

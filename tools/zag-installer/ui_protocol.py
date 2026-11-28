@@ -40,10 +40,15 @@ class Channel:
                     raise BrokenPipeError("Graphical installer disconnected")
                 view = view[sent:]
 
-    def ask(self, message, *, secret=False):
+    def ask(self, message, *, secret=False, confirmation=None, action=None):
         if not isinstance(message, str) or not message or len(message) > 2048:
             raise ValueError("Invalid installer prompt")
-        self.send({"type": "prompt", "message": message, "secure": bool(secret)})
+        payload = {"type": "prompt", "message": message, "secure": bool(secret)}
+        if confirmation is not None:
+            if secret or not isinstance(confirmation, str) or not confirmation or len(confirmation) > 256 or action not in ("Install", "Upgrade", "Replace", "Continue", "Resume Setup", "Create Certificate"):
+                raise ValueError("Invalid confirmation contract")
+            payload.update(confirmation=confirmation, action=action)
+        self.send(payload)
         wire = self.input.readline(MAX_REPLY + 1)
         if not wire or len(wire) > MAX_REPLY or not wire.endswith(b"\n"):
             raise ValueError("Graphical installer input was interrupted or oversized")
@@ -57,4 +62,9 @@ class Channel:
             raise ValueError("Installation cancelled")
         if set(reply) != {"value"} or type(reply["value"]) is not str or len(reply["value"]) > 2048:
             raise ValueError("Invalid graphical installer reply")
+        if confirmation is not None and reply["value"] != confirmation:
+            raise ValueError("Installation cancelled")
         return reply["value"]
+
+    def confirm(self, message, expected, action):
+        return self.ask(message, confirmation=expected, action=action)

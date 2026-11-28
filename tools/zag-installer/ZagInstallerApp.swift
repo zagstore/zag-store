@@ -6,6 +6,8 @@ struct InstallerPrompt: Identifiable {
     let id = UUID()
     let message: String
     let secure: Bool
+    let confirmation: String?
+    let action: String?
 }
 
 @MainActor
@@ -182,7 +184,14 @@ final class InstallerController: ObservableObject {
                     task?.terminate()
                     return
                 }
-                prompt = InstallerPrompt(message: message, secure: secure)
+                let confirmation = object["confirmation"] as? String
+                let action = object["action"] as? String
+                guard (confirmation == nil && action == nil) || (!secure && confirmation?.isEmpty == false && ["Install", "Upgrade", "Replace", "Continue", "Resume Setup", "Create Certificate"].contains(action ?? "")) else {
+                    status = "Invalid installer confirmation"
+                    task?.terminate()
+                    return
+                }
+                prompt = InstallerPrompt(message: message, secure: secure, confirmation: confirmation, action: action)
                 status = "Your confirmation is required"
             case "finished":
                 if let result = object["result"] as? [String: Any] {
@@ -500,7 +509,7 @@ private struct InstallerView: View {
                 if prompt.secure {
                     SecureField("Enter securely", text: $reply)
                         .textFieldStyle(.roundedBorder)
-                } else {
+                } else if prompt.confirmation == nil {
                     TextField("Response", text: $reply)
                         .textFieldStyle(.roundedBorder)
                 }
@@ -510,8 +519,8 @@ private struct InstallerView: View {
                         installer.cancel()
                     }
                     Spacer()
-                    Button("Continue") {
-                        let answer = reply
+                    Button(prompt.action ?? "Continue") {
+                        let answer = prompt.confirmation ?? reply
                         reply = "" // Do not retain passwords in UI state
                         installer.answer(answer)
                     }

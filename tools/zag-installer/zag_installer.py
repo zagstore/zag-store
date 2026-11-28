@@ -429,6 +429,13 @@ def check_destination(installed, release, upgrade, *, replace_same_build=False):
         artifact.require(candidate > current, "Signed release is not newer than the installed build")
 
 
+def confirm_action(approve, message, expected, action):
+    channel = getattr(approve, "__self__", None)
+    if isinstance(channel, ui_protocol.Channel):
+        return channel.confirm(message, expected, action)
+    return approve(f"{message} Type {expected}: ")
+
+
 def validate_and_install(signed, release, team, apple_root, scratch, device, target, udid, approve, certificate,
                          installed=None, check_authorization=releases.check_fresh, *, replace_same_build=False):
     expected = artifact.mapped_bundle(team)
@@ -466,7 +473,8 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
         native_receipt = device.preflight_signed(
             signed, release, team, apple_root, certificate,
             previous=prior, check_authorization=check_authorization)
-    artifact.require(approve(f"{operation} {label}? Type {confirmation}: ") == confirmation,
+    artifact.require(confirm_action(approve, f"{operation} {label}?", confirmation,
+                                     "Replace" if replace_same_build else ("Upgrade" if installed is not None else "Install")) == confirmation,
                      "Installation cancelled")
     artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
     device.check_compatibility(info)
@@ -541,7 +549,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
         check_destination(current, release, upgrade, replace_same_build=replace_same_build)
         artifact.require(current == installed, "Destination inventory changed before provisioning")
         check_authorization(release)
-        artifact.require(approve(f"Use {team} as your Personal Team and allow Apple provisioning? Type PROVISION: ")
+        artifact.require(confirm_action(approve, f"Use {team} as your Personal Team and allow Apple provisioning?", "PROVISION", "Continue")
                          == "PROVISION", "Apple provisioning cancelled")
         return team
 
@@ -726,7 +734,7 @@ def main():
                         command = handoff.send if args.mode == "handoff" else handoff.retry
                         if gui_helper is not None:
                             bundle = artifact.mapped_bundle(args.team)
-                            artifact.require(approve(f"Resume Signing Setup for {bundle}? Type SETUP: ") == "SETUP",
+                            artifact.require(confirm_action(approve, f"Resume Signing Setup for {bundle}?", "SETUP", "Resume Setup") == "SETUP",
                                              "Signing Setup cancelled")
                         result = command(ROOT, cache, scratch, device, args.team)
                         if gui_helper is not None:

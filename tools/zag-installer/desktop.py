@@ -99,7 +99,7 @@ class Identity:
         require(not self.upgrade, "Upgrade requires an active Apple certificate for the existing local signing key")
         require(self.store.read(self.pending_item) in (None, b""),
                 "Previous certificate issuance is unresolved. Check Apple certificate inventory before retrying.")
-        require(self.approve("Create an Apple Development certificate if Apple has capacity? Type CREATE: ") == "CREATE",
+        require(confirm_action(self.approve, "Create an Apple Development certificate if Apple has capacity?", "CREATE", "Create Certificate") == "CREATE",
                 "Certificate creation cancelled")
         if self.key is None:
             self.key = command([self.openssl, "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"],
@@ -180,7 +180,7 @@ class NativeAnisette:
         if prepare:
             self.state = self.store.read(self.item)
         if self.state is None:
-            require(prepare and self.approve("Allow a new local ADI profile to provision with Apple? Type ANISETTE: ")
+            require(prepare and confirm_action(self.approve, "Allow a new local ADI profile to provision with Apple?", "ANISETTE", "Continue")
                     == "ANISETTE", "Apple ADI provisioning cancelled")
             mode = "provision"
         else:
@@ -225,7 +225,7 @@ class Provisioning:
             if self.native:
                 self.native.item = scope("anisette", "clean-room-mac-legacy-v1", email.casefold())
                 return {"provider": "native", "email": email, "udid": self.udid, "suffixes": list(self.components.values())}
-            require(self.endpoint and self.approve(f"Use approved anisette service {self.endpoint}? Type ANISETTE: ")
+            require(self.endpoint and confirm_action(self.approve, f"Use approved anisette service {self.endpoint}?", "ANISETTE", "Continue")
                     == "ANISETTE", "Remote anisette cancelled")
             self.anisette_scope = scope("anisette", self.endpoint, email.casefold())
             return {"provider": "remote", "endpoint": self.endpoint, "email": email, "udid": self.udid,
@@ -495,3 +495,12 @@ class BuildCache:
                 subprocess.run(["bash", repo / "tools/zag-installer/build-anisette.sh", build_dir],
                                check=True, timeout=600)
         return cargo_target / "debug/examples/zag_desktop", signer, openssl, anisette
+
+
+# Keep Terminal confirmation phrases while using explicit GUI button contracts.
+def confirm_action(approve, message, expected, action):
+    from ui_protocol import Channel
+    channel = getattr(approve, "__self__", None)
+    if isinstance(channel, Channel):
+        return channel.confirm(message, expected, action)
+    return approve(f"{message} Type {expected}: ")
