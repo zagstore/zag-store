@@ -445,7 +445,7 @@ private struct WiredDevice: Sendable {
             let model = info?["ProductType"] as? String
             let name = info?["DeviceName"] as? String ?? "Unverified device"
             let version = info?["ProductVersion"] as? String
-            return WiredDevice(title: name, detail: [version.map { "iOS " + $0 }, trusted ? "Trusted · USB installation not ready" : "Trust not verified"].compactMap { $0 }.joined(separator: " · "), ready: false, trusted: trusted, modelIdentifier: model, udid: id, usb: usb, wifi: wifi)
+            return WiredDevice(title: name, detail: [version.map { "iOS " + $0 }, trusted ? "Trusted connection" : "Trust not verified"].compactMap { $0 }.joined(separator: " · "), ready: false, trusted: trusted, modelIdentifier: model, udid: id, usb: usb, wifi: wifi)
         }
     }
 
@@ -509,7 +509,7 @@ private struct WiredDevice: Sendable {
             let modelAlreadyInName = name.range(of: modelName, options: [.caseInsensitive, .diacriticInsensitive]) != nil
             return WiredDevice(title: name,
                                detail: ((modelAlreadyInName ? [] : [modelName]) + ["iOS \(version)",
-                                        ready ? "Trusted USB connection" : (developerMode == false ? "Developer Mode required" : "Developer Mode status unavailable")])
+                                        "Trusted connection"])
                                    .joined(separator: " · "),
                                ready: ready, developerModeRequired: developerMode == false, trusted: true, modelIdentifier: model, udid: root["udid"] as? String, usb: true)
         } catch {
@@ -729,6 +729,30 @@ private struct InstallerView: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Devices").font(.headline)
+                    Spacer()
+                Button {
+                    Task { await refreshDevices() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(ZagPalette.spectrum)
+                        .frame(width: 32, height: 32)
+                        .background(surface.opacity(hoveringRefresh ? 1 : 0.5), in: Circle())
+                        .overlay { Circle().strokeBorder(border, lineWidth: 1) }
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(discoveringDevices || installer.busy)
+                .help("Refresh USB and Wi-Fi device discovery")
+                .accessibilityLabel(discoveringDevices ? "Discovering devices" : "Refresh devices")
+                .onHover { inside in
+                    hoveringRefresh = inside
+                    if inside && !discoveringDevices && !installer.busy { NSCursor.pointingHand.set() }
+                    else { NSCursor.arrow.set() }
+                }
+                }
                 HStack(spacing: 12) {
                     DeviceIllustration(identifier: device.modelIdentifier)
                     VStack(alignment: .leading, spacing: 4) {
@@ -740,28 +764,6 @@ private struct InstallerView: View {
                     if device.usb { Image(systemName: "cable.connector").foregroundStyle(muted).help("USB available") }
                     if device.wifi { Image(systemName: "wifi").foregroundStyle(muted).help("Wi-Fi advertised") }
                     connectionLight
-                    Button {
-                        Task { await refreshDevices() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(ZagPalette.spectrum)
-                            .rotationEffect(.degrees(discoveringDevices && !reduceMotion ? 360 : 0))
-                            .animation(discoveringDevices && !reduceMotion ? .linear(duration: 0.9).repeatForever(autoreverses: false) : nil, value: discoveringDevices)
-                            .frame(width: 32, height: 32)
-                            .background(surface.opacity(hoveringRefresh ? 1 : 0.5), in: Circle())
-                            .overlay { Circle().strokeBorder(border, lineWidth: 1) }
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(discoveringDevices || installer.busy)
-                    .help("Refresh USB and Wi-Fi device discovery")
-                    .accessibilityLabel(discoveringDevices ? "Discovering devices" : "Refresh devices")
-                    .onHover { inside in
-                        hoveringRefresh = inside
-                        if inside && !discoveringDevices && !installer.busy { NSCursor.pointingHand.set() }
-                        else { NSCursor.arrow.set() }
-                    }
                     Button { showDeviceDetails.toggle() } label: {
                         Image(systemName: showDeviceDetails ? "chevron.down" : "chevron.right")
                             .frame(width: 28, height: 28)
@@ -772,7 +774,6 @@ private struct InstallerView: View {
                 .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
                 if showDeviceDetails || devices.count > 1 || discoveryFailed {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Devices").font(.headline)
                         if discoveryFailed { Text("Discovery unavailable · refresh to retry").font(.caption).foregroundStyle(muted) }
                         ForEach(devices, id: \.udid) { item in
                             Button {
@@ -1072,12 +1073,7 @@ private struct InstallerView: View {
             .padding(.horizontal, 24)
             .padding(.vertical, 10)
         }
-        .task {
-            while !Task.isCancelled {
-                await refreshDevices()
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-            }
-        }
+        .task { await refreshDevices() }
         .frame(minWidth: 860, idealWidth: 1000, minHeight: 460, idealHeight: 650)
         .background { atmosphere.ignoresSafeArea() }
         .tint(ZagPalette.rgb(0x3a5ce8))
