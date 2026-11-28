@@ -398,6 +398,7 @@ private struct InstallerView: View {
         guard let url = Bundle.main.url(forResource: name, withExtension: "png") else { return nil }
         return NSImage(contentsOf: url)
     }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var installer: InstallerController
     @State private var showRecovery = false
     @State private var upgrade = false
@@ -459,17 +460,24 @@ private struct InstallerView: View {
                 Button {
                     installer.begin(upgrade: upgrade, team: team)
                 } label: {
-                    Text(installer.busy ? "Installing…" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store"))
+                    Text(upgrade ? "Upgrade Zag Store" : "Install Zag Store")
                         .font(.system(size: 19, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 12)
                         .frame(maxWidth: .infinity, minHeight: 54)
+                        .opacity(installer.busy ? 0 : 1)
                         .background {
-                            Capsule().fill(ZagPalette.rgb(0x0090ff))
+                            ZagUpdateSpectrumSurface(morph: installer.busy ? 1 : 0,
+                                                     progress: 1, theme: ZagPalette.rgb(0x0090ff),
+                                                     moving: installer.busy)
                         }
                         .contentShape(Capsule())
-                        .opacity(installer.busy || !device.ready || nativeUSBPreview ? 0.45 : 1)
+                        .opacity(!installer.busy && (!device.ready || nativeUSBPreview) ? 0.45 : 1)
+                        .animation(reduceMotion ? nil : .timingCurve(ZagUpdateMorphSpecification.x1,
+                            ZagUpdateMorphSpecification.y1, ZagUpdateMorphSpecification.x2,
+                            ZagUpdateMorphSpecification.y2, duration: ZagUpdateMorphSpecification.duration),
+                            value: installer.busy)
                 }
                 .buttonStyle(.plain)
                 .disabled(installer.busy || !device.ready || nativeUSBPreview)
@@ -479,18 +487,7 @@ private struct InstallerView: View {
             }
             Divider()
             if installer.busy {
-                ProgressView().controlSize(.small)
-                Text(installer.status).font(.headline)
-                if let stage = installer.stage {
-                    let stages = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
-                    HStack(spacing: 5) {
-                        ForEach(stages, id: \.self) { item in
-                            Capsule().fill((stages.firstIndex(of: item) ?? 0) <= (stages.firstIndex(of: stage) ?? 0) ? success : border)
-                                .frame(height: 4)
-                        }
-                    }
-                    .accessibilityHidden(true)
-                }
+                Text(installer.status).font(.headline).frame(maxWidth: .infinity)
             } else if !installer.installedBundle.isEmpty {
                 Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
                 if installer.identityImported {

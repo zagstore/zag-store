@@ -24,11 +24,21 @@ command -v xcrun >/dev/null || {
     exit 1
 }
 
-xcrun swiftc -parse "$SOURCE" "$UPDATE_SOURCE"
+# Compile the original iOS renderer and presentation model directly.
+# Extract only the shared palette declaration from its iOS-specific icon file.
+SPECTRUM_SOURCE="$ROOT/Feather/Views/Settings/ZagUpdateSpectrumSurface.swift"
+PROGRESS_SOURCE="$ROOT/Feather/Utilities/ZagUpdateProgressPresentation.swift"
+PALETTE_SOURCE="$CACHE/ZagInstallerSpectrumPalette.swift"
+{
+    echo 'import SwiftUI'
+    sed -n '/^enum ZagSelfUpdateSpectrum {$/,/^}$/p' "$ROOT/Feather/Views/TabView/Bars/ZagAppsTabIcon.swift"
+} > "$PALETTE_SOURCE"
+grep -q '^enum ZagSelfUpdateSpectrum {' "$PALETTE_SOURCE"
+xcrun swiftc -parse "$SOURCE" "$UPDATE_SOURCE" "$SPECTRUM_SOURCE" "$PROGRESS_SOURCE" "$PALETTE_SOURCE"
 xcrun swiftc -parse-as-library -O -framework SwiftUI -framework AppKit \
     -F "$SPARKLE_ROOT" -framework Sparkle \
     -Xlinker -rpath -Xlinker "@executable_path/../Frameworks" \
-    "$SOURCE" "$UPDATE_SOURCE" -o "$CACHE/ZagInstaller"
+    "$SOURCE" "$UPDATE_SOURCE" "$SPECTRUM_SOURCE" "$PROGRESS_SOURCE" "$PALETTE_SOURCE" -o "$CACHE/ZagInstaller"
 
 APP="$HOME/Applications/Zag Installer.app"
 NATIVE_DEV="${ZAG_INSTALLER_NATIVE_GUI_DEV:-0}"
