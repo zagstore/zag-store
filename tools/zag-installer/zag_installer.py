@@ -17,6 +17,7 @@ import zipfile
 import desktop
 import handoff
 import releases
+import native_preflight
 import ui_protocol
 
 ROOT = Path(__file__).resolve().parents[2]

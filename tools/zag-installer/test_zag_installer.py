@@ -247,3 +247,67 @@ class NativeUSBAdapterTests(unittest.TestCase):
             locked.assert_not_called()
             release.assert_not_called()
             provision.assert_not_called()
+
+class NativeSignedIpaPreflightTests(unittest.TestCase):
+    """The native intent is created only after full macOS signing validation."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.ipa = self.root / "signed.ipa"
+        with zipfile.ZipFile(self.ipa, "w") as archive:
+            archive.writestr("Payload/Zag.app/Info.plist", plistlib.dumps({
+                "CFBundleIdentifier": DESTINATION, "CFBundleShortVersionString": "1.0.0",
+                "CFBundleVersion": "4", "MinimumOSVersion": "16.4"
+            }))
+        self.udid = "00008130-000E3D9C2110001C"
+        self.cert = b"test certificate"
+        self.root_pem = self.root / "apple.pem"
+
+    def create(self, *, checker=None):
+        return installer.native_preflight.create(
+            self.ipa, RELEASE, TEAM, self.udid, self.cert,
+            self.root_pem, installer.artifact, checker or (lambda _: None))
+
+    def test_validated_ipa_binding_contains_digest_and_identity(self):
+        with patch.object(installer.artifact, "validate", return_value={
+            "bundle_identifier": DESTINATION, "build": "4"
+        }) as validator:
+            intent = self.create()
+        self.assertEqual(intent["bundle_identifier"], DESTINATION)
+        self.assertEqual(intent["ipa_sha256"], hashlib.sha256(self.ipa.read_bytes()).hexdigest())
+        self.assertEqual(intent["device_udid"], self.udid)
+        self.assertIsNone(intent["previous"])
+        validator.assert_called_once_with(
+            self.ipa, TEAM, self.udid, self.root_pem, expected_signer=self.cert)
+
+    def test_bad_apple_signature_never_generates_plan(self):
+        with patch.object(installer.artifact, "validate", side_effect=ValueError("bad profile")):
+            with self.assertRaisesRegex(ValueError, "bad profile"):
+                self.create()
+
+    def test_release_expiry_never_generates_plan(self):
+        with patch.object(installer.artifact, "validate", return_value={
+            "bundle_identifier": DESTINATION, "build": "4"
+        }):
+            with self.assertRaisesRegex(ValueError, "expired"):
+                self.create(checker=lambda _: (_ for _ in ()).throw(ValueError("expired")))
+
+    def test_bundle_mismatch_never_generates_plan(self):
+        with patch.object(installer.artifact, "validate", return_value={
+            "bundle_identifier": "com.cwd43.gu29", "build": "4"
+        }):
+            with self.assertRaisesRegex(ValueError, "identity"):
+                self.create()
+
+    def test_private_plan_is_exclusive_and_contains_no_key(self):
+        with patch.object(installer.artifact, "validate", return_value={
+            "bundle_identifier": DESTINATION, "build": "4"
+        }):
+            plan = self.create()
+        path = installer.native_preflight.write_private(plan, self.root)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(self.cert, path.read_bytes())
+        with self.assertRaises(FileExistsError):
+            installer.native_preflight.write_private(plan, self.root)

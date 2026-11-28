@@ -1,6 +1,7 @@
 mod transfer;
 mod installation;
 mod inventory;
+mod preflight;
 use idevice::{IdeviceService, lockdown::LockdownClient, provider::{IdeviceProvider, UsbmuxdProvider}, usbmuxd::{Connection, UsbmuxdAddr}, installation_proxy::InstallationProxyClient, amfi::AmfiClient};
 use serde_json::json;
 use std::time::Duration;
@@ -51,8 +52,23 @@ async fn inspect(mode: &str) -> Result<serde_json::Value, Box<dyn std::error::Er
 #[tokio::main(flavor="current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "preflight" {
+        // Read-only, bounded digest and USB identity check. The plan is
+        // untrusted input and never authorizes a device installation.
+        let job = async {
+            let plan = preflight::verify(std::path::Path::new(&args[1])).await?;
+            let status = inspect("status").await?;
+            preflight::device_binding(&plan, &status)
+        };
+        match tokio::time::timeout(Duration::from_secs(90), job).await {
+            Ok(Ok(result)) => println!("{}", result),
+            _ => { eprintln!("Native IPA preflight failed; no device writes performed"); std::process::exit(1); }
+        }
+        return;
+    }
     if args.len() != 1 || !matches!(args[0].as_str(), "inspect" | "status" | "inventory") {
-        eprintln!("Usage: zag-usb inspect|status|inventory"); std::process::exit(2);
+        eprintln!("Usage: zag-usb inspect|status|inventory|preflight PLAN.json");
+        std::process::exit(2);
     }
     match tokio::time::timeout(Duration::from_secs(30), inspect(&args[0])).await {
         Ok(Ok(result)) => println!("{}", result),
