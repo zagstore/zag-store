@@ -144,7 +144,7 @@ def imported_components(app, original):
         if not isinstance(identifier, str) or not identifier.startswith(original + "."):
             raise ValueError("Imported extension identifier is not a child of the main app")
         suffix = identifier[len(original):]
-        if (not re.fullmatch(r"(?:\\.[A-Za-z0-9-]+)+", suffix) or len(suffix) > 180
+        if (not re.fullmatch(r"(?:\.[A-Za-z0-9-]+)+", suffix) or len(suffix) > 180
                 or suffix.casefold() in {v.casefold() for v in components.values()}):
             raise ValueError("Invalid or duplicate imported extension identifier")
         components[str(relative)] = suffix
@@ -160,8 +160,8 @@ def validate_imported_components(components):
     for path, suffix in components.items():
         if path == "":
             continue
-        if (not isinstance(path, str) or not re.fullmatch(r"PlugIns/[^/]+\\.appex", path)
-                or not isinstance(suffix, str) or not re.fullmatch(r"(?:\\.[A-Za-z0-9-]+)+", suffix)
+        if (not isinstance(path, str) or not re.fullmatch(r"PlugIns/[^/]+\.appex", path)
+                or not isinstance(suffix, str) or not re.fullmatch(r"(?:\.[A-Za-z0-9-]+)+", suffix)
                 or len(suffix) > 180 or suffix.casefold() in seen):
             raise ValueError("Invalid or duplicate imported extension identifier")
         seen.add(suffix.casefold())
