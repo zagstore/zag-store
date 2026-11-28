@@ -15,7 +15,7 @@ trap 'rm -rf "$TEMP"' EXIT
 
 mkdir -p "$TEMP/package/tools/zag-installer" "$TEMP/package/scripts" "$TEMP/package/helpers" \
     "$TEMP/package/AppleAuthCore/zag-isideload/src/assets"
-for name in zag_installer.py desktop.py handoff.py releases.py ui_protocol.py; do
+for name in zag_installer.py desktop.py handoff.py releases.py ui_protocol.py native_preflight.py; do
     cp "$ROOT/tools/zag-installer/$name" "$TEMP/package/tools/zag-installer/$name"
 done
 cp "$ROOT/scripts/zag-personal-ota.py" "$TEMP/package/scripts/zag-personal-ota.py"
@@ -42,7 +42,7 @@ import sys
 
 root = Path(sys.argv[1]).resolve(strict=True)
 module_root = root / "tools" / "zag-installer"
-for name in ("zag_installer", "desktop", "handoff", "releases", "ui_protocol"):
+for name in ("zag_installer", "desktop", "handoff", "releases", "ui_protocol", "native_preflight"):
     path = module_root / f"{name}.py"
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 ast.parse((root / "scripts" / "zag-personal-ota.py").read_text(encoding="utf-8"))
@@ -51,6 +51,8 @@ import desktop
 import releases
 import handoff
 import ui_protocol
+import native_preflight
+import zag_installer
 sys.path.insert(0, str(root / "scripts"))
 spec = importlib.util.spec_from_file_location("artifact_validation", root / "scripts" / "zag-personal-ota.py")
 assert spec is not None and spec.loader is not None

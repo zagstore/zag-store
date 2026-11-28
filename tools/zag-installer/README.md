@@ -198,3 +198,47 @@ Test the design separately with a disposable artifact signed only on the Mac. Ac
 ## Test status
 
 The installer regression suite exercises offline source and installation guards, interactive 2FA choices, account isolation and certificate recovery, Personal Team profile binding, and failure before any device installation. The signed-manifest upgrade path has offline regression coverage. Physical upgrade and launch remain separate acceptance steps.
+
+
+## Native signed IPA preflight (read-only development milestone)
+
+The isolated native helper now accepts `zag-usb preflight PLAN.json` in
+addition to `status`, `inspect` and `inventory`. It does **not** support
+`install`, `upgrade` or writing to an iPhone. The preflight record binds a
+specific signed IPA file path, exact local SHA-256 and byte length, mapped
+Personal Team bundle, version, build, minimum iOS and wired-device UDID.
+Rust rejects unknown JSON fields and recomputes the digest from disk, then
+checks the native USB pairing and device identity. This can detect a changed
+file or unexpectedly swapped iPhone **without** importing the Apple ID into
+Rust.
+
+`native_preflight.create` is the macOS producer. It invokes the existing
+pinned `artifact.validate` checks for Apple code signatures, development
+certificates and provisioning profiles, checks exact release metadata, and
+runs the provided current-release authorization check before writing a
+private plan with `native_preflight.write_private`. A plan contains no private
+keys or Apple login material. The plan's JSON itself is **not** signed and
+cannot establish authorization if created by an untrusted process. In
+particular, Rust's `preflight` reports
+`"installation_authorized":false` and is deliberately not connected to
+Installation Proxy.
+
+The installed AppTesters copy `com.cwd43.gu29` is exposed as a legacy
+diagnostic only and is **never** a Personal Team upgrade target. An empty
+native Personal Team inventory does not prove the destination is vacant;
+fresh native installation remains blocked. The existing Xcode/CoreDevice
+CLI installation path is not modified.
+
+Run development checks without modifying an iPhone:
+
+```sh
+cd "$HOME/Documents/ZagStore-claude"
+python3 -m unittest -q tools/zag-installer/test_zag_installer.py
+cargo test --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
+cargo build --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
+```
+
+The Python tests can alternatively be run from `tools/zag-installer` with
+`python3 -m unittest -q test_zag_installer`. A real signed IPA from the
+existing signing pipeline is required for meaningful complete preflight
+validation. Never mistake an arbitrary JSON file for a signed release.

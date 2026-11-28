@@ -73,7 +73,8 @@ if [[ -n "$ENGINE_STAGE" ]]; then
         echo "Invalid staged installer engine." >&2; exit 1;
     }
     ENGINE_STAGE="$(cd "$ENGINE_STAGE" && pwd -P)"
-    for source in tools/zag-installer/zag_installer.py scripts/zag-personal-ota.py \
+    for source in tools/zag-installer/zag_installer.py tools/zag-installer/native_preflight.py \
+                  scripts/zag-personal-ota.py \
                   AppleAuthCore/zag-isideload/src/assets/apple_root.cer \
                   helpers/release helpers/handoff helpers/zag_desktop helpers/zag-usb \
                   helpers/zag-desktop-anisette helpers/zag-desktop-signer helpers/openssl \
