@@ -562,10 +562,81 @@ private struct InstallerView: View {
     @State private var revealPassword = false
     @State private var combinedPassword = ""
     @FocusState private var promptFocused: Bool
+    @State private var preferredAccount: String?
+
+    private var accountColumn: some View {
+        let accounts = RememberedAccounts.decode(rememberedAppleIDs)
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "apple.logo").font(.system(size: 17, weight: .medium))
+                Text("Apple IDs").font(.title3.weight(.semibold))
+                Spacer()
+                Text("\(accounts.count)").font(.caption.monospacedDigit())
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(border, in: Capsule())
+            }
+            Text("Choose an account for your next installation.")
+                .font(.caption).foregroundStyle(muted)
+            if accounts.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "person.crop.circle").font(.system(size: 36, weight: .light))
+                    Text("No remembered accounts").font(.callout.weight(.medium))
+                    Text("Remember an Apple ID when signing in.").font(.caption)
+                }.foregroundStyle(muted).multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity).padding(.vertical, 20)
+            }
+            ForEach(accounts, id: \.self) { account in
+                HStack(spacing: 8) {
+                    Button {
+                        preferredAccount = account
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: "person.crop.circle.fill").font(.title2)
+                                .foregroundStyle(ZagPalette.blue)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(account).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                                Text(preferredAccount == account ? "Selected for next sign-in" : "Remembered")
+                                    .font(.caption2).foregroundStyle(muted)
+                            }
+                            Spacer(minLength: 0)
+                            if preferredAccount == account {
+                                Image(systemName: "checkmark.circle.fill").foregroundStyle(success)
+                            }
+                        }.contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                    Menu {
+                        Button("Forget Apple ID", role: .destructive) {
+                            rememberedAppleIDs = RememberedAccounts.encode(accounts.filter { $0 != account })
+                            if preferredAccount == account { preferredAccount = nil }
+                        }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton).fixedSize()
+                }.padding(10)
+                    .background(surface, in: RoundedRectangle(cornerRadius: 10))
+                    .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(preferredAccount == account ? ZagPalette.blue : border, lineWidth: 1) }
+            }
+            Button {
+                preferredAccount = nil
+                installer.begin(upgrade: upgrade, team: team)
+            } label: {
+                Label("Use another Apple ID", systemImage: "plus.circle")
+                    .frame(maxWidth: .infinity)
+            }.disabled(!device.ready || nativeUSBPreview || installer.busy || completed)
+            Divider()
+            Label("Only account identifiers are remembered. Passwords are not saved.", systemImage: "lock.shield")
+                .font(.caption).foregroundStyle(muted)
+        }
+        .padding(16)
+        .frame(width: 260)
+        .background(surface.opacity(0.65), in: RoundedRectangle(cornerRadius: 16))
+        .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(border, lineWidth: 1) }
+        .disabled(installer.busy)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
         ScrollView {
+        HStack(alignment: .top, spacing: 20) {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
                 if let image = brandImage {
@@ -576,7 +647,7 @@ private struct InstallerView: View {
                     Text("Z").font(.largeTitle.bold()).frame(width: 64, height: 64)
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Loader").font(.largeTitle.bold()).accessibilityLabel("zLoader")
+                    Text("Loader").font(.largeTitle.bold()).foregroundStyle(dark ? Color.white : Color.primary).accessibilityLabel("zLoader")
                     Text("Your device. Your apps.")
                         .foregroundStyle(muted)
                 }
@@ -589,6 +660,7 @@ private struct InstallerView: View {
                     DeviceIllustration(identifier: device.modelIdentifier)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(device.title).font(.system(size: 19, weight: .semibold))
+                            .foregroundStyle(dark ? ZagPalette.rgb(0xe8edf5) : Color.primary)
                         Text(device.detail).font(.system(size: 13)).foregroundStyle(muted)
                     }
                     Spacer()
@@ -784,8 +856,10 @@ private struct InstallerView: View {
             }
             }
         }
-        .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
+        accountColumn
+        }
+        .padding(24)
         }
         Divider()
             HStack {
@@ -806,7 +880,7 @@ private struct InstallerView: View {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
-        .frame(minWidth: 480, idealWidth: 700, minHeight: 420, idealHeight: 565)
+        .frame(minWidth: 800, idealWidth: 960, minHeight: 420, idealHeight: 620)
         .background { atmosphere.ignoresSafeArea() }
         .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
@@ -933,8 +1007,11 @@ private struct InstallerView: View {
                     rememberedAppleIDs = RememberedAccounts.encode(accounts)
                     rememberedAppleID = ""
                 }
-                reply = ""
-                rememberAccount = false
+                let selected = preferredAccount.flatMap { account in
+                    RememberedAccounts.decode(rememberedAppleIDs).contains(account) ? account : nil
+                }
+                reply = accountPrompt ? (selected ?? "") : ""
+                rememberAccount = accountPrompt && selected != nil
                 revealPassword = false
                 promptFocused = true
             }
