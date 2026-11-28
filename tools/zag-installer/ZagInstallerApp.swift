@@ -498,6 +498,16 @@ private struct InstallerView: View {
                         .foregroundStyle(installer.setupVerified ? success : muted)
                 } else {
                     Text(installer.status).foregroundStyle(muted)
+                    if nativeDevelopment,
+                       installer.installedBundle.range(of: #"^app\.zagstore\.ios\.[A-Z0-9]{10}$"#, options: .regularExpression) != nil {
+                        let recoveryTeam = String(installer.installedBundle.suffix(10))
+                        Button("Resume Signing Setup") {
+                            installer.begin(upgrade: false, team: recoveryTeam, resumeSetup: true)
+                        }
+                        .disabled(!device.ready)
+                        Text("Uses the saved signing identity for this installation. No reinstall is required. Apple ID sign-in may still be needed on your iPhone.")
+                            .font(.caption).foregroundStyle(muted)
+                    }
                 }
             } else {
                 Text(installer.status).font(.headline)
