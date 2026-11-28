@@ -48,6 +48,8 @@ def create(signed, release, team, udid, certificate, root, artifact,
             raise ValueError("Invalid previous destination identity")
     check_authorization(release)
     digest = artifact.sha(signed)
+    if imported_bundle is not None and digest != verified.get("sha256"):
+        raise ValueError("Signed imported IPA changed after validation")
     if not re.fullmatch(r"[a-f0-9]{64}", digest):
         raise ValueError("Malformed validated IPA checksum")
     return {

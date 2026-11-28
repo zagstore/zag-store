@@ -151,6 +151,17 @@ class ProtocolTests(unittest.TestCase):
             run_native_install([sys.executable, "-c", "import time; time.sleep(10)"],
                                lambda *_: None, timeout=0.1)
 
+    def test_imported_destination_mapping_is_separate_and_stable(self):
+        original = "com.example.app"
+        team = "FTB8PRW638"
+        mapped = ipa_preview.mapped_import_bundle(original, team)
+        self.assertRegex(mapped, r"^app\.zloader\.imported\.[a-f0-9]{32}\.FTB8PRW638$")
+        self.assertEqual(mapped, ipa_preview.mapped_import_bundle(original, team))
+        self.assertNotEqual(mapped, ipa_preview.mapped_import_bundle(original, "AAAAAAAAAA"))
+        for protected in ("app.zagstore.ios", "app.zagstore.ios.FTB8PRW638", "com.cwd43.gu29"):
+            with self.assertRaises(ValueError):
+                ipa_preview.mapped_import_bundle(protected, team)
+
     def test_ipa_metadata_uses_main_application_name(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "unrelated-file-name.ipa"

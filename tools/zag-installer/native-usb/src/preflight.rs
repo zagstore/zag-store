@@ -174,6 +174,19 @@ mod tests {
         assert!(validate(&req).is_err());
     }
     #[test]
+    fn imported_plan_requires_distinct_schema_and_fresh_install() {
+        let mut req = plan();
+        req.bundle_identifier = "app.zloader.imported.0123456789abcdef0123456789abcdef.FTB8PRW638".into();
+        assert!(validate(&req).is_err());
+        req.schema = 2;
+        assert!(validate(&req).is_ok());
+        req.previous = Some(Prior {version:"1.0.0".into(), build:"1".into()});
+        assert!(validate(&req).is_err());
+        req.previous = None;
+        req.bundle_identifier = "app.zagstore.ios.FTB8PRW638".into();
+        assert!(validate(&req).is_err());
+    }
+    #[test]
     fn unknown_json_fields_fail_closed() {
         let value = json!({
             "schema":1,"ipa_path":"/tmp/signed.ipa","ipa_sha256":"0".repeat(64),
