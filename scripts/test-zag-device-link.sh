@@ -70,9 +70,9 @@ RUST="$ROOT/RPPairingCore/rust-core/src/lib.rs"
 session=$(sed -n '/^async fn with_zag_device_session_mode/,/^}/p' "$RUST")
 production=$(awk '/SessionMode::Production => \{/{f=1} /SessionMode::Diagnostic => \{/{f=0} f' <<< "$session")
 diagnostic=$(awk '/SessionMode::Diagnostic => \{/{f=1} f&&/^    }$/{f=0} f' <<< "$session")
-check "rust: production sessions still use rpc.connect" grep -q 'rpc.connect(&mut pairing_file' <<< "$production"
-check "rust: production sessions still persist verified credentials" grep -q 'write_to_file(pairing_path)' <<< "$production"
-check "rust: credentials are written in exactly one place in the session" test "$(grep -c 'write_to_file' <<< "$session")" = 1
+check "rust: production verifies the saved pairing" grep -q 'validate_pairing(&mut pairing_file)' <<< "$production"
+check "rust: production does not fall back to pair setup" bash -c "! grep -qE '\.pair\(|rpc\.connect' <<< \"\$1\"" _ "$production"
+check "rust: neither session writes credentials" absent 'write_to_file' "$session"
 check "rust: diagnostic sessions never write credentials" absent 'write_to_file' "$diagnostic"
 check "rust: diagnostic sessions have no pair-setup fallback" bash -c "! grep -qE '\.pair\(|rpc\.connect' <<< \"\$1\"" _ "$diagnostic"
 check "rust: diagnostic handshake and pair-verify are separate steps" bash -c "grep -q 'attempt_pair_verify()' <<< \"\$1\" && grep -q 'validate_pairing(&mut verify_copy)' <<< \"\$1\"" _ "$diagnostic"
@@ -110,50 +110,20 @@ COORD="$ROOT/Feather/Utilities/ZagMobileDataInstallCoordinator.swift"
 for f in Feather/Views/Sources/Apps/DownloadButtonView.swift Feather/Views/Library/LibraryCellView.swift Feather/Views/Library/LibraryView.swift Feather/Views/Library/Install/InstallPreviewView.swift; do
 	check "install: $(basename $f) installs through Mobile Data Fix" grep -qE '(ZagMobileDataInstallCoordinator.shared|coordinator)\.install\(jobID:' "$ROOT/$f"
 done
-installer_core_unchanged() {
-    python3 - "$ROOT" "$CORE" <<'PYCODE'
+install_reuses_pairing() {
+    python3 - "$CORE" <<'PYCODE'
 from pathlib import Path
-import subprocess, sys
-root, core = sys.argv[1:]
-baseline = subprocess.check_output(['git', 'show', 'cdc94c31a8293d7f504d268dee19185f36bf258f:Feather/RPPairing/ZagRPPairingCore.swift'], cwd=root, text=True)
-current = Path(core).read_text()
-def excluding_pin_presentation(source):
-    # Keep the state callback and notification submission/lifecycle protected.
-    # Only code-content construction and the removed automatic copy may differ.
-    start = source.index('\n', source.index('state = .pin(message)'))
-    end = source.index('\n\t\t\tUNUserNotificationCenter.current().add(', start)
-    return source[:start] + source[end:]
-def excluding_local_cleanup(source):
-    source = source.replace('    @Published private(set) var localPairingCleanupPending = UserDefaults.standard.bool(forKey: ZagLocalPairingRemoval.pendingKey)\n', '')
-    source = source.replace('        guard !localPairingCleanupPending else { return false }\n', '')
-    source = source.replace('        guard !localPairingCleanupPending else {\n            state = .failed("Retry Local Cleanup before starting pairing again.")\n            return\n        }\n', '')
-    source = source.replace('        guard !localPairingCleanupPending else {\n            gate2State = .failed("Retry Local Cleanup before checking pairing again.")\n            return\n        }\n', '')
-    source = source.replace('    /// Forgets only this app\'s local material; system trust must be removed in Settings.\n', '')
-    source = source.replace('Stop the current RPPairing operation before removing local pairing credentials.', 'Stop the current RPPairing operation before forgetting this iPhone.')
-    start = source.index('\tfunc forgetPairing() throws {')
-    end = source.index('\n\tfileprivate func receive(code:', start)
-    return source[:start] + '<local cleanup>\n' + source[end:]
-def excluding_installed_profiles(source):
-    # PR #25: the read-only installed-profile reader (misagent), purely
-    # additive; each block is removed exactly, so any other change still fails.
-    for block in ['private func zagInstalledProfilesCallback(_ code: Int32, _ message: UnsafePointer<CChar>?) {\n\tlet text = message.map { String(cString: $0) } ?? ""\n\tDispatchQueue.main.async {\n\t\tZagRPPairingCore.shared.receiveInstalledProfiles(code: code, message: text)\n\t}\n}\n\n', '\tprivate var installedProfilesDirectory: URL?\n\tprivate var installedProfilesCompletion: ((Result<[Data], Error>) -> Void)?\n', '\t/// The provisioning profiles installed on the device, exactly as it\n\t/// returns them (misagent, read only). Used to confirm which profile, and\n\t/// so which expiry, an app signed by Zag Store was installed with.\n\tfunc readInstalledProfiles(\n\t\tdeviceIP: String = "10.7.0.1",\n\t\tcompletion: @escaping (Result<[Data], Error>) -> Void\n\t) {\n\t\tguard installedProfilesCompletion == nil else { return completion(.failure(InstalledAppsError.alreadyRunning)) }\n\t\tguard pairingFileExists else { return completion(.failure(InstalledAppsError.notPaired)) }\n\t\tguard acquireTransport("Installed profiles") else { return completion(.failure(InstalledAppsError.alreadyRunning)) }\n\n\t\tlet directory = FileManager.default.temporaryDirectory\n\t\t\t.appendingPathComponent("ZagStore-InstalledProfiles-\\(UUID().uuidString)", isDirectory: true)\n\t\tinstalledProfilesDirectory = directory\n\t\tinstalledProfilesCompletion = completion\n\t\tlet started = deviceIP.withCString { ip in\n\t\t\tSelf.pairingFileURL.path.withCString { pairingPath in\n\t\t\t\tdirectory.path.withCString { outputDirectory in\n\t\t\t\t\tzag_installed_profiles(ip, pairingPath, outputDirectory, zagInstalledProfilesCallback)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif !started {\n\t\t\tfinishInstalledProfiles(.failure(InstalledAppsError.couldNotStart))\n\t\t}\n\t}\n\n\tfileprivate func receiveInstalledProfiles(code: Int32, message: String) {\n\t\tswitch code {\n\t\tcase 603:\n\t\t\t// Read every file the core wrote, in order, then remove the folder.\n\t\t\tlet count = Int(message) ?? 0\n\t\t\tlet profiles = (0..<count).compactMap { index in\n\t\t\t\tinstalledProfilesDirectory.flatMap { try? Data(contentsOf: $0.appendingPathComponent("\\(index).mobileprovision")) }\n\t\t\t}\n\t\t\tfinishInstalledProfiles(profiles.count == count ? .success(profiles) : .failure(InstalledAppsError.refreshFailed("An installed profile could not be read.")))\n\t\tcase -8:\n\t\t\tZagLogger.shared.error("RPPairing", "Installed-profile listing failed: \\(message)")\n\t\t\tfinishInstalledProfiles(.failure(InstalledAppsError.refreshFailed(message)))\n\t\tdefault:\n\t\t\tbreak\n\t\t}\n\t}\n\n\tprivate func finishInstalledProfiles(_ result: Result<[Data], Error>) {\n\t\treleaseTransport("Installed profiles")\n\t\tif let directory = installedProfilesDirectory { try? FileManager.default.removeItem(at: directory) }\n\t\tinstalledProfilesDirectory = nil\n\t\tlet completion = installedProfilesCompletion\n\t\tinstalledProfilesCompletion = nil\n\t\tcompletion?(result)\n\t}\n\n']:
-        assert source.count(block) == 1, block[:60]
-        source = source.replace(block, '')
-    return source
-def excluding_gate4_presentation(source):
-    # Gate4 publication cadence and the verified-staging (209) hook only;
-    # each documented edit is reversed exactly, so any other change still fails.
-    for new, old in [('\t/// The exact native state. Views observing the whole core are invalidated\n\t/// for every stage change but for a percentage only every ten points: one\n\t/// publication per transfer callback re-evaluated the tab hierarchy up to\n\t/// a hundred times while the update control was animating. Every exact\n\t/// value still reaches gate4StatePublisher.\n\tprivate(set) var gate4State: Gate4State = .idle {\n\t\twillSet {\n\t\t\tif Self.gate4StateInvalidatesViews(from: gate4State, to: newValue) { objectWillChange.send() }\n\t\t}\n\t\tdidSet { gate4StateSubject.send(gate4State) }\n\t}\n\tprivate let gate4StateSubject = CurrentValueSubject<Gate4State, Never>(.idle)\n\t/// Every native state, including each percentage, after it is stored.\n\tvar gate4StatePublisher: AnyPublisher<Gate4State, Never> { gate4StateSubject.eraseToAnyPublisher() }\n\n\tnonisolated static func gate4StateInvalidatesViews(from old: Gate4State, to new: Gate4State) -> Bool {\n\t\tswitch (old, new) {\n\t\tcase let (.uploading(previous), .uploading(next)), let (.progress(previous), .progress(next)):\n\t\t\treturn ZagGate4PublicationPolicy.invalidatesViews(fromPercent: previous, toPercent: next)\n\t\tdefault:\n\t\t\treturn old != new\n\t\t}\n\t}\n', '\t@Published private(set) var gate4State: Gate4State = .idle\n'), ('\t\tgate4AttemptEvents.append(ZagGate4Event(code: code, message: message))\n\t\t// Percentages arrive up to a hundred times per phase on the main\n\t\t// thread. Keep the diagnostic record and log at the same ten-point\n\t\t// cadence as view invalidation; the retry policy still sees every event.\n\t\tvar percentage: Gate4State?\n\t\tif code == 208 { percentage = Int(message).map { .uploading($0) } }\n\t\tif code == 206 { percentage = Int(message).map { .progress($0) } }\n\t\tif percentage == nil || Self.gate4StateInvalidatesViews(from: gate4State, to: percentage!) {\n\t\t\trecordGate4Event("Gate4 callback \\(code): \\(message)")\n\t\t\t// Record native installation stages for diagnostics.\n\t\t\tif code == 206 {\n\t\t\t\tZagLogger.shared.info("RPPairing", "Gate4 install progress: \\(message)%")\n\t\t\t} else {\n\t\t\t\tZagLogger.shared.info("RPPairing", "Gate4 callback stage=\\(code) detail=\\(message)")\n\t\t\t}\n\t\t}\n', '\t\tgate4AttemptEvents.append(ZagGate4Event(code: code, message: message))\n\t\trecordGate4Event("Gate4 callback \\(code): \\(message)")\n\t\t// Record native installation stages for diagnostics.\n\t\tif code == 206 {\n\t\t\tZagLogger.shared.info("RPPairing", "Gate4 install progress: \\(message)%")\n\t\t} else {\n\t\t\tZagLogger.shared.info("RPPairing", "Gate4 callback stage=\\(code) detail=\\(message)")\n\t\t}\n'), ("\t\tcase 209:\n\t\t\tgate4State = .staged\n\t\t\t// Same main-thread turn as the stage change, so the screen never\n\t\t\t// renders the stage without the attempt's handoff state.\n\t\t\tgate4Staged?()\n", '\t\tcase 209: gate4State = .staged\n')]:
-        assert source.count(new) == 1, new[:60]
-        source = source.replace(new, old)
-    for line in ['\tprivate var gate4Staged: (() -> Void)?\n', '\t\tstaged: (() -> Void)? = nil,\n', '\t\tgate4Staged = staged\n']:
-        assert source.count(line) == 1, line
-        source = source.replace(line, '')
-    return source.replace('\t\t\tgate4Staged = nil\n', '')
-assert excluding_local_cleanup(excluding_pin_presentation(excluding_gate4_presentation(excluding_installed_profiles(current)))) == excluding_local_cleanup(excluding_pin_presentation(baseline))
+import sys
+source = Path(sys.argv[1]).read_text()
+install = source[source.index("func installGate4IPA("):source.index("private func startGate4Worker(")]
+assert 'guard hasSavedPairing' in install
+assert 'acquireTransport("Gate4 install")' in install and 'startGate4Worker(' in install
+assert "zag_rppairing_start(" not in install
+assert "case 207:" in source and "gate4Completion?(.success(()))" in source
+assert "case 405:" in source and "savePairedIdentity(device)" in source
 PYCODE
 }
-check "install: installer core is unchanged outside PIN presentation and explicit local-cleanup guards" installer_core_unchanged
+check "install: the shared worker reuses saved pairing and publishes completion" install_reuses_pairing
 check "install: self-update never uses Mobile Data Fix" bash -c "! grep -q 'ZagMobileDataInstall' '$ROOT/Feather/Utilities/ZagSelfUpdateCoordinator.swift' && grep -q 'if isSelfInstall {' '$ROOT/Feather/Views/Library/Install/InstallPreviewView.swift'"
 check "uninstall: Library removal goes through the shared coordinator" grep -q 'coordinator.perform(.uninstall' "$ROOT/Feather/Views/Library/LibraryView.swift"
 check "uninstall: only one RPPairing uninstall entry point exists" bash -c "[ \$(grep -rn 'uninstallGate4App(' '$ROOT/Feather' | grep -vc 'func uninstallGate4App') -eq 1 ]"
@@ -161,7 +131,7 @@ check "decision: no exact interface-count rule remains" bash -c "! grep -rqE 'co
 check "decision: Mobile Data Fix requires a refusal through LocalDevVPN" grep -q 'guard endpoint == .refused, tunnel else' "$ROOT/Feather/Utilities/ZagMobileDataInstallFlow.swift"
 OVERLAY="$ROOT/Feather/Views/Settings/Installation/ZagMobileDataInstallOverlay.swift"
 check "ui: no floating installation progress capsule" bash -c "! grep -qE 'StageCapsule|stageText|in: Capsule|coordinator.stage, coordinator' '$OVERLAY'"
-check "ui: no other floating Mobile Data progress UI" bash -c "! grep -rqE 'usingMobileDataFix' '$ROOT/Feather/Views' --include=*.swift --exclude=VariedTabbarView.swift --exclude=LibraryView.swift --exclude=DownloadButtonView.swift --exclude=LibraryCellView.swift && [ \$(grep -c 'usingMobileDataFix' '$ROOT/Feather/Views/Library/LibraryView.swift') -eq 1 ] && for f in Sources/Apps/DownloadButtonView.swift Library/LibraryCellView.swift; do [ \$(grep -c 'usingMobileDataFix' \"$ROOT/Feather/Views/\$f\") -eq 1 ] && grep -q 'if coordinator.usingMobileDataFix { jobs.advance(key, to: .restoringMobileData) }' \"$ROOT/Feather/Views/\$f\" || exit 1; done"
+check "ui: no other floating Mobile Data progress UI" bash -c "! grep -rqE 'usingMobileDataFix' '$ROOT/Feather/Views' --include=*.swift --exclude=VariedTabbarView.swift --exclude=LibraryView.swift --exclude=DownloadButtonView.swift --exclude=LibraryCellView.swift && [ \$(grep 'usingMobileDataFix' '$ROOT/Feather/Views/Library/LibraryView.swift' | grep -vc 'jobs.advance(job, to: .restoringMobileData)') -eq 1 ] && for f in Sources/Apps/DownloadButtonView.swift Library/LibraryCellView.swift; do [ \$(grep -c 'usingMobileDataFix' \"$ROOT/Feather/Views/\$f\") -eq 1 ] && grep -q 'if coordinator.usingMobileDataFix { jobs.advance(key, to: .restoringMobileData) }' \"$ROOT/Feather/Views/\$f\" || exit 1; done"
 check "ui: consent alert and recovery banner remain" bash -c "grep -q 'Allow Automatically' '$OVERLAY' && grep -q 'Mobile Data may still be off' '$OVERLAY' && grep -q 'Turn On Mobile Data' '$OVERLAY'"
 CONTROL="$ROOT/Feather/Views/ZagInstallControl.swift"
 BODY="$ROOT/Feather/Views/ZagInstallControlBody.swift"
@@ -186,15 +156,22 @@ check "control: the drawn view never handles touches; a SwiftUI Button owns the 
 check "control: hit area follows the visible shape and is centred on the slot" bash -c "grep -q 'Color.clear' '$BODY' && grep -q '.frame(width: hitWidth, height: ZagInstallControlLayout.pillHeight)' '$BODY' && grep -q 'hitWidth = max(hitWidth, target)' '$BODY'"
 check "control: VoiceOver can still activate the control" grep -q 'accessibilityAction { if mode.isInteractive { action() } }' "$CONTROL"
 check "control: real-tap UI tests exist for every row pattern" bash -c "[ -f '$ROOT/scripts/test-zag-install-control-taps.sh' ] && grep -q 'parent: \"button\"' '$ROOT/scripts/ZagInstallControlTapHarness.swift' && grep -q 'parent: \"gesture\"' '$ROOT/scripts/ZagInstallControlTapHarness.swift' && [ \$(grep -c 'func test' '$ROOT/scripts/ZagInstallControlTapUITests.swift') -ge 8 ]"
-check "control: Open only after confirmed success (repository row)" bash -c "grep -B1 -A1 'installedBundleID == bundleID {' '$JOBUI' | grep -q 'Open'"
-check "ui: Install Preview and Update All are not part of this phase" bash -c "cd '$ROOT' && git diff --quiet 45768c763c7bb9a01d1f1de0d50077563a26b14f -- Feather/Views/Library/Install/InstallPreviewView.swift && ! grep -q 'ZagInstallJobs' Feather/Views/Library/LibraryView.swift"
+check "control: Open only after confirmed success (repository row)" bash -c "grep -A2 'if let bundleID = installedBundleID, pairingCore.isInstalled' '$JOBUI' | grep -q 'Open'"
+check "ui: expiry icons use the recorded signing method" bash -c "grep -q 'Storage.shared.getCertificate(from: app)' '$CELLUI' && grep -Fq '_expiryCaption(expiry, appleID: status.map { \$0.method == .personal } ?? _isNativeAccountApp,' '$CELLUI' && grep -q 'ZagAppleIDMark()' '$CELLUI' && grep -q 'Image(systemName: .*shield' '$CELLUI'"
+check "ui: the pinned running row shares the native action control and cannot expose destructive actions" \
+	bash -c "grep -Fq 'app: runningInstallation.runningApp' '$ROOT/Feather/Views/Library/LibraryView.swift' && grep -Fq 'if !isEditing, runningInstallation == nil' '$CELLUI' && grep -Fq 'if runningInstallation != nil {' '$CELLUI'"
+check "self renewal: certificate handoff persists the running bundle evidence and cannot use the full-install fallback" \
+	bash -c "batch='$ROOT/Feather/Utilities/ZagBatchCoordinator.swift'; grep -Fq 'receipt.runningBundleIdentifier = running.identifier' \"\$batch\" && grep -Fq 'receipt.runningBuild = running.build' \"\$batch\" && grep -Fq 'guard record != nil else { throw RefreshSkip' \"\$batch\""
+check "ui: Refresh All shares the Installed badge styling and precedes the chevron" bash -c "grep -q 'trailingTitle:.*Refresh All' '$ROOT/Feather/Views/Library/LibraryView.swift' && sed -n '/private struct ZagLibraryHeader:/,/private struct FeatherCountBadge:/p' '$ROOT/Feather/Views/Library/LibraryView.swift' | awk '/ZagCountBadge.*trailingTitle/{badge=NR} /chevron.down/{chevron=NR} END{exit !(badge > 0 && badge < chevron)}'"
+
+check "ui: native signing and renewal wrap the shared job store" bash -c "grep -q 'ZagNativeAccountInstall.runInline' '$ROOT/Feather/Views/Library/LibraryView.swift' && grep -q 'InstallProgressView(app:' '$ROOT/Feather/Views/Library/Install/InstallPreviewView.swift'"
 check "ui: rows read one shared job state, not view-local phases" bash -c "grep -q '@ObservedObject private var jobs = ZagInstallJobs.shared' '$JOBUI' && grep -q '@ObservedObject private var jobs = ZagInstallJobs.shared' '$CELLUI' && ! grep -qE '@State private var (zagPhase|installationProgress|isSigningImmediately|isInstallingImmediately)' '$JOBUI' '$CELLUI'"
 check "control: tap pauses a resumable download; Resume continues it" bash -c "grep -q 'if job.canPause { _pause(download) } else { _cancelJob(download) }' '$JOBUI' && grep -q '{ _resume(currentDownload) }' '$JOBUI'"
 check "control: no pause without genuine resume support" grep -q 'return job.canPause ? .pause : .stop' "$JOBUI"
 check "control: cancellation is unavailable once installation begins" bash -c "grep -q 'job.offersCancel && job.stage.allowsCancel && !job.cancelRequested' '$JOBUI' && grep -q 'job.offersCancel && job.stage.allowsCancel && !job.cancelRequested' '$CELLUI' && [ \$(grep -c 'try jobs.beginInstalling(key)' '$JOBUI') -eq 2 ] && [ \$(grep -c 'try jobs.beginInstalling(key)' '$CELLUI') -eq 1 ]"
 check "badge: VPN matches LOCAL width; LOCAL and status typography unchanged" bash -c "grep -q 'size: 13.34, weight: .bold, design: .rounded' '$TABBAR' && grep -q 'size: 8, weight: .semibold, design: .rounded' '$TABBAR' && grep -q 'size: 9, weight: .bold, design: .rounded' '$TABBAR'"
 check "ui: safe points keep committed Imported and Signed records" bash -c "[ \$(grep -c 'if jobs.isCancelRequested(_jobKey)' '$JOBUI') -eq 2 ] && grep -q 'Cancelled after signing' '$CELLUI' && ! grep -A12 'catch where Self._isCancellation' '$CELLUI' | grep -q 'deleteApp'"
-check "ui: install jobs are used only by the in-scope rows" bash -c "! grep -rlE 'ZagInstallJobs' '$ROOT/Feather/Views' | grep -vE 'DownloadButtonView.swift|LibraryCellView.swift'"
+check "ui: install jobs are used only by the in-scope rows" bash -c "! grep -rlE 'ZagInstallJobs' '$ROOT/Feather/Views' | grep -vE 'DownloadButtonView.swift|LibraryCellView.swift|LibraryView.swift'"
 
 check "badge: toolbar uses the badge mapping, not the raw indicator" bash -c "grep -q 'ZagLocalVPNBadge.make' '$TABBAR' && ! grep -q 'private var indicator: ZagLinkIndicator' '$TABBAR'"
 check "badge: toolbar observes Shortcut verification and consent" bash -c "grep -q 'ZagMobileDataToggleController.shared' '$TABBAR' && grep -q 'automaticHandling == true' '$TABBAR'"

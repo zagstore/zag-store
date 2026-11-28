@@ -7,8 +7,10 @@ PLATFORMS := iphoneos maccatalyst
 # checkout wiped the other's cache.
 TMP := $(TMPDIR)/$(NAME)-$(notdir $(CURDIR))
 CERT_JSON_URL := https://backloop.dev/pack.json
+# Optional local candidate only; the project and release defaults stay intact.
+ZAG_BUILD_NUMBER ?=
 
-.PHONY: all clean $(PLATFORMS)
+.PHONY: all clean $(PLATFORMS) apple-bridge-iphoneos
 
 all: $(PLATFORMS)
 
@@ -16,6 +18,17 @@ clean:
 	rm -rf $(TMP)
 	rm -rf packages
 	rm -rf Payload
+
+iphoneos: RPPairingCore/build/device/libzag_rppairing_core.a apple-bridge-iphoneos
+
+# Xcode links this generated archive from the checkout's Cargo target directory.
+# Let Cargo check its inputs, including the local zag-isideload dependency.
+apple-bridge-iphoneos:
+	IPHONEOS_DEPLOYMENT_TARGET=16.4 CARGO_TARGET_DIR="$(CURDIR)/AppleAuthCore/zag-apple-bridge/target" \
+		cargo build --locked --manifest-path AppleAuthCore/zag-apple-bridge/Cargo.toml --release --target aarch64-apple-ios
+
+RPPairingCore/build/device/libzag_rppairing_core.a: RPPairingCore/build-rust.sh RPPairingCore/rust-core/Cargo.toml RPPairingCore/rust-core/Cargo.lock RPPairingCore/rust-core/src/lib.rs
+	bash RPPairingCore/build-rust.sh
 
 $(PLATFORMS):
 	rm -rf _build
@@ -33,7 +46,7 @@ $(PLATFORMS):
 		-derivedDataPath $(TMP)/$@ \
 		-skipPackagePluginValidation \
 		CODE_SIGNING_ALLOWED=NO \
-		ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=NO
+		ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=NO $(if $(ZAG_BUILD_NUMBER),CURRENT_PROJECT_VERSION=$(ZAG_BUILD_NUMBER))
 
 	mkdir -p _build/Payload
 	cp -R _build/Applications/*.app _build/Payload/Feather.app

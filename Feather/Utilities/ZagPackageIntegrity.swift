@@ -36,6 +36,18 @@ enum ZagPackageIntegrity {
 		}
 	}
 
+	/// A share snapshot is either byte-for-byte the retained artifact or
+	/// removed before the caller can hand it to another application.
+	static func copyVerified(_ source: URL, to destination: URL, expectedSHA256: String) throws {
+		try FileManager.default.copyItem(at: source, to: destination)
+		do {
+			try verify(destination, expectedSHA256: expectedSHA256)
+		} catch {
+			try? FileManager.default.removeItem(at: destination)
+			throw error
+		}
+	}
+
     static func sha256InBackground(of url: URL) async throws -> String {
         let worker = Task.detached(priority: .utility) { try sha256(of: url) }
         return try await withTaskCancellationHandler {

@@ -113,14 +113,220 @@ extension Result where Failure == ZagProvisioningFailure {
 	}
 
 	static func main() async {
+		distributionSignerLookup()
+		await nativeCertificateInventory()
+		await nativeInstallAndRestart()
+		await nativeAppIDsAcrossAccounts()
 		await firstProvisioning()
 		await reuseAndRefresh()
+		await handoffCertificateReuse()
 		await limitsCheckedBeforeChanges()
 		await certificates()
 		await profileChecks()
 		await failures()
 		await liveDisabled()
 		print("SUCCESS: \(passed) free-account provisioning checks passed")
+	}
+
+	static func distributionSignerLookup() {
+		let certificate = try! Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+		let cert = try! ZagDER.single(certificate)
+		var tbs = try! cert.children()[0].children()
+		if tbs.first?.tag == 0xa0 { tbs.removeFirst() }
+		let signer = ZagDER.sequence([ZagDER.integer(Data([1])), ZagDER.sequence([tbs[2].encoded, tbs[0].encoded])])
+		let oid = ZagDER.objectIdentifier("1.2.840.113549.1.7.2")
+		let parts = ZagDER.integer(Data([1])) + ZagDER.set([]) + ZagDER.sequence([]) +
+			ZagDER.element(0xa0, certificate) + ZagDER.set([signer])
+		func indefinite(_ tag: UInt8, _ body: Data) -> Data { Data([tag, 0x80]) + body + Data([0, 0]) }
+		let ber = indefinite(0x30, oid + indefinite(0xa0, indefinite(0x30, parts)))
+		check(ZagCMSVerifier.embeddedSigner(ber) == certificate, "BER code-signature wrappers preserve exact signer DER")
+		check(ZagCMSVerifier.embeddedSigner(Data(ber.dropLast())) == nil, "truncated BER signer data is refused")
+		check(ZagCMSVerifier.embeddedSigner(ber + Data([0])) == nil, "trailing BER signer data is refused")
+	}
+
+	static func nativeCertificateInventory() async {
+		let fixture = try! Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+		let certificate = ZagCertificateInspection(der: fixture)!
+		actor Transport: ZagHTTPTransport {
+			let fixture: Data
+			let serial: String
+			var requests: [ZagHTTPRequest] = []
+			var inventoryStatus = 200
+
+			init(fixture: Data, serial: String) {
+				self.fixture = fixture
+				self.serial = serial
+			}
+
+			func failInventory() { inventoryStatus = 429 }
+
+			func send(_ request: ZagHTTPRequest) async throws -> ZagHTTPResponse {
+				requests.append(request)
+				let path = request.url.lastPathComponent
+				let body: Data
+				if path == "submitDevelopmentCSR.action" {
+					body = try PropertyListSerialization.data(
+						fromPropertyList: ["resultCode": 0, "certRequest": ["certificateId": "CERT1"]],
+						format: .xml, options: 0
+					)
+				} else if path == "CERT1" {
+					body = try JSONSerialization.data(withJSONObject: [
+						"data": ["id": "CERT1", "attributes": ["certificateContent": fixture.base64EncodedString()]]
+					])
+				} else {
+					body = try JSONSerialization.data(withJSONObject: [
+						"data": [["id": "CERT1", "attributes": ["serialNumber": serial]]]
+					])
+				}
+				return ZagHTTPResponse(statusCode: path == "certificates" ? inventoryStatus : 200, headers: [:], body: body)
+			}
+		}
+
+		let transport = Transport(fixture: fixture, serial: certificate.serialNumber)
+		let consent = ZagMutationConsentCoordinator()
+		let portal = ZagNativeDeveloperPortal(
+			transport: transport, headers: { ["X-Apple-GS-Token": "persisted-test-token"] }, consent: consent
+		)
+		do {
+			let candidates = try await portal.revocableCertificates(team: team)
+			check(candidates.map(\.id) == ["CERT1"] && candidates.first?.sha1 == nil,
+				  "native inventory distinguishes metadata-only rows")
+			let hydrated = try await portal.certificates(team: team)
+			check(hydrated.first?.data == fixture, "native recovery loads verified DER from the individual certificate resource")
+			let csr = ZagCertificateRequest(data: Data([1]))
+			do {
+				_ = try await portal.submitCertificateRequest(csr, team: team)
+				check(false, "native CSR requires consent")
+			} catch ZagNativePortalError.consentRequired(.submitCSR) {
+				check(true, "native CSR requires consent")
+			}
+			consent.authorize([.submitCSR])
+			let issued = try await portal.submitCertificateRequest(csr, team: team)
+			check(issued.certificate.serialNumber == certificate.serialNumber && issued.data == fixture,
+				  "native CSR resolves a response containing only the certificate ID")
+			let requests = await transport.requests
+			check(requests.map { $0.url.lastPathComponent } == ["certificates", "certificates", "CERT1", "submitDevelopmentCSR.action", "certificates", "CERT1"],
+				  "production portal uses read-only details and submits exactly one CSR")
+			check(requests.allSatisfy { $0.headers["X-Apple-GS-Token"] == "persisted-test-token" },
+				  "production portal uses the injected session for each operation")
+			let inventory = requests[0]
+			let query = try JSONSerialization.jsonObject(with: inventory.body ?? Data()) as? [String: String]
+			check(inventory.method == "POST" && inventory.headers["X-HTTP-Method-Override"] == "GET"
+				  && inventory.headers["Accept"] == "application/vnd.api+json"
+				  && query == ["urlEncodedQueryParams": "teamId=\(team)"], "Personal Team certificate request matches the v1 wire format")
+			await transport.failInventory()
+			do {
+				_ = try await portal.submitCertificateRequest(csr, team: team)
+				check(false, "failed read-back should surface an unconfirmed CSR")
+			} catch let failure as ZagPortalOperationFailure {
+				check(failure.underlying == .malformedResponse && failure.reason.contains("HTTP 429"),
+					"a read-back 429 after CSR success retains the read-back status without classifying the CSR as refused")
+			}
+		} catch {
+			check(false, "native inventory and CSR flow: \(error)")
+		}
+	}
+
+	@MainActor
+	static func nativeInstallAndRestart() async {
+		enum Interruption: Error { case duringInstall }
+		final class Signer: ZagAppSigning, @unchecked Sendable {
+			private let lock = NSLock()
+			private var staged: ZagProvisioningResult?
+			var result: ZagProvisioningResult? { lock.withLock { staged } }
+
+			func sign(appAt app: URL, with result: ZagProvisioningResult, identity: ZagSigningIdentity,
+					  authorization: ZagSigningAuthorization, now: Date) throws -> ZagSignedAppRecord {
+				guard identity.serialNumber == result.certificateSerial, authorization.scope.teamID == result.team,
+					  result.app.entitlements.dictionary["application-identifier"] as? String == "\(result.team).\(result.app.bundleIdentifier)" else {
+					throw ZagFreeAccountSigningError.identityMismatch
+				}
+				try Data(result.app.bundleIdentifier.utf8).write(to: app.appendingPathComponent("simulated-signature"))
+				lock.withLock { staged = result }
+				return .init(bundleIdentifier: result.app.bundleIdentifier,
+					originalBundleIdentifier: result.app.originalBundleIdentifier, signedAt: now,
+					profileExpiresAt: result.expiresAt, certificateExpiresAt: identity.expiresAt)
+			}
+		}
+		actor Installer: ZagFreeAccountInstaller {
+			let interrupted: Bool
+			var installed: String?
+			init(interrupted: Bool) { self.interrupted = interrupted }
+
+			func install(signedApp: URL, bundleIdentifier: String) async throws {
+				let signature = try String(contentsOf: signedApp.appendingPathComponent("simulated-signature"), encoding: .utf8)
+				guard signature == bundleIdentifier else { throw ZagFreeAccountSigningError.verification("signature") }
+				if interrupted { throw Interruption.duringInstall }
+				installed = bundleIdentifier
+			}
+
+			func verify(_ expectation: ZagInstallExpectation) async -> ZagInstallVerification {
+				guard installed == expectation.bundleIdentifier else { return .notInstalled }
+				guard expectation.version == "1.2", expectation.build == "7",
+					  expectation.teamIdentifier == team, !expectation.profileUUID.isEmpty else { return .mismatch("handoff") }
+				return .verified(profileExpiresAt: expectation.profileExpiresAt, certificateExpiresAt: expectation.certificateExpiresAt)
+			}
+		}
+
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+		defer { try? FileManager.default.removeItem(at: root) }
+		let credentials = root.appendingPathComponent("rppairing.plist")
+		let metadata = root.appendingPathComponent("rppairing-device.plist")
+		let device = ZagPairedDeviceIdentity(name: "Test iPhone", model: "iPhone", udid: "0000ABCD-0123456789ABCDEF")!
+		do {
+			try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+			func writeHost(_ byte: UInt8) throws {
+				try PropertyListSerialization.data(fromPropertyList: [
+					"identifier": "Zag Store", "public_key": Data(repeating: byte, count: 32),
+					"private_key": Data(repeating: 2, count: 32)
+				], format: .xml, options: 0).write(to: credentials)
+			}
+			try writeHost(1)
+			let migration = ZagSavedPairing(credentials: credentials, metadata: metadata)
+			check(migration.hasCredentials && migration.restore(cleanupPending: false) == nil,
+				  "legacy credentials allow identity migration without pairing again")
+			try migration.save(device)
+			let restarted = ZagSavedPairing(credentials: credentials, metadata: metadata)
+			check(restarted.restore(cleanupPending: false) == device && restarted.restore(cleanupPending: true) == nil,
+				  "a restarted core restores the saved device and respects pending cleanup")
+			try writeHost(3)
+			check(restarted.restore(cleanupPending: false) == nil, "a replaced host key invalidates stale device metadata")
+			try writeHost(1)
+			let restored = restarted.restore(cleanupPending: false)!
+			let harness = await Harness.make()
+			let authorization = await harness.authorization()
+			let component = request().app
+			var request = ZagProvisioningRequest(accountID: harness.account, team: team, deviceUDID: restored.udid,
+				deviceName: restored.name, app: component, extensions: [], installedFreeAccountApps: [])
+			try PropertyListSerialization.data(fromPropertyList: [
+				"CFBundleShortVersionString": "1.2", "CFBundleVersion": "7"
+			], format: .xml, options: 0).write(to: root.appendingPathComponent("Info.plist"))
+			let signer = Signer()
+			do {
+				_ = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+					provisioner: harness.provisioner, secrets: harness.secrets, signer: signer, installer: Installer(interrupted: true),
+					verifyTarget: {}, now: { harness.clock.now })
+				check(false, "interrupted installer must report its failure")
+			} catch let failure as ZagStagedSigningFailure where failure.phase == .installation && failure.underlying is Interruption {
+				check(true, "the production pipeline surfaces a simulated installation interruption")
+			}
+			guard let result = signer.result else { return check(false, "signing produced a provisioning result") }
+			request.reusableProfiles = [result.app.profile]
+			let newProvisioner = ZagFreeAccountProvisioner(portal: harness.portal, keys: ZagSimulatedSigningKeyFactory(),
+				secrets: harness.secrets, account: harness.account, now: { harness.clock.now })
+			let verification = try await ZagNativeSigningPipeline.run(request, authorization: authorization, app: root,
+				provisioner: newProvisioner, secrets: harness.secrets, signer: signer, installer: Installer(interrupted: false),
+				verifyTarget: {}, now: { harness.clock.now })
+			let calls = await harness.portal.calls
+			check(calls.filter { $0 == .registerDevice }.count == 1 && calls.filter { $0 == .registerAppID }.count == 1
+				  && calls.filter { $0 == .submitCertificateRequest }.count == 1 && calls.filter { $0 == .profile }.count == 1,
+				  "resumed pipeline reuses the device, App ID, certificate and valid profile")
+			check(verification == .verified(profileExpiresAt: result.app.profile.expiresAt,
+				certificateExpiresAt: harness.storedIdentity!.expiresAt),
+				  "resumed pipeline signs, installs and independently verifies the intended app")
+		} catch {
+			check(false, "native signing restart and installation: \(error)")
+		}
 	}
 
 	static func firstProvisioning() async {
@@ -217,6 +423,39 @@ extension Result where Failure == ZagProvisioningFailure {
 		let issued = await limit.portal.issuedCertificates.count
 		check(issued == 2, "no certificate is revoked automatically")
 
+		let conflict = await Harness.make()
+		await conflict.portal.seedCertificate(serial: "16EED9", expiresAt: conflict.clock.now + 100 * 86_400)
+		await conflict.portal.fail(.submitCertificateRequest, with: .certificateConflict)
+		let refused = await conflict.run(request())
+		guard case .certificateMustBeRevoked(let listed)? = refused.failure?.kind else {
+			return check(false, "Apple 7460 must surface as a certificate conflict")
+		}
+		let pending = try! conflict.secrets.load(.pendingSigningKey, account: conflict.account, team: team)
+			.map { try JSONDecoder().decode(ZagPendingSigningKey.self, from: $0) }
+		check(listed.map(\.serialNumber) == ["16EED9"] && pending?.submissionUnconfirmed == false,
+			  "Apple 7460 preserves the key and records explicit refusal")
+		conflict.clock.advance(ZagPendingSigningKey.lifetime + 1)
+		await conflict.portal.fail(.submitCertificateRequest, with: nil)
+		let resumed = await conflict.run(request())
+		let published = try! conflict.secrets.load(.signingPrivateKey, account: conflict.account, team: team)
+			.map { try JSONDecoder().decode(ZagSigningIdentity.self, from: $0) }
+		check(resumed.value?.changes.createdCertificate == true && published?.privateKey == pending?.privateKey,
+			  "signing resumes with the preserved key after Apple allows issuance")
+
+		let ambiguous = await Harness.make()
+		await ambiguous.portal.fail(.submitCertificateRequest, with: .network)
+		let lost = await ambiguous.run(request())
+		await ambiguous.portal.fail(.submitCertificateRequest, with: nil)
+		let retry = await ambiguous.run(request())
+		let calls = await ambiguous.portal.calls
+		check(lost.failure?.kind == .certificateRequestUnresolved && retry.failure?.kind == .certificateRequestUnresolved
+			  && calls.filter { $0 == .submitCertificateRequest }.count == 1,
+			  "an ambiguous CSR with no inventory match stays pending and does not resubmit")
+		let abandoned = await ambiguous.provisioner.abandonUnresolvedCertificateRequest(accountID: ambiguous.account, team: team)
+		let afterAbandon = await ambiguous.run(request())
+		check(abandoned == .abandoned && afterAbandon.value?.changes.createdCertificate == true,
+			  "explicit abandonment allows a fresh request and resumes provisioning")
+
 		let expiring = await Harness.make()
 		_ = await expiring.run(request())
 		expiring.clock.advance(360 * 86_400)
@@ -272,6 +511,52 @@ extension Result where Failure == ZagProvisioningFailure {
 		check(outcome.failure?.kind == .cancelled, "provisioning can be cancelled")
 		let step = await cancelled.provisioner.currentStep
 		check(step == nil, "the provisioner is idle after cancelling")
+	}
+
+	static func handoffCertificateReuse() async {
+		let h = await Harness.make()
+		_ = await h.run(request())
+		guard let issued = h.storedIdentity else {
+			check(false, "handoff test fixture has an Apple certificate")
+			return
+		}
+		do {
+			try h.secrets.delete(.signingPrivateKey, account: h.account, team: team)
+			let pending = ZagPendingSigningKey(request: Data([42]), privateKey: Data(), keySlot: "pending",
+				startedAt: h.clock.now, attempts: 1, certificate: nil, submissionUnconfirmed: false, preserveAfterConflict: true)
+			let journal = try JSONEncoder().encode(pending)
+			try h.secrets.save(journal, kind: .pendingSigningKey, account: h.account, team: team)
+			let other = UUID()
+			try h.secrets.save(Data([7]), kind: .signingPrivateKey, account: other, team: team)
+			var importedSlots: [String?] = []
+			func transfer() throws {
+				try ZagSigningIdentityHandoffImport.commit(certificate: issued.certificate, serial: issued.serialNumber,
+					expires: issued.expiresAt, scope: h.scope, store: h.secrets) { importedSlots.append($0) }
+			}
+			h.secrets.failSaves = true
+			do { try transfer(); check(false, "interrupted handoff must report storage failure") } catch {}
+			check(h.storedIdentity == nil, "interrupted handoff does not publish partial identity")
+			h.secrets.failSaves = false
+			try transfer()
+			try transfer()
+			check(importedSlots.count == 3 && Set(importedSlots).count == 1, "retry and duplicate use the same scoped key slot")
+			let otherValue = try h.secrets.load(.signingPrivateKey, account: other, team: team)
+			check(otherValue == Data([7]), "handoff does not modify another account")
+			let pendingValue = try h.secrets.load(.pendingSigningKey, account: h.account, team: team)
+			check(pendingValue == journal, "known 7460 refusal journal is preserved")
+			let refreshed = await h.run(request())
+			check(refreshed.value?.changes.createdCertificate == false && refreshed.value?.certificateSerial == issued.serialNumber,
+				"provisioning reuses the received certificate without submitting a new CSR")
+			do {
+				try ZagSigningIdentityHandoffImport.commit(certificate: Data([99]), serial: "other", expires: issued.expiresAt,
+					scope: h.scope, store: h.secrets) { _ in check(false, "conflicting handoff must not import a key") }
+				check(false, "conflicting handoff must be refused")
+			} catch ZagSigningIdentityHandoffImport.Failure.conflict {
+				check(true, "handoff cannot replace a different existing certificate")
+			}
+		} catch {
+			check(false, "handoff persistence test did not complete")
+		}
 	}
 
 	static func liveDisabled() async {

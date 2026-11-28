@@ -162,6 +162,21 @@ final class ZagLiveExperimentModel: ObservableObject {
 		}
 	}
 
+	/// Explicit, non-destructive owner arming (replaces the E5 delete-and-
+	/// reinstall ritual). The campaign runs its full preflight; on success the
+	/// state becomes `armed` and the native Apple Account sign-in is unlocked.
+	/// No app data, sources, certificates or Keychain entries are touched.
+	func arm() {
+		let result = campaign.arm()
+		durability = result
+		state = campaign.state
+		switch result {
+		case .armed: outcome = "Campaign armed. Sign in under Settings › Apple Account."
+		case .unconfigured: outcome = "This build has no armable campaign (constants are the placeholder)."
+		default: outcome = "Could not arm (\(result.rawValue)). Check that the device clock is inside the campaign window."
+		}
+	}
+
 
 
 	/// P3: the device's profiles must be readable before anything live.
@@ -316,40 +331,62 @@ struct ZagLiveExperimentView: View {
 					Text("State: \(model.state?.rawValue ?? "none") · Launch: \(model.durability?.rawValue ?? "…")").font(.caption)
 				}
 			} footer: {
-				Text("Arming (E5): open this screen once, delete Zag Store, reinstall the same build, and open it again. Only then does the state read armed.")
-			}
-
-			Section("Owner confirmations") {
-				ForEach(ZagLiveExperimentModel.confirmationsRequired, id: \.0) { item in
-					Toggle(isOn: Binding(
-						get: { model.confirmations.contains(item.0) },
-						set: { if $0 { model.confirmations.insert(item.0) } else { model.confirmations.remove(item.0) } }
-					)) {
-						Text("\(item.0): \(item.1)").font(.footnote)
-					}
+				if model.constants.isNative {
+					Text("Native on-device campaign. Arm it below (within the campaign window), then sign in under Settings › Apple Accounts & Signing. No reinstall and no data loss — installing over the existing app keeps all settings, sources, certificates and Keychain entries.")
+				} else {
+					Text("Arming (E5): open this screen once, delete Zag Store, reinstall the same build, and open it again. Only then does the state read armed.")
 				}
 			}
 
-			if let signIn = model.signIn {
-				ZagLiveExperimentSignInSection(signIn: signIn, enabled: model.canRun)
+			Section {
+				Button("Arm Campaign") { model.arm() }
+					.disabled(model.state == .armed || model.isBusy)
+				if model.state == .armed {
+					Text("Armed. Sign in under Settings › Apple Accounts & Signing.").font(.footnote).foregroundStyle(.green)
+				}
+				if let outcome = model.outcome { Text(outcome).font(.footnote) }
+			} header: {
+				Text("Arm")
+			} footer: {
+				Text("Explicit owner authorisation for this one campaign, in place of the delete-and-reinstall proof. It preserves all settings, sources, certificates, databases and Keychain entries, and it arms only within the campaign window.")
 			}
 
-			#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
-			ZagExistingAccountSection(model: model)
-			#endif
+			// The bridge install flow and its owner confirmations are obsolete for
+			// a native read-only authentication campaign: it signs and installs
+			// nothing, and its inventory is read on the Apple Account screen.
+			if !model.constants.isNative {
+				Section("Owner confirmations") {
+					ForEach(ZagLiveExperimentModel.confirmationsRequired, id: \.0) { item in
+						Toggle(isOn: Binding(
+							get: { model.confirmations.contains(item.0) },
+							set: { if $0 { model.confirmations.insert(item.0) } else { model.confirmations.remove(item.0) } }
+						)) {
+							Text("\(item.0): \(item.1)").font(.footnote)
+						}
+					}
+				}
 
-			Section {
-				Button("Read Installed Profiles (P3)") { Task { await model.readPreflight() } }
-					.disabled(model.isBusy)
-				if let preflight = model.preflight { Text("Read-back: \(preflight.rawValue)").font(.footnote) }
-				Button(model.testApp == nil ? "Choose Test App…" : "Test App: \(model.testApp!.lastPathComponent)") { choosingApp = true }
-				Button("Provision, Sign and Install") { Task { await model.run() } }
-					.disabled(!model.canRun || model.preflight != .verified || model.testApp == nil || model.signIn?.phase != .signedIn || !model.existingAccountReady)
-				if let outcome = model.outcome { Text(outcome).font(.footnote) }
-				Button("The test app opened") { model.confirmLaunch(true) }
-				Button("The test app did not open") { model.confirmLaunch(false) }
-			} header: {
-				Text("Run")
+				if let signIn = model.signIn {
+					ZagLiveExperimentSignInSection(signIn: signIn, enabled: model.canRun)
+				}
+
+				#if ZAG_EXISTING_ACCOUNT_EXPERIMENT
+				ZagExistingAccountSection(model: model)
+				#endif
+
+				Section {
+					Button("Read Installed Profiles (P3)") { Task { await model.readPreflight() } }
+						.disabled(model.isBusy)
+					if let preflight = model.preflight { Text("Read-back: \(preflight.rawValue)").font(.footnote) }
+					Button(model.testApp == nil ? "Choose Test App…" : "Test App: \(model.testApp!.lastPathComponent)") { choosingApp = true }
+					Button("Provision, Sign and Install") { Task { await model.run() } }
+						.disabled(!model.canRun || model.preflight != .verified || model.testApp == nil || model.signIn?.phase != .signedIn || !model.existingAccountReady)
+					if let outcome = model.outcome { Text(outcome).font(.footnote) }
+					Button("The test app opened") { model.confirmLaunch(true) }
+					Button("The test app did not open") { model.confirmLaunch(false) }
+				} header: {
+					Text("Run")
+				}
 			}
 
 			Section {

@@ -25,6 +25,7 @@ pub struct AnisetteData {
     device_unique_identifier: String,
     _local_user_id: String,
     generated_at: SystemTime,
+    local_headers: HashMap<String, String>,
 }
 
 /// Zag Store fork: the one-time password, machine and device identifiers
@@ -38,12 +39,50 @@ impl std::fmt::Debug for AnisetteData {
     }
 }
 
-// Some headers don't seem to be required. I guess not including them is technically more efficient soooo
 impl AnisetteData {
+    /// Adapts the clean-room apple-auth provider's local header snapshot.
+    /// Accept only anisette fields and keep the client identity in GrandSlam.
+    pub fn from_local_headers(headers: &HashMap<String, String>) -> Result<Self, Report> {
+        let required = |name: &str| {
+            let mut values = headers
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name));
+            let value = values
+                .next()
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty() && value.len() <= 4096)
+                .ok_or_else(|| report!("Missing local anisette header"))?;
+            if values.next().is_some() || reqwest::header::HeaderValue::from_str(value).is_err() {
+                bail!("Invalid local anisette header");
+            }
+            Ok::<_, Report>(value.clone())
+        };
+        let local_headers = [
+            "X-Apple-I-MD-RINFO",
+            "X-Apple-I-MD-LU",
+            "X-Apple-I-Client-Time",
+            "X-Apple-I-TimeZone",
+            "X-Apple-Locale",
+        ]
+        .into_iter()
+        .map(|name| Ok((name.to_string(), required(name)?)))
+        .collect::<Result<HashMap<_, _>, Report>>()?;
+        Ok(Self {
+            machine_id: required("X-Apple-I-MD-M")?,
+            one_time_password: required("X-Apple-I-MD")?,
+            routing_info: local_headers["X-Apple-I-MD-RINFO"].clone(),
+            _device_description: required("X-MMe-Client-Info")?,
+            device_unique_identifier: required("X-Mme-Device-Id")?,
+            _local_user_id: local_headers["X-Apple-I-MD-LU"].clone(),
+            generated_at: SystemTime::now(),
+            local_headers,
+        })
+    }
+
     pub fn get_headers(&self) -> HashMap<String, String> {
         //let dt: DateTime<Utc> = Utc::now().round_subsecs(0);
 
-        HashMap::from_iter([
+        let mut headers = HashMap::from_iter([
             // (
             //     "X-Apple-I-Client-Time".to_string(),
             //     dt.format("%+").to_string().replace("+00:00", "Z"),
@@ -63,7 +102,9 @@ impl AnisetteData {
             //     "X-Mme-Client-Info".to_string(),
             //     self.device_description.clone(),
             // ),
-        ])
+        ]);
+        headers.extend(self.local_headers.clone());
+        headers
     }
 
     pub fn get_header_map(&self) -> Result<HeaderMap, Report> {
@@ -174,7 +215,8 @@ impl AnisetteDataGenerator {
         let provider = self.provider.read().await;
         match provider.get_anisette_data().await? {
             AnisetteDataResponse::Data(data) => Ok(data),
-            AnisetteDataResponse::NeedsProvisioning | AnisetteDataResponse::IncorrectlyProvisioned => {
+            AnisetteDataResponse::NeedsProvisioning
+            | AnisetteDataResponse::IncorrectlyProvisioned => {
                 drop(provider);
                 let mut provider_write = self.provider.write().await;
                 // Zag Store fork: clones of this generator share the provider.
@@ -231,6 +273,37 @@ mod tests {
         incorrect_first: bool,
     }
 
+    #[test]
+    fn local_headers_are_validated_and_only_anisette_fields_are_forwarded() {
+        let mut headers: HashMap<String, String> = [
+            ("X-Apple-I-MD", "otp"),
+            ("X-Apple-I-MD-M", "machine"),
+            ("X-Mme-Device-Id", "device"),
+            ("X-MMe-Client-Info", "identity"),
+            ("X-Apple-I-MD-RINFO", "routing"),
+            ("X-Apple-I-MD-LU", "local-user"),
+            ("X-Apple-I-Client-Time", "time"),
+            ("X-Apple-I-TimeZone", "UTC"),
+            ("X-Apple-Locale", "en_US"),
+            ("Authorization", "unexpected"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let adapted = AnisetteData::from_local_headers(&headers)
+            .unwrap()
+            .get_headers();
+        assert_eq!(adapted["X-Apple-I-MD-RINFO"], "routing");
+        assert_eq!(adapted["X-Apple-I-MD-LU"], "local-user");
+        assert!(!adapted.contains_key("Authorization"));
+        assert!(!adapted.contains_key("X-MMe-Client-Info"));
+        headers.insert("x-apple-i-md".into(), "other".into());
+        assert!(AnisetteData::from_local_headers(&headers).is_err());
+        headers.remove("x-apple-i-md");
+        headers.remove("X-Apple-I-MD-M");
+        assert!(AnisetteData::from_local_headers(&headers).is_err());
+    }
+
     fn data() -> AnisetteData {
         AnisetteData {
             machine_id: "M".into(),
@@ -240,6 +313,7 @@ mod tests {
             device_unique_identifier: "D".into(),
             _local_user_id: String::new(),
             generated_at: SystemTime::now(),
+            local_headers: HashMap::new(),
         }
     }
 

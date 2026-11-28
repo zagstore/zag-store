@@ -517,6 +517,7 @@ impl RemoteV3AnisetteProvider {
                 _device_description: client_info.client_info.clone(),
                 device_unique_identifier: state.get_device_id(),
                 _local_user_id: hex::encode(state.get_md_lu()),
+                local_headers: Default::default(),
                 generated_at: SystemTime::now(),
             })),
             AnisetteHeaders::GetHeadersError { message } => {

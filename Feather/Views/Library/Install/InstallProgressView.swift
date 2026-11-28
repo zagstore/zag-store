@@ -12,7 +12,14 @@ struct InstallProgressView: View {
 	@State private var _isPulsing = false
 	
 	var app: AppInfoPresentable
-	@ObservedObject var viewModel: InstallerStatusViewModel
+	var progress: Double
+	var completed: Bool
+
+	init(app: AppInfoPresentable, progress: Double, completed: Bool) {
+		self.app = app
+		self.progress = progress
+		self.completed = completed
+	}
 	
 	var body: some View {
 		VStack(spacing: 12) {
@@ -38,12 +45,12 @@ struct InstallProgressView: View {
 				.mask(
 					ZStack {
 						Circle().strokeBorder(Color.white, lineWidth: 4.5)
-						PieShape(progress: viewModel.overallProgress)
-							.scaleEffect(viewModel.isCompleted ? 2.2 : 1)
-							.animation(.smooth, value: viewModel.isCompleted)
+						PieShape(progress: progress)
+							.scaleEffect(completed ? 2.2 : 1)
+							.animation(.smooth, value: completed)
 					}
 				)
-				.animation(.smooth, value: viewModel.overallProgress)
+				.animation(.smooth, value: progress)
 		}
 	}
 	

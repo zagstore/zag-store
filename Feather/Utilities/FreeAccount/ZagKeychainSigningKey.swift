@@ -73,6 +73,40 @@ struct ZagKeychainSigningKeys {
 		return (key, ZagCertificateRequest(data: request))
 	}
 
+	/// Imports an authenticated handoff into an isolated, non-extractable key
+	/// item. A deterministic slot lets an interrupted import resume safely.
+	func importHandoff(_ der: Data, certificate: Data, account: UUID, team: String, slot: String?) throws {
+		guard let imported = SecKeyCreateWithData(der as CFData, [
+			kSecAttrKeyType: kSecAttrKeyTypeRSA,
+			kSecAttrKeyClass: kSecAttrKeyClassPrivate,
+			kSecAttrKeySizeInBits: Self.keySizeInBits,
+		] as CFDictionary, nil),
+			  ZagKeychainSigningKeyFactory.verify(certificate: certificate, key: imported) != .mismatch
+		else { throw Failure.keyGeneration }
+		let tag = try tag(account: account, team: team, slot: slot)
+		if let existing = try key(tag: tag) {
+			guard ZagKeychainSigningKeyFactory.verify(certificate: certificate, key: existing) != .mismatch else {
+				throw Failure.exists
+			}
+			return
+		}
+		let result = SecItemAdd([
+			kSecClass: kSecClassKey,
+			kSecValueRef: imported,
+			kSecAttrApplicationTag: tag,
+			kSecAttrLabel: label(account: account),
+			kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+			kSecAttrSynchronizable: false,
+			kSecAttrIsExtractable: false,
+		] as CFDictionary, nil)
+		guard result == errSecSuccess else { throw Failure.keychain(result) }
+		guard let stored = try key(tag: tag),
+			  ZagKeychainSigningKeyFactory.verify(certificate: certificate, key: stored) != .mismatch else {
+			try? delete(account: account, team: team, slot: slot)
+			throw Failure.keyGeneration
+		}
+	}
+
 	/// A reference to the key; the key itself stays in the Keychain.
 	func key(account: UUID, team: String, slot: String? = nil) throws -> SecKey? {
 		try key(tag: try tag(account: account, team: team, slot: slot))
@@ -203,16 +237,15 @@ struct ZagKeychainSigningKeyFactory: ZagSigningKeyFactory {
 	/// The certificate is for the key item: a fresh challenge signed by the
 	/// key verifies with the certificate's public key.
 	func check(certificate: Data, privateKey: Data, account: UUID, team: String, keySlot: String?) -> ZagIssuedCertificateCheck {
-		check(certificate: certificate, privateKey: privateKey, key: try? keys.key(account: account, team: team, slot: keySlot))
+		guard privateKey.isEmpty, let key = try? keys.key(account: account, team: team, slot: keySlot) else { return .mismatch }
+		return Self.verify(certificate: certificate, key: key)
 	}
 
-	private func check(certificate: Data, privateKey: Data, key: SecKey?) -> ZagIssuedCertificateCheck {
+	static func verify(certificate: Data, key: SecKey) -> ZagIssuedCertificateCheck {
 		var challenge = Data(count: 32)
-		guard privateKey.isEmpty,
-			  let inspection = ZagCertificateInspection(der: certificate),
+		guard let inspection = ZagCertificateInspection(der: certificate),
 			  let parsed = SecCertificateCreateWithData(nil, certificate as CFData),
 			  let certificateKey = SecCertificateCopyKey(parsed),
-			  let key,
 			  challenge.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }) == errSecSuccess,
 			  let signature = SecKeyCreateSignature(key, .rsaSignatureMessagePKCS1v15SHA256, challenge as CFData, nil),
 			  SecKeyVerifySignature(certificateKey, .rsaSignatureMessagePKCS1v15SHA256, challenge as CFData, signature, nil) else {

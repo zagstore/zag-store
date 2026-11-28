@@ -193,9 +193,26 @@ final class ZagCertificateRecoveryModel: ObservableObject {
 		if phase == .confirmingAbandon { phase = .idle }
 	}
 
+	/// Claim the confirmation synchronously before SwiftUI dismisses the dialog.
+	func startAbandon() {
+		guard phase == .confirmingAbandon else { return }
+		phase = .abandoning
+		Task { await performAbandon() }
+	}
+
 	func confirmAbandon() async {
 		guard phase == .confirmingAbandon else { return }
 		phase = .abandoning
+		await performAbandon()
+	}
+
+	private func performAbandon() async {
+		guard let request, await service.unresolvedCertificateRequest(accountID: scope.accountID, team: scope.teamID) == request else {
+			outcome = nil
+			await load()
+			phase = .idle
+			return
+		}
 		outcome = await service.abandonUnresolvedCertificateRequest(accountID: scope.accountID, team: scope.teamID)
 		await load()
 		phase = .idle

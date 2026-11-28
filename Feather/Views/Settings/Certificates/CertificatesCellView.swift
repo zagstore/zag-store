@@ -30,88 +30,11 @@ struct CertificatesCellView: View {
         } ?? false
         let needsAttention = cert.revoked || !isCurrent || !hasP12 || expiringSoon
 
-        return VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .center, spacing: 12) {
-                Image(systemName: needsAttention ? "exclamationmark.shield.fill" : "checkmark.shield.fill")
-                    .font(.system(size: 24, weight: .medium))
-                    .foregroundStyle(
-                        needsAttention
-                            ? Color(uiColor: UIColor(displayP3Red: 0.96, green: 0.23, blue: 0.27, alpha: 1))
-                            : Color(uiColor: UIColor(displayP3Red: 0.12, green: 0.83, blue: 0.34, alpha: 1))
-                    )
-                    .frame(width: 46, height: 46)
-                    .background(
-                        needsAttention
-                            ? Color(uiColor: UIColor(displayP3Red: 0.30, green: 0.10, blue: 0.13, alpha: 1))
-                            : Color(uiColor: UIColor(displayP3Red: 0.08, green: 0.26, blue: 0.14, alpha: 1)),
-                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    )
-
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 5) {
-                        Text(title)
-                            .font(.system(size: 19, weight: .bold))
-                            .lineLimit(2)
-                            .multilineTextAlignment(.leading)
-
-                        Button {
-                            _copyCertificateName()
-                        } label: {
-                            Image(systemName: isCopyFeedbackActive ? "checkmark" : "doc.on.doc")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(isCopyFeedbackActive ? copyFeedbackColor : Color.secondary)
-                                .frame(width: 21, height: 21)
-                                .background(Color.primary.opacity(0.05), in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Copy Certificate Name")
-                        .accessibilityHint("Copies the original provisioning profile name")
-                    }
-
-                    Text(profile?.TeamName ?? profile?.AppIDName ?? "Unknown signing team")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 4)
-            }
-
-            HStack(spacing: 6) {
-                if needsAttention {
-                    Label(
-                        cert.revoked ? "Marked revoked" :
-                        !hasP12 ? "P12 missing" :
-                        profile == nil ? "Profile unavailable" :
-                        !isCurrent ? "Profile not current" : "Expiring soon",
-                        systemImage: "exclamationmark.circle"
-                    )
-                    .foregroundStyle(Color.orange)
-                }
-
-                Spacer(minLength: 4)
-
-                if let profileExpiry {
-                    HStack(spacing: 4) {
-                        Image(systemName: "calendar")
-                            .font(.system(size: 11, weight: .medium))
-                        Text(profileExpiry.formatted(.dateTime.day().month(.abbreviated).year()))
-                    }
-                    .foregroundStyle(.secondary)
-                }
-            }
-            .font(.system(size: 12, weight: .medium))
-            .lineLimit(1)
-            .minimumScaleFactor(0.75)
-            .padding(.top, 1)
-
-            if cert.ppQCheck {
-                Label("PPQ Check", systemImage: "shield.lefthalf.filled")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        return ZagCertificateCard(title: title, team: profile?.TeamName ?? profile?.AppIDName ?? "Unknown signing team",
+            expiry: profileExpiry, needsAttention: needsAttention,
+            status: cert.revoked ? "Marked revoked" : !hasP12 ? "P12 missing" : profile == nil ? "Profile unavailable" : !isCurrent ? "Profile not current" : "Expiring soon",
+            ppq: cert.ppQCheck, isCopyFeedbackActive: isCopyFeedbackActive, copyFeedbackColor: copyFeedbackColor,
+            copyName: _copyCertificateName)
         .onAppear {
             guard let uuid = cert.uuid else { return }
             let directory = FileManager.default.certificates(uuid)
@@ -218,5 +141,109 @@ extension CertificatesCellView {
 		}
 
 		return pills
+	}
+}
+
+
+/// A certificate library card for either a file-backed or Keychain identity.
+struct ZagCertificateCard: View {
+	let title: String
+	let team: String
+	let expiry: Date?
+	let needsAttention: Bool
+	let status: String?
+	var serial: String? = nil
+	var detail: String? = nil
+	var ppq = false
+	var isCopyFeedbackActive = false
+	var copyFeedbackColor: Color = .green
+	let copyName: () -> Void
+
+	var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: needsAttention ? "exclamationmark.shield.fill" : "checkmark.shield.fill")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(
+                        needsAttention
+                            ? Color(uiColor: UIColor(displayP3Red: 0.96, green: 0.23, blue: 0.27, alpha: 1))
+                            : Color(uiColor: UIColor(displayP3Red: 0.12, green: 0.83, blue: 0.34, alpha: 1))
+                    )
+                    .frame(width: 46, height: 46)
+                    .background(
+                        needsAttention
+                            ? Color(uiColor: UIColor(displayP3Red: 0.30, green: 0.10, blue: 0.13, alpha: 1))
+                            : Color(uiColor: UIColor(displayP3Red: 0.08, green: 0.26, blue: 0.14, alpha: 1)),
+                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    )
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 5) {
+                        Text(title)
+                            .font(.system(size: 19, weight: .bold))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+
+                        Button {
+                            copyName()
+                        } label: {
+                            Image(systemName: isCopyFeedbackActive ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(isCopyFeedbackActive ? copyFeedbackColor : Color.secondary)
+                                .frame(width: 21, height: 21)
+                                .background(Color.primary.opacity(0.05), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Copy Certificate Name")
+                        .accessibilityHint("Copies the original provisioning profile name")
+                    }
+
+                    Text(team)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+            }
+
+            HStack(spacing: 6) {
+                if needsAttention {
+                    Label(
+                        status ?? "Needs Attention",
+                        systemImage: "exclamationmark.circle"
+                    )
+                    .foregroundStyle(Color.orange)
+                }
+
+                Spacer(minLength: 4)
+
+                if let expiry {
+                    HStack(spacing: 4) {
+                        Image(systemName: "calendar")
+                            .font(.system(size: 11, weight: .medium))
+                        Text(expiry.formatted(.dateTime.day().month(.abbreviated).year()))
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .font(.system(size: 12, weight: .medium))
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .padding(.top, 1)
+
+            if let serial {
+                Text("SN: \(serial)").font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if let detail {
+                Text(detail).font(.caption2).foregroundStyle(.secondary)
+            }
+            if ppq {
+                Label("PPQ Check", systemImage: "shield.lefthalf.filled")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
 	}
 }

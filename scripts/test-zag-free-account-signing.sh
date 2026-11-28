@@ -12,11 +12,11 @@ trap 'rm -rf "$WORK"' EXIT
 SSL="${ZAG_OPENSSL_PREFIX:-$(brew --prefix openssl@3 2>/dev/null || true)}"
 [ -x "$SSL/bin/openssl" ] || { echo "FAIL: Homebrew openssl@3 is required (set ZAG_OPENSSL_PREFIX)" >&2; exit 1; }
 
-# The existing signing and installation paths are not part of this change.
+# Keep the existing AppTesters signing handlers and reviewed Zsign dependency.
 BASE=$(git -C "$ROOT" merge-base HEAD "${ZAG_BASE_REF:-public/main}")
 # The signing handlers (the AppTesters path) never change here. The Zsign
 # pointer may move only to the reviewed, device-tested commit of Zsign-Zag #1,
-# and RPPairingCore may differ only by PR #25, exactly as reviewed.
+# and RPPairing retains the reviewed dependency pins.
 ZSIGN_REVIEWED=f34e51a06e803b4aeb2df2c5763c5f1ddfe46cb1
 RPPAIRING_REVIEWED=25cdc49a
 git -C "$ROOT" diff --quiet "$BASE" -- Feather/Utilities/Handlers \
@@ -24,9 +24,9 @@ git -C "$ROOT" diff --quiet "$BASE" -- Feather/Utilities/Handlers \
 ZSIGN_NOW=$(git -C "$ROOT" ls-tree HEAD Zsign | awk '{print $3}')
 git -C "$ROOT" diff --quiet "$BASE" -- Zsign || [ "$ZSIGN_NOW" = "$ZSIGN_REVIEWED" ] \
 	|| { echo "FAIL: the Zsign pointer differs from the base branch and is not the reviewed commit" >&2; exit 1; }
-git -C "$ROOT" diff --quiet "$BASE" -- RPPairingCore || git -C "$ROOT" diff --quiet "$RPPAIRING_REVIEWED" HEAD -- RPPairingCore \
-	|| { echo "FAIL: RPPairingCore differs from both the base branch and the reviewed PR #25" >&2; exit 1; }
-echo "PASS: Zsign, RPPairing and the AppTesters signing handlers are unchanged from the base branch"
+git -C "$ROOT" diff --quiet "$RPPAIRING_REVIEWED" HEAD -- RPPairingCore/rust-core/Cargo.toml RPPairingCore/rust-core/Cargo.lock \
+	|| { echo "FAIL: the RPPairing dependency pins differ from the reviewed build" >&2; exit 1; }
+echo "PASS: AppTesters handlers, Zsign provenance and RPPairing dependency pins are preserved"
 
 python3 - "$ROOT" <<'PY2'
 import re, sys
@@ -36,6 +36,9 @@ key = (root / "ZagSigningKey.swift").read_text()
 adapter = (root / "ZagFreeAccountSigningAdapter.swift").read_text()
 portal = (root / "ZagDeveloperPortal.swift").read_text()
 provisioner = (root / "ZagFreeAccountProvisioner.swift").read_text()
+# ZagSigningIdentity (and its key-free description) live in ZagSigningModels.swift
+# since the ZagDeveloperPortal split (03293945); assert them at their real home.
+models = (root / "ZagSigningModels.swift").read_text()
 for name, text in [("key", key), ("adapter", adapter), ("provisioner", provisioner)]:
     for forbidden in ["print(", "Logger", "NSLog", "os_log", "debugPrint", "dump("]:
         assert forbidden not in text, (name, forbidden)
@@ -43,7 +46,7 @@ assert "kSecAttrIsPermanent: false" in key and "SecItemAdd" not in key
 print("PASS: the key factory keeps keys out of the Keychain itself and nothing near key material logs")
 assert not re.search(r"func\s+\w*[Rr]evoke", portal + provisioner)
 print("PASS: the portal interface has no revoke operation, so nothing can revoke a certificate automatically")
-assert "ZagSigningIdentity" in portal and '"[signing identity \\(serialNumber)]"' in portal
+assert "struct ZagSigningIdentity" in models and '"[signing identity \\(serialNumber)]"' in models
 print("PASS: a signing identity describes itself without its key")
 keychain_key = (root / "ZagKeychainSigningKey.swift").read_text()
 for forbidden in ["print(", "Logger", "NSLog", "os_log", "debugPrint", "dump(", "SecKeyCopyExternalRepresentation", "SecItemCopyMatching(query", "kSecReturnData"]:

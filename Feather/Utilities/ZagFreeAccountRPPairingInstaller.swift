@@ -12,14 +12,21 @@ import Zip
 /// signed app before installation can be reported as verified.
 /// The G5 experiment also records its separate four-way read-back result.
 struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
-	enum Failure: Error, Equatable {
+	enum Failure: LocalizedError, Equatable {
 		case disabled
 		case packaging
-		case install(String)
+
+		var errorDescription: String? {
+			switch self {
+			case .disabled: "Apple Account installation is unavailable in this build."
+			case .packaging: "Zag Store could not package the signed app for installation."
+			}
+		}
 	}
 
 	var gate = ZagFreeAccountSigningGate.production
 	var workRoot = FileManager.default.temporaryDirectory
+	var beforeHandoff: @MainActor @Sendable () throws -> Void = {}
 	/// The paired device's profiles are read through misagent by default.
 	/// Tests can replace the callback; nil intentionally disables read-back.
 	var installedProfiles: (@Sendable () async -> Result<[Data], Error>)? = {
@@ -49,15 +56,21 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 	private func installThroughRPPairing(_ signedApp: URL) async throws {
 		let staging = workRoot.appendingPathComponent("zag-free-account-install-\(UUID().uuidString)", isDirectory: true)
 		defer { try? FileManager.default.removeItem(at: staging) }
+		let packageStart = ContinuousClock.now
 		let ipa = try Self.package(signedApp, in: staging)
+		ZagSigningDiagnostics.elapsed("Rebuild IPA", since: packageStart)
+		let installStart = ContinuousClock.now
+		defer { ZagSigningDiagnostics.elapsed("Transfer IPA and reinstall", since: installStart) }
 		try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
 			Task { @MainActor in
 				do {
+					do { try beforeHandoff() }
+					catch { continuation.resume(throwing: error); return }
 					try ZagRPPairingCore.shared.installGate4IPA(at: ipa) { result in
-						continuation.resume(with: result.mapError { Failure.install($0.localizedDescription) })
+						continuation.resume(with: result)
 					}
 				} catch {
-					continuation.resume(throwing: Failure.install(error.localizedDescription))
+					continuation.resume(throwing: error)
 				}
 			}
 		}
@@ -68,7 +81,7 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 		let listed: Result<ZagRPPairingCore.InstalledAppInfo?, Error> = await withCheckedContinuation { continuation in
 			Task { @MainActor in
 				do {
-					try ZagRPPairingCore.shared.refreshInstalledApps { result in
+					try ZagRPPairingCore.shared.refreshInstalledApps(joinExisting: true) { result in
 						continuation.resume(returning: result.map { _ in ZagRPPairingCore.shared.installedApps[expectation.bundleIdentifier] })
 					}
 				} catch {
@@ -82,6 +95,8 @@ struct ZagRPPairingFreeAccountInstaller: ZagFreeAccountInstaller {
 		case .success(nil):
 			return .notInstalled
 		case .success(let app?):
+			if let version = expectation.version, !app.version.isEmpty, app.version != version { return .mismatch("installed version") }
+			if let build = expectation.build, !app.build.isEmpty, app.build != build { return .mismatch("installed build") }
 			if let expected = expectation.signerCommonName, !app.signerIdentity.isEmpty, app.signerIdentity != expected {
 				return .mismatch("signer")
 			}

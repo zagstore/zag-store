@@ -46,6 +46,14 @@ extension ZagDeviceLinkTests {
 		expect(response(at: .installing) == .notPossible && response(at: .restoringMobileData) == .notPossible, "cancel: not possible once RPPairing installation begins")
 		expect(ZagInstallJobs().requestCancel("none") == .noJob, "cancel: no job, nothing to cancel")
 
+		let native = ZagInstallJobs()
+		native.begin("native", stage: .signing)
+		native.setNativeProgress("native", caption: "Signing", fraction: 0.4)
+		try? native.beginInstalling("native")
+		native.setNativeProgress("native", caption: "Installing", fraction: 0.3)
+		expect(native.job("native")?.progress == 0.4, "native progress stays monotonic across the install boundary")
+		expect(native.requestCancel("native") == .notPossible, "native installation cannot be cancelled after handoff")
+
 		let signOnly = ZagInstallJobs()
 		signOnly.begin("s", stage: .signing, offersCancel: false)
 		expect(signOnly.requestCancel("s") == .notPossible, "cancel: sign-only jobs do not offer cancel")

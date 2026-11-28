@@ -120,7 +120,7 @@ struct ZagASCSigningCoordinator: Sendable {
 			var unverified = record
 			unverified.expiryVerified = false
 			return .installedUnverified(unverified)
-		case .mismatch, .notInstalled:
+		case .mismatch, .notInstalled, .signedOnly:
 			return .failed(.notVerified)
 		}
 	}

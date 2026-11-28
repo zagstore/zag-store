@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Free Personal Team (V54K5JYGS4) development entitlements for the
+	     read-only certificate-inventory experiment app, bundle id
+	     dev.zagstore.rocertinv. Minimal on purpose: a free team grants only these.
+	     The native stores set no explicit kSecAttrAccessGroup, so the fresh
+	     read-only session, and any native item this app creates, live in this
+	     app's DEFAULT keychain group (= the application-identifier below) and are
+	     isolated from com.cwd43.gu29 and dev.zagstore.ptteamprobe. -->
+	<key>application-identifier</key>
+	<string>V54K5JYGS4.dev.zagstore.rocertinv</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>V54K5JYGS4</string>
+	<key>get-task-allow</key>
+	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>V54K5JYGS4.dev.zagstore.rocertinv</string>
+	</array>
+</dict>
+</plist>

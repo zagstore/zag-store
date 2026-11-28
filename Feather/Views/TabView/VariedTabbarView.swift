@@ -685,7 +685,7 @@ struct ZagAccountPopup: View {
                     }
                 }
                 .toolbar {
-                    if destination != .settings {
+                    if destination != .settings && destination != .certificates {
                         ToolbarItem(placement: .topBarTrailing) {
                             Button(action: onClose) {
                                 Image(systemName: "xmark")

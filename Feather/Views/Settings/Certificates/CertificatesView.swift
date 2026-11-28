@@ -10,8 +10,10 @@ import NimbleViews
 
 // MARK: - View
 struct CertificatesView: View {
+    @Environment(\.dismiss) private var dismiss
     @Environment(\.zagAccountClose) private var closeAccount
     @Environment(\.zagInsideAccountPopup) private var insideAccountPopup
+	@AppStorage(ZagSigningPreference.key) private var _signingPreference = ZagCertificateSelection.preference
 	@AppStorage("feather.selectedCert") private var _storedSelectedCert: Int = 0
     @AppStorage("Feather.userTintColor") private var _themeColorHex = "#0090FF"
     private var _themeTint: Color { Color(hex: _themeColorHex) }
@@ -26,6 +28,26 @@ struct CertificatesView: View {
     @State private var _searchText = ""
     @State private var _filter: LibraryFilter = .all
     @State private var _dictationAvailable = false
+
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	@State private var _nativeCertificates: [ZagNativeAccountInstall.LocalCertificate] = []
+	private var _visibleNative: [ZagNativeAccountInstall.LocalCertificate] {
+		let query = _searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+		return _nativeCertificates.filter { cert in
+			let attention = !cert.hasPrivateKey || cert.expires <= Date().addingTimeInterval(30 * 86_400)
+			return (query.isEmpty || [cert.title, cert.serial, cert.scope.teamID].contains { $0.localizedCaseInsensitiveContains(query) })
+				&& (_filter == .all || (_filter == .attention ? attention : !attention))
+		}
+	}
+	#endif
+
+	private var _hasNativeCertificates: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return _bindingSelectedCert == nil && !_nativeCertificates.isEmpty
+		#else
+		return false
+		#endif
+	}
 
     private enum LibraryFilter: String, CaseIterable {
         case all = "All"
@@ -60,6 +82,52 @@ struct CertificatesView: View {
                                || (_filter == .ready && !needsAttention))
         }
     }
+    @ViewBuilder
+    private var _nativeCertificateSection: some View {
+        #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+        if _hasNativeCertificates {
+            Section {
+                HStack(spacing: 8) {
+                    Text("Apple ID Certificates")
+                    _certificateCountBadge(_nativeCertificates.count)
+                }
+                .modifier(ZagCertificateSectionTitleRow())
+                if _certificates.isEmpty {
+                    _libraryControls.listRowInsets(EdgeInsets(top: 4, leading: 20, bottom: 6, trailing: 20))
+                        .listRowSeparator(.hidden).listRowBackground(Color.clear)
+                }
+                if _visibleNative.isEmpty {
+                    Text("No certificates match your search or filter.").foregroundStyle(.secondary)
+                }
+                ForEach(_visibleNative) { certificate in _nativeCard(certificate) }
+                Text("App provisioning profile expiry appears on the Apps page.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        #endif
+    }
+
+    #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+    private func _nativeCard(_ cert: ZagNativeAccountInstall.LocalCertificate) -> some View {
+        let active = _signingPreference == .appleAccount && cert.hasPrivateKey && cert.expires > Date()
+            && (try? ZagNativeAppleIDs.shared.catalog().activeID) == cert.scope.accountID
+            && ZagNativeAccountInstall.hasConnectedAccount(cert.scope.accountID)
+        let keyStatus = cert.hasPrivateKey ? "Private key available" : "Private key unavailable"
+        let detail = [active ? "Active Apple ID" : nil, keyStatus, "Certificate expiry"]
+            .compactMap { $0 }.joined(separator: " · ")
+        let accountLabel = (try? ZagNativeAppleIDs.shared.catalog().accounts.first(where: { $0.id == cert.scope.accountID })?.label) ?? "Apple ID"
+        return ZagCertificateCard(title: accountLabel, team: "Apple Development · Personal Team · " + cert.scope.teamID,
+            expiry: cert.expires, needsAttention: !cert.hasPrivateKey || cert.expires <= Date().addingTimeInterval(30 * 86_400),
+            status: !cert.hasPrivateKey ? keyStatus : cert.expires <= Date() ? "Certificate expired" : "Expiring soon",
+            serial: cert.serial, detail: detail, copyName: { UIPasteboard.general.string = cert.title })
+            .padding()
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: _cardRadius))
+            .overlay(RoundedRectangle(cornerRadius: _cardRadius)
+                .strokeBorder(active ? _themeTint.opacity(0.55) : Color.primary.opacity(0.06), lineWidth: 1))
+            .listRowInsets(EdgeInsets(top: 4, leading: 20, bottom: 4, trailing: 20))
+            .listRowSeparator(.hidden).listRowBackground(Color.clear)
+    }
+    #endif
 
 	// MARK: Fetch
 	@FetchRequest(
@@ -74,12 +142,15 @@ struct CertificatesView: View {
 		_bindingSelectedCert ?? $_storedSelectedCert
 	}
 	
-	init(selectedCert: Binding<Int>? = nil) {
+	private let openedFromSettings: Bool
+
+	init(selectedCert: Binding<Int>? = nil, openedFromSettings: Bool = false) {
 		self._bindingSelectedCert = selectedCert
+		self.openedFromSettings = openedFromSettings
 	}
 	
 	// MARK: Body
-    var body: some View {
+    private var _certificateList: some View {
         List {
             if !_certificates.isEmpty {
                 Section {
@@ -91,7 +162,7 @@ struct CertificatesView: View {
                 }
             }
 
-            if let active = _activeCertificate {
+            if (_bindingSelectedCert != nil || _signingPreference == .importedCertificate), let active = _activeCertificate {
                 Section {
                     _nonStickyTitle("Active Certificate")
                     _activeCertificateCard(active)
@@ -104,11 +175,11 @@ struct CertificatesView: View {
             if !_certificates.isEmpty {
                 Section {
                     HStack(spacing: 8) {
-                        Text("Certificates")
+                        Text("Imported Certificates")
                         _certificateCountBadge(_certificates.count)
                     }
                     .modifier(ZagCertificateSectionTitleRow())
-                    if _certificates.count > 1 || _filter != .all {
+                    if _certificates.count > 1 || _filter != .all || _hasNativeCertificates {
                         _libraryControls
                             .listRowInsets(EdgeInsets(top: 4, leading: 20, bottom: 6, trailing: 20))
                             .listRowSeparator(.hidden)
@@ -129,6 +200,8 @@ struct CertificatesView: View {
                     }
                 }
             }
+
+            _nativeCertificateSection
 
             if !_certificates.isEmpty {
                 Section {
@@ -154,6 +227,10 @@ struct CertificatesView: View {
                 }
             }
         }
+    }
+
+    var body: some View {
+        _certificateList
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .modifier(ZagCertificatesTopInset())
@@ -169,7 +246,7 @@ struct CertificatesView: View {
         }
 		.navigationTitle(.localized("Certificates"))
 		.overlay {
-			if _certificates.isEmpty {
+			if _certificates.isEmpty && !_hasNativeCertificates {
 				if #available(iOS 17, *) {
 					ContentUnavailableView {
 						Label(.localized("No Certificates"), systemImage: "questionmark.folder.fill")
@@ -186,13 +263,12 @@ struct CertificatesView: View {
 			}
 		}
 		.toolbar {
+            if openedFromSettings, !insideAccountPopup {
+                ToolbarItem(placement: .principal) { ZagLocalVPNToolbarStatus() }
+            }
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if insideAccountPopup, let closeAccount {
-                    Button(action: closeAccount) {
-                        Image(systemName: "xmark")
-                    }
-                    .tint(.primary)
-                    .accessibilityLabel("Close")
+                if openedFromSettings, !insideAccountPopup {
+                    ZagProfileToolbarButton().tint(.primary)
                 }
                 if _bindingSelectedCert == nil {
                     Button {
@@ -202,9 +278,25 @@ struct CertificatesView: View {
                     }
                     .accessibilityLabel("Import Certificate")
                 }
+                if insideAccountPopup || openedFromSettings {
+                    Button {
+                        if insideAccountPopup, let closeAccount {
+                            closeAccount()
+                        } else {
+                            dismiss()
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .tint(.primary)
+                    .accessibilityLabel("Close")
+                }
             }
 		}
         .task {
+            #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+            _nativeCertificates = ZagNativeAccountInstall.localCertificates()
+            #endif
             _probeSystemDictation()
             await ZagCertificateExpiryNotifications.refresh()
         }
@@ -490,16 +582,15 @@ extension CertificatesView {
 
 // MARK: - View extension
 extension CertificatesView {
+	private var _cardRadius: CGFloat {
+		if #available(iOS 26.0, *) { return 22 }
+		return 16
+	}
+
 	@ViewBuilder
 	private func _cellButton(for cert: CertificatePair, at index: Int) -> some View {
-		let cornerRadius = {
-			if #available(iOS 26.0, *) {
-				22.0
-			} else {
-				16.0
-			}
-		}()
-		
+		let cornerRadius = _cardRadius
+
 		Button {
 			_selectedCertBinding.wrappedValue = index
 		} label: {
@@ -514,7 +605,7 @@ extension CertificatesView {
 			.overlay(
 				RoundedRectangle(cornerRadius: cornerRadius)
 					.strokeBorder(
-						_selectedCertBinding.wrappedValue == index ? _themeTint.opacity(0.55) : Color.primary.opacity(0.06),
+						(_bindingSelectedCert != nil || _signingPreference == .importedCertificate) && _selectedCertBinding.wrappedValue == index ? _themeTint.opacity(0.55) : Color.primary.opacity(0.06),
 						lineWidth: 1
 					)
 			)

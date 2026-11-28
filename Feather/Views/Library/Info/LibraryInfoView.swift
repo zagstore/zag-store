@@ -14,6 +14,7 @@ import NukeUI
 // MARK: - View
 struct LibraryInfoView: View {
 	var app: AppInfoPresentable
+	@ObservedObject private var runningInstallation = ZagRunningInstallation.shared
 	@ObservedObject private var sourcesViewModel = SourcesViewModel.shared
 	@State private var selectedRepositorySource: AltSource?
 	@State private var promotionalHeaderImage: UIImage?
@@ -51,21 +52,34 @@ struct LibraryInfoView: View {
 								.padding(.horizontal, 6)
 								.accessibilityLabel("Verified app screenshot")
 						}
-						FRAppIconView(app: app)
+						FRAppIconView(app: app is ZagRunningApp ? nil : app)
 							.frame(maxWidth: .infinity, alignment: .center)
 					}
 					.frame(maxWidth: .infinity)
 				}
-				
-				_infoSection(for: app)
-				_repositorySection
-				_certSection(for: app)
-				_bundleSection(for: app)
-				_executableSection(for: app)
-				
-				Section {
-					Button(.localized("Open in Files"), systemImage: "folder") {
-						UIApplication.open(Storage.shared.getUuidDirectory(for: app)!.toSharedDocumentsURL()!)
+
+				if let running = app as? ZagRunningApp {
+					Section("Installation") {
+						LabeledContent("Version", value: running.version ?? "Unknown")
+						LabeledContent("Build", value: running.build ?? "Unknown")
+						LabeledContent("Bundle Identifier", value: running.identifier ?? "Unknown")
+						LabeledContent("Signing Method", value: runningInstallation.method.rawValue)
+						LabeledContent("Verified expiration", value: runningInstallation.expiry?.formatted() ?? "Unknown")
+						if let recovery = runningInstallation.recovery {
+							Text(recovery).font(.footnote).foregroundStyle(.secondary)
+						}
+					}
+				} else {
+					_infoSection(for: app)
+					_repositorySection
+					_certSection(for: app)
+					_bundleSection(for: app)
+					_executableSection(for: app)
+
+					Section {
+						Button(.localized("Open in Files"), systemImage: "folder") {
+							UIApplication.open(Storage.shared.getUuidDirectory(for: app)!.toSharedDocumentsURL()!)
+						}
 					}
 				}
 			}
@@ -181,6 +195,17 @@ extension LibraryInfoView {
 
 	@ViewBuilder
 	private func _certSection(for app: AppInfoPresentable) -> some View {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let entry = ZagNativeAppInventory.entry(app), let scope = entry.installation.record.owner?.scope {
+			let account = (try? ZagNativeAppleIDs.shared.catalog().accounts)?.first { $0.id == scope.accountID }
+			NBSection("Signing Identity") {
+				LabeledContent("Apple ID", value: account?.label ?? "Account unavailable")
+				LabeledContent("Team", value: scope.teamID)
+			}
+		} else if app.isSigned, Storage.shared.getCertificate(from: app) == nil {
+			NBSection("Signing Identity") { Text("Signing identity unavailable").foregroundStyle(.secondary) }
+		}
+		#endif
 		if let cert = Storage.shared.getCertificate(from: app) {
 			NBSection(.localized("Certificate")) {
 				CertificatesCellView(

@@ -1,0 +1,21 @@
+[package]
+name = "zag-usb"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = []
+# Developer-only build: introduces native Installation Proxy writes; never
+# enable in public, packaged, or unattended Zag Installer builds.
+native-install-dev = []
+
+[dependencies]
+idevice = { path = "../../../IDeviceKitten/idevice", default-features = false, features = ["aws-lc", "usbmuxd", "installation_proxy", "amfi", "afc", "house_arrest"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "fs", "io-util"] }
+serde_json = "1"
+
+sha2 = "0.10"
+plist = "1.8"
+serde = { version = "1", features = ["derive"] }

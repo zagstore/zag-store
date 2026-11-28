@@ -1,0 +1,367 @@
+#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+import CoreData
+import Combine
+import Foundation
+import UIKit
+import Zip
+
+/// Metadata and an unmodified renewal IPA for apps signed with a Personal Team.
+/// The library row uses the existing Signed store. Files live outside Documents.
+@MainActor
+enum ZagNativeAppInventory {
+	static let changes = PassthroughSubject<String, Never>()
+	struct Entry: Codable, Sendable {
+		let uuid: String
+		let name: String
+		let version: String?
+		var installation: ZagNativeInstalledProfiles
+		var signingMethod: ZagSigningMethod = .freeAppleAccount
+		var pendingInstall: ZagInstallExpectation? = nil
+		var signedIPADigest: String? = nil
+		var artifactDeviceUDID: String? = nil
+	}
+
+	enum Failure: LocalizedError {
+		case missingSource, wrongAccount, unverified, staleArtifact, missingArtifact
+
+		var errorDescription: String? {
+			switch self {
+			case .missingSource: "Import the original IPA, then choose it from the Resign screen. The installed app and its data can stay on this iPhone."
+			case .staleArtifact: "The signed IPA expired or was replaced. Sign the app again before exporting."
+			case .missingArtifact: "The verified signed IPA is unavailable. Sign the app again with Install After Signing off."
+			case .wrongAccount: "Connect the Apple Account that originally signed this app."
+			case .unverified: "The new installation could not be verified. The saved expiration has not changed."
+			}
+		}
+	}
+
+	nonisolated private static var root: URL {
+		URL.applicationSupportDirectory.appendingPathComponent("ZagStore/NativeApps", isDirectory: true)
+	}
+
+	nonisolated private static func folder(_ id: String) -> URL {
+		root.appendingPathComponent(id, isDirectory: true)
+	}
+
+	static func entry(_ app: AppInfoPresentable) -> Entry? {
+		guard app.isSigned, let id = app.uuid, UUID(uuidString: id) != nil else { return nil }
+		return entry(id)
+	}
+
+	private static func entry(_ id: String) -> Entry? {
+		guard let data = try? Data(contentsOf: folder(id).appendingPathComponent("installation.json")),
+			  let entry = try? JSONDecoder().decode(Entry.self, from: data), entry.uuid == id,
+			  entry.signingMethod == .freeAppleAccount else { return nil }
+		return entry
+	}
+
+	static func entry(bundleIdentifier: String) -> Entry? {
+		let request = Signed.fetchRequest()
+		request.predicate = NSPredicate(format: "identifier == %@", bundleIdentifier)
+		let entries = (try? Storage.shared.context.fetch(request))?.compactMap { Self.entry($0) } ?? []
+		return entries.first(where: { $0.pendingInstall == nil }) ?? entries.first
+	}
+
+	static func pendingEntry(bundleIdentifier: String) -> Entry? {
+		let request = Signed.fetchRequest()
+		request.predicate = NSPredicate(format: "identifier == %@", bundleIdentifier)
+		return (try? Storage.shared.context.fetch(request))?.lazy.compactMap { Self.entry($0) }
+			.first { $0.pendingInstall != nil }
+	}
+
+	static func entry(originalIdentifier: String, pending: Bool = false) -> Entry? {
+		guard let rows = try? Storage.shared.context.fetch(Signed.fetchRequest()) else { return nil }
+		let matches = rows.compactMap { Self.entry($0) }.filter {
+			($0.pendingInstall != nil) == pending && $0.installation.record.originalBundleIdentifier == originalIdentifier
+
+		}
+		return matches.count == 1 ? matches.first : nil
+	}
+
+	static func verifiedInstalledEntries() -> [Entry] {
+		let data = UserDefaults.standard.data(forKey: "zagStore.managedInstalledBundleIDs") ?? Data()
+		let installed = (try? JSONDecoder().decode(Set<String>.self, from: data)) ?? []
+		let rows = (try? Storage.shared.context.fetch(Signed.fetchRequest())) ?? []
+		var seen: Set<String> = []
+		return rows.compactMap { row in
+			guard let value = entry(row), value.pendingInstall == nil,
+				  value.installation.record.expiryVerified == true,
+				  value.installation.record.owner != nil else { return nil }
+			let id = value.installation.record.bundleIdentifier
+			let isSelf = id == Bundle.main.bundleIdentifier
+			if isSelf, value.uuid != ZagRunningInstallation.shared.nativeUUID { return nil }
+			guard id == row.identifier, installed.contains(id) || isSelf,
+				  seen.insert(id).inserted else { return nil }
+			return value
+		}
+	}
+
+	static func recordAutomaticFailure(_ original: Entry, reason: ZagRefreshFailureReason) {
+		guard var current = entry(original.uuid), current.pendingInstall == nil,
+			  current.installation == original.installation else { return }
+		let now = Date()
+		current.installation.record.consecutiveFailures += 1
+		current.installation.record.lastFailure = .init(at: now, reason: reason)
+		try? JSONEncoder().encode(current).write(to: folder(current.uuid).appendingPathComponent("installation.json"),
+			options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+	}
+
+	static func resolveAuthenticationFailure(account: UUID) {
+		for var entry in verifiedInstalledEntries() where entry.installation.record.owner?.scope.accountID == account
+			&& entry.installation.record.lastFailure?.reason == .signedOut {
+			entry.installation.record.lastFailure = nil
+			entry.installation.record.consecutiveFailures = 0
+			try? JSONEncoder().encode(entry).write(to: folder(entry.uuid).appendingPathComponent("installation.json"),
+				options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		}
+	}
+
+	static func iconURL(_ app: AppInfoPresentable) -> URL? {
+		guard app.isSigned, let id = app.uuid, UUID(uuidString: id) != nil else { return nil }
+		let url = folder(id).appendingPathComponent("icon.png")
+		return FileManager.default.fileExists(atPath: url.path) ? url : nil
+	}
+
+	static func forget(_ app: AppInfoPresentable) {
+		guard app.isSigned, let id = app.uuid, UUID(uuidString: id) != nil else { return }
+		try? FileManager.default.removeItem(at: folder(id))
+		changes.send(id)
+	}
+
+	static func save(
+		_ verified: ZagNativeInstalledProfiles, source: URL, name: String, renewing: Entry?,
+		signedOnly: (ZagInstallExpectation, URL)? = nil, artifactDeviceUDID: String? = nil, retainSource: Bool = true
+	) async throws {
+		let storage = Storage.shared
+		let request = Signed.fetchRequest()
+		request.predicate = NSPredicate(format: "identifier == %@", verified.record.bundleIdentifier)
+		let existing = try storage.context.fetch(request).first {
+			guard let entry = Self.entry($0) else { return false }
+			if let renewing { return entry.uuid == renewing.uuid }
+			return signedOnly == nil ? entry.pendingInstall == nil : entry.pendingInstall != nil
+		}
+		let id = renewing?.uuid ?? existing?.uuid ?? UUID().uuidString
+		let destination = folder(id)
+		let archive = destination.appendingPathComponent("Archive.ipa")
+		let replacements = destination.appendingPathComponent(UUID().uuidString, isDirectory: true)
+		let manager = FileManager.default
+		try manager.createDirectory(at: destination, withIntermediateDirectories: true,
+			attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+		var excluded = destination
+		var values = URLResourceValues()
+		values.isExcludedFromBackup = true
+		try excluded.setResourceValues(values)
+
+		if retainSource, !manager.fileExists(atPath: archive.path) || renewing == nil {
+			defer { try? manager.removeItem(at: replacements) }
+			let newArchive = try await Task.detached(priority: .utility) {
+				try ZagRPPairingFreeAccountInstaller.package(source, in: replacements)
+			}.value
+			try manager.setAttributes([.posixPermissions: 0o600, .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+				ofItemAtPath: newArchive.path)
+			if manager.fileExists(atPath: archive.path) {
+				_ = try manager.replaceItemAt(archive, withItemAt: newArchive)
+			} else {
+				try manager.moveItem(at: newArchive, to: archive)
+			}
+		}
+
+		let icon = destination.appendingPathComponent("icon.png")
+		if renewing == nil || !manager.fileExists(atPath: icon.path),
+		   let image = await Task.detached(priority: .utility, operation: { iconTest(source)?.pngData() }).value {
+			try? image.write(to: icon, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		}
+		let version = Bundle(url: source)?.version ?? renewing?.version
+		var signedIPADigest: String?
+		if let (expectation, signedApp) = signedOnly {
+			let staged = folder(id)
+			let destination = staged.appendingPathComponent("Signed.app")
+			let temporary = staged.appendingPathComponent(UUID().uuidString + ".app")
+			defer { try? manager.removeItem(at: temporary) }
+			signedIPADigest = try await Task.detached(priority: .utility) {
+				try manager.copyItem(at: signedApp, to: temporary)
+				guard let artifactDeviceUDID else { throw Failure.missingArtifact }
+				try verified.validateArtifact(temporary, expectation: expectation, deviceUDID: artifactDeviceUDID)
+				let artifactStaging = staged.appendingPathComponent(UUID().uuidString, isDirectory: true)
+				defer { try? manager.removeItem(at: artifactStaging) }
+				// Package the same private copy that was just verified.
+				let ipa = try ZagRPPairingFreeAccountInstaller.package(temporary, in: artifactStaging)
+				let digest = try ZagPackageIntegrity.sha256(of: ipa)
+				let stored = staged.appendingPathComponent("Signed-\(digest).ipa")
+				if !manager.fileExists(atPath: stored.path) {
+					try manager.setAttributes([.posixPermissions: 0o600,
+						.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: ipa.path)
+					try manager.moveItem(at: ipa, to: stored)
+				}
+				return digest
+			}.value
+			if manager.fileExists(atPath: destination.path) {
+				_ = try manager.replaceItemAt(destination, withItemAt: temporary)
+			} else { try manager.moveItem(at: temporary, to: destination) }
+		}
+		let entry = Entry(uuid: id, name: name, version: version, installation: verified, pendingInstall: signedOnly?.0, signedIPADigest: signedIPADigest, artifactDeviceUDID: artifactDeviceUDID)
+		let row = existing ?? Signed(context: storage.context)
+		row.uuid = id
+		row.identifier = verified.record.bundleIdentifier
+		row.name = name
+		row.version = version
+		row.date = verified.record.signedAt
+		row.certificate = nil
+		try JSONEncoder().encode(entry).write(to: destination.appendingPathComponent("installation.json"),
+			options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		do {
+			try storage.context.save()
+		} catch {
+			if existing == nil { storage.context.delete(row) }
+			throw error
+		}
+
+		if signedOnly == nil {
+			try markInstalled(verified.record.bundleIdentifier)
+			if renewing?.pendingInstall != nil {
+				if let staged = signedApp(entry) { try? manager.removeItem(at: staged) }
+				try removeSuperseded(by: entry)
+			}
+		}
+		pruneSignedIPAs(id: id, keeping: signedIPADigest)
+		changes.send(id)
+	}
+
+	private static func pruneSignedIPAs(id: String, keeping digest: String?) {
+		let manager = FileManager.default
+		let files = (try? manager.contentsOfDirectory(at: folder(id), includingPropertiesForKeys: nil)) ?? []
+		for file in files where file.lastPathComponent.hasPrefix("Signed-") && file.pathExtension == "ipa"
+			&& file.lastPathComponent != digest.map({ "Signed-\($0).ipa" }) {
+			try? manager.removeItem(at: file)
+		}
+	}
+
+	/// Copy the exact retained signed archive to a temporary share location.
+	/// Legacy staged bundles can be exported after revalidating their receipt.
+	static func prepareIPAExport(_ app: AppInfoPresentable) async throws -> URL {
+		guard let entry = entry(app), let expectation = entry.pendingInstall else { throw Failure.missingArtifact }
+		guard entry.installation.record.expiresAt > .now else { throw Failure.staleArtifact }
+		if let digest = entry.signedIPADigest,
+		   digest.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) == nil { throw Failure.missingArtifact }
+		let artifact = entry.signedIPADigest.map { folder(entry.uuid).appendingPathComponent("Signed-\($0).ipa") }
+		let staged = signedApp(entry)
+		let udid = entry.artifactDeviceUDID ?? ZagRPPairingCore.shared.pairedIdentity?.udid
+		let destination = FileManager.default.temporaryDirectory.appendingPathComponent("ZagIPAExport-\(UUID().uuidString)", isDirectory: true)
+		do {
+			let url = try await Task.detached(priority: .utility) {
+				let manager = FileManager.default
+				try manager.createDirectory(at: destination, withIntermediateDirectories: false,
+					attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+				let exported = destination.appendingPathComponent("ZagStore-Signed.ipa")
+				if let artifact, let digest = entry.signedIPADigest {
+					guard manager.fileExists(atPath: artifact.path) else { throw Failure.missingArtifact }
+					try ZagPackageIntegrity.copyVerified(artifact, to: exported, expectedSHA256: digest)
+				} else {
+					guard let staged, let udid else { throw Failure.missingArtifact }
+					try entry.installation.validateArtifact(staged, expectation: expectation, deviceUDID: udid)
+					let ipa = try ZagRPPairingFreeAccountInstaller.package(staged, in: destination.appendingPathComponent("work"))
+					try manager.moveItem(at: ipa, to: exported)
+					try manager.removeItem(at: destination.appendingPathComponent("work"))
+				}
+				return exported
+			}.value
+			guard let latest = self.entry(entry.uuid), latest.pendingInstall == expectation,
+				  latest.signedIPADigest == entry.signedIPADigest, latest.installation == entry.installation,
+				  latest.installation.record.expiresAt > .now else { throw Failure.staleArtifact }
+			return url
+		} catch {
+			try? FileManager.default.removeItem(at: destination)
+			throw error
+		}
+	}
+
+	static func confirmProfileRefresh(_ original: Entry, profiles: [ZagIssuedProfile]) throws {
+		guard var current = entry(original.uuid), current.pendingInstall == nil,
+			  current.installation == original.installation,
+			  let main = profiles.first(where: { $0.bundleIdentifier == current.installation.record.bundleIdentifier }),
+			  profiles.count == current.installation.profiles.count,
+			  let earliest = profiles.map(\.expiresAt).min() else { throw Failure.unverified }
+		let updated = current.installation.profiles.compactMap { component -> ZagNativeInstalledProfiles.Component? in
+			guard let profile = profiles.first(where: { $0.bundleIdentifier == component.bundleIdentifier }) else { return nil }
+			var next = component
+			next.uuid = profile.uuid
+			next.expiresAt = profile.expiresAt
+			return next
+		}
+		guard updated.count == profiles.count else { throw Failure.unverified }
+		current.installation.record.owner?.profileUUID = main.uuid
+		current.installation.record.profileExpiresAt = earliest
+		current.installation.record.lastSuccessfulRefresh = Date()
+		current.installation.record.lastFailure = nil
+		current.installation.record.consecutiveFailures = 0
+		current.installation.record.expiryVerified = true
+		current.installation = .init(record: current.installation.record, profiles: updated,
+			executableIdentity: current.installation.executableIdentity)
+		try JSONEncoder().encode(current).write(to: folder(current.uuid).appendingPathComponent("installation.json"),
+			options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		changes.send(current.uuid)
+	}
+
+	static func signedApp(_ entry: Entry) -> URL? {
+		let url = folder(entry.uuid).appendingPathComponent("Signed.app")
+		return FileManager.default.fileExists(atPath: url.path) ? url : nil
+	}
+
+	static func confirm(_ entry: Entry, expiry: Date, certificateExpiry: Date) throws {
+		var updated = entry
+		updated.pendingInstall = nil
+		updated.signedIPADigest = nil
+		updated.artifactDeviceUDID = nil
+		updated.installation.record.profileExpiresAt = expiry
+		updated.installation.record.certificateExpiresAt = certificateExpiry
+		updated.installation.record.expiryVerified = true
+		try JSONEncoder().encode(updated).write(to: folder(entry.uuid).appendingPathComponent("installation.json"),
+			options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+		try markInstalled(updated.installation.record.bundleIdentifier)
+		if let staged = signedApp(entry) { try? FileManager.default.removeItem(at: staged) }
+		pruneSignedIPAs(id: entry.uuid, keeping: nil)
+		try removeSuperseded(by: updated)
+		changes.send(entry.uuid)
+	}
+
+	private static func removeSuperseded(by entry: Entry) throws {
+		let request = Signed.fetchRequest()
+		request.predicate = NSPredicate(format: "identifier == %@", entry.installation.record.bundleIdentifier)
+		for row in try Storage.shared.context.fetch(request) where row.uuid != entry.uuid {
+			guard let old = Self.entry(row), old.pendingInstall == nil,
+				  old.installation.record.owner?.scope == entry.installation.record.owner?.scope else { continue }
+			Storage.shared.deleteApp(for: row)
+		}
+	}
+
+	private static func markInstalled(_ identifier: String) throws {
+		let key = "zagStore.managedInstalledBundleIDs"
+		let defaults = UserDefaults.standard
+		var installed = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Set<String>.self, from: $0) } ?? []
+		installed.insert(identifier)
+		defaults.set(try JSONEncoder().encode(installed), forKey: key)
+	}
+
+	static func hasSource(_ entry: Entry) -> Bool {
+		FileManager.default.fileExists(atPath: folder(entry.uuid).appendingPathComponent("Archive.ipa").path)
+	}
+
+	static func withSource<T>(_ entry: Entry, body: (URL) async throws -> T) async throws -> T {
+		guard hasSource(entry) else { throw Failure.missingSource }
+		let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+		defer { try? FileManager.default.removeItem(at: directory) }
+		try await Task.detached(priority: .utility) {
+			Zip.addCustomFileExtension("ipa")
+			let archive = folder(entry.uuid).appendingPathComponent("Archive.ipa")
+			try ZagIPAArchiveSafety.validate(archive)
+			try Zip.unzipFile(archive, destination: directory,
+				overwrite: false, password: nil)
+		}.value
+		guard let app = FileManager.default.getPath(in: directory.appendingPathComponent("Payload"), for: "app") else {
+			throw Failure.missingSource
+		}
+		return try await body(app)
+	}
+}
+#endif

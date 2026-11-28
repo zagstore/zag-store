@@ -111,6 +111,12 @@ struct FRAppIconView: View {
 		let bundleURL: URL
 
 		if let app {
+			#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+			if let url = ZagNativeAppInventory.iconURL(app), let image = UIImage(contentsOfFile: url.path) {
+				loader.image = image
+				return
+			}
+			#endif
 			guard let url = Storage.shared.getAppDirectory(for: app) else { return }
 			bundleURL = url
 		} else {

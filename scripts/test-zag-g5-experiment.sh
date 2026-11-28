@@ -35,7 +35,15 @@ for name in ["recordSubmission(", "authorizeSubmission("]:
     callers = sorted(p.name for p, t in swift.items() if re.search(r"\.\s*" + re.escape(name), code(t)))
     assert callers == ["ZagCertificateBudget.swift"], (name, callers)
 callers = sorted({p.name for p, t in swift.items() if re.search(r"\.submitCertificateRequest\(", code(t))})
-assert callers == ["ZagASCProvisioner.swift", "ZagFreeAccountProvisioner.swift"], callers
+# Callers of the submit PROTOCOL method. The free-account provisioner and the
+# consent-gated revoke-and-replace service (ZagCertificateReplacementService,
+# via ZagReplacementPortal) both reach the one free-account portal, whose
+# submit calls ZagCertificateBudget.consume first (asserted above: the op
+# string and consume live only in ZagIsideloadBridge, consume precedes the
+# send). So every one of these funnels through the single budget-enforcing
+# send — no caller sends a request or consumes the budget itself. The ASC
+# provisioner submits only to the separate ASC portal (verified below).
+assert callers == ["ZagASCProvisioner.swift", "ZagCertificateReplacementService.swift", "ZagFreeAccountProvisioner.swift"], callers
 # The developer-account (ASC) provisioner submits only to an ASC portal: its
 # portal is typed ZagASCProvisioningPortal, and only the ASC portal conforms,
 # so the free-account portal (and its certificate budget) is out of its reach.
@@ -95,9 +103,31 @@ assert campaign_cfg.count("configureLive(anisetteURL:") == 1
 window = campaign_cfg.index("guard zag_bridge_configure_time_window(")
 assert window < campaign_cfg.index("Int64(ZagCampaignConstants.maximumSkew)) == 0 else { return false }") < campaign_cfg.index("configureLive(anisetteURL:")
 assert [f for f, t in app_swift.items() if "configureFromCampaign(" in t] == ["Feather/Utilities/FreeAccount/ZagIsideloadBridge.swift", "Feather/Views/Settings/FreeAccount/ZagLiveExperimentView.swift"]
-assert not [f for f, t in app_swift.items() if re.search(r"ZagURLSessionTransport\(", t) and not f.endswith("ZagFreeAccountTransport.swift")]
-assert not [f for f, t in app_swift.items() if re.search(r"gsa\.apple\.com|developerservices2\.apple\.com", t) and not f.endswith("ZagExperimentLogger.swift")]
-print("PASS: C5 configuration: the live backend is configured only by configureFromCampaign, after the window is accepted; configureLive refuses an unconfigured gate in experiment builds; no Swift HTTP client reaches Apple")
+# A raw Swift HTTP client to Apple (ZagURLSessionTransport) exists in two
+# places: the bridge's own transport file, and the native (Option B) read-only
+# Developer Services portal. The native portal's safety does not rest on the
+# client's absence but on an enforced transport boundary, asserted here.
+raw_clients = sorted(f for f, t in app_swift.items() if re.search(r"ZagURLSessionTransport\(", t))
+assert raw_clients == ["Feather/Utilities/FreeAccount/ZagFreeAccountTransport.swift",
+                       "Feather/Utilities/FreeAccount/ZagNativeDeveloperPortal.swift"], raw_clients
+native_portal = app_swift["Feather/Utilities/FreeAccount/ZagNativeDeveloperPortal.swift"]
+# (a) the raw client is built by ONE private factory, pinned to the one Apple host.
+assert native_portal.count("ZagURLSessionTransport(") == 1, "more than one raw client in the native portal"
+assert "allowedHosts: [ZagDeveloperServicesProtocol.host]" in native_portal, "the native raw client is not host-pinned"
+# (b) the first-live-session inventory wraps that client in the HARD read-only
+#     boundary, so a mutating request cannot leave the device on that path.
+assert "ZagReadOnlyTransport(base: transport())" in native_portal, "the read-only inventory is not wrapped"
+# (c) Option B sign-in reaches Apple's Developer Services ONLY through the
+#     read-only inventory, never the raw-transport `live(` portal.
+native_signin = app_swift["Feather/Views/Settings/FreeAccount/ZagNativeAccountSignInView.swift"]
+assert "readOnlyInventory(" in native_signin, "native sign-in does not use the read-only inventory"
+assert ".live(" not in native_signin and "DeveloperPortal.live" not in native_signin, "native sign-in reaches the raw-transport portal"
+# Apple's Developer Services host name appears in code only where it is defined
+# and where it is redaction-listed; nowhere else builds a path to it.
+host_files = sorted(f for f, t in app_swift.items() if re.search(r"gsa\.apple\.com|developerservices2\.apple\.com", code(t)))
+assert host_files == ["Feather/Utilities/FreeAccount/ZagDeveloperServicesProtocol.swift",
+                      "Feather/Utilities/FreeAccount/ZagExperimentLogger.swift"], host_files
+print("PASS: C5 configuration: the live backend is configured only by configureFromCampaign, after the window is accepted; the native read-only transport boundary is enforced; no unbounded Swift HTTP client reaches Apple")
 
 # L7: outside the experiment the provisioner's hooks do nothing, so the
 # event names passed to them are inert in production (and, as Swift small
@@ -115,9 +145,14 @@ for name in ["experimentStop", "experimentFailure", "experimentEvent"]:
     assert rest in ("", "#else\n\t\treturn nil\n\t\t#endif"), (name, rest)
 print("PASS: L7 the provisioner's experiment hooks are empty outside the experiment")
 
-# Revocation is not implemented anywhere.
-assert not re.search(r"revoke[A-Za-z]*Cert[a-zA-Z]*\s*\(", "\n".join(code(t) for t in swift.values()))
-print("PASS: no certificate revocation call exists")
+# Certificate revocation exists only as the consent-gated revoke-and-replace
+# workflow and the one portal method it calls. Both are mutating, so on the
+# read-only native campaign path they are blocked at the transport boundary
+# (ZagReadOnlyTransport) and the consent layer (ZagDenyingMutationConsent),
+# asserted in C5. It appears in no other file, so no other path can revoke.
+revoke_files = sorted(p.name for p, t in swift.items() if re.search(r"revoke[A-Za-z]*Cert[a-zA-Z]*\s*\(", code(t)))
+assert revoke_files == ["ZagCertificateReplacementService.swift", "ZagNativeDeveloperPortal.swift"], revoke_files
+print("PASS: revocation is confined to the consent-gated replacement path; the read-only campaign path cannot reach it")
 
 # L5: the failure map has no default branch.
 logger = (fa / "ZagExperimentLogger.swift").read_text()

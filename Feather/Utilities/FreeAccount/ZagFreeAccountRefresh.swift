@@ -1,5 +1,20 @@
 import Foundation
 
+/// Apple ID profile warnings are based on the exact expiration timestamp.
+enum ZagAppleIDProfileValidity: Equatable {
+	case valid, soon, urgent, expired
+
+	init(expiresAt: Date, now: Date) {
+		let remaining = expiresAt.timeIntervalSince(now)
+		switch remaining {
+		case ...0: self = .expired
+		case ...172_800: self = .urgent
+		case ...345_600: self = .soon
+		default: self = .valid
+		}
+	}
+}
+
 /// How soon a signed app needs refreshing, from the real expiry of its
 /// profile and certificate (whichever is first). Profiles are not assumed to
 /// last 7 days.
@@ -130,11 +145,12 @@ enum ZagRefreshFailureReason: String, Codable, Sendable {
 	case accountRemoved
 	/// The account no longer belongs to the team that signed the app.
 	case teamUnavailable
+	case manualRecovery
 
 	/// Retrying cannot help until the user acts.
 	var needsUser: Bool {
 		switch self {
-		case .signedOut, .appIDCapacity, .installSlots, .cancelled, .noOwner, .accountRemoved, .teamUnavailable: return true
+		case .signedOut, .appIDCapacity, .installSlots, .cancelled, .noOwner, .accountRemoved, .teamUnavailable, .manualRecovery: return true
 		default: return false
 		}
 	}

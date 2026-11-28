@@ -36,6 +36,7 @@ void zag_rppairing_string_free(char *value);
 bool zag_rppairing_start(const char *host_name, const char *output_path, ZagRPPairingCallback callback);
 bool zag_gate2_probe(const char *device_ip, const char *pairing_path, ZagRPPairingCallback callback);
 bool zag_installed_apps(const char *device_ip, const char *pairing_path, ZagRPPairingCallback callback);
+bool zag_install_profiles(const char *device_ip, const char *pairing_path, const char *output_dir, const char *input_dir, ZagRPPairingCallback callback);
 bool zag_installed_profiles(const char *device_ip, const char *pairing_path, const char *output_dir, ZagRPPairingCallback callback);
 bool zag_gate4_install(const char *device_ip, const char *pairing_path, const char *ipa_path, ZagRPPairingCallback callback);
 bool zag_gate4_uninstall(const char *device_ip, const char *pairing_path, const char *bundle_id, ZagRPPairingCallback callback);

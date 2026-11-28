@@ -179,6 +179,16 @@ final class Device: @unchecked Sendable {
 		)
 	}
 
+	/// Option B: a native, on-device campaign — no remote anisette host and no
+	/// external device serial.
+	static func nativeConstants(_ number: Int = 1, nonce: String = "0123456789abcdef0123456789abcdef", now: Date = Date()) -> ZagCampaignConstants {
+		ZagCampaignConstants(
+			campaignID: "G5-C\(number)", campaignNumber: number,
+			notBefore: now.addingTimeInterval(-3_600), notAfter: now.addingTimeInterval(72 * 3_600),
+			buildNonce: nonce, anisetteURL: "native", deviceSerialPolicy: "native", deviceSerial: ""
+		)
+	}
+
 	/// A launch of the app: a new campaign object over the same stores, made
 	/// the process-wide one (the provisioner's stop hooks use it).
 	func launch(_ constants: ZagCampaignConstants = Device.constants()) -> (ZagLiveExperimentCampaign, ZagLiveExperimentCampaign.Durability) {
@@ -188,6 +198,17 @@ final class Device: @unchecked Sendable {
 		ZagLiveExperiment.campaign = campaign
 		ZagLiveExperiment.logger = logger
 		return (campaign, campaign.launch())
+	}
+
+	/// Explicit owner arming over the same stores (a fresh campaign object, as a
+	/// real launch makes, then `arm()`), returning its durability.
+	func armExplicitly(_ constants: ZagCampaignConstants = Device.constants()) -> ZagLiveExperimentCampaign.Durability {
+		let appleTime = appleTime, clock = clock
+		let campaign = ZagLiveExperimentCampaign(constants: constants, registry: registry, marker: marker, logger: logger,
+												 now: { clock.value }, authenticatedTime: { appleTime.value })
+		ZagLiveExperiment.campaign = campaign
+		ZagLiveExperiment.logger = logger
+		return campaign.arm()
 	}
 
 	/// E5 done: first launch, one delete-and-reinstall, second launch.

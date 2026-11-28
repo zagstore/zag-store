@@ -8,6 +8,11 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp/}zag-free-account-portal.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 swiftc -warnings-as-errors -parse-as-library -D DEBUG -target "$(uname -m)-apple-macos13" \
 	"$ROOT"/Feather/Utilities/FreeAccount/*.swift \
+	"$ROOT/Feather/RPPairing/ZagSavedPairing.swift" \
 	"$ROOT/Feather/Utilities/ZagEntitlementCompatibility.swift" "$ROOT/Feather/Utilities/CertificateReader/Models/CertificateModel.swift" "$ROOT/Feather/Utilities/AnyCodable.swift" \
-	"$ROOT/scripts/ZagFreeAccountTestSupport.swift" "$ROOT/scripts/ZagFreeAccountPortalTests.swift" -o "$WORK/tests"
-"$WORK/tests"
+	"$ROOT/Feather/Backend/Observable/OptionsManager.swift" \
+	"$ROOT/NimbleKit/Sources/NimbleExtensions/String/String+localized.swift" \
+	"$ROOT/NimbleKit/Sources/NimbleExtensions/Date/Date+timeLeft.swift" \
+	"$ROOT/NimbleKit/Sources/NimbleExtensions/Color/Color+expiration.swift" \
+	"$ROOT/scripts/ZagFreeAccountTestSupport.swift" "$ROOT/scripts/ZagFreeAccountPortalTests.swift" "$ROOT/scripts/ZagNativeAppIDIntegrationTests.swift" -o "$WORK/tests"
+"$WORK/tests" "$ROOT/AppleAuthCore/zag-isideload/src/assets/apple_root.cer"

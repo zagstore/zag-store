@@ -17,6 +17,7 @@ import NimbleJSON
 @main
 struct FeatherApp: App {
     @StateObject private var launch = ZagPairingLaunchCoordinator()
+	@Environment(\.scenePhase) private var scenePhase
 	@UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 	
 	let heartbeat = HeartbeatManager.shared
@@ -48,6 +49,9 @@ struct FeatherApp: App {
                 }
 				ZagAnimatedLaunchOverlay()
 			}
+            #if os(iOS) && canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+            .modifier(ZagAutomaticIdentitySetupModifier(ready: launch.policy.splashFinished))
+            #endif
             .onOpenURL { url in
                 guard url.absoluteString.utf8.count <= 4 * 1024 * 1024 else { return }
                 if ZagMobileDataToggleController.shared.handle(url) { return }
@@ -58,6 +62,7 @@ struct FeatherApp: App {
                 launch.startIfNeeded()
                 await ZagLaunchGate.shared.waitUntilSplashFinishes()
                 launch.finishSplash()
+				ZagBatchQuickActions.shared.setMainReady(launch.policy.canEnterMain)
                 drainPendingURLs()
             }
             // Connection status refreshes on its own; a reconnect re-checks
@@ -65,7 +70,14 @@ struct FeatherApp: App {
             .onReceive(ZagLocalVPNMonitor.shared.$model.map(\.tunnel).removeDuplicates()) { tunnel in
                 if tunnel == .operational { launch.connectionAvailable() }
             }
-            .onChange(of: launch.policy.canEnterMain) { _ in
+            .onChange(of: scenePhase) { phase in
+				if phase == .active {
+					ZagBatchQuickActions.shared.drain()
+					ZagAppleIDExpirationNotifications.shared.reconcile()
+				}
+			}
+            .onChange(of: launch.policy.canEnterMain) { ready in
+				ZagBatchQuickActions.shared.setMainReady(ready && launch.policy.splashFinished)
                 Task { @MainActor in
                     await Task.yield()
                     drainPendingURLs()
@@ -394,6 +406,25 @@ private struct ZagAnimatedLaunchOverlay: View {
 class AppDelegate: NSObject, UIApplicationDelegate {
 	func application(
 		_ application: UIApplication,
+		configurationForConnecting session: UISceneSession,
+		options: UIScene.ConnectionOptions
+	) -> UISceneConfiguration {
+		if let shortcut = options.shortcutItem { _ = ZagBatchQuickActions.shared.receive(shortcut) }
+		let configuration = session.configuration
+		configuration.delegateClass = ZagBatchSceneDelegate.self
+		return configuration
+	}
+
+	func application(
+		_ application: UIApplication,
+		performActionFor shortcutItem: UIApplicationShortcutItem,
+		completionHandler: @escaping (Bool) -> Void
+	) {
+		completionHandler(ZagBatchQuickActions.shared.receive(shortcutItem))
+	}
+
+	func application(
+		_ application: UIApplication,
 		didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
 	) -> Bool {
 		// This is the earliest stable app-delegate milestone. Store the
@@ -404,10 +435,17 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 				ZagPerformanceMonitor.shared.markLaunchStarted(at: launchStarted)
 			}
 		}
+		let shortcut = launchOptions?[.shortcutItem] as? UIApplicationShortcutItem
+		if let shortcut { _ = ZagBatchQuickActions.shared.receive(shortcut) }
+		application.shortcutItems = [ZagBatchOperation.update, .refresh].map {
+			UIApplicationShortcutItem(type: $0.shortcutType, localizedTitle: $0.title,
+				localizedSubtitle: nil, icon: UIApplicationShortcutIcon(systemImageName: $0.icon), userInfo: nil)
+		}
 		_createPipeline()
 		_createDocumentsDirectories()
 		ResetView.clearWorkCache()
 		_addDefaultCertificates()
+		ZagAppleIDExpirationNotifications.shared.register()
 		ZagBackgroundUpdateRefresh.shared.register()
 		ZagBackgroundUpdateRefresh.shared.applySchedulingPreference()
 		application.isIdleTimerDisabled = UserDefaults.standard.bool(
@@ -514,6 +552,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 	}
 
 	func applicationDidBecomeActive(_ application: UIApplication) {
+		ZagBatchQuickActions.shared.drain()
+		ZagAppleIDExpirationNotifications.shared.reconcile()
 		if ZagRPPairingCore.shared.isRunning {
 			ZagRPPairingCore.shared.refreshPairingBackgroundTime()
 		}
@@ -536,6 +576,11 @@ final class ZagBackgroundUpdateRefresh {
 
 	private init() {}
 
+	private var schedulingEnabled: Bool {
+		UserDefaults.standard.bool(forKey: Self.enabledKey) ||
+		UserDefaults.standard.bool(forKey: ZagAppleIDMaintenancePolicy.automaticKey)
+	}
+
 	func register() {
 		BGTaskScheduler.shared.register(
 			forTaskWithIdentifier: taskIdentifier,
@@ -550,7 +595,7 @@ final class ZagBackgroundUpdateRefresh {
 	}
 
 	func applySchedulingPreference() {
-		if UserDefaults.standard.bool(forKey: Self.enabledKey) {
+		if schedulingEnabled {
 			schedule()
 		} else {
 			cancel()
@@ -565,7 +610,7 @@ final class ZagBackgroundUpdateRefresh {
 	}
 
 	func schedule() {
-		guard UserDefaults.standard.bool(forKey: Self.enabledKey) else {
+		guard schedulingEnabled else {
 			cancel()
 			return
 		}
@@ -605,8 +650,19 @@ final class ZagBackgroundUpdateRefresh {
 		}
 
 		let work = Task {
-			let success = await refreshRepositoriesAndUpdates()
-			completion.complete(success: success && !Task.isCancelled)
+			let defaults = UserDefaults.standard
+			var refreshSucceeded = true
+			if defaults.bool(forKey: ZagAppleIDMaintenancePolicy.automaticKey), !Task.isCancelled {
+				let result = await ZagBatchCoordinator.shared.run(.refresh, origin: .automatic)
+				refreshSucceeded = !result.needsAttention
+			}
+			let success: Bool
+			if defaults.bool(forKey: Self.enabledKey), !Task.isCancelled {
+				success = await refreshRepositoriesAndUpdates()
+			} else {
+				success = true
+			}
+			completion.complete(success: success && refreshSucceeded && !Task.isCancelled)
 		}
 
 		task.expirationHandler = {
@@ -689,7 +745,7 @@ final class ZagBackgroundUpdateRefresh {
 			for update in updates {
 				guard !Task.isCancelled else { return false }
 				do {
-					let signedUUID = try await ZagUpdateTransactionManager.shared.prepareAsync(update)
+					let signedUUID = try await ZagUpdateTransactionManager.shared.prepareAsync(update, interactive: false)
 					Logger.misc.info("[Zag Store Background] Prepared update for \(update.app.currentName)")
 
 					if UserDefaults.standard.bool(forKey: Self.automaticInstallationKey) {
@@ -697,8 +753,9 @@ final class ZagBackgroundUpdateRefresh {
 							Logger.misc.warning("[Zag Store Background] Automatic installation requires iOS 17 or later")
 							continue
 						}
-						try await ZagUpdateTransactionManager.shared.installPreparedUpdate(signedUUID: signedUUID)
-						Logger.misc.info("[Zag Store Background] Installed update for \(update.app.currentName)")
+						if try await ZagUpdateTransactionManager.shared.installPreparedUpdate(signedUUID: signedUUID) {
+							Logger.misc.info("[Zag Store Background] Installed update for \(update.app.currentName)")
+						}
 					}
 				} catch {
 					Logger.misc.error("[Zag Store Background] Automatic update failed for \(update.app.currentName): \(error.localizedDescription)")

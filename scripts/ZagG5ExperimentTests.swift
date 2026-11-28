@@ -399,6 +399,24 @@ import Security
 			check(!c.isAuthorisable, "Constants refused: \(c.campaignID) #\(c.campaignNumber) window \(Int(c.notAfter.timeIntervalSince(c.notBefore) / 3600))h \(c.anisetteURL) \(c.deviceSerialPolicy)")
 		}
 
+		// Option B (native) + explicit, non-destructive arming.
+		let native = Device.nativeConstants()
+		check(native.isAuthorisable && native.isNative, "Native constants (anisette=native, serial=native) authorise")
+		let nativeDevice = Device()
+		let (_, nativeFirst) = nativeDevice.launch(native)
+		check(nativeFirst == .probeWritten && nativeDevice.registryValue?.campaigns["G5-C1"]?.state == .probing,
+			  "Native: the first launch probes")
+		let armedNative = nativeDevice.armExplicitly(native)
+		check(armedNative == .armed && nativeDevice.registryValue?.campaigns["G5-C1"]?.state == .armed && nativeDevice.registryValue != nil,
+			  "arm(): explicit owner arming reaches armed from probing without a reinstall; the registry is intact")
+		check(nativeDevice.armExplicitly(native) == .armed, "arm(): idempotent once armed")
+		// It never arms a campaign outside its window (clock before notBefore).
+		let early = Device()
+		let future = Device.nativeConstants(now: Date().addingTimeInterval(10 * 86_400))
+		check(early.armExplicitly(future) != .armed, "arm(): refuses a campaign whose window has not opened")
+		// The placeholder (unconfigured) never arms through arm() either.
+		check(Device().armExplicitly(ZagCampaignConstants.compiled) == .unconfigured, "arm(): the placeholder stays unarmable")
+
 		// The one writer's transition table (E2: nothing leaves halted).
 		typealias R = ZagCampaignRegistry.Record
 		func r(_ state: ZagCampaignState, _ submissions: Int = 0, key: String? = nil, nonce: String = "n") -> R {

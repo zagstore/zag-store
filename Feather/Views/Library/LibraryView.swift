@@ -32,6 +32,7 @@ import Combine
 
 
 import CoreData
+import Security
 
 
 
@@ -84,6 +85,7 @@ private struct ZagLibraryListSnapshot {
 struct LibraryView: View {
 	private static var didPerformInitialDeviceInventory = false
 	private static var didMeasureFirstListPreparation = false
+	@ObservedObject private var runningInstallation = ZagRunningInstallation.shared
 
 	@Environment(\.scenePhase) private var scenePhase
 
@@ -163,6 +165,11 @@ struct LibraryView: View {
 
 	@State private var _editMode: EditMode = .inactive
     @AppStorage("zagStore.apps.sortOrder") private var _sortOrder = 0
+	@AppStorage("zagStore.apps.signingMethodFilter") private var _signingFilter = 0
+	@ObservedObject private var batch = ZagBatchCoordinator.shared
+	private var _refreshingNativeApps: Bool { batch.operation == .refresh }
+	@State private var _nativeInventoryRevision = 0
+	@State private var _checkedNativeReconciliation = false
     @State private var _showAppDiagnostics = false
 
 
@@ -224,19 +231,21 @@ struct LibraryView: View {
     // than repeatedly filtering the same Core Data results for every header,
     // row separator and animation value during initial navigation.
     private var _listSnapshot: ZagLibraryListSnapshot {
+        _ = _nativeInventoryRevision
         let shouldMeasure = !Self.didMeasureFirstListPreparation &&
             ZagPerformanceMonitor.shared.isEnabled
         let startedAt = shouldMeasure ? ZagPerformanceMonitor.now() : 0
         let managed = _managedInstalledBundleIDs
         let signed = filteredAndSortedApps(from: _signedApps).filter {
-            $0.identifier != Bundle.main.bundleIdentifier
+            !ZagRunningAppPolicy.isRunning($0.identifier, bundle: Bundle.main.bundleIdentifier) && _matchesSigningFilter($0)
         }
         let installed = signed.filter { app in
             guard let id = app.identifier, !id.isEmpty else { return false }
-            return managed.contains(id) &&
+            return managed.contains(id) && !_isNativePending(app) &&
                 !ZagUpdateTransactionManager.shared.isPendingInstallationSigned(uuid: app.uuid)
         }
         let signedOnly = signed.filter { app in
+            if _isNativePending(app) { return true }
             if let uuid = app.uuid, _transactionSignedUUIDs.contains(uuid) { return false }
             if ZagUpdateTransactionManager.shared.isPendingInstallationSigned(uuid: app.uuid) {
                 return true
@@ -248,7 +257,7 @@ struct LibraryView: View {
         var uniqueUpdates: [String: UpdateManager.AvailableUpdate] = [:]
         var ambiguous = Set<String>()
         for update in updateManager.updates {
-            guard let id = update.app.id else { continue }
+            guard let id = update.installedBundleID else { continue }
             if uniqueUpdates[id] == nil {
                 uniqueUpdates[id] = update
             } else {
@@ -281,10 +290,28 @@ struct LibraryView: View {
         )
     }
 
+	private func _isNativePending(_ app: Signed) -> Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return ZagNativeAppInventory.entry(app)?.pendingInstall != nil
+		#else
+		return false
+		#endif
+	}
+
+
+	private func _matchesSigningFilter(_ app: Signed) -> Bool {
+		guard _signingFilter != 0 else { return true }
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return (ZagNativeAppInventory.entry(app) != nil) == (_signingFilter == 1)
+		#else
+		return _signingFilter != 1
+		#endif
+	}
+
     // Keep device inventory intact; hide the store's own signed archive from Library.
     private var _filteredSignedApps: [Signed] {
 		filteredAndSortedApps(from: _signedApps).filter {
-			$0.identifier != Bundle.main.bundleIdentifier
+			!ZagRunningAppPolicy.isRunning($0.identifier, bundle: Bundle.main.bundleIdentifier) && _matchesSigningFilter($0)
 		}
 	}
 
@@ -293,7 +320,7 @@ struct LibraryView: View {
 			guard let identifier = app.identifier, !identifier.isEmpty else {
 				return false
 			}
-			return _managedInstalledBundleIDs.contains(identifier) &&
+			return _managedInstalledBundleIDs.contains(identifier) && !_isNativePending(app) &&
 				!ZagUpdateTransactionManager.shared.isPendingInstallationSigned(uuid: app.uuid)
 		}
 	}
@@ -302,12 +329,13 @@ struct LibraryView: View {
 	// Only offer a row-level update when exactly one repository candidate matches.
 	private func _installedRowUpdate(for app: Signed) -> UpdateManager.AvailableUpdate? {
 		guard let identifier = app.identifier, !identifier.isEmpty else { return nil }
-		let matches = updateManager.updates.filter { $0.app.id == identifier }
+		let matches = updateManager.updates.filter { $0.installedBundleID == identifier }
 		return matches.count == 1 ? matches.first : nil
 	}
 
 	private var _filteredSignedOnlyApps: [Signed] {
 		_filteredSignedApps.filter { app in
+			if _isNativePending(app) { return true }
 			if let uuid = app.uuid, _transactionSignedUUIDs.contains(uuid) {
 				return false
 			}
@@ -660,13 +688,18 @@ struct LibraryView: View {
 		Group {
 			zagUpdatesContent
 
-			if !snapshot.installed.isEmpty,
-			   _selectedScope == .all || _selectedScope == .installed {
+			let eligibleCount = batch.operation == nil && (_selectedScope == .all || _selectedScope == .installed)
+				? batch.refreshEligibleCount(Array(_signedApps)) : 0
+			if _selectedScope == .all || _selectedScope == .installed {
 				Section {
 					ZagLibraryHeader(
 						title: .localized("Installed"),
-						count: snapshot.installed.count,
-						isCollapsed: _installedCollapsed
+						count: snapshot.installed.count + 1,
+						isCollapsed: _installedCollapsed,
+						trailingTitle: _refreshingNativeApps ? "Cancel" : "Refresh All · \(eligibleCount)",
+						trailingAction: eligibleCount == 0 && !_refreshingNativeApps ? nil : {
+							if _refreshingNativeApps { batch.cancel() } else { batch.start(.refresh, origin: .inApp) }
+						}
 					) {
 						withAnimation(.easeInOut(duration: 0.28)) {
 							_installedCollapsed.toggle()
@@ -676,6 +709,20 @@ struct LibraryView: View {
 						.listRowBackground(Color.clear)
 
 					if !_installedCollapsed {
+						LibraryCellView(
+							app: runningInstallation.runningApp,
+							isManagedInstalled: true,
+							showsSeparator: !snapshot.installed.isEmpty,
+							runningInstallation: runningInstallation,
+							runningHasUpdate: selfUpdateCoordinator.availableRelease != nil,
+							onRunningUpdate: { _isSelfUpdatePresenting = true },
+							selectedInfoAppPresenting: $_selectedInfoAppPresenting,
+							selectedSigningAppPresenting: $_selectedSigningAppPresenting,
+							selectedInstallAppPresenting: $_selectedInstallAppPresenting,
+							selectedAppUUIDs: $_selectedAppUUIDs
+						)
+						.listRowSeparator(.hidden)
+						.task { await runningInstallation.inspect() }
 					ForEach(Array(snapshot.installed.enumerated()), id: \.element.uuid) { index, app in
 						LibraryCellView(
 							app: app,
@@ -721,7 +768,7 @@ struct LibraryView: View {
 					ForEach(Array(snapshot.signedOnly.enumerated()), id: \.element.uuid) { index, app in
 						LibraryCellView(
 							app: app,
-							isManagedInstalled: snapshot.managedIDs.contains(app.identifier ?? ""),
+							isManagedInstalled: false,
 							isRemoving: _removingBundleIDs.contains(app.identifier ?? ""),
 							showsSeparator: index < snapshot.signedOnly.count - 1,
 							onDeleteApp: _deleteStoredApp,
@@ -804,6 +851,9 @@ struct LibraryView: View {
 				libraryListContent(snapshot)
 			}
 			.modifier(ZagLibrarySectionSpacingModifier())
+			#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+			.onReceive(ZagNativeAppInventory.changes) { _ in _nativeInventoryRevision &+= 1 }
+			#endif
 			.zagWallpaperSurface()
 			.toolbarBackground(.hidden, for: .navigationBar)
 			.searchable(
@@ -992,6 +1042,13 @@ struct LibraryView: View {
                             Text("Name A–Z").tag(1)
                             Text("Name Z–A").tag(2)
                         }
+                        #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+                        Picker("Signing Method", selection: $_signingFilter) {
+                            Text("All").tag(0)
+                            Text("Apple Account").tag(1)
+                            Text("Certificates").tag(2)
+                        }
+                        #endif
                         Divider()
                         Button {
                             _showAppDiagnostics = true
@@ -1319,6 +1376,13 @@ extension LibraryView {
 							_managedInstalledBundleIDsData = encoded
 						}
 						_updateRepositoryUpdates()
+						ZagAppleIDExpirationNotifications.shared.reconcile()
+						#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+						if !_checkedNativeReconciliation, ZagNativeAccountInstall.hasSession, !_importedApps.isEmpty {
+							_checkedNativeReconciliation = true
+							Task { await ZagNativeAccountInstall.reconcile(imports: Array(_importedApps), installedIDs: installedBundleIDs) }
+						}
+						#endif
 
 					case .failure(let error):
 						print(
@@ -1365,6 +1429,7 @@ extension LibraryView {
 	}
 
 	private func _deleteStoredApp(_ app: AppInfoPresentable) {
+		guard !(app is ZagRunningApp), app.identifier != Bundle.main.bundleIdentifier else { return }
 		if let identifier = app.identifier, !identifier.isEmpty {
 			_clearManagedInstalledMarker(identifier)
 		}
@@ -1372,11 +1437,12 @@ extension LibraryView {
 	}
 
 	private func _requestRemoveManagedApp(_ app: AppInfoPresentable) {
+		guard !(app is ZagRunningApp), app.identifier != Bundle.main.bundleIdentifier else { return }
 		_pendingRemoveApp = AnyApp(base: app)
 	}
 
 	private func _removeManagedApp(_ app: AppInfoPresentable) {
-		guard let identifier = app.identifier, !identifier.isEmpty else {
+		guard let identifier = app.identifier, !identifier.isEmpty, identifier != Bundle.main.bundleIdentifier else {
 			return
 		}
 		guard !_removingBundleIDs.contains(identifier) else {
@@ -2291,6 +2357,7 @@ private struct ZagUpdateRow: View {
 	let onSelect: () -> Void
 	let onCompleted: () -> Void
 
+	@ObservedObject private var signingJobs = ZagInstallJobs.shared
 	@ObservedObject private var transactionManager =
 		ZagUpdateTransactionManager.shared
 
@@ -2370,7 +2437,7 @@ private struct ZagUpdateRow: View {
 	var snapshot: ZagUpdateRowSnapshot {
 		ZagUpdateRowSnapshot(
 			id: update.id,
-			bundleID: update.app.id ?? update.id,
+			bundleID: update.installedBundleID ?? update.id,
 			name: update.app.currentName,
 			iconURL: update.app.iconURL?.absoluteString,
 			sourceIconURL: update.source.currentIconURL?.absoluteString,
@@ -2462,6 +2529,11 @@ private struct ZagUpdateRow: View {
 	@ViewBuilder
 	private var zagUpdateButton: some View {
 		let stage = transactionManager.stage(for: update)
+		let jobID = ZagUpdateTransactionManager.jobID(update)
+		let job = signingJobs.job(jobID)
+		let caption = job?.nativeCaption ?? _stageCaption(stage)
+		let running: ZagInstallControlMode = job?.nativeCaption != nil && (job?.progress ?? 0) > 0
+			? .progress(job?.progress ?? 0, .none) : .spinner(.none)
 
 		VStack(spacing: 2) {
 			// One control: Update contracts into the progress circle and
@@ -2471,26 +2543,29 @@ private struct ZagUpdateRow: View {
 				mode: showsOpen
 					? .pill(ZagInstallPill(title: .localized("Open"), accessibilityLabel: "Open \(update.app.currentName)"))
 					: (stage != nil && !isFailed(stage))
-						? .spinner(.none)
+						? running
 						: .pill(ZagInstallPill(title: stage?.title ?? .localized("Update"), accessibilityLabel: "Update \(update.app.currentName)")),
 				fill: zagUpdatePillBackground,
 				action: {
 					if showsOpen {
-						if let bundleID = update.app.id {
+						if let bundleID = update.installedBundleID {
 							UIApplication.openApp(with: bundleID)
 						}
 					} else if stage == nil || isFailed(stage) {
 						_startInlineUpdate()
 					}
-				}
+				},
+				cancelAction: job.map { $0.stage.allowsCancel && !$0.cancelRequested } == true ? {
+					_ = signingJobs.requestCancel(jobID)
+				} : nil
 			)
 
-			Text(_stageCaption(stage))
+			Text(caption)
 				.font(.system(size: 9, weight: .medium))
 				.foregroundStyle(.secondary)
 				.lineLimit(1)
 				.frame(width: 88, height: 11)
-				.opacity(_stageCaption(stage).isEmpty ? 0 : 1)
+				.opacity(caption.isEmpty ? 0 : 1)
 		}
 	}
 
@@ -2504,11 +2579,11 @@ private struct ZagUpdateRow: View {
 	) -> String {
 		switch stage {
 		case .downloading:
-			return .localized("Downloading…")
+			return .localized("Downloading")
 		case .importing, .signing, .readyToInstall:
-			return .localized("Preparing…")
+			return .localized("Preparing")
 		case .installing:
-			return .localized("Installing…")
+			return .localized("Installing")
 		default:
 			return ""
 		}
@@ -2521,9 +2596,7 @@ private struct ZagUpdateRow: View {
 			case .success(let signedUUID):
 				Task {
 					do {
-						try await transactionManager.installPreparedUpdate(
-							signedUUID: signedUUID
-						)
+						guard try await transactionManager.installPreparedUpdate(signedUUID: signedUUID) else { return }
 						try? pairingCore.refreshInstalledApps()
 						withAnimation(.easeInOut(duration: 0.2)) {
 							justCompleted = true
@@ -2535,18 +2608,20 @@ private struct ZagUpdateRow: View {
 							update: update,
 							error: error
 						)
-						UIAlertController.showAlertWithOk(
-							title: .localized("Update Failed"),
-							message: error.localizedDescription
-						)
+						#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+						if !(error is ZagInstallCancelled) { ZagNativeAccountInstall.showInlineFailure(error, fallback: .installation) }
+						#else
+						UIAlertController.showAlertWithOk(title: .localized("Installation Failed"), message: error.localizedDescription)
+						#endif
 					}
 				}
 
 			case .failure(let error):
-				UIAlertController.showAlertWithOk(
-					title: .localized("Update Failed"),
-					message: error.localizedDescription
-				)
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				if !(error is ZagInstallCancelled) { ZagNativeAccountInstall.showInlineFailure(error) }
+				#else
+				UIAlertController.showAlertWithOk(title: .localized("Update Failed"), message: error.localizedDescription)
+				#endif
 			}
 		}
 	}
@@ -2604,11 +2679,8 @@ struct ZagUpdatesPopup: View {
 	private let sourcesViewModel = SourcesViewModel.shared
 	@ObservedObject private var pairingCore = ZagRPPairingCore.shared
 	@State private var selectedUpdate: UpdateManager.AvailableUpdate?
-	@State private var isUpdatingAll = false
-	@State private var bulkUpdateProgress = 0
-	@State private var bulkUpdateTotal = 0
-	@State private var bulkUpdateFailures: [String] = []
-	@State private var showBulkUpdateResult = false
+	@ObservedObject private var batch = ZagBatchCoordinator.shared
+	private var isUpdatingAll: Bool { batch.operation == .update }
 
 	private var popupBackground: Color {
 		colorScheme == .dark ? Color(hex: "#1C1C1E") : Color(hex: "#F2F1F6")
@@ -2653,7 +2725,7 @@ struct ZagUpdatesPopup: View {
 
 				ScrollView {
 					LazyVStack(alignment: .leading, spacing: 18) {
-						if displayedAvailableCount > 0 {
+						if displayedAvailableCount > 0 || isUpdatingAll {
 							updateAllCard
 								.padding(.top, 22)
 								.transition(
@@ -2779,16 +2851,10 @@ struct ZagUpdatesPopup: View {
 					)
 				}
 			}
-			.interactiveDismissDisabled(isUpdatingAll || !embeddedInAccountNavigation)
-			.alert("Update All", isPresented: $showBulkUpdateResult) {
-				Button("OK", role: .cancel) { }
-			} message: {
-				if bulkUpdateFailures.isEmpty {
-					Text("Successfully installed all \(bulkUpdateTotal) updates.")
-				} else {
-					Text("Installed \(bulkUpdateTotal - bulkUpdateFailures.count) of \(bulkUpdateTotal) updates. Failed: \(bulkUpdateFailures.joined(separator: ", ")). You can retry failed updates individually.")
-				}
+			.onChange(of: batch.completed) { _ in
+				cachedRecentRows = ZagUpdateRowSnapshot.load(ZagUpdateRowSnapshot.recentKey)
 			}
+			.interactiveDismissDisabled(isUpdatingAll || !embeddedInAccountNavigation)
 			.toolbar {
 				ToolbarItem(placement: .topBarTrailing) {
 					if !embeddedInAccountNavigation {
@@ -2805,22 +2871,10 @@ struct ZagUpdatesPopup: View {
 
 	private var updateAllCard: some View {
 		Button {
-			guard !isUpdatingAll, updateManager.hasCompletedUpdateCheck else { return }
-			let pending = availableUpdates.filter { update in
-				switch ZagUpdateTransactionManager.shared.stage(for: update) {
-				case nil, .failed: return true
-				default: return false
-				}
-			}
-			guard !pending.isEmpty else { return }
-			isUpdatingAll = true
-			bulkUpdateTotal = pending.count
-			bulkUpdateProgress = 0
-			bulkUpdateFailures = []
-			Task { await _installAll(pending) }
+			if isUpdatingAll { batch.cancel() } else { batch.start(.update, origin: .inApp) }
 		} label: {
 		HStack {
-			Text(isUpdatingAll ? "Updating \(bulkUpdateProgress + 1) of \(bulkUpdateTotal)…" : .localized("Update All"))
+			Text(isUpdatingAll ? "Cancel · \(min(batch.completed + 1, batch.total)) of \(batch.total)" : .localized("Update All"))
 				.font(.system(size: 19, weight: .regular))
 				.foregroundStyle(updatesBlue)
 
@@ -2844,28 +2898,10 @@ struct ZagUpdatesPopup: View {
 		)
 		}
 		.buttonStyle(.plain)
-		.disabled(isUpdatingAll || !updateManager.hasCompletedUpdateCheck)
+		.disabled(batch.operation == .refresh || (!isUpdatingAll && !updateManager.hasCompletedUpdateCheck))
 		.accessibilityElement(children: .combine)
 	}
 
-	@MainActor
-	private func _installAll(_ pending: [UpdateManager.AvailableUpdate]) async {
-		let manager = ZagUpdateTransactionManager.shared
-		for update in pending {
-			do {
-				let signedUUID = try await manager.prepareAsync(update)
-				try await manager.installPreparedUpdate(signedUUID: signedUUID)
-				_moveToUpdatedRecently(update)
-				try? pairingCore.refreshInstalledApps()
-			} catch {
-				manager.failInstallation(update: update, error: error)
-				bulkUpdateFailures.append(update.app.currentName)
-			}
-			bulkUpdateProgress += 1
-		}
-		isUpdatingAll = false
-		showBulkUpdateResult = true
-	}
 }
 
 
@@ -2874,16 +2910,9 @@ private extension ZagUpdatesPopup {
 		guard !completedUpdateIDs.contains(update.id) else { return }
 
 		let row = _snapshot(for: update, completedAt: Date())
-		var recent = ZagUpdateRowSnapshot.load(ZagUpdateRowSnapshot.recentKey)
-		recent.removeAll { $0.bundleID == row.bundleID }
-		recent.insert(row, at: 0)
-		ZagUpdateRowSnapshot.save(recent, key: ZagUpdateRowSnapshot.recentKey)
-		cachedRecentRows = recent
-
-		var available = ZagUpdateRowSnapshot.load(ZagUpdateRowSnapshot.availableKey)
-		available.removeAll { $0.bundleID == row.bundleID }
-		ZagUpdateRowSnapshot.save(available, key: ZagUpdateRowSnapshot.availableKey)
-		cachedAvailableRows = available
+		ZagBatchCoordinator.recordCompletedUpdate(row)
+		cachedRecentRows = ZagUpdateRowSnapshot.load(ZagUpdateRowSnapshot.recentKey)
+		cachedAvailableRows = ZagUpdateRowSnapshot.load(ZagUpdateRowSnapshot.availableKey)
 
 		withAnimation(.easeInOut(duration: 0.35)) {
 			completedUpdateIDs.insert(update.id)
@@ -2891,44 +2920,13 @@ private extension ZagUpdatesPopup {
 			completedUpdates.insert(update, at: 0)
 		}
 		_cacheAvailableRows()
-		updateManager.updateCompletionDidChange()
 	}
 
 	func _snapshot(
 		for update: UpdateManager.AvailableUpdate,
 		completedAt: Date? = nil
 	) -> ZagUpdateRowSnapshot {
-		let notes =
-			update.app.currentAppVersion?.localizedDescription ??
-			update.app.versionDescription ??
-			update.app.localizedDescription
-
-		var metadata: [String] = []
-		if let version = update.app.currentVersion {
-			var value = String(format: .localized("Version %@"), version)
-			if let build = update.app.currentAppVersion?.build,
-			   !build.isEmpty, build != version {
-				value += " (\(build))"
-			}
-			metadata.append(value)
-		}
-		if let size = update.app.size {
-			metadata.append(size.formattedByteCount)
-		}
-
-		return ZagUpdateRowSnapshot(
-			id: update.id,
-			bundleID: update.app.id ?? update.id,
-			name: update.app.currentName,
-			iconURL: update.app.iconURL?.absoluteString,
-			sourceIconURL: update.source.currentIconURL?.absoluteString,
-			releaseDateText: nil,
-			releaseNotes: notes,
-			metadataText: metadata.isEmpty ? nil : metadata.joined(separator: " • "),
-			version: update.availableVersion,
-			build: update.availableBuild,
-			completedAt: completedAt
-		)
+		ZagBatchCoordinator.updateSnapshot(update, completedAt: completedAt)
 	}
 
 	func _cacheAvailableRows() {
@@ -3117,35 +3115,43 @@ private struct ZagCachedUpdateRow: View {
 
 
 private struct ZagLibraryHeader: View {
+	@AppStorage("zagStore.designer.header.gap") private var headerGap: Double = 8
 	let title: String
 	let count: Int
 	let isCollapsed: Bool
+	var trailingTitle: String = "Refresh All"
+	var trailingAction: (() -> Void)? = nil
 	let onToggle: () -> Void
 
 	var body: some View {
-		Button(action: onToggle) {
-			HStack(spacing: 8) {
-				ZagSectionHeader(
-					title: title,
-					count: count
-				)
+		HStack(spacing: headerGap) {
+			Button(action: onToggle) {
+				ZagSectionHeader(title: title, count: count)
+					.frame(maxWidth: .infinity, alignment: .leading)
+					.contentShape(Rectangle())
+			}
+			.buttonStyle(.plain)
+			.accessibilityLabel(Text(title))
+			.accessibilityValue(Text(isCollapsed ? "Collapsed" : "Expanded"))
+			.accessibilityHint(Text(isCollapsed ? "Expand section" : "Collapse section"))
 
-				Spacer(minLength: 8)
+			if let trailingAction {
+				Button(action: trailingAction) { ZagCountBadge(title: trailingTitle, tracking: 0.4) }
+					.buttonStyle(.plain)
+			}
 
+			Button(action: onToggle) {
 				Image(systemName: "chevron.down")
 					.font(.system(size: 20, weight: .semibold))
 					.foregroundStyle(.secondary)
 					.frame(width: 44, height: 44)
+					.contentShape(Rectangle())
 					.rotationEffect(.degrees(isCollapsed ? -90 : 0))
 					.animation(.easeInOut(duration: 0.28), value: isCollapsed)
 			}
-			.frame(maxWidth: .infinity, alignment: .leading)
-			.contentShape(Rectangle())
+			.buttonStyle(.plain)
+			.accessibilityHidden(true)
 		}
-		.buttonStyle(.plain)
-		.accessibilityLabel(Text(title))
-		.accessibilityValue(Text(isCollapsed ? "Collapsed" : "Expanded"))
-		.accessibilityHint(Text(isCollapsed ? "Expand section" : "Collapse section"))
 	}
 }
 
@@ -3425,7 +3431,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 		_ update: UpdateManager.AvailableUpdate,
 		signedUUID: String
 	) {
-		guard let bundleID = update.app.id, !bundleID.isEmpty else { return }
+		guard let bundleID = update.installedBundleID, !bundleID.isEmpty else { return }
 		var stored = baselines()
 		// Preserve the first known installed release through multiple retries,
 		// while tracking every prepared IPA that has never been installed.
@@ -3475,18 +3481,34 @@ final class ZagUpdateTransactionManager: ObservableObject {
         }
     }
 
+	static func jobID(_ update: UpdateManager.AvailableUpdate) -> String { jobID(update.id) }
+
+	static func jobID(_ updateID: String) -> String { "repository-update:\(updateID)" }
+
 	func stage(for update: UpdateManager.AvailableUpdate) -> Stage? {
 		stages[update.id]
 	}
 
 	func prepare(
 		_ update: UpdateManager.AvailableUpdate,
+		interactive: Bool = true,
 		completion: @escaping (Result<String, Error>) -> Void
 	) {
 		rememberName(update)
 		guard stages[update.id] == nil || isRetryable(update) else {
 			return
 		}
+
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if isRetryable(update),
+		   let pending = nativePendingUpdates.first(where: { $0.value == update.id }),
+		   let row = signedApp(uuid: pending.key),
+		   let entry = ZagNativeAppInventory.entry(row), entry.pendingInstall != nil {
+			stages[update.id] = .readyToInstall
+			completion(.success(pending.key))
+			return
+		}
+		#endif
 
 		// Retry the signed package after a transport failure. Re-downloading
 		// and signing would create yet another false installed-state record.
@@ -3537,27 +3559,67 @@ final class ZagUpdateTransactionManager: ObservableObject {
 
 				stages[update.id] = .signing
 
-				guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				let native = update.installedBundleID.flatMap { ZagNativeAppInventory.entry(bundleIdentifier: $0) }
+					.flatMap { $0.pendingInstall == nil && $0.installation.record.expiryVerified == true ? $0 : nil }
+				if native != nil && native?.installation.record.owner == nil { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+				#endif
+				let existingCertificate: CertificatePair? = update.installedBundleID.flatMap { identifier in
+					let request = Signed.fetchRequest()
+					request.predicate = NSPredicate(format: "identifier == %@ AND version == %@", identifier, update.installedVersion)
+					let matches = (try? Storage.shared.context.fetch(request))?.compactMap(\.certificate) ?? []
+					let ids = Set(matches.map(\.objectID))
+					return ids.count == 1 ? matches.first : nil
+				}
+				let method: ZagSigningMethod
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				if native != nil { method = .freeAppleAccount }
+				else if existingCertificate != nil { method = .importedCertificate }
+				else { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+				#else
+				guard existingCertificate != nil else { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+				method = .importedCertificate
+				#endif
+				let selectedOptions = OptionsManager.shared.options
+				if method == .freeAppleAccount {
+					#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+					guard let native, let scope = native.installation.record.owner?.scope else { throw ZagUpdateTransactionError.signingIdentityUnavailable }
+					let target = native.installation.record.bundleIdentifier
+					let job = Self.jobID(update)
+					guard ZagInstallJobs.shared.begin(job, stage: .signing) else { throw ZagNativeAccountInstall.Failure.busy }
+					var keepJob = false
+					defer { if !keepJob { ZagInstallJobs.shared.finish(job) } }
+					let preferredOptions = OptionsManager.shared.appleIDSigningDefaults
+					var options = preferredOptions
+					options.installAfterSigning = false
+					_ = try await ZagNativeAccountInstall.runInline(imported, job: job, options: options, requiredInstalledIdentifier: target,
+						requiredScope: scope, interactive: interactive)
+					guard let saved = ZagNativeAppInventory.pendingEntry(bundleIdentifier: target) else {
+						throw ZagUpdateTransactionError.signedRecordNotFound
+					}
+					if preferredOptions.installAfterSigning {
+						nativePendingUpdates[saved.uuid] = update.id
+						stages[update.id] = .readyToInstall
+						keepJob = interactive
+					} else {
+						savedOnlyUpdates.insert(saved.uuid)
+						stages[update.id] = nil
+					}
+					if preferredOptions.deleteImportAfterSigning { Storage.shared.deleteApp(for: imported) }
+					try? FileManager.default.removeItem(at: localURL)
+					completion(.success(saved.uuid))
+					return
+					#else
+					throw ZagUpdateTransactionError.missingCertificate
+					#endif
+				}
+				guard let certificate = existingCertificate else {
 					throw ZagUpdateTransactionError.missingCertificate
 				}
 
-				var options = OptionsManager.shared.options
+				var options = selectedOptions
 
-				if
-					options.ppqProtection,
-					let identifier = imported.identifier,
-					certificate.ppQCheck
-				{
-					options.appIdentifier =
-						"\(identifier).\(OptionsManager.shared.options.ppqString)"
-				}
-
-				if
-					let identifier = imported.identifier,
-					let mappedIdentifier = options.identifiers[identifier]
-				{
-					options.appIdentifier = mappedIdentifier
-				}
+				options.appIdentifier = update.installedBundleID
 
 				if
 					let name = imported.name,
@@ -3577,7 +3639,16 @@ final class ZagUpdateTransactionManager: ObservableObject {
 				try await signingHandler.modify()
 				try? await signingHandler.clean()
 
-				guard let newSigned = signedApp(uuid: signingHandler.uuid) else {
+				let signedUUID = signingHandler.uuid
+				if !selectedOptions.post_installAppAfterSigned {
+					savedOnlyUpdates.insert(signedUUID)
+					stages[update.id] = nil
+					if selectedOptions.post_deleteAppAfterSigned { Storage.shared.deleteApp(for: imported) }
+					try? FileManager.default.removeItem(at: localURL)
+					completion(.success(signedUUID))
+					return
+				}
+				guard let newSigned = signedApp(uuid: signedUUID) else {
 					throw ZagUpdateTransactionError.signedRecordNotFound
 				}
 
@@ -3585,16 +3656,16 @@ final class ZagUpdateTransactionManager: ObservableObject {
 					matchingIdentifier: newSigned.identifier,
 					name: newSigned.name,
 					version: update.installedVersion,
-					excludingUUID: signingHandler.uuid
+					excludingUUID: signedUUID
 				).compactMap(\.uuid)
 
-				pendingBySignedUUID[signingHandler.uuid] = PendingUpdate(
+				pendingBySignedUUID[signedUUID] = PendingUpdate(
 					updateID: update.id,
 					importedUUID: importHandler.uuid,
-					signedUUID: signingHandler.uuid,
+					signedUUID: signedUUID,
 					supersededSignedUUIDs: supersededSignedUUIDs
 				)
-				recordPendingInstallation(update, signedUUID: signingHandler.uuid)
+				recordPendingInstallation(update, signedUUID: signedUUID)
 				// New signed records must not make the device look updated before
 				// Gate4 confirms the installation.
 				UpdateManager.shared.refresh(
@@ -3605,7 +3676,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 
 				stages[update.id] = .readyToInstall
                 recordActivity(updateID: update.id, status: "Ready to Install", appName: updateNames[update.id])
-				completion(.success(signingHandler.uuid))
+				completion(.success(signedUUID))
 			} catch {
 				if let downloadedFile {
 					try? FileManager.default.removeItem(at: downloadedFile)
@@ -3618,15 +3689,39 @@ final class ZagUpdateTransactionManager: ObservableObject {
 		}
 	}
 
-	func prepareAsync(_ update: UpdateManager.AvailableUpdate) async throws -> String {
+	private var savedOnlyUpdates: Set<String> = []
+	private var nativePendingUpdates: [String: String] = [:]
+
+	func prepareAsync(_ update: UpdateManager.AvailableUpdate, interactive: Bool = true) async throws -> String {
 		try await withCheckedThrowingContinuation { continuation in
-			prepare(update) { result in
+			prepare(update, interactive: interactive) { result in
 				continuation.resume(with: result)
 			}
 		}
 	}
 
-	func installPreparedUpdate(signedUUID: String) async throws {
+	@discardableResult
+	func installPreparedUpdate(signedUUID: String, verifyDevice: Bool = false) async throws -> Bool {
+		if savedOnlyUpdates.remove(signedUUID) != nil { return false }
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let updateID = nativePendingUpdates[signedUUID],
+		   let row = signedApp(uuid: signedUUID), let entry = ZagNativeAppInventory.entry(row) {
+			let job = Self.jobID(updateID)
+			let jobs = ZagInstallJobs.shared
+			if !jobs.begin(job, stage: .packaging) {
+				guard jobs.job(job)?.stage == .signing else { throw ZagNativeAccountInstall.Failure.busy }
+				jobs.advance(job, to: .packaging)
+			}
+			defer { jobs.finish(job) }
+			stages[updateID] = .installing
+			try await ZagNativeAccountInstall.installSaved(entry: entry, job: job)
+			nativePendingUpdates[signedUUID] = nil
+			stages[updateID] = nil
+			recordActivity(updateID: updateID, status: "Installed", appName: updateNames[updateID])
+			UpdateManager.shared.refresh(repositories: Array(SourcesViewModel.shared.sources.values))
+			return true
+		}
+		#endif
 		guard let signed = signedApp(uuid: signedUUID) else {
 			throw ZagUpdateTransactionError.signedRecordNotFound
 		}
@@ -3643,7 +3738,7 @@ final class ZagUpdateTransactionManager: ObservableObject {
 		defer { try? FileManager.default.removeItem(at: packageURL.deletingLastPathComponent()) }
 
 		// Mobile Data Fix wraps the existing installer when Mobile Data blocks it.
-		try await ZagMobileDataInstallCoordinator.shared.install(jobID: signedUUID) {
+		try await ZagMobileDataInstallCoordinator.shared.install(jobID: signedUUID, bundleID: signed.identifier) {
 			try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
 				Task { @MainActor in
 					do {
@@ -3660,7 +3755,22 @@ final class ZagUpdateTransactionManager: ObservableObject {
 			}
 		}
 
+		if verifyDevice {
+			let pairing = ZagRPPairingCore.shared
+			if ZagMobileDataInstallCoordinator.shared.takeInventory(jobID: signedUUID) == nil {
+				_ = try await pairing.signingDeviceInventory()
+			}
+			let bundle = Storage.shared.getAppDirectory(for: signed).flatMap(Bundle.init(url:))
+			let build = bundle?.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+			guard let identifier = signed.identifier, let installed = pairing.installedAppInfo(bundleID: identifier),
+				  installed.version == signed.version,
+				  let build, installed.build == build else {
+				throw ZagUpdateTransactionError.installedVersionUnverified
+			}
+		}
+
 		completeInstallation(signedUUID: signedUUID)
+		return true
 	}
 
 	func completeInstallation(signedUUID: String) {
@@ -3714,11 +3824,16 @@ final class ZagUpdateTransactionManager: ObservableObject {
 		)
 	}
 
+	func pausePreparedUpdate(_ update: UpdateManager.AvailableUpdate) {
+		stages[update.id] = .failed("Cancelled. Retry to install the saved update.")
+		ZagInstallJobs.shared.finish(Self.jobID(update))
+	}
+
 	func reset(_ update: UpdateManager.AvailableUpdate) {
 		stages[update.id] = nil
 	}
 
-	private func isRetryable(_ update: UpdateManager.AvailableUpdate) -> Bool {
+	func isRetryable(_ update: UpdateManager.AvailableUpdate) -> Bool {
 		if case .failed = stages[update.id] {
 			return true
 		}
@@ -3776,6 +3891,8 @@ final class ZagUpdateTransactionManager: ObservableObject {
 }
 
 private enum ZagUpdateTransactionError: LocalizedError {
+	case signingIdentityUnavailable
+	case installedVersionUnverified
 	case missingDownloadURL
 	case missingCertificate
 	case importedRecordNotFound
@@ -3783,6 +3900,9 @@ private enum ZagUpdateTransactionError: LocalizedError {
 
 	var errorDescription: String? {
 		switch self {
+		case .signingIdentityUnavailable: return "The installed app’s signing identity could not be confirmed. Use Customise to sign a separate copy."
+		case .installedVersionUnverified:
+			return "The device did not verify the updated app version."
 		case .missingDownloadURL:
 			return "The repository did not provide a download URL."
 		case .missingCertificate:

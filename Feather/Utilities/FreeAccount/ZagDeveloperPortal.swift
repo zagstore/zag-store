@@ -39,10 +39,10 @@ struct ZagIssuedCertificate: Sendable, Equatable {
 	let data: Data
 }
 
-/// A certificate signing request, generated on the device. Opaque here.
-struct ZagCertificateRequest: Sendable, Equatable {
-	let data: Data
-}
+// ZagCertificateRequest, ZagSigningKeyFactory, ZagDisabledSigningKeyFactory and
+// ZagSigningIdentity now live in ZagSigningModels.swift (a light file with no
+// profile-parser dependency), so the on-device signing stack can be reused by
+// the certificate-issuance harness without pulling in Certificate.decode.
 
 /// A provisioning profile as issued. `data` is the signed file embedded in
 /// the app; the other fields are read from that file (by the live service)
@@ -60,45 +60,68 @@ struct ZagIssuedProfile: Sendable, Equatable {
 }
 
 extension ZagIssuedProfile {
-	/// Reads a signed .mobileprovision with Zag Store's profile parser
-	/// (`Certificate.decode`). Certificate serials come from the profile's own
-	/// developer certificates, in `ZagCertificateInspection`'s format.
+	enum DecodeFailure: Error {
+		case missing(String)
+	}
+
+	/// Read the signing metadata from the profile plist. Display metadata and
+	/// DER-Encoded-Profile are optional in profiles issued by developer services.
+	/// Cryptographic checks are performed separately on the original CMS bytes.
 	init(profileData: Data) throws {
-		guard let profile = try? Certificate.decode(profileData: profileData),
-			  let team = profile.TeamIdentifier.first,
-			  let entitlements = profile.Entitlements?.mapValues(\.value),
-			  let applicationIdentifier = entitlements[ZagFreeAccountEntitlements.applicationIdentifierKey] as? String,
-			  let dot = applicationIdentifier.firstIndex(of: "."),
-			  let entitlementSet = try? ZagEntitlementSet(entitlements) else {
-			throw ZagPortalError.malformedResponse
+		let payload: Data
+		if let start = profileData.range(of: Data("<?xml".utf8)),
+		   let end = profileData.range(of: Data("</plist>".utf8), options: [], in: start.lowerBound..<profileData.endIndex) {
+			payload = profileData.subdata(in: start.lowerBound..<end.upperBound)
+		} else { payload = profileData }
+		guard let plist = (try? PropertyListSerialization.propertyList(from: payload, format: nil)) as? [String: Any] else {
+			throw DecodeFailure.missing("mobileprovision plist")
 		}
+		func required<T>(_ name: String) throws -> T {
+			guard let value = plist[name] as? T else { throw DecodeFailure.missing(name) }
+			return value
+		}
+		let teams: [String] = try required("TeamIdentifier")
+		guard let team = teams.first, !team.isEmpty else { throw DecodeFailure.missing("TeamIdentifier[0]") }
+		let entitlements: [String: Any] = try required("Entitlements")
+		guard let appID = entitlements[ZagFreeAccountEntitlements.applicationIdentifierKey] as? String,
+			  let dot = appID.firstIndex(of: "."), appID.index(after: dot) < appID.endIndex else {
+			throw DecodeFailure.missing("Entitlements.application-identifier")
+		}
+		let certificates: [Data] = try required("DeveloperCertificates")
 		self.init(
-			uuid: profile.UUID,
+			uuid: try required("UUID"),
 			teamIdentifier: team,
-			bundleIdentifier: String(applicationIdentifier[applicationIdentifier.index(after: dot)...]),
-			certificateSerials: (profile.DeveloperCertificates ?? []).compactMap { ZagCertificateInspection(der: $0)?.serialNumber },
-			deviceUDIDs: profile.ProvisionedDevices ?? [],
-			entitlements: entitlementSet,
-			createdAt: profile.CreationDate,
-			expiresAt: profile.ExpirationDate,
+			bundleIdentifier: String(appID[appID.index(after: dot)...]),
+			certificateSerials: certificates.compactMap { ZagCertificateInspection(der: $0)?.serialNumber },
+			deviceUDIDs: plist["ProvisionedDevices"] as? [String] ?? [],
+			entitlements: try ZagEntitlementSet(entitlements),
+			createdAt: try required("CreationDate"),
+			expiresAt: try required("ExpirationDate"),
 			data: profileData
 		)
 	}
 }
 
-enum ZagPortalError: Error, Equatable, Sendable {
-	/// Apple no longer accepts the session; the user must sign in again.
-	case sessionRejected
-	case network
-	case rateLimited
-	case malformedResponse
-	/// Another team owns this identifier.
-	case identifierUnavailable(String)
-	case deviceLimitReached
-	case appIDLimitReached
-	case certificateLimitReached
-	case livePortalDisabled
+extension ZagProfileIdentityAudit {
+	/// Audits a parsed profile against the discovered team and this device.
+	/// Pulls primitives from `ZagIssuedProfile`; the audit itself is pure.
+	init(profile: ZagIssuedProfile, discoveredTeam: String, expectedDeviceUDID: String?,
+		 targetBundle: String?, now: Date = Date()) {
+		self = ZagProfileIdentityAudit.audit(
+			profileTeam: profile.teamIdentifier,
+			profileDevices: profile.deviceUDIDs,
+			profileCertificateSerials: profile.certificateSerials,
+			profileBundle: profile.bundleIdentifier,
+			profileExpiresAt: profile.expiresAt,
+			discoveredTeam: discoveredTeam,
+			expectedDeviceUDID: expectedDeviceUDID,
+			targetBundle: targetBundle,
+			now: now)
+	}
 }
+
+// ZagPortalError now lives in ZagPortalError.swift (so the pure developer-
+// services codec can be compiled and host-tested without the model graph).
 
 /// The portal operations, for one signed-in team.
 protocol ZagDeveloperPortalService: Sendable {
@@ -138,68 +161,6 @@ struct ZagDisabledDeveloperPortal: ZagDeveloperPortalService {
 }
 
 // MARK: - Signing key
-
-/// Creates the development signing key and its certificate signing request
-/// on the device. Only a simulation implements it in this phase.
-protocol ZagSigningKeyFactory: Sendable {
-	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest)
-	/// Whether an issued certificate is for `privateKey`, with its serial and expiry.
-	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck
-	// A new key is made beside the one in use. The stored identity names the
-	// key it uses (`ZagSigningIdentity.keySlot`), so the key in use stays in use
-	// until the new certificate is issued, verified and stored, and switching is
-	// that one write (`ZagPendingSigningKey`).
-	func makePendingKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest, keySlot: String?)
-	/// Whether an issued certificate is for this account and team's key in
-	/// `keySlot` (or for `privateKey`, for a factory that returns key bytes).
-	func check(certificate: Data, privateKey: Data, account: UUID, team: String, keySlot: String?) -> ZagIssuedCertificateCheck
-	func hasKey(account: UUID, team: String, keySlot: String?) -> Bool
-	func discardKey(account: UUID, team: String, keySlot: String?) throws
-	/// Removes the team's keys other than those in `keeping`: keys of abandoned
-	/// attempts that no identity or request in progress names.
-	func discardKeys(account: UUID, team: String, except keeping: Set<String?>) throws
-}
-
-extension ZagSigningKeyFactory {
-	/// For a factory whose key bytes are returned (and kept, while a request is
-	/// in progress, in `ZagPendingSigningKey`). A factory whose keys stay in the
-	/// Keychain implements these with key items and returns an empty `privateKey`.
-	func makePendingKey(commonName: String, account: UUID, team: String) throws -> (privateKey: Data, request: ZagCertificateRequest, keySlot: String?) {
-		let made = try makeKey(commonName: commonName)
-		return (made.privateKey, made.request, nil)
-	}
-	func check(certificate: Data, privateKey: Data, account: UUID, team: String, keySlot: String?) -> ZagIssuedCertificateCheck {
-		check(certificate: certificate, privateKey: privateKey)
-	}
-	func hasKey(account: UUID, team: String, keySlot: String?) -> Bool { true }
-	func discardKey(account: UUID, team: String, keySlot: String?) throws {}
-	func discardKeys(account: UUID, team: String, except keeping: Set<String?>) throws {}
-}
-
-struct ZagDisabledSigningKeyFactory: ZagSigningKeyFactory {
-	enum Failure: Error { case unavailable }
-	func makeKey(commonName: String) throws -> (privateKey: Data, request: ZagCertificateRequest) { throw Failure.unavailable }
-	func check(certificate: Data, privateKey: Data) -> ZagIssuedCertificateCheck { .mismatch }
-}
-
-/// The development signing identity kept in the Keychain
-/// (`ZagFreeAccountSecretKind.signingPrivateKey`) for the signed-in account:
-/// the private key and the certificate Apple issued for it.
-struct ZagSigningIdentity: Codable, Equatable, Sendable, CustomStringConvertible {
-	let serialNumber: String
-	let certificate: Data
-	/// Empty when the key is a Keychain key item (`ZagKeychainSigningKeys`),
-	/// which is never exported.
-	let privateKey: Data
-	let expiresAt: Date
-	/// The slot of the Keychain key item (`ZagKeychainSigningKeys`); nil for
-	/// key bytes, or a key made before slots existed.
-	var keySlot: String? = nil
-
-	var keyIsInKeychain: Bool { privateKey.isEmpty }
-
-	var description: String { "[signing identity \(serialNumber)]" }
-}
 
 // MARK: - Profile checks
 

@@ -86,6 +86,48 @@ final class ZagRPPairingCore: ObservableObject {
 	@Published private(set) var state: State = .idle
     @Published private(set) var localPairingCleanupPending = UserDefaults.standard.bool(forKey: ZagLocalPairingRemoval.pendingKey)
 
+	@Published private(set) var pairedIdentity: ZagPairedDeviceIdentity?
+
+	private init() {
+		pairedIdentity = Self.savedPairing.restore(cleanupPending: localPairingCleanupPending)
+		restorePairingStatus()
+	}
+
+	/// Older installs already hold the host key, even when no UDID was saved.
+	var hasSavedPairing: Bool { !localPairingCleanupPending && Self.savedPairing.hasCredentials }
+
+	private func restorePairingStatus() {
+		if let identity = pairedIdentity, hasSavedPairing {
+			state = .paired(name: identity.name, model: identity.model, udid: identity.udid)
+		} else {
+			state = .idle
+		}
+	}
+
+	private func savePairedIdentity(_ identity: ZagPairedDeviceIdentity) {
+		guard hasSavedPairing else { return }
+		do {
+			try Self.savedPairing.save(identity)
+		} catch {
+			ZagLogger.shared.warning("RPPairing", "Could not persist device identity")
+		}
+		pairedIdentity = identity
+		if !isRunning { restorePairingStatus() }
+	}
+
+	func signingDeviceInventory() async throws -> (ZagPairedDeviceIdentity, [String: InstalledAppInfo]) {
+		guard hasSavedPairing else { throw InstalledAppsError.notPaired }
+		_ = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Set<String>, Error>) in
+			do {
+				try refreshInstalledApps(deviceIP: ZagDeviceLink.peerAddress, joinExisting: true) { continuation.resume(with: $0) }
+			} catch { continuation.resume(throwing: error) }
+		}
+		guard let pairedIdentity else {
+			throw InstalledAppsError.refreshFailed("The paired iPhone did not provide its device identifier. Check the LocalDevVPN connection and try again.")
+		}
+		return (pairedIdentity, installedApps)
+	}
+
 	enum InstalledAppsState: Equatable {
 		case idle
 		case refreshing
@@ -93,7 +135,7 @@ final class ZagRPPairingCore: ObservableObject {
 		case failed(String)
 	}
 
-	struct InstalledAppInfo: Equatable {
+	struct InstalledAppInfo: Equatable, Sendable {
 		let bundleID: String
 		let version: String
 		let build: String
@@ -121,6 +163,8 @@ final class ZagRPPairingCore: ObservableObject {
 	@Published private(set) var houseArrestPairingInstallError: String?
 	private var pendingInstalledApps: [String: InstalledAppInfo] = [:]
 
+	private var installedAppsEndpoint: String?
+	private var installedAppsIdentityMismatch = false
 	private var installedAppsCompletion: ((Result<Set<String>, Error>) -> Void)?
 	// All native RPPairing workers open their own socket. Never overlap them.
 	// Gate2 is queued behind an automatic inventory request for diagnostics.
@@ -286,6 +330,7 @@ final class ZagRPPairingCore: ObservableObject {
 		staged: (() -> Void)? = nil,
 		completion: ((Result<Void, Error>) -> Void)? = nil
 	) throws {
+		guard hasSavedPairing else { throw InstalledAppsError.notPaired }
 		guard !isGate4Running, acquireTransport("Gate4 install") else {
 			throw Gate4InstallError.alreadyRunning
 		}
@@ -618,14 +663,25 @@ final class ZagRPPairingCore: ObservableObject {
 	}
 
 	func refreshInstalledApps(
-		deviceIP: String = "10.7.0.1",
+		deviceIP: String = ZagDeviceLink.peerAddress,
+		joinExisting: Bool = false,
 		completion: ((Result<Set<String>, Error>) -> Void)? = nil
 	) throws {
-		guard installedAppsState != .refreshing else { throw InstalledAppsError.alreadyRunning }
-		guard pairingFileExists else { throw InstalledAppsError.notPaired }
+		guard hasSavedPairing else { throw InstalledAppsError.notPaired }
+		if installedAppsState == .refreshing {
+			guard joinExisting, installedAppsEndpoint == deviceIP else { throw InstalledAppsError.alreadyRunning }
+			let previous = installedAppsCompletion
+			installedAppsCompletion = { result in
+				previous?(result)
+				completion?(result)
+			}
+			return
+		}
 		guard acquireTransport("Installed apps inventory") else { throw InstalledAppsError.alreadyRunning }
 
 		pendingInstalledApps.removeAll(keepingCapacity: true)
+		installedAppsEndpoint = deviceIP
+		installedAppsIdentityMismatch = false
 		installedAppsCompletion = completion
 		ZagLogger.shared.info("RPPairing", "Installed-app inventory refresh starting | deviceIP=\(deviceIP)")
 		installedAppsState = .refreshing
@@ -664,7 +720,19 @@ final class ZagRPPairingCore: ObservableObject {
 		case 404:
 			installedAppsDebugKeys = message
 			ZagLogger.shared.info("RPPairing", "Installed-app metadata keys | \(message)")
+		case 405:
+			guard installedAppsEndpoint == ZagDeviceLink.peerAddress,
+				  let device = ZagPairedDeviceIdentity(name: pairedIdentity?.name ?? "", model: pairedIdentity?.model ?? "", udid: message) else { break }
+			if let known = pairedIdentity {
+				installedAppsIdentityMismatch = known.udid != device.udid
+			} else {
+				savePairedIdentity(device)
+			}
 		case 403:
+			if installedAppsIdentityMismatch {
+				receiveInstalledApps(code: -6, message: "The connected iPhone does not match the saved pairing identity.")
+				return
+			}
 			releaseTransport("Installed apps inventory")
 			ZagLogger.shared.info("RPPairing", "Installed-app inventory loaded | count=\(Int(message) ?? pendingInstalledApps.count)")
 			installedApps = pendingInstalledApps
@@ -764,6 +832,22 @@ final class ZagRPPairingCore: ObservableObject {
 		deviceIP: String = "10.7.0.1",
 		completion: @escaping (Result<[Data], Error>) -> Void
 	) {
+		manageProfiles(deviceIP: deviceIP, installing: nil, completion: completion)
+	}
+
+	func installProfiles(_ profiles: [Data], deviceIP: String = ZagDeviceLink.peerAddress) async throws -> [Data] {
+		let input = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+		try FileManager.default.createDirectory(at: input, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+		defer { try? FileManager.default.removeItem(at: input) }
+		for (index, profile) in profiles.enumerated() {
+			try profile.write(to: input.appendingPathComponent("\(index).mobileprovision"), options: .atomic)
+		}
+		return try await withCheckedThrowingContinuation { continuation in
+			manageProfiles(deviceIP: deviceIP, installing: input) { continuation.resume(with: $0) }
+		}
+	}
+
+	private func manageProfiles(deviceIP: String, installing input: URL?, completion: @escaping (Result<[Data], Error>) -> Void) {
 		guard installedProfilesCompletion == nil else { return completion(.failure(InstalledAppsError.alreadyRunning)) }
 		guard pairingFileExists else { return completion(.failure(InstalledAppsError.notPaired)) }
 		guard acquireTransport("Installed profiles") else { return completion(.failure(InstalledAppsError.alreadyRunning)) }
@@ -775,7 +859,12 @@ final class ZagRPPairingCore: ObservableObject {
 		let started = deviceIP.withCString { ip in
 			Self.pairingFileURL.path.withCString { pairingPath in
 				directory.path.withCString { outputDirectory in
-					zag_installed_profiles(ip, pairingPath, outputDirectory, zagInstalledProfilesCallback)
+					if let input {
+						return input.path.withCString {
+							zag_install_profiles(ip, pairingPath, outputDirectory, $0, zagInstalledProfilesCallback)
+						}
+					}
+					return zag_installed_profiles(ip, pairingPath, outputDirectory, zagInstalledProfilesCallback)
 				}
 			}
 		}
@@ -788,7 +877,10 @@ final class ZagRPPairingCore: ObservableObject {
 		switch code {
 		case 603:
 			// Read every file the core wrote, in order, then remove the folder.
-			let count = Int(message) ?? 0
+			guard let count = Int(message), (0...10_000).contains(count) else {
+				finishInstalledProfiles(.failure(InstalledAppsError.refreshFailed("Invalid installed-profile count.")))
+				return
+			}
 			let profiles = (0..<count).compactMap { index in
 				installedProfilesDirectory.flatMap { try? Data(contentsOf: $0.appendingPathComponent("\(index).mobileprovision")) }
 			}
@@ -983,6 +1075,10 @@ final class ZagRPPairingCore: ObservableObject {
             return
         }
 		guard !isRunning else { return }
+		guard !isTransportBusy else {
+			state = .failed("An installation or device check is in progress. Try again when it finishes.")
+			return
+		}
 		ZagLogger.shared.info("RPPairing", "Pairing session starting")
 		// The PIN is generated after iOS connects while the user is normally in
 		// Settings > Developer Mode. Ask for notification permission up front so
@@ -999,7 +1095,7 @@ final class ZagRPPairingCore: ObservableObject {
 			intentIdentifiers: [],
 			options: []
 		)
-		UNUserNotificationCenter.current().setNotificationCategories([category])
+		ZagAppleIDExpirationNotifications.shared.registerCategory(category)
 		advertiser.stop()
 		beginPairingBackgroundTime()
 		state = .starting
@@ -1020,7 +1116,8 @@ final class ZagRPPairingCore: ObservableObject {
 		guard !isRunning else { return }
 		advertiser.stop()
 		endPairingBackgroundTime()
-		state = .idle
+		pairedIdentity = Self.savedPairing.restore(cleanupPending: localPairingCleanupPending)
+		restorePairingStatus()
 	}
 
     /// Forgets only this app's local material; system trust must be removed in Settings.
@@ -1046,6 +1143,8 @@ final class ZagRPPairingCore: ObservableObject {
     }
 
     private func invalidateLocalPairingStatus() {
+        pairedIdentity = nil
+        try? FileManager.default.removeItem(at: Self.savedPairing.metadata)
         gate2DeviceInfo = nil
         gate2LastAppResult = nil
         gate2State = .idle
@@ -1077,12 +1176,11 @@ final class ZagRPPairingCore: ObservableObject {
 			advertiser.stop()
 			endPairingBackgroundTime()
 			let fields = message.split(separator: "|", omittingEmptySubsequences: false)
-			let deviceName = fields.indices.contains(0) ? String(fields[0]) : "This iPhone"
-			state = .paired(
-				name: deviceName,
-				model: fields.indices.contains(1) ? String(fields[1]) : "",
-				udid: fields.indices.contains(2) ? String(fields[2]) : ""
-			)
+			let deviceName = fields.first.map(String.init) ?? "This iPhone"
+			if fields.count == 3, let identity = ZagPairedDeviceIdentity(name: deviceName, model: String(fields[1]), udid: String(fields[2])) {
+				savePairedIdentity(identity)
+			}
+			restorePairingStatus()
 
 			// The PIN notification has served its purpose once iOS accepts the code.
 			// Replace it with a fresh completion notification so the user still has
@@ -1188,6 +1286,12 @@ final class ZagRPPairingCore: ObservableObject {
 			.appendingPathComponent("rppairing-host-identity.bin", isDirectory: false)
 	}
 
+	private static var savedPairing: ZagSavedPairing {
+		let credentials = pairingFileURL
+		return ZagSavedPairing(credentials: credentials, metadata: credentials.deletingLastPathComponent()
+			.appendingPathComponent("rppairing-device.plist"))
+	}
+
 	private static var pairingFileURL: URL {
 		let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
 		return base
@@ -1277,13 +1381,27 @@ private enum InstalledAppsError: LocalizedError {
 }
 
 
-private enum Gate4InstallError: LocalizedError {
+private enum Gate4InstallError: LocalizedError, CustomNSError {
 	case alreadyRunning
 	case couldNotStart
 	case installFailed(String)
 	/// User installs: the raw error plus what it means and whether anything
 	/// changed on the device.
 	case classifiedFailure(String, ZagRPPairingFailureKind)
+
+	static let errorDomain = "ZagStore.RPPairing.Install"
+
+	var errorCode: Int {
+		switch self {
+		case .alreadyRunning: -1
+		case .couldNotStart: -2
+		case .installFailed, .classifiedFailure: -4
+		}
+	}
+
+	var errorUserInfo: [String: Any] {
+		[NSLocalizedDescriptionKey: errorDescription ?? "Installation failed."]
+	}
 
 	var errorDescription: String? {
 		switch self {

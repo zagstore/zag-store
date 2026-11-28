@@ -41,7 +41,6 @@ extension EnvironmentValues {
 // Shared avatar for pushed Settings destinations. Keep it on the destination
 // (not the parent) so the native back button and existing actions remain intact.
 private struct ZagSettingsDestinationAvatar: ViewModifier {
-    var showClose = true
     @Environment(\.zagInsideAccountPopup) private var insideAccountPopup
     @Environment(\.zagAccountClose) private var closeAccount
     func body(content: Content) -> some View {
@@ -55,7 +54,7 @@ private struct ZagSettingsDestinationAvatar: ViewModifier {
                         .tint(.primary)
                         .padding(.trailing, -2)
                 }
-            } else if showClose, let closeAccount {
+            } else if let closeAccount {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: closeAccount) {
                         Image(systemName: "xmark")
@@ -69,8 +68,8 @@ private struct ZagSettingsDestinationAvatar: ViewModifier {
 }
 
 extension View {
-    func zagSettingsDestinationAvatar(showClose: Bool = true) -> some View {
-        modifier(ZagSettingsDestinationAvatar(showClose: showClose))
+    func zagSettingsDestinationAvatar() -> some View {
+        modifier(ZagSettingsDestinationAvatar())
     }
 }
 
@@ -102,8 +101,9 @@ private enum ZagSettingsSection: String, CaseIterable, Identifiable {
 	}
 }
 
+// About is a fixed section (rendered above Apple Accounts & Signing), so it is
+// not part of the reorderable set.
 private let zagDefaultSettingsSectionOrder: [ZagSettingsSection] = [
-	.aboutUs,
 	.certificates,
 	.display,
 	.features,
@@ -144,14 +144,15 @@ struct SettingsView: View {
     @AppStorage(ZagDockConfiguration.storageKey) private var _dockTabs = ""
 	@AppStorage("ZagStore.animatedSplashEnabled") private var _animatedSplashEnabled = true
 	@AppStorage("ZagStore.splashSoundEnabled") private var _splashSoundEnabled = true
-	@AppStorage(ZagCertificateSelection.askEveryTimeKey) private var _askCertificateEveryTime = false
-	@AppStorage(ZagCertificateSelection.allowCustomisationKey) private var _allowSigningCustomisation = false
+	@AppStorage(ZagSigningPreference.key) private var _signingPreference = ZagCertificateSelection.preference
 	@AppStorage(ZagBackgroundUpdateRefresh.enabledKey) private var _backgroundUpdatesEnabled = false
 	@AppStorage(ZagBackgroundUpdateRefresh.automaticPreparationKey) private var _automaticUpdatePreparation = false
 	@AppStorage(ZagBackgroundUpdateRefresh.automaticInstallationKey) private var _automaticUpdateInstallation = false
 	@AppStorage("ZagStore.disableIdleTimeout") private var _disableIdleTimeout = false
 	@State private var _currentIcon: String? = UIApplication.shared.alternateIconName
 	@State private var _selectedCertificateInfo: CertificatePair?
+	@State private var _showFeedback = false
+	@Environment(\.openURL) private var openURL
 	@State private var _pendingCertificateDelete: CertificatePair?
 	@State private var _settingsSectionOrder = zagDefaultSettingsSectionOrder
 	@State private var _isReorderingSettings = false
@@ -210,6 +211,75 @@ struct SettingsView: View {
 		animation: .snappy
 	) private var _certificates: FetchedResults<CertificatePair>
 	
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	@State private var _nativeSettingsCertificates: [ZagNativeAccountInstall.LocalCertificate] = []
+	private var _activeAppleCertificate: ZagNativeAccountInstall.LocalCertificate? {
+		guard let account = try? ZagNativeAppleIDs.shared.catalog().activeID else { return nil }
+		return _nativeSettingsCertificates.first { $0.scope.accountID == account && $0.hasPrivateKey && $0.expires > Date() }
+	}
+	#endif
+
+	private var _hasSettingsCertificates: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return !_certificates.isEmpty || !_nativeSettingsCertificates.isEmpty
+		#else
+		return !_certificates.isEmpty
+		#endif
+	}
+
+	private func _reloadSettingsCertificates() {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		_nativeSettingsCertificates = ZagNativeAccountInstall.localCertificates()
+		#endif
+	}
+
+	@ViewBuilder
+	private var _settingsCertificateSummary: some View {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let cert = _activeAppleCertificate, _signingPreference == .appleAccount || selectedCertificate == nil {
+			HStack(spacing: 12) {
+				Image(systemName: "checkmark.shield.fill")
+					.foregroundStyle(.green)
+				VStack(alignment: .leading, spacing: 4) {
+					Text("Apple Development").font(.subheadline.weight(.semibold))
+					Text((try? ZagNativeAppleIDs.shared.catalog().accounts.first(where: { $0.id == cert.scope.accountID })?.label) ?? "Personal Team")
+						.font(.footnote).foregroundStyle(.secondary)
+					Text(cert.expires, style: .date)
+						.font(.caption).foregroundStyle(.secondary)
+				}
+			}
+			.padding(.vertical, 4)
+		} else {
+			_importedSettingsCertificateSummary
+		}
+		#else
+		_importedSettingsCertificateSummary
+		#endif
+	}
+
+	@ViewBuilder
+	private var _importedSettingsCertificateSummary: some View {
+				if let cert = selectedCertificate {
+					CertificatesCellView(cert: cert)
+                        .padding(.vertical, 0)
+					.contentShape(Rectangle())
+					.onTapGesture { _selectedCertificateInfo = cert }
+                    .listRowInsets(EdgeInsets(top: 10, leading: 20, bottom: 10, trailing: 20))
+					.swipeActions(edge: .trailing) {
+						Button(role: .destructive) {
+							_pendingCertificateDelete = cert
+						} label: {
+							Label(.localized("Delete"), systemImage: "trash")
+						}
+					}
+				} else {
+					Text(.localized("No Certificate"))
+						.font(.footnote)
+						.foregroundColor(.disabled())
+				}
+
+	}
+
 	private var selectedCertificate: CertificatePair? {
 		guard
 			_storedSelectedCert >= 0,
@@ -221,7 +291,9 @@ struct SettingsView: View {
 	}
 
     
-	private let _githubUrl = "https://github.com/zagstore/zag-store"
+	private static let githubURL = URL(string: "https://github.com/zagstore/zag-store")!
+	private static let githubIssuesURL = githubURL.appendingPathComponent("issues/new/choose")
+	private static let discordURL = URL(string: "https://discord.zagstore.app")!
     
 	private var settingsContent: some View {
 			Form {
@@ -239,6 +311,8 @@ struct SettingsView: View {
                         _settingsSearchResults
                     } else {
 					_supportSection
+					_settingsSection(.aboutUs)
+					_appleSigningSection
 					ForEach(_settingsSectionOrder) { section in
 						_settingsSection(section)
 					}
@@ -252,8 +326,7 @@ struct SettingsView: View {
 					// MARK: Zag Store Running Build Footer
 					Section {
 						VStack(spacing: 5) {
-							Text("Zag Store")
-								.font(.footnote.weight(.semibold))
+							_socialLinks
 							Text(ZagInstalledRelease.settingsVersion(info: Bundle.main.infoDictionary ?? [:]))
 							.font(.caption)
 							.monospacedDigit()
@@ -305,6 +378,7 @@ struct SettingsView: View {
 				_handleZagStoreRoute(route)
 			}
 			.onAppear {
+				_reloadSettingsCertificates()
 				_loadSettingsSectionOrder()
                 _probeSettingsDictation()
 				_refreshPhotoAuthorizationStatus()
@@ -414,6 +488,17 @@ struct SettingsView: View {
 		.sheet(item: $_selectedCertificateInfo) { cert in
 			CertificatesInfoView(cert: cert)
 		}
+		.alert("Send Feedback", isPresented: $_showFeedback) {
+			Button("GitHub") { openURL(Self.githubIssuesURL) }
+			Button("Discord") { openURL(Self.discordURL) }
+			Button("Send Email") {
+				if let email = Self.feedbackEmailURL { openURL(email) }
+			}
+			.disabled(Self.feedbackEmailURL == nil)
+			Button("Cancel", role: .cancel) {}
+		} message: {
+			Text("Choose a method to send feedback:")
+		}
 		.alert(
 			.localized("Delete Certificate?"),
 			isPresented: Binding(
@@ -440,26 +525,26 @@ struct SettingsView: View {
 	}
 }
 
-// About uses one continuous native row background on iOS 26. Native Form
-// cells can otherwise leave a one-pixel gap at a fractional row boundary.
+// A shared Form cell keeps the background continuous across fractional row boundaries on iOS 26.
 @available(iOS 26.0, *)
-private struct ZagAboutSettingsCard<Rows: View>: View {
+private struct ZagContinuousSettingsCard<Rows: View>: View {
     @Environment(\.defaultMinListRowHeight) private var rowHeight
+    var verticalPadding: CGFloat = 15
     @ViewBuilder var rows: Rows
 
     var body: some View {
-        ZagAboutCardLayout {
+        ZagContinuousSettingsCardLayout {
             Group(subviews: rows) { children in
                 ForEach(children.indices, id: \.self) { index in
                     children[index]
-                        .padding(.vertical, 15)
+                        .padding(.vertical, verticalPadding)
                         .frame(minHeight: rowHeight)
                         .contentShape(Rectangle())
                     if index < children.count - 1 {
                         // Reuse the native Label's icon slot to align the
                         // separator with the titles at every text size.
                         Label {
-                            ZagAboutDivider().frame(height: 1)
+                            ZagSettingsCardDivider().frame(height: 1)
                         } icon: {
                             Color.clear.frame(width: 25, height: 25)
                         }
@@ -474,7 +559,7 @@ private struct ZagAboutSettingsCard<Rows: View>: View {
     }
 }
 
-private struct ZagAboutCardLayout: Layout {
+private struct ZagContinuousSettingsCardLayout: Layout {
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width ?? subviews.first?.sizeThatFits(.unspecified).width ?? 0
         let height = stride(from: 0, to: subviews.count, by: 2).reduce(CGFloat.zero) {
@@ -507,7 +592,7 @@ private struct ZagAboutCardLayout: Layout {
 }
 
 // Match the native list's one-point separator and adaptive UIKit colour.
-private struct ZagAboutDivider: UIViewRepresentable {
+private struct ZagSettingsCardDivider: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         view.backgroundColor = .separator
@@ -595,6 +680,29 @@ extension SettingsView {
 		ZagStoreRouter.consume(route)
 	}
 
+	// First-class entry point for the native standalone-signing feature. Visible
+	// in every build; the screen itself declares its mode honestly (offline vs.
+	// read-only live) and performs no Apple contact without separate authorisation.
+	@ViewBuilder
+	private var _appleSigningSection: some View {
+		Section {
+			NavigationLink(destination: ZagAppleSigningSettingsView().zagSettingsDestinationAvatar()) {
+				Label {
+					VStack(alignment: .leading, spacing: 2) {
+						Text("Apple IDs")
+						Text("Sign apps on-device with multiple free Apple Accounts")
+							.font(.caption).foregroundStyle(.secondary)
+					}
+				} icon: {
+					Image(systemName: "key.horizontal.fill")
+				}
+			}
+			.accessibilityIdentifier("settings.appleSigning")
+		} header: {
+			Text(" Accounts")
+		}
+	}
+
 	@ViewBuilder
 	private var _advancedSettingsSections: some View {
 		Section {
@@ -641,6 +749,21 @@ extension SettingsView {
 				Label("Live Test", systemImage: "flask")
 			}
 			#endif
+			#if ZAG_SIGNING_EXPERIMENT
+			// Supervised first real imported-identity signing experiment. Signs a
+			// minimal dev.zagstore.ptteamprobe app on-device; never installs it.
+			NavigationLink(destination: ZagSigningExperimentView().zagSettingsDestinationAvatar()) {
+				Label("First Signing Experiment", systemImage: "signature")
+			}
+			#endif
+			#if ZAG_CERT_REPLACEMENT_EXPERIMENT
+			// Native certificate-replacement workflow (7460 recovery). Backed by the
+			// disabled portal unless a live portal is explicitly enabled; every
+			// mutation is separately confirmed and nothing is guaranteed.
+			NavigationLink(destination: ZagCertificateReplacementView(model: ZagCertificateReplacementModel.inventory(team: "")).zagSettingsDestinationAvatar()) {
+				Label("Replace a Certificate", systemImage: "arrow.triangle.2.circlepath")
+			}
+			#endif
 		} header: {
 			Text("Experimental Features")
 		}
@@ -663,6 +786,12 @@ extension SettingsView {
             if _settingsSearchMatches("Support Zag Store Donate Contribute Patreon PayPal Stripe Ko-fi GitHub Sponsors Buy Me a Coffee Independent") {
                 _supportSection
             }
+            if _settingsSearchMatches("Apple IDs Apple Accounts Apple Account Signing") {
+                _appleSigningSection
+            }
+            if _settingsSearchMatches("About About Us Zag Store Feedback Bug Report") {
+                _settingsSection(.aboutUs)
+            }
             ForEach(_settingsSectionOrder.filter { section in
                 switch section {
                 case .display:
@@ -678,7 +807,7 @@ extension SettingsView {
                 case .refreshingApps:
                     return _settingsSearchMatches("Refreshing Apps Background Updates Automatic Preparation Automatic Installation Disable Idle Timeout")
                 case .aboutUs:
-                    return _settingsSearchMatches("About About Us Zag Store GitHub Feedback Bug Report")
+                    return false
                 case .misc:
                     return _settingsSearchMatches("Browse Documents Archives Certificates Files")
                 case .reset:
@@ -740,65 +869,49 @@ extension SettingsView {
 
 		case .certificates:
 			Section {
-				NavigationLink(destination: CertificatesView().zagSettingsDestinationAvatar(showClose: false)) {
+				NavigationLink(destination: CertificatesView(openedFromSettings: true)) {
 					Label {
                         Text(.localized("Certificates"))
                     } icon: {
-                        Image(systemName: _certificates.isEmpty ? "checkmark.shield" : "checkmark.shield.fill")
-                            .foregroundStyle(_certificates.isEmpty ? Color.primary : Color(uiColor: UIColor(displayP3Red: 0.12, green: 0.83, blue: 0.34, alpha: 1)))
+                        Image(systemName: !_hasSettingsCertificates ? "checkmark.shield" : "checkmark.shield.fill")
+                            .foregroundStyle(!_hasSettingsCertificates ? Color.primary : Color(uiColor: UIColor(displayP3Red: 0.12, green: 0.83, blue: 0.34, alpha: 1)))
                     }
 				}
 
-				if let cert = selectedCertificate {
-					CertificatesCellView(cert: cert)
-                        .padding(.vertical, 0)
-					.contentShape(Rectangle())
-					.onTapGesture { _selectedCertificateInfo = cert }
-                    .listRowInsets(EdgeInsets(top: 10, leading: 20, bottom: 10, trailing: 20))
-					.swipeActions(edge: .trailing) {
-						Button(role: .destructive) {
-							_pendingCertificateDelete = cert
-						} label: {
-							Label(.localized("Delete"), systemImage: "trash")
-						}
-					}
-				} else {
-					Text(.localized("No Certificate"))
-						.font(.footnote)
-						.foregroundColor(.disabled())
-				}
+				_settingsCertificateSummary
 
-				Toggle(.localized("Ask every time"), isOn: $_askCertificateEveryTime)
-				Toggle(.localized("Allow Customisation"), isOn: $_allowSigningCustomisation)
+				LabeledContent("Signing Method") {
+					Menu {
+						Picker("Signing Method", selection: $_signingPreference) {
+							ForEach(ZagSigningPreference.allCases, id: \.self) { method in
+								Text(method.title).tag(method)
+							}
+						}
+					} label: {
+						HStack(spacing: 6) {
+							Text(_signingPreference.title)
+							Image(systemName: "chevron.up.chevron.down").font(.caption).accessibilityHidden(true)
+						}
+						.foregroundStyle(.secondary)
+						.fixedSize(horizontal: true, vertical: false)
+					}
+				}
+				.lineLimit(1)
 			} header: {
 				Text(.localized("Certificates"))
 			} footer: {
-				Text("Manage certificated used for signing apps.")
+				Text("Manage the certificates used to sign apps.")
 			}
 
 		case .features:
 			Section {
-				NavigationLink(destination: InstallationView().zagSettingsDestinationAvatar()) {
-					Label(.localized("Installation"), systemImage: "arrow.down.circle")
+				if #available(iOS 26.0, *) {
+					ZagContinuousSettingsCard(verticalPadding: 8) { _featureRows }
+						.listRowInsets(.vertical, 0)
+						.listRowSeparator(.hidden)
+				} else {
+					_featureRows
 				}
-				NavigationLink(destination: ConfigurationView().zagSettingsDestinationAvatar()) {
-					Label(.localized("Signing Options"), systemImage: "signature")
-				}
-				NavigationLink(destination: ArchiveView().zagSettingsDestinationAvatar()) {
-					Label(.localized("Archive & Compression"), systemImage: "archivebox")
-				}
-
-				Button {
-					_handlePhotosAccess()
-				} label: {
-					HStack {
-						Label("Photos Access", systemImage: "photo.on.rectangle")
-						Spacer()
-						Text(_photoAuthorizationTitle)
-							.foregroundStyle(.secondary)
-					}
-				}
-				.buttonStyle(.plain)
 			} header: {
 				Text(.localized("Features"))
 			} footer: {
@@ -885,6 +998,47 @@ extension SettingsView {
 		}
 	}
 
+	@ViewBuilder
+	private var _featureRows: some View {
+		NavigationLink(destination: InstallationView().zagSettingsDestinationAvatar()) {
+			_featureLinkLabel(.localized("Installation"), icon: "arrow.down.circle")
+		}
+		NavigationLink(destination: ConfigurationView().zagSettingsDestinationAvatar()) {
+			_featureLinkLabel(.localized("Signing Options"), icon: "signature")
+		}
+		NavigationLink(destination: ArchiveView().zagSettingsDestinationAvatar()) {
+			_featureLinkLabel(.localized("Archive & Compression"), icon: "archivebox")
+		}
+
+		Button {
+			_handlePhotosAccess()
+		} label: {
+			HStack {
+				Label("Photos Access", systemImage: "photo.on.rectangle")
+				Spacer()
+				Text(_photoAuthorizationTitle)
+					.foregroundStyle(.secondary)
+			}
+		}
+		.buttonStyle(.plain)
+	}
+
+	@ViewBuilder
+	private func _featureLinkLabel(_ title: String, icon: String) -> some View {
+		if #available(iOS 26.0, *) {
+			HStack {
+				Label(title, systemImage: icon)
+				Spacer()
+				Image(systemName: "chevron.right")
+					.font(.footnote.weight(.semibold))
+					.foregroundStyle(.tertiary)
+					.accessibilityHidden(true)
+			}
+		} else {
+			Label(title, systemImage: icon)
+		}
+	}
+
 	private var _photoAuthorizationTitle: String {
 		switch _photoAuthorizationStatus {
 		case .authorized: return "Full Access"
@@ -943,7 +1097,7 @@ extension SettingsView {
 		let stored = _storedSettingsSectionOrder
 			.split(separator: ",")
 			.compactMap { ZagSettingsSection(rawValue: String($0)) }
-			.filter { $0 != .reset }
+			.filter { $0 != .reset && $0 != .aboutUs }
 		let unique = stored.reduce(into: [ZagSettingsSection]()) { result, section in
 			if !result.contains(section) { result.append(section) }
 		}
@@ -986,9 +1140,7 @@ extension SettingsView {
 	private func _feedback() -> some View {
         Section {
             if #available(iOS 26.0, *) {
-                // One native cell avoids Form's fractional gap between the
-                // GitHub and Feedback cells. The actions stay independent.
-                ZagAboutSettingsCard { _aboutRows }
+                ZagContinuousSettingsCard { _aboutRows }
                     .listRowInsets(.vertical, 0)
                     .listRowSeparator(.hidden)
             } else {
@@ -1010,40 +1162,7 @@ extension SettingsView {
 			}
 
             Button {
-                UIApplication.open("https://github.com/zagstore/zag-store")
-            } label: {
-                Label {
-                    HStack {
-                        Text("GitHub")
-                        Spacer(minLength: 8)
-                        // Sized and coloured like the chevron on the row above.
-                        Image(systemName: "arrow.up.right")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
-                            .accessibilityHidden(true)
-                    }
-                } icon: {
-                    ZagGitHubMark()
-                        .fill(ZagWideGamutTint.color(hex: userTintColor))
-                        .frame(width: 25, height: 25)
-                }
-            }
-
-            Button {
-
-                let bugAction: UIAlertAction = .init(title: .localized("Bug Report"), style: .default) { _ in
-					UIApplication.open(_makeGitHubIssueURL(url: _githubUrl))
-				}
-				
-				let chooseAction: UIAlertAction = .init(title: .localized("Other"), style: .default) { _ in
-					UIApplication.open(URL(string: "\(_githubUrl)/issues/new/choose")!)
-				}
-				
-				UIAlertController.showAlertWithCancel(
-					title: .localized("Submit Feedback"),
-					message: nil,
-					actions: [bugAction, chooseAction]
-				)
+                _showFeedback = true
             } label: {
                 Label {
                     Text("Feedback")
@@ -1144,53 +1263,49 @@ extension SettingsView {
 		presenter.present(alert, animated: true)
 	}
 
-	private func _makeGitHubIssueURL(url: String) -> String {
-		var configurationSection = "### App Configuration:\n"
-		
-		switch UserDefaults.standard.integer(forKey: "Feather.installationMethod") {
-		case 0: // Server
-			let serverMethod = UserDefaults.standard.integer(forKey: "Feather.serverMethod")
-			let ipFix = UserDefaults.standard.bool(forKey: "Feather.ipFix")
-			let serverType = (serverMethod == 0) ? "Fully Local" : "Semi Local"
-			configurationSection += "- Install method: `Server`\n"
-			configurationSection += "  - Server type: `\(serverType)`\n"
-			configurationSection += "  - IP Fix: `\(ipFix)`\n"
-		case 1: // idevice
-			let pairingPath = HeartbeatManager.pairingFile()
-			let pairingExists = FileManager.default.fileExists(atPath: pairingPath)
-			let pairingStatus = pairingExists ? "`Present`" : "`Not Present`"
-			configurationSection += "- Install method: `idevice`\n"
-			configurationSection += "  - Pairing file: \(pairingStatus)\n"
-		default:
-			configurationSection += "- Install method: `Unknown`\n"
-		}
-        
-		let body = """
-		### Device Information
-		- Device: `\(MobileGestalt().getStringForName("PhysicalHardwareNameString") ?? "Unknown")`
-		- iOS Version: `\(UIDevice.current.systemVersion)`
-		- App Version: `\(Bundle.main.version)`
-		
-		\(configurationSection)
-		
-		### Issue Description
-		<!-- Describe your issue here -->
-		
-		### Steps to Reproduce
-		1. 
-		2. 
-		3. 
-		
-		### Expected Behavior
-		
-		### Actual Behavior
-		"""
-		let encodedTitle = "[Bug] replace this with a descriptive title "
-			.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-		let encodedBody = body
-			.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-		return "\(url)/issues/new?template=bug.yml&title=\(encodedTitle)&text=\(encodedBody)"
+	private static var feedbackEmailURL: URL? {
+		guard let address = Bundle.main.object(forInfoDictionaryKey: "ZagSupportEmail") as? String,
+			  !address.isEmpty else { return nil }
+		var components = URLComponents()
+		components.scheme = "mailto"
+		components.path = address
+		components.queryItems = [URLQueryItem(name: "subject", value: "Zag Store Feedback")]
+		return components.url
 	}
+
+	private enum SocialLink: String, CaseIterable, Identifiable {
+		case github
+		case discord
+
+		var id: Self { self }
+		var title: String { self == .github ? "GitHub" : "Discord" }
+		var url: URL { self == .github ? SettingsView.githubURL : SettingsView.discordURL }
+	}
+
+	private var _socialLinks: some View {
+		HStack(spacing: 8) {
+			ForEach(SocialLink.allCases) { link in
+				Link(destination: link.url) {
+					Group {
+						switch link {
+						case .github:
+							ZagGitHubMark().fill(.primary)
+						case .discord:
+							Image("ZagSocialDiscord").renderingMode(.template).resizable().scaledToFit()
+						}
+					}
+					.frame(width: 28, height: 28)
+					.frame(width: 44, height: 44)
+					.contentShape(Rectangle())
+					.foregroundStyle(.primary)
+				}
+				.buttonStyle(.plain)
+				.accessibilityLabel(link.title)
+			}
+		}
+		.frame(maxWidth: .infinity)
+	}
+
 }
 
 

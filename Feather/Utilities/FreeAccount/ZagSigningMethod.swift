@@ -5,9 +5,7 @@ import Foundation
 /// Imported certificates are signed on this device with Zsign. BYOC signs on
 /// the Zag Store website with the user's own certificate, so the app only
 /// links to it. Free Apple Account signing will create a development
-/// certificate and profiles for the user's Personal Team and then sign with
-/// the same Zsign path as imported certificates; it stays hidden until it can
-/// sign and install end to end (`ZagSigningMethodAvailability.freeAccountEnabled`).
+/// certificate and profiles for the user's Personal Team and signs with Zsign.
 enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 	case freeAppleAccount
 	case importedCertificate
@@ -16,8 +14,8 @@ enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 
 	var title: String {
 		switch self {
-		case .freeAppleAccount: return "Free Apple Account"
-		case .importedCertificate: return "Imported Certificate"
+		case .freeAppleAccount: return "Apple ID"
+		case .importedCertificate: return "Certificate"
 		case .byoc: return "BYOC"
 		case .developerAccount: return "Developer Account"
 		}
@@ -26,7 +24,7 @@ enum ZagSigningMethod: String, CaseIterable, Codable, Sendable {
 	var summary: String {
 		switch self {
 		case .freeAppleAccount:
-			return "Sign with your own Apple Account. Apps last 7 days and need refreshing."
+			return "Sign with your own Apple Account and renew apps before their provisioning profiles expire."
 		case .importedCertificate:
 			return "Sign with a .p12 certificate and provisioning profile you already have."
 		case .byoc:
@@ -52,10 +50,11 @@ enum ZagSigningMethodStatus: Equatable, Sendable {
 }
 
 enum ZagSigningMethodAvailability {
-	/// Free Apple Account signing is not listed until authentication,
-	/// provisioning, signing and installation all work against Apple's real
-	/// services and a device (phases 2-4 of docs/free-developer-accounts).
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	static let freeAccountEnabled = true
+	#else
 	static let freeAccountEnabled = false
+	#endif
 
 	/// Developer Account (App Store Connect API) signing is not listed until
 	/// its milestones (ASC_API_ARCHITECTURE.md) are validated against Apple
@@ -125,5 +124,44 @@ enum ZagSigningMethodAvailability {
 			case .signedIn(let session): return .ready(detail: session.team.name)
 			}
 		}
+	}
+}
+
+enum ZagSigningPreference: String, CaseIterable {
+	case appleAccount, importedCertificate, askEveryTime
+
+	static let key = "ZagStore.defaultSigningMethod"
+
+	static func resolve(saved: String?, legacyAsk: Bool) -> Self {
+		saved.flatMap(Self.init(rawValue:)) ?? (legacyAsk ? .askEveryTime : .importedCertificate)
+	}
+
+	var title: String {
+		switch self {
+		case .appleAccount: ZagSigningMethod.freeAppleAccount.title
+		case .importedCertificate: ZagSigningMethod.importedCertificate.title
+		case .askEveryTime: "Always Ask"
+		}
+	}
+}
+
+/// Only the options the native signer supports. A legacy installation seeds
+/// these two preferences once, without changing the certificate options.
+struct ZagAppleIDSigningOptions: Codable, Equatable {
+	var installAfterSigning: Bool
+	var deleteImportAfterSigning: Bool
+
+	private static let key = "zagStore.appleIDSigningOptions"
+
+	static func load(from defaults: UserDefaults, inheriting legacy: Self) -> Self {
+		if let saved = defaults.data(forKey: key), let decoded = try? JSONDecoder().decode(Self.self, from: saved) {
+			return decoded
+		}
+		legacy.save(to: defaults)
+		return legacy
+	}
+
+	func save(to defaults: UserDefaults) {
+		if let data = try? JSONEncoder().encode(self) { defaults.set(data, forKey: Self.key) }
 	}
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - Standard Zag Store Badge
 
@@ -15,7 +16,11 @@ struct ZagCountBadge: View {
 	@AppStorage("Feather.userTintColor")
 	private var themeColorHex: String = "#3F8EF7"
 
-	let count: Int
+	private let title: String
+	private let tracking: CGFloat
+
+	init(count: Int) { title = count.description; tracking = 0 }
+	init(title: String, tracking: CGFloat = 0) { self.title = title; self.tracking = tracking }
 
 	@Environment(\.colorScheme)
 	private var colorScheme
@@ -25,7 +30,8 @@ struct ZagCountBadge: View {
 	}
 
 	var body: some View {
-		Text(count.description)
+		Text(title)
+			.tracking(tracking)
 			.font(.system(size: badgeFontSize, weight: .medium, design: .rounded))
 			.monospacedDigit()
 			.foregroundStyle(tint)
@@ -44,7 +50,7 @@ struct ZagCountBadge: View {
 					.strokeBorder(tint.opacity(0.32), lineWidth: 0.75)
 			}
 			.shadow(color: tint.opacity(0.10), radius: 3, y: 1)
-			.accessibilityLabel("\(count)")
+			.accessibilityLabel(Text(title))
 	}
 }
 
@@ -155,5 +161,29 @@ struct ZagActionPill: View {
 			.contentShape(Capsule())
 		}
 		.buttonStyle(.borderless)
+	}
+}
+
+
+struct ZagAppleIDMark: View {
+	static var symbol: String { UIImage(systemName: "apple.logo") == nil ? "person.crop.circle" : "apple.logo" }
+
+	var body: some View {
+		Image(systemName: Self.symbol).accessibilityHidden(true)
+	}
+}
+
+struct ZagSigningMethodLabel: View {
+	let title: String
+	let appleID: Bool
+
+	var body: some View {
+		HStack(spacing: 4) {
+			if appleID { ZagAppleIDMark() }
+			Text(title)
+		}
+		.lineLimit(1)
+		.accessibilityElement(children: .ignore)
+		.accessibilityLabel(Text(title))
 	}
 }

@@ -66,9 +66,13 @@ struct ZagCampaignConstants: Equatable, Sendable {
 			&& notAfter > notBefore
 			&& notAfter.timeIntervalSince(notBefore) <= Self.maximumWindow
 			&& notBefore.timeIntervalSince1970 > 1_700_000_000
-			&& providerHost != nil
-			&& ["g3Fixed", "g3PerAccount"].contains(deviceSerialPolicy)
+			&& (isNative || (providerHost != nil && ["g3Fixed", "g3PerAccount"].contains(deviceSerialPolicy)))
 	}
+
+	/// Option B: a native, on-device campaign. It authenticates through
+	/// ZagAppleAuthMachine's own ADI engine, so it needs no remote anisette
+	/// host and no external device serial.
+	var isNative: Bool { anisetteURL == "native" && deviceSerialPolicy == "native" }
 }
 
 enum ZagCampaignState: String, Codable, Sendable, CaseIterable {
@@ -443,6 +447,47 @@ final class ZagLiveExperimentCampaign: @unchecked Sendable {
 	@discardableResult
 	func launch() -> Durability {
 		lock.withLock { launchLocked() }
+	}
+
+	/// Explicit, non-destructive owner arming. The owner authorises this one
+	/// campaign from inside the app (the "Arm Campaign" button), which replaces
+	/// E5's destructive delete-and-reinstall durability proof: the owner's
+	/// deliberate in-app action is the proof. Every other check is unchanged —
+	/// this runs the full launch preflight (C1 build nonce, C2 single use, C3
+	/// ordering, C4 window, C7 container agreement) through `launchLocked`, and
+	/// only promotes a campaign that passed them from `probing` to `armed`. It
+	/// never arms a refused, unconfigured, spent or out-of-window campaign, and
+	/// it touches nothing but the campaign registry item — settings, sources,
+	/// certificates, databases and other Keychain entries are left intact.
+	@discardableResult
+	func arm() -> Durability {
+		lock.withLock {
+			let preflight = launchLocked()
+			switch preflight {
+			case .armed:
+				return .armed
+			case .probeWritten, .stillProbing:
+				// The preflight passed and the campaign is `probing`; the owner
+				// has explicitly authorised it, so arm it directly.
+				do {
+					try commit { registry in
+						guard var record = registry.campaigns[constants.campaignID], record.state == .probing else { return }
+						record.state = .armed
+						registry.campaigns[constants.campaignID] = record
+						registry.highestCampaignNumber = max(registry.highestCampaignNumber, constants.campaignNumber)
+					}
+					writeMarker(.armed)
+					logger?.campaignDurability(registryProbe: true, containerMarker: true, result: .armed)
+					return .armed
+				} catch {
+					_ = haltLocked(.ledgerWriteFailed)
+					return .refused
+				}
+			case .unconfigured, .refused:
+				// A check failed: do not arm.
+				return preflight
+			}
+		}
 	}
 
 	private func refuseLocked(_ check: String, halting: Bool) -> Durability {

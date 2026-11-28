@@ -157,7 +157,7 @@ final class ZagInstalledProfilesProbe: ObservableObject {
 		case .verified: return "VERIFIED"
 		case .unverifiable(let reason): return "NOT VERIFIED (\(reason))"
 		case .mismatch(let what): return "MISMATCH (\(what))"
-		case .notInstalled: return "NOT INSTALLED"
+		case .notInstalled, .signedOnly: return "NOT INSTALLED"
 		}
 	}
 }

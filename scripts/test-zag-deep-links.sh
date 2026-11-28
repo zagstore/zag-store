@@ -13,7 +13,7 @@ root = pathlib.Path(sys.argv[1])
 p = plistlib.loads((root / 'Feather/Resources/Info.plist').read_bytes())
 assert {s for entry in p['CFBundleURLTypes'] for s in entry['CFBundleURLSchemes']} == {'feather', 'zagstore'}
 assert p['LSApplicationQueriesSchemes'] == ['localdevvpn']
-assert 'private let _githubUrl = "https://github.com/zagstore/zag-store"' in (root / 'Feather/Views/Settings/SettingsView.swift').read_text()
+assert 'private static let githubURL = URL(string: "https://github.com/zagstore/zag-store")!' in (root / 'Feather/Views/Settings/SettingsView.swift').read_text()
 assert '"https://github.com/khcrysalis/Feather"' not in (root / 'Feather/Views/Sources/SourcesView.swift').read_text()
 print('PASS: app feedback and support links target Zag Store; attribution links retained')
 print('PASS: registered schemes and LocalDevVPN compatibility retained')

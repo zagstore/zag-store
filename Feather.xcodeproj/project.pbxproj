@@ -394,7 +394,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMPRESS_PNG_FILES = NO;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				DEVELOPMENT_ASSET_PATHS = "";
 				DEVELOPMENT_TEAM = V54K5JYGS4;
 				ENABLE_PREVIEWS = YES;
@@ -425,6 +425,17 @@
 					"$(PROJECT_DIR)/Feather/Resources",
 					"$(PROJECT_DIR)/RPPairingCore/build/device",
 				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-L$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64",
+					"-lZagAppleAuth",
+					"$(PROJECT_DIR)/AppleAuthCore/zag-apple-bridge/target/aarch64-apple-ios/release/libzag_apple_bridge.a",
+					"-lc++",
+				);
+				"SWIFT_INCLUDE_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64/Headers",
+				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
 				MARKETING_VERSION = "$(FEATHER_PROJECT_VERSION)-debug";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(FEATHER_PRODUCT_BUNDLE_IDENTIFIER)$(FEATHER_DISAMBIGUATOR)";
@@ -437,6 +448,7 @@
 				SUPPORTS_MACCATALYST = YES;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos*]" = "DEBUG $(inherited) ZAG_APPLE_AUTH_ADI ZAG_APPLE_BRIDGE ZAG_ZSIGN_STRICT";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "Feather/Supporting Files/Feather-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -462,7 +474,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				COMPRESS_PNG_FILES = NO;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
 				DEPLOYMENT_POSTPROCESSING = YES;
 				DEVELOPMENT_ASSET_PATHS = "";
@@ -492,6 +504,17 @@
 					"$(PROJECT_DIR)/Feather/Resources",
 					"$(PROJECT_DIR)/RPPairingCore/build/device",
 				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-L$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64",
+					"-lZagAppleAuth",
+					"$(PROJECT_DIR)/AppleAuthCore/zag-apple-bridge/target/aarch64-apple-ios/release/libzag_apple_bridge.a",
+					"-lc++",
+				);
+				"SWIFT_INCLUDE_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/AppleAuthCore/apple-auth/ZagAppleAuth.xcframework/ios-arm64/Headers",
+				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
 				MARKETING_VERSION = "$(FEATHER_PROJECT_VERSION)";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(FEATHER_PRODUCT_BUNDLE_IDENTIFIER)";
@@ -504,6 +527,7 @@
 				SUPPORTS_MACCATALYST = YES;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos*]" = "$(inherited) ZAG_APPLE_AUTH_ADI ZAG_APPLE_BRIDGE ZAG_ZSIGN_STRICT";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "Feather/Supporting Files/Feather-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Osize";

@@ -25,8 +25,14 @@ placeholder constants, which can never arm.
 - **ID and number:** `G5-C<n>` and `<n>`, sequential from 1.
 - **Window:** ISO 8601 UTC, `notAfter` at most 7 days after `notBefore`.
 - **Account label:** a letter (`A`, `B`, …), never the account's address.
-- **Provider:** the G3 anisette provider's `https` URL. **Serial policy:**
-  `g3Fixed`, with the serial given to the build check privately, never
-  here. (`g3PerAccount` is refused: the bridge supports one fixed serial.)
+- **Provider:** either `native` (Option B: the on-device ADI engine,
+  ZagAppleAuthMachine — no remote anisette server and no external dependency),
+  or the G3 anisette provider's `https` URL (the bridge path). **Serial
+  policy:** for a `native` provider, `native` (the on-device ADI identity is
+  the device; no external serial). For an `https` provider, `g3Fixed`, with
+  the serial given to the build check privately, never here. (`g3PerAccount`
+  is refused: the bridge supports one fixed serial.) A `native` campaign does
+  not configure the bridge; it gates ZagAppleAuthMachine sign-in through the
+  same `ZagLiveExperiment.campaign.authorize(.signIn)` arming check.
 - **State:** `authorised`, `built`, `running`, or `closed: <class>`, where
   the class is the report's verdict, or `INCOMPLETE: durability not proven`.

@@ -51,6 +51,27 @@ private final class ProgressCapture: @unchecked Sendable {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
         let digest = SHA256.hash(data: StreamFixtureProtocol.payload).map { String(format: "%02x", $0) }.joined()
+
+        let signed = folder.appendingPathComponent("Signed.ipa")
+        let exported = folder.appendingPathComponent("Exported.ipa")
+        try StreamFixtureProtocol.payload.write(to: signed)
+        try ZagPackageIntegrity.copyVerified(signed, to: exported, expectedSHA256: digest)
+        check(try Data(contentsOf: exported) == StreamFixtureProtocol.payload, "export copies the retained signed bytes")
+        try FileManager.default.removeItem(at: exported)
+        try Data("unsigned source".utf8).write(to: signed)
+        do {
+            try ZagPackageIntegrity.copyVerified(signed, to: exported, expectedSHA256: digest)
+            preconditionFailure("unsigned or stale archive exported")
+        } catch ZagPackageIntegrity.Failure.checksumMismatch {
+            check(!FileManager.default.fileExists(atPath: exported.path), "stale or unsigned export is removed")
+        }
+        try FileManager.default.removeItem(at: signed)
+        do {
+            try ZagPackageIntegrity.copyVerified(signed, to: exported, expectedSHA256: digest)
+            preconditionFailure("missing archive exported")
+        } catch {
+            check(!FileManager.default.fileExists(atPath: exported.path), "missing signed archive creates no export")
+        }
         for path in ["known", "unknown"] {
             let file = folder.appendingPathComponent(path)
             FileManager.default.createFile(atPath: file.path, contents: nil)

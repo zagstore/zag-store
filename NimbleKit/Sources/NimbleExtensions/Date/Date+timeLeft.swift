@@ -29,27 +29,12 @@ extension Date {
 			)
 		}
 		
-		let daysLeft = Int(timeLeft / 86400)
-		let color = Color.expiration(days: daysLeft)
-		
-		let formatter = Date._expirationFormatter(for: timeLeft)
-		let timeString = formatter.string(from: timeLeft) ?? .localized("%lld days", arguments: daysLeft)
-		
-		return ExpirationInfo(
-			formatted: timeString,
-			color: color,
-			icon: "clock"
-		)
-	}
-	
-	private static func _expirationFormatter(for interval: TimeInterval) -> DateComponentsFormatter {
+		let daysLeft = Int(ceil(timeLeft / 86_400))
+		let color = Color.expiration(days: Int(timeLeft / 86_400))
 		let formatter = DateComponentsFormatter()
-		formatter.allowedUnits = interval < 3600
-			? [.minute]
-			: interval < 86400
-			? [.hour]
-			: [.day]
+		formatter.allowedUnits = [.day]
 		formatter.unitsStyle = .full
-		return formatter
+		let timeString = formatter.string(from: Double(daysLeft) * 86_400) ?? .localized("%lld days", arguments: daysLeft)
+		return ExpirationInfo(formatted: timeString, color: color, icon: "clock")
 	}
 }

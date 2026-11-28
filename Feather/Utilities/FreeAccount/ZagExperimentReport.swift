@@ -262,7 +262,7 @@ enum ZagExperimentReadback: String, Sendable {
 		switch verification {
 		case .verified: return readSucceeded ? .verified : .unavailable
 		case .mismatch: return .mismatch
-		case .notInstalled: return .notVerified
+		case .notInstalled, .signedOnly: return .notVerified
 		case .unverifiable: return readSucceeded ? .notVerified : .unavailable
 		}
 	}

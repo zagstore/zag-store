@@ -14,12 +14,35 @@ struct SigningView: View {
 	@Environment(\.dismiss) var dismiss
 	@StateObject private var _optionsManager = OptionsManager.shared
 	
-	@State private var _temporaryOptions: Options = OptionsManager.shared.options
+	@State private var _temporaryOptions: Options
+	private let _certificateDefaults: Options
 	@State private var _temporaryCertificate: Int
 	@State private var _isAltPickerPresenting = false
 	@State private var _isFilePickerPresenting = false
 	@State private var _isImagePickerPresenting = false
 	@State private var _isSigning = false
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	@ObservedObject private var _accountPairing = ZagRPPairingCore.shared
+	@State private var _signingMethod: ZagSigningMethod = .importedCertificate
+	@State private var _appleIDOptions = OptionsManager.shared.appleIDSigningDefaults
+	@State private var _useOnlyAppleIDOptions = false
+	private var _certificateChanges: [String] {
+		_temporaryOptions.certificateCustomisations(since: _certificateDefaults,
+			identifier: app.identifier, name: app.name, hasIcon: appIcon != nil)
+	}
+	@State private var _accountInstallMessage: String?
+	@State private var _certificateIssue: ZagNativeAccountInstall.CertificateIssue?
+	@State private var _nativeProgress: ZagNativeSigningProgress?
+	@State private var _accountDiagnostics = ""
+	@State private var _sourceImportID: String?
+	@FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Imported.date, ascending: false)])
+	private var _originalImports: FetchedResults<Imported>
+	private var _renewing: ZagNativeAppInventory.Entry? { ZagNativeAppInventory.entry(app) }
+	private var _matchingImports: [Imported] {
+		guard let original = _renewing?.installation.record.originalBundleIdentifier else { return [] }
+		return _originalImports.filter { $0.identifier == original }
+	}
+	#endif
 	@State private var _selectedPhoto: PhotosPickerItem? = nil
 	@State var appIcon: UIImage?
     @State private var _originalEntitlementAudit: ZagOriginalEntitlementAudit.Report?
@@ -39,21 +62,105 @@ struct SigningView: View {
 	}
 	
 	var app: AppInfoPresentable
-	
 	init(app: AppInfoPresentable) {
 		self.app = app
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if ZagNativeAppInventory.entry(app) != nil || ZagCertificateSelection.preference == .appleAccount {
+			__signingMethod = State(initialValue: .freeAppleAccount)
+		}
+		#endif
 		let storedCert = UserDefaults.standard.integer(forKey: "feather.selectedCert")
 		__temporaryCertificate = State(initialValue: storedCert)
+		var certificate = OptionsManager.shared.options
+		if certificate.ppqProtection, let identifier = app.identifier, ZagCertificateSelection.activeCertificate()?.ppQCheck == true {
+			certificate.appIdentifier = "\(identifier).\(certificate.ppqString)"
+		}
+		if let id = app.identifier, let mapped = certificate.identifiers[id] { certificate.appIdentifier = mapped }
+		if let name = app.name, let mapped = certificate.displayNames[name] { certificate.appName = mapped }
+		_certificateDefaults = certificate
+		__temporaryOptions = State(initialValue: certificate)
 	}
 		
 	// MARK: Body
 	var body: some View {
-		NBNavigationView("Sign App", displayMode: .inline) {
+		NBNavigationView("Customise App", displayMode: .inline) {
 			Form {
-				_customizationOptions(for: app)
-				_cert()
-                _signingPreflightSection()
-				_customizationProperties(for: app)
+				#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+				if _renewing == nil {
+					Picker("Signing Method", selection: $_signingMethod) {
+						Text(ZagSigningMethod.importedCertificate.title).tag(ZagSigningMethod.importedCertificate)
+						Text(ZagSigningMethod.freeAppleAccount.title).tag(ZagSigningMethod.freeAppleAccount)
+					}
+				}
+				if _signingMethod == .freeAppleAccount {
+					if _renewing == nil, !ZagNativeAccountInstall.hasSession {
+						NavigationLink("Add Apple ID") { ZagAppleSigningSettingsView() }
+					} else if !_accountPairing.hasSavedPairing {
+						Text("Pair this iPhone in Settings to install apps.").foregroundStyle(.secondary)
+					} else if _accountPairing.pairedIdentity == nil {
+						Text("Zag Store will identify this iPhone using its saved pairing when you start.").foregroundStyle(.secondary)
+					}
+					if let entry = _renewing {
+						if let scope = entry.installation.record.owner?.scope,
+						   !ZagNativeAccountInstall.hasConnectedAccount(scope.accountID),
+						   let owner = try? ZagNativeAppleIDs.shared.accountForAuthentication(scope.accountID) {
+							NavigationLink("Sign in with the Apple ID that signed this app") {
+								ZagAppleIDAuthenticationView(account: owner, requiresOriginalAccount: true)
+							}
+						}
+						if !ZagNativeAppInventory.hasSource(entry) {
+							Text(ZagNativeAppInventory.Failure.missingSource.localizedDescription)
+								.font(.footnote).foregroundStyle(.secondary)
+							Picker("Original App", selection: $_sourceImportID) {
+								Text("Select Import").tag(nil as String?)
+								ForEach(_matchingImports) { imported in
+									Text(imported.name ?? "App").tag(imported.uuid)
+								}
+							}
+						}
+					} else {
+						Toggle("Install After Signing", isOn: $_appleIDOptions.installAfterSigning)
+						Toggle("Delete Imported App After Signing", isOn: $_appleIDOptions.deleteImportAfterSigning)
+						if !_certificateChanges.isEmpty {
+							Text(ZagNativeAccountInstall.Failure.unsupportedOptions(_certificateChanges).localizedDescription)
+								.font(.footnote).foregroundStyle(.orange)
+							Toggle("Use only Apple ID options for this signing", isOn: $_useOnlyAppleIDOptions)
+						}
+					}
+					if let progress = _nativeProgress {
+						VStack(spacing: 12) {
+							InstallProgressView(app: app, progress: progress.fraction, completed: progress == .verified)
+								.foregroundStyle(.tint)
+							Text(progress.title)
+								.font(.footnote.weight(.medium))
+								.contentTransition(.numericText())
+						}
+						.frame(maxWidth: .infinity)
+						.accessibilityElement(children: .combine)
+						.accessibilityValue(progress.title)
+					}
+					if let issue = _certificateIssue, ZagNativeAccountInstall.hasConnectedAccount(issue.scope.accountID) {
+						Section("Development Certificate") {
+							Text(issue.failure.message).font(.footnote)
+							Button("Copy Diagnostics") { UIPasteboard.general.string = ZagSigningDiagnostics.latest }
+							if let recovery = issue.recovery {
+								NavigationLink("Recover Certificate Request") {
+									ZagCertificateRecoveryView(model: recovery, teamName: issue.teamName, onResolved: { _startAccountInstall(resuming: issue.scope) })
+								}
+							}
+							NavigationLink("Manage Development Certificates") {
+								ZagCertificateReplacementView(model: .inventory(team: issue.scope.teamID, expectedScope: issue.scope), onRevoked: { _startAccountInstall(resuming: issue.scope) })
+							}
+							Text("Signing continues after the certificate request is resolved.")
+								.font(.footnote).foregroundStyle(.secondary)
+						}
+					}
+				} else {
+					_certificateOptions
+				}
+				#else
+				_certificateOptions
+				#endif
 				
 				// horrible
 				Rectangle()
@@ -71,10 +178,11 @@ struct SigningView: View {
 							Button {
 								_start()
 							} label: {
-								NBSheetButton(title: .localized("Start Signing"), style: .prominent)
+								NBSheetButton(title: _signButtonTitle, style: .prominent)
 									.padding()
 							}
 							.buttonStyle(.plain)
+							.disabled(!_canStartSigning)
 							.offset(y: UIDevice.current.userInterfaceIdiom == .pad ? -20 : -40)
 						}
 				}
@@ -85,15 +193,22 @@ struct SigningView: View {
 				NBToolbarButton(role: .dismiss)
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button("Reset") {
-                        _temporaryOptions = OptionsManager.shared.options
+                        #if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+                        if _signingMethod == .freeAppleAccount {
+                            _appleIDOptions = OptionsManager.shared.appleIDSigningDefaults
+                            _useOnlyAppleIDOptions = false
+                            return
+                        }
+                        #endif
+                        _temporaryOptions = _certificateDefaults
                         appIcon = nil
                     }
                     .accessibilityLabel("Reset Signing Options")
 
-                    Button { dismiss() } label: {
+                    Button { _closeSigning() } label: {
                         Image(systemName: "xmark")
                     }
-                    .accessibilityLabel("Close Sign App")
+                    .accessibilityLabel("Close Customise App")
                 }
 			}
 			.sheet(isPresented: $_isAltPickerPresenting) { SigningAlternativeIconView(app: app, appIcon: $appIcon, isModifing: .constant(true)) }
@@ -121,31 +236,22 @@ struct SigningView: View {
 			.disabled(_isSigning)
 			.animation(.smooth, value: _isSigning)
 		}
-		.onAppear {
-			// ppq protection
-			if
-				_optionsManager.options.ppqProtection,
-				let identifier = app.identifier,
-				let cert = _selectedCert(),
-				cert.ppQCheck
-			{
-				_temporaryOptions.appIdentifier = "\(identifier).\(_optionsManager.options.ppqString)"
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		.alert("Apple Account Installation", isPresented: Binding(
+			get: { _accountInstallMessage != nil },
+			set: { if !$0 { _accountInstallMessage = nil } }
+		)) {
+			if !_accountDiagnostics.isEmpty {
+				Button("Copy Diagnostics") { UIPasteboard.general.string = _accountDiagnostics }
 			}
-			
-			if
-				let currentBundleId = app.identifier,
-				let newBundleId = _temporaryOptions.identifiers[currentBundleId]
-			{
-				_temporaryOptions.appIdentifier = newBundleId
-			}
-			
-			if
-				let currentName = app.name,
-				let newName = _temporaryOptions.displayNames[currentName]
-			{
-				_temporaryOptions.appName = newName
-			}
+			Button("OK", role: .cancel) { _accountInstallMessage = nil }
+		} message: {
+			Text(_accountInstallMessage ?? "")
 		}
+		.interactiveDismissDisabled(_isSigning && _signingMethod == .freeAppleAccount)
+		.onChange(of: _temporaryOptions) { _ in _useOnlyAppleIDOptions = false }
+		.onChange(of: appIcon != nil) { _ in _useOnlyAppleIDOptions = false }
+		#endif
 	}
 }
 
@@ -838,18 +944,133 @@ private enum ZagOriginalEntitlementAudit {
 
 // MARK: - Extension: View (import)
 extension SigningView {
-	private func _start() {
-		if ZagCertificateSelection.asksEveryTime,
-		   _temporaryOptions.signingOption == .default {
-			Task { @MainActor in
-				guard let certificate = await ZagCertificateSelection.chooseForSigning() else {
-					return
-				}
-				_startSigning(using: certificate)
+	private var _signButtonTitle: String {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if _signingMethod == .freeAppleAccount {
+			if _isSigning { return _nativeProgress?.title ?? "Preparing App" }
+			if _renewing != nil { return "Resign and Install" }
+			if let issue = _certificateIssue, ZagNativeAccountInstall.hasConnectedAccount(issue.scope.accountID) {
+				return "Resume Sign and Install"
 			}
+			return _appleIDOptions.installAfterSigning ? "Sign and Install" : "Sign"
+		}
+		#endif
+		return .localized("Start Signing")
+	}
+
+	private var _canStartSigning: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if _signingMethod == .freeAppleAccount {
+			guard _accountPairing.hasSavedPairing && !_isSigning else { return false }
+			if let entry = _renewing {
+				guard entry.installation.record.owner != nil else { return false }
+				return ZagNativeAppInventory.hasSource(entry) || _sourceImportID != nil
+			}
+			return _useOnlyAppleIDOptions || _certificateChanges.isEmpty
+		}
+		#endif
+		return true
+	}
+
+	@ViewBuilder
+	private var _certificateOptions: some View {
+		_customizationOptions(for: app)
+		_cert()
+		_signingPreflightSection()
+		_customizationProperties(for: app)
+	}
+
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	private func _startAccountInstall(resuming scope: ZagSigningScope? = nil) {
+		guard !_isSigning else { return }
+		if let issue = _certificateIssue, !ZagNativeAccountInstall.hasConnectedAccount(issue.scope.accountID) { _certificateIssue = nil }
+		let expectedScope = scope ?? _certificateIssue?.scope
+		_isSigning = true
+		_accountDiagnostics = ""
+		_nativeProgress = .preparing
+		Task { @MainActor in
+			defer { _isSigning = false }
+			do {
+				if let entry = _renewing {
+					try await _renew(entry)
+				} else {
+					try ZagNativeAccountInstall.validateOptions(explicitCertificateChanges: _useOnlyAppleIDOptions ? [] : _certificateChanges)
+					guard let source = Storage.shared.getAppDirectory(for: app) else { throw ZagNativeAccountInstall.Failure.invalidApp }
+					let accountID = try await ZagAppleIDSigningSelection.resolve(required: expectedScope?.accountID)
+					let result = try await ZagNativeAccountInstall.install(
+						source: source, name: app.name ?? "App", accountID: accountID, expectedScope: expectedScope,
+						installAfterSigning: _appleIDOptions.installAfterSigning,
+						onCertificateReady: { @MainActor in _certificateIssue = nil }, progress: _reportNativeProgress
+					)
+					switch result {
+					case .verified, .signedOnly:
+						if _appleIDOptions.deleteImportAfterSigning, !app.isSigned { Storage.shared.deleteApp(for: app) }
+					default: throw ZagNativeAppInventory.Failure.unverified
+					}
+					if case .signedOnly = result {
+						_certificateIssue = nil
+						_nativeProgress = nil
+						_accountInstallMessage = "Signed and saved in Apps. Tap Install when you’re ready."
+						return
+					}
+				}
+				_certificateIssue = nil
+				_accountInstallMessage = "Installed and verified on this iPhone. Open the app from the Home Screen."
+			} catch is ZagInstallCancelled {
+				_nativeProgress = nil
+			} catch let issue as ZagNativeAccountInstall.CertificateIssue {
+				_nativeProgress = nil
+				_certificateIssue = issue
+			} catch {
+				_nativeProgress = nil
+				let phase = ZagNativeAccountInstall.failurePhase(error, fallback: _renewing == nil ? .signing : .refresh)
+				_accountDiagnostics = [ZagSigningDiagnostics.latest, ZagSigningDiagnostics.failureDetails(phase, error)].joined(separator: "\n")
+				if ZagFreeAppLimitReached.classify(error) != nil {
+					ZagNativeAccountInstall.showInlineFailure(error, fallback: phase)
+				} else {
+					_accountInstallMessage = phase.message
+				}
+			}
+		}
+	}
+
+	private func _renew(_ entry: ZagNativeAppInventory.Entry) async throws {
+		guard let scope = entry.installation.record.owner?.scope else {
+			throw ZagNativeAppInventory.Failure.wrongAccount
+		}
+		let accountID = try await ZagAppleIDSigningSelection.resolve(required: scope.accountID)
+		func renew(_ source: URL) async throws {
+			let result = try await ZagNativeAccountInstall.install(source: source, name: entry.name, accountID: accountID, expectedScope: scope,
+				onCertificateReady: { @MainActor in _certificateIssue = nil }, renewing: entry, progress: _reportNativeProgress)
+			guard case .verified = result else { throw ZagNativeAppInventory.Failure.unverified }
+		}
+		if !ZagNativeAppInventory.hasSource(entry),
+		   let imported = _matchingImports.first(where: { $0.uuid == _sourceImportID }),
+		   let source = Storage.shared.getAppDirectory(for: imported) {
+			try await renew(source)
+		} else {
+			try await ZagNativeAppInventory.withSource(entry, body: renew)
+		}
+	}
+
+	private var _reportNativeProgress: @Sendable (ZagNativeSigningProgress) async -> Void {
+		{ @MainActor stage in
+			withAnimation(.smooth) { _nativeProgress = max(_nativeProgress ?? .preparing, stage) }
+		}
+	}
+	#endif
+
+	private func _closeSigning() {
+		dismiss()
+	}
+
+	private func _start() {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if _signingMethod == .freeAppleAccount {
+			_startAccountInstall()
 			return
 		}
-
+		#endif
 		_startSigning(using: _selectedCert())
 	}
 
@@ -889,7 +1110,7 @@ extension SigningView {
 			if let error {
 				ZagLogger.shared.error("Manual Signing", "\(app.name ?? "Unknown") | id=\(app.identifier ?? "unknown") | \(error.localizedDescription)")
 				let ok = UIAlertAction(title: .localized("Dismiss"), style: .cancel) { _ in
-					dismiss()
+					_closeSigning()
 				}
 
 				UIAlertController.showAlert(
@@ -914,7 +1135,7 @@ extension SigningView {
 						)
 					}
 				}
-				dismiss()
+				_closeSigning()
 			}
 		}
 	}}

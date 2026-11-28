@@ -101,6 +101,7 @@ enum ZagDER {
 		static let rsaEncryption = "1.2.840.113549.1.1.1"
 		static let sha256WithRSAEncryption = "1.2.840.113549.1.1.11"
 		static let commonName = "2.5.4.3"
+		static let organizationalUnit = "2.5.4.11"
 	}
 
 	static func decodeObjectIdentifier(_ node: Node) -> String? {
@@ -116,10 +117,20 @@ enum ZagDER {
 
 	/// The common name in an X.501 name, if present.
 	static func commonName(in name: Node) -> String? {
+		attribute(OID.commonName, in: name)
+	}
+
+	/// The organizational unit (the Apple team identifier, for Apple certs), if present.
+	static func organizationalUnit(in name: Node) -> String? {
+		attribute(OID.organizationalUnit, in: name)
+	}
+
+	/// The first value for `oid` in an X.501 name, if present.
+	static func attribute(_ oid: String, in name: Node) -> String? {
 		for rdn in (try? name.children()) ?? [] {
 			for attribute in (try? rdn.children()) ?? [] {
 				guard let pair = try? attribute.children(), pair.count == 2,
-					  decodeObjectIdentifier(pair[0]) == OID.commonName else { continue }
+					  decodeObjectIdentifier(pair[0]) == oid else { continue }
 				return String(data: pair[1].content, encoding: .utf8)
 			}
 		}
@@ -220,6 +231,8 @@ struct ZagCertificateInspection: Equatable, Sendable {
 	/// Upper-case hexadecimal, without leading zeros.
 	let serialNumber: String
 	let commonName: String?
+	/// Subject organizational unit (the Apple team identifier, for Apple certs).
+	let organizationalUnit: String?
 	let expiresAt: Date
 	/// PKCS #1 RSA public key, if the certificate holds an RSA key.
 	let publicKey: Data?
@@ -237,6 +250,7 @@ struct ZagCertificateInspection: Equatable, Sendable {
 		let serial = fields[0].content.drop { $0 == 0 }
 		serialNumber = serial.isEmpty ? "0" : serial.map { String(format: "%02X", $0) }.joined()
 		commonName = ZagDER.commonName(in: fields[4])
+		organizationalUnit = ZagDER.organizationalUnit(in: fields[4])
 		self.expiresAt = expiresAt
 		publicKey = ZagDER.rsaPublicKey(in: fields[5])
 	}

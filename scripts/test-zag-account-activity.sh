@@ -17,12 +17,31 @@ account = view.split('struct ZagAccountPopup:', 1)[1]
 assert 'Button(action: onOpenActivity)' in account
 assert 'AccountDestination.activity' not in account and 'case .activity:' not in account
 assert 'TabEnum.view(for: .activity)' not in account
+certificates = (root / 'Feather/Views/Settings/Certificates/CertificatesView.swift').read_text()
+toolbar = certificates.split('.toolbar {', 1)[1].split('.task {', 1)[0]
+assert toolbar.count('.accessibilityLabel("Close")') == 1
+assert toolbar.index('Image(systemName: "plus")') < toolbar.index('Image(systemName: "xmark")')
+assert 'closeAccount()' in toolbar and 'dismiss()' in toolbar
+assert 'destination != .settings && destination != .certificates' in account
+settings = (root / 'Feather/Views/Settings/SettingsView.swift').read_text()
+assert 'CertificatesView(openedFromSettings: true)' in settings
+about = settings.split('private var _aboutRows:', 1)[1].split('private func _directories', 1)[0]
+assert 'Text("GitHub")' not in about and '_showFeedback = true' in about
+feedback = settings.split('.alert("Send Feedback"', 1)[1].split('Delete Certificate?', 1)[0]
+actions = [feedback.index(f'Button("{name}"') for name in ('GitHub', 'Discord', 'Send Email', 'Cancel')]
+assert actions == sorted(actions) and 'Choose a method to send feedback:' in feedback
+assert settings.index('_socialLinks') < settings.index('ZagInstalledRelease.settingsVersion')
+footer = settings.split('private enum SocialLink:', 1)[1].split('private struct ZagLoggingSettingsView', 1)[0]
+assert footer.index('case github') < footer.index('case discord')
+assert '.foregroundStyle(.primary)' in footer and '.frame(width: 44, height: 44)' in footer
+assert 'ZagContinuousSettingsCard(verticalPadding: 8) { _featureRows }' in settings
 old = subprocess.check_output(['git', 'show', '0ff5181d:Feather/Views/TabView/VariedTabbarView.swift'], cwd=root, text=True).split('struct ZagAccountPopup:', 1)[1]
 normalized = account.replace('    let onOpenActivity: () -> Void\n', '').replace('devices, selfUpdate, settings', 'devices, activity, selfUpdate, settings', 1)
 normalized = normalized.replace('Button(action: onOpenActivity) {\n                        Text("Activity").foregroundStyle(.primary)\n                    }', 'NavigationLink(value: AccountDestination.activity) {\n                        Text("Activity")\n                    }', 1)
 normalized = normalized.replace('                    case .selfUpdate: ZagSelfUpdateStatusView()', '                    case .activity: TabEnum.view(for: .activity).tint(themeTint)\n                    case .selfUpdate: ZagSelfUpdateStatusView()', 1)
 assert account.count('Text("Guest User")') == 1
 old = old.replace('Text("Petar Zagorski")', 'Text("Guest User")', 1)
+normalized = normalized.replace('destination != .settings && destination != .certificates', 'destination != .settings', 1)
 assert normalized == old, 'other Account destinations must be unchanged'
 tabs = (root / 'Feather/Views/TabView/TabEnum.swift').read_text()
 assert 'case .activity: ZagActivityPage()' in tabs and 'NBNavigationView("Activity")' in tabs
