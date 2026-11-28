@@ -239,85 +239,91 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
             raise ValueError("Invalid or expired portable developer credential") from None
         finally:
             credential = None
-    secret = secrets.token_bytes(32)
-    transaction = str(uuid.uuid4())
-    deadline = time.monotonic() + 600
-    bootstrap = scratch / "setup-bootstrap.json"
     try:
-        check_target()
-        private_write(bootstrap, json.dumps({
-            "id": transaction, "expires": time.time() + 600, "secret": base64.b64encode(secret).decode(),
-            "udid": udid, "bundle": bundle, "team": team, "keyScope": item,
-            "certificate": base64.b64encode(certificate).decode(),
-            "accountTransfer": account_credential is not None,
-        }).encode())
-        device.copy_to_app(target, bundle, bootstrap, BOOTSTRAP)
-        notify("Verified USB bootstrap delivery to the installed Personal Team app.")
-    finally:
-        bootstrap.unlink(missing_ok=True)
-    try:
-        device.launch_app(target, bundle)
-    except (ValueError, subprocess.SubprocessError):
-        notify("Unlock the iPhone and open the newly installed Zag Store.")
-    notify("Complete any prerequisites on the iPhone and authorize Signing Setup there.")
-    notify("Local installation pairing may still be required for renewal. Do not change pairing in the AppTesters copy.")
-    labels = ("request", "account-request") if account_credential is not None else ("request",)
-    phase, request_bytes = poll([(SETUP_REQUEST, labels), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
-    if phase == "account-request":
-        scope, leaf = validate_request(request_bytes, udid, bundle, team)
-        desktop.require(scope == item and leaf == certificate, "Account request does not match the installed signing identity")
-        check_target()
-        account_request = scratch / "account-setup-request.json"
-        account_response = scratch / "account-setup-response.json"
-        try:
-            private_write(account_request, request_bytes)
-            ciphertext = encrypt_payload(repo, cache, account_request, account_credential)
-            private_write(account_response, wrap(secret, transaction, "account-response", ciphertext))
-            while time.monotonic() < deadline:
-                try:
-                    check_target()
-                    device.copy_to_app(target, bundle, account_response, SETUP_RESPONSE)
-                    break
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    time.sleep(2)
-            else:
-                raise ValueError("Could not deliver the encrypted Apple ID session")
-            notify("Encrypted Apple ID session delivered. Zag Store will validate it with Apple.")
-        finally:
-            account_request.unlink(missing_ok=True)
-            account_response.unlink(missing_ok=True)
-            account_credential = None
-        phase, request_bytes = poll([(SETUP_REQUEST, ("request",)), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
-    if phase == "existing":
-        desktop.require(hmac.compare_digest(request_bytes, hashlib.sha256(certificate).digest()),
-                        "Existing setup acknowledgement does not match the installed certificate")
-        check_target()
-        return {"signing_setup": "verified"}
-    scope, leaf = validate_request(request_bytes, udid, bundle, team)
-    desktop.require(scope == item and leaf == certificate, "Setup request does not match the installed signing identity")
-    check_target()
-    request = scratch / "setup-request.json"
-    private_write(request, request_bytes)
-    response = scratch / "setup-response.json"
-    private_write(response, wrap(secret, transaction, "response", encrypt(repo, cache, openssl, request, key)))
-
-    # Retry delivery after a transient disconnect, using the same authenticated
-    # response. The iPhone consumes the request before importing it.
-    while time.monotonic() < deadline:
+        secret = secrets.token_bytes(32)
+        transaction = str(uuid.uuid4())
+        deadline = time.monotonic() + 600
+        bootstrap = scratch / "setup-bootstrap.json"
         try:
             check_target()
-            device.copy_to_app(target, bundle, response, SETUP_RESPONSE)
-            break
-        except (OSError, ValueError, subprocess.SubprocessError):
-            time.sleep(2)
-    else:
-        raise ValueError("Could not deliver the signing identity. Reconnect and use setup to retry.")
+            private_write(bootstrap, json.dumps({
+                "id": transaction, "expires": time.time() + 600, "secret": base64.b64encode(secret).decode(),
+                "udid": udid, "bundle": bundle, "team": team, "keyScope": item,
+                "certificate": base64.b64encode(certificate).decode(),
+                "accountTransfer": account_credential is not None,
+            }).encode())
+            device.copy_to_app(target, bundle, bootstrap, BOOTSTRAP)
+            notify("Verified USB bootstrap delivery to the installed Personal Team app.")
+        finally:
+            bootstrap.unlink(missing_ok=True)
+        try:
+            device.launch_app(target, bundle)
+        except (ValueError, subprocess.SubprocessError):
+            notify("Unlock the iPhone and open the newly installed Zag Store.")
+        notify("Complete any prerequisites on the iPhone and authorize Signing Setup there.")
+        notify("Local installation pairing may still be required for renewal. Do not change pairing in the AppTesters copy.")
+        labels = ("request", "account-request") if account_credential is not None else ("request",)
+        phase, request_bytes = poll([(SETUP_REQUEST, labels), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
+        if phase == "account-request":
+            scope, leaf = validate_request(request_bytes, udid, bundle, team)
+            desktop.require(scope == item and leaf == certificate, "Account request does not match the installed signing identity")
+            check_target()
+            account_request = scratch / "account-setup-request.json"
+            account_response = scratch / "account-setup-response.json"
+            try:
+                private_write(account_request, request_bytes)
+                ciphertext = encrypt_payload(repo, cache, account_request, account_credential)
+                private_write(account_response, wrap(secret, transaction, "account-response", ciphertext))
+                while time.monotonic() < deadline:
+                    try:
+                        check_target()
+                        device.copy_to_app(target, bundle, account_response, SETUP_RESPONSE)
+                        break
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        time.sleep(2)
+                else:
+                    raise ValueError("Could not deliver the encrypted Apple ID session")
+                notify("Encrypted Apple ID session delivered. Zag Store will validate it with Apple.")
+            finally:
+                account_request.unlink(missing_ok=True)
+                account_response.unlink(missing_ok=True)
+                account_credential = None
+            phase, request_bytes = poll([(SETUP_REQUEST, ("request",)), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
+        if phase == "existing":
+            desktop.require(hmac.compare_digest(request_bytes, hashlib.sha256(certificate).digest()),
+                            "Existing setup acknowledgement does not match the installed certificate")
+            check_target()
+            return {"signing_setup": "verified"}
+        scope, leaf = validate_request(request_bytes, udid, bundle, team)
+        desktop.require(scope == item and leaf == certificate, "Setup request does not match the installed signing identity")
+        check_target()
+        request = scratch / "setup-request.json"
+        private_write(request, request_bytes)
+        response = scratch / "setup-response.json"
+        private_write(response, wrap(secret, transaction, "response", encrypt(repo, cache, openssl, request, key)))
 
-    completion, acknowledgement = poll([(ACKNOWLEDGEMENT, ("verified", "imported", "cancelled"))])
-    desktop.require(hmac.compare_digest(acknowledgement, hashlib.sha256(request_bytes).digest()),
-                    "The completion acknowledgement is for a different request")
-    check_target()
-    if completion == "imported":
-        notify("Signing identity imported. Local installation ownership verification is still pending.")
-        return {"signing_setup": "incomplete", "signing_identity": "imported"}
-    return {"signing_setup": "verified"}
+        # Retry delivery after a transient disconnect, using the same authenticated
+        # response. The iPhone consumes the request before importing it.
+        while time.monotonic() < deadline:
+            try:
+                check_target()
+                device.copy_to_app(target, bundle, response, SETUP_RESPONSE)
+                break
+            except (OSError, ValueError, subprocess.SubprocessError):
+                time.sleep(2)
+        else:
+            raise ValueError("Could not deliver the signing identity. Reconnect and use setup to retry.")
+
+        completion, acknowledgement = poll([(ACKNOWLEDGEMENT, ("verified", "imported", "cancelled"))])
+        desktop.require(hmac.compare_digest(acknowledgement, hashlib.sha256(request_bytes).digest()),
+                        "The completion acknowledgement is for a different request")
+        check_target()
+        if completion == "imported":
+            notify("Signing identity imported. Local installation ownership verification is still pending.")
+            return {"signing_setup": "incomplete", "signing_identity": "imported"}
+        return {"signing_setup": "verified"}
+    finally:
+        account_credential = None
+        for name in ("setup-bootstrap.json", "setup-inbound", "account-setup-request.json",
+                     "account-setup-response.json", "setup-request.json", "setup-response.json"):
+            (scratch / name).unlink(missing_ok=True)
