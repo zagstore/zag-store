@@ -569,19 +569,19 @@ private struct InstallerView: View {
         return VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Image(systemName: "apple.logo").font(.system(size: 17, weight: .medium))
-                Text("Apple IDs").font(.title3.weight(.semibold))
+                Text("Apple IDs").font(.system(size: 23, weight: .semibold))
                 Spacer()
                 Text("\(accounts.count)").font(.caption.monospacedDigit())
                     .padding(.horizontal, 8).padding(.vertical, 4)
                     .background(border, in: Capsule())
             }
             Text("Choose an account for your next installation.")
-                .font(.caption).foregroundStyle(muted)
+                .font(.system(size: 14)).foregroundStyle(muted)
             if accounts.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "person.crop.circle").font(.system(size: 36, weight: .light))
-                    Text("No remembered accounts").font(.callout.weight(.medium))
-                    Text("Remember an Apple ID when signing in.").font(.caption)
+                    Text("No remembered accounts").font(.system(size: 16, weight: .medium))
+                    Text("Remember an Apple ID when signing in.").font(.system(size: 14))
                 }.foregroundStyle(muted).multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity).padding(.vertical, 20)
             }
@@ -594,9 +594,9 @@ private struct InstallerView: View {
                             Image(systemName: "person.crop.circle.fill").font(.title2)
                                 .foregroundStyle(ZagPalette.blue)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(account).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                                Text(account).font(.system(size: 15, weight: .medium)).lineLimit(1).truncationMode(.middle)
                                 Text(preferredAccount == account ? "Selected for next sign-in" : "Remembered")
-                                    .font(.caption2).foregroundStyle(muted)
+                                    .font(.system(size: 12)).foregroundStyle(muted)
                             }
                             Spacer(minLength: 0)
                             if preferredAccount == account {
@@ -627,7 +627,7 @@ private struct InstallerView: View {
                 .font(.caption).foregroundStyle(muted)
         }
         .padding(16)
-        .frame(width: 260)
+        .frame(width: 290)
         .background(surface.opacity(0.65), in: RoundedRectangle(cornerRadius: 16))
         .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(border, lineWidth: 1) }
         .disabled(installer.busy)
@@ -647,9 +647,9 @@ private struct InstallerView: View {
                     Text("Z").font(.largeTitle.bold()).frame(width: 64, height: 64)
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Loader").font(.largeTitle.bold()).foregroundStyle(dark ? Color.white : Color.primary).accessibilityLabel("zLoader")
+                    Text("Loader").font(.system(size: 38, weight: .bold)).foregroundStyle(dark ? Color.white : Color.primary).accessibilityLabel("zLoader")
                     Text("Your device. Your apps.")
-                        .foregroundStyle(muted)
+                        .font(.system(size: 16, weight: .medium)).foregroundStyle(muted)
                 }
                 Spacer()
             }
@@ -659,9 +659,9 @@ private struct InstallerView: View {
                 HStack(spacing: 12) {
                     DeviceIllustration(identifier: device.modelIdentifier)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(device.title).font(.system(size: 19, weight: .semibold))
+                        Text(device.title).font(.system(size: 24, weight: .semibold))
                             .foregroundStyle(dark ? ZagPalette.rgb(0xe8edf5) : Color.primary)
-                        Text(device.detail).font(.system(size: 13)).foregroundStyle(muted)
+                        Text(device.detail).font(.system(size: 15)).foregroundStyle(muted)
                     }
                     Spacer()
                     connectionLight
@@ -698,7 +698,7 @@ private struct InstallerView: View {
                         .foregroundStyle(attention)
                 }
             }
-            .font(.callout)
+            .font(.system(size: 14))
             .foregroundStyle(muted)
 
             if !nativeDevelopment {
@@ -719,7 +719,7 @@ private struct InstallerView: View {
                     }
                 } label: {
                     Text(actionTitle)
-                        .font(.system(size: 19, weight: .semibold))
+                        .font(.system(size: 21, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 12)
@@ -880,7 +880,7 @@ private struct InstallerView: View {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
-        .frame(minWidth: 800, idealWidth: 960, minHeight: 420, idealHeight: 620)
+        .frame(minWidth: 860, idealWidth: 1000, minHeight: 460, idealHeight: 650)
         .background { atmosphere.ignoresSafeArea() }
         .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
