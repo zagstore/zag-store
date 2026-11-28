@@ -137,6 +137,49 @@ class StandaloneUSB:
             )
         return result
 
+    def preflight_signed(self, signed, release, team, root, certificate, *,
+                         previous=None, check_authorization=releases.check_fresh):
+        """Validate Apple signing on macOS, then independently bind IPA/device.
+
+        This method performs ONLY local reads and native USB inventory.
+        Its returned report is explicitly not an installation authorization.
+        """
+        artifact.require(self.identity is not None, "Discover the trusted USB iPhone first")
+        self._run("status")
+        intent = native_preflight.create(signed, release, team, self.identity,
+                                         certificate, root, artifact,
+                                         check_authorization, previous=previous)
+        intent_file = native_preflight.write_private(intent, self.scratch)
+        try:
+            try:
+                result = subprocess.run([str(self.executable), "preflight", str(intent_file)],
+                                        capture_output=True, timeout=95, check=False)
+            except subprocess.TimeoutExpired as error:
+                raise ValueError("Native IPA preflight timed out") from error
+            artifact.require(result.returncode == 0 and len(result.stdout) <= 4096,
+                             "Native signed IPA/device preflight failed without device writes")
+            try:
+                report = json.loads(result.stdout)
+            except (ValueError, UnicodeError) as error:
+                raise ValueError("Native preflight returned invalid JSON") from error
+            expected_state = ("expected_upgrade_detected" if previous is not None
+                              else "not_reported_by_inventory")
+            artifact.require(
+                isinstance(report, dict)
+                and report.get("preflight") == "validated_local_digest_and_device"
+                and report.get("writes_performed") is False
+                and report.get("installation_authorized") is False
+                and report.get("bundleIdentifier") == intent["bundle_identifier"]
+                and report.get("version") == intent["version"]
+                and report.get("build") == intent["build"]
+                and report.get("sha256") == intent["ipa_sha256"]
+                and report.get("operation") == ("upgrade" if previous is not None else "fresh_install")
+                and report.get("destination_state") == expected_state,
+                "Native preflight returned an inconsistent installation state")
+            return report
+        finally:
+            intent_file.unlink(missing_ok=True)
+
     def install(self, identifier, path):
         raise ValueError("Native USB installation is disabled pending validated release-to-transfer integration")
 
@@ -309,6 +352,14 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
         confirmation = f"UPGRADE {expected}" if installed is not None else "INSTALL"
         operation = "Upgrade in place" if installed is not None else "Install as a separate app"
     check_authorization(release)
+    if isinstance(device, StandaloneUSB):
+        # The signing validator has already passed. Independently verify the
+        # exact signed IPA checksum, wired device, minimum iOS, and targeted
+        # destination before asking the user to approve any device write.
+        prior = ({"version": installed["version"], "build": installed["bundleVersion"]}
+                 if installed is not None else None)
+        device.preflight_signed(signed, release, team, apple_root, certificate,
+                                previous=prior, check_authorization=check_authorization)
     artifact.require(approve(f"{operation} {label}? Type {confirmation}: ") == confirmation,
                      "Installation cancelled")
     artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
