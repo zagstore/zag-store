@@ -92,6 +92,29 @@ class DesktopTests(unittest.TestCase):
             portal.handle({"event": "configuration"})
         self.assertIsNone(portal.anisette_scope)
 
+    def test_account_candidate_requires_explicit_native_opt_in_and_matching_account(self):
+        import json
+        store = Mock()
+        store.read.return_value = None
+        portal = desktop.Provisioning(None, "udid", store, "openssl", lambda _: TEAM,
+                                      Mock(return_value="apple@example.invalid"), "native")
+        event = {"event": "account_bootstrap", "credential": {
+            "accountID": "12345", "token": "synthetic",
+            "expiresAtMs": int((dt.datetime.now(dt.timezone.utc).timestamp() + 300) * 1000)}}
+        self.assertNotIn("account_bootstrap", portal.handle({"event": "configuration"}))
+        with self.assertRaisesRegex(ValueError, "Unexpected account"):
+            portal.handle(event)
+        portal.account_bootstrap = True
+        self.assertTrue(portal.handle({"event": "configuration"})["account_bootstrap"])
+        portal.handle({"event": "team", "account": "12345", "teams": [{"id": TEAM}]})
+        with self.assertRaisesRegex(ValueError, "Invalid portable"):
+            portal.handle({**event, "credential": {**event["credential"], "accountID": "67890"}})
+        self.assertTrue(portal.handle(event))
+        self.assertEqual(json.loads(portal.account_credential)["token"], event["credential"])
+        store.write.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "Unexpected account"):
+            portal.handle(event)
+
     def test_unknown_second_factor_requires_a_delivery_method(self):
         event = {"retry": False, "unknown": True, "sms": False,
                  "numbers": [{"id": 77, "last_two": "12"}]}

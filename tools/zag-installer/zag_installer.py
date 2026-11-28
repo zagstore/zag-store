@@ -556,6 +556,17 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     auth, helper, openssl, anisette = cache.installer_tools(ROOT, native=endpoint is None)
     store = desktop.Keychain(helper)
     portal = desktop.Provisioning(endpoint, udid, store, openssl, choose_team, approve, anisette, upgrade, components)
+    # Only the separately packaged native development GUI can offer account
+    # portability, and only to a fresh, capability-advertising signed release.
+    account_bootstrap = (defer_setup and not upgrade and endpoint is None and anisette is not None
+                         and info.get("ZagAutomaticSigningSetup") is True
+                         and info.get("ZagDesktopAccountBootstrap") is True)
+    if account_bootstrap:
+        artifact.require(confirm_action(approve,
+            "Use the Apple ID from this Mac in the new Zag Store installation? "
+            "Only its developer session and signing identity will be transferred privately over USB.",
+            "ACCOUNT", "Continue") == "ACCOUNT", "Apple ID transfer cancelled")
+        portal.account_bootstrap = True
     team, identity, profiles = portal.run(auth)
     signed = desktop.sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch)
     result = validate_and_install(signed, release, team, root, scratch, device, target, udid,
@@ -568,7 +579,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     except (OSError, ValueError, subprocess.SubprocessError):
         result["signing_receipt_saved"] = False
     if info.get("ZagAutomaticSigningSetup") is True:
-        if defer_setup:
+        if defer_setup and not (account_bootstrap and portal.account_credential):
             result["signing_setup"] = "incomplete"
             print("Installation verified. Use Resume Signing Setup when ready; no pairing changes have been requested.", flush=True)
             return result
@@ -578,10 +589,13 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
             artifact.require(observed and observed.get("version") == result["version"]
                              and observed.get("bundleVersion") == result["build"], "The installed Personal Team copy changed")
             result.update(handoff.automatic(ROOT, cache, scratch, device, target, udid, team, identity.key_item,
-                                            identity.certificate, identity.key, openssl, observed))
+                                            identity.certificate, identity.key, openssl, observed,
+                                            account_credential=portal.account_credential if account_bootstrap else None))
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"Signing Setup is incomplete. {error if type(error) is ValueError else 'Check USB and retry.'}", file=sys.stderr)
             result["signing_setup"] = "incomplete"
+        finally:
+            portal.account_credential = None
     return result
 
 

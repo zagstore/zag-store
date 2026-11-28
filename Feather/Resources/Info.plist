@@ -4,6 +4,8 @@
 <dict>
 	<key>ZagAutomaticSigningSetup</key>
 	<true/>
+	<key>ZagDesktopAccountBootstrap</key>
+	<true/>
 	<key>ZagReleaseChannel</key>
 	<string>$(ZAG_RELEASE_CHANNEL)</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>

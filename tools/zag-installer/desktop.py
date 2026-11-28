@@ -216,15 +216,23 @@ class Provisioning:
         self.upgrade = upgrade
         self.components = components if components is not None else {"": ""}
         self.profiles = {}
+        self.account_bootstrap = False
+        self.account_credential = None
+        self.account_id = None
+        self.email = None
 
     def handle(self, message):
         event = message["event"]
         if event == "configuration":
             email = self.approve("Apple ID: ").strip()
             require(email, "Apple ID is required")
+            self.email = email
             if self.native:
                 self.native.item = scope("anisette", "clean-room-mac-legacy-v1", email.casefold())
-                return {"provider": "native", "email": email, "udid": self.udid, "suffixes": list(self.components.values())}
+                config = {"provider": "native", "email": email, "udid": self.udid, "suffixes": list(self.components.values())}
+                if self.account_bootstrap:
+                    config["account_bootstrap"] = True
+                return config
             require(self.endpoint and confirm_action(self.approve, f"Use approved anisette service {self.endpoint}?", "ANISETTE", "Continue")
                     == "ANISETTE", "Remote anisette cancelled")
             self.anisette_scope = scope("anisette", self.endpoint, email.casefold())
@@ -250,6 +258,7 @@ class Provisioning:
         if event == "team":
             account = message["account"]
             require(isinstance(account, str) and account, "Missing authenticated Apple account ID")
+            self.account_id = account
             self.team = self.choose_team(message["teams"])
             self.receipt_item = scope("installed-leaf", self.udid.casefold(), self.team)
             stored_leaf = self.store.read(self.receipt_item) if self.upgrade else None
@@ -259,6 +268,24 @@ class Provisioning:
                 require(re.fullmatch(r"[0-9a-f]{64}", expected), "Installed signing receipt is unreadable")
             self.identity = Identity(self.store, account, self.team, self.openssl, self.approve, self.upgrade, expected)
             return self.team
+        if event == "account_bootstrap":
+            # This event arrives over the private child pipe, never the GUI
+            # event stream, and is retained in memory only for this install.
+            require(self.account_bootstrap and self.native is not None and self.identity is not None
+                    and self.account_credential is None, "Unexpected account bootstrap event")
+            token = message.get("credential")
+            require(isinstance(token, dict) and set(token) == {"accountID", "token", "expiresAtMs"}
+                    and token["accountID"] == self.account_id
+                    and isinstance(token["accountID"], str) and re.fullmatch(r"[0-9]{1,32}", token["accountID"])
+                    and isinstance(token["token"], str) and re.fullmatch(r"[!-~]{1,3500}", token["token"])
+                    and type(token["expiresAtMs"]) is int
+                    and token["expiresAtMs"] > int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+                    "Invalid portable developer credential")
+            require(isinstance(self.email, str) and 0 < len(self.email) <= 320, "Invalid account label")
+            payload = json.dumps({"token": token, "email": self.email}, separators=(",", ":")).encode()
+            require(len(payload) <= 4096, "Portable developer credential exceeds handoff limit")
+            self.account_credential = payload
+            return True
         if event == "failure":
             code = message.get("code")
             suffix = f" (Apple code {code})" if type(code) is int else ""

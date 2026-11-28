@@ -469,6 +469,14 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
         Ok::<(), Report>(())
     };
     check_session()?;
+    // Only an explicitly authorised native development installer requests a
+    // portable developer token. Never export the password, SPD or ADI state.
+    let portable = if config["account_bootstrap"] == true {
+        Some(json!({"accountID": &adsid, "token": &token.token,
+                    "expiresAtMs": expires.checked_mul(1000).ok_or_else(|| report!("Invalid token expiry"))?}))
+    } else {
+        None
+    };
     let mut session = DeveloperSession::new(
         token,
         adsid.clone(),
@@ -496,6 +504,11 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
         status: None,
     };
 
+    if let Some(credential) = portable {
+        if relay(json!({"event":"account_bootstrap","credential":credential}))? != true {
+            bail!("Desktop account transfer was not accepted");
+        }
+    }
     *stage = "development certificate inventory";
     check_session()?;
     let available = inventory(&mut session, team_id, None).await?;

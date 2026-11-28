@@ -177,6 +177,64 @@ class HandoffTests(unittest.TestCase):
                                        b"existing-key", "openssl", {"bundleIdentifier": BUNDLE}, notify=Mock())
         self.assertEqual(result, {"signing_setup": "incomplete", "signing_identity": "imported"})
 
+    def test_account_candidate_has_a_separate_authenticated_exchange(self):
+        state = {"phase": "account-request"}
+        credential = json.dumps({"token": {"accountID": "12345", "token": "synthetic",
+                                            "expiresAtMs": int((time.time() + 300) * 1000)}}).encode()
+        def copy_to(target, bundle, local, remote):
+            self.assertEqual((target, bundle), ("target", BUNDLE))
+            if remote == handoff.BOOTSTRAP:
+                bootstrap = json.loads(local.read_bytes())
+                self.assertTrue(bootstrap["accountTransfer"])
+                self.assertNotIn(credential, local.read_bytes())
+                state["id"] = bootstrap["id"]
+                state["secret"] = base64.b64decode(bootstrap["secret"])
+                state["account"] = self.request_bytes(expires=bootstrap["expires"] - 10)
+                state["signing"] = self.request_bytes(expires=bootstrap["expires"] - 10, nonce="new")
+            elif state["phase"] == "account-request":
+                self.assertEqual(remote, handoff.SETUP_RESPONSE)
+                self.assertEqual(handoff.unwrap(state["secret"], state["id"], "account-response",
+                                                local.read_bytes()), b"encrypted-account")
+                state["phase"] = "request"
+            else:
+                self.assertEqual(remote, handoff.SETUP_RESPONSE)
+                self.assertEqual(handoff.unwrap(state["secret"], state["id"], "response",
+                                                local.read_bytes()), b"encrypted-key")
+                state["phase"] = "imported"
+        def copy_from(target, bundle, remote, local):
+            self.assertEqual((target, bundle), ("target", BUNDLE))
+            phase = state["phase"]
+            if phase == "imported":
+                self.assertEqual(remote, handoff.ACKNOWLEDGEMENT)
+                payload = hashlib.sha256(state["signing"]).digest()
+            else:
+                self.assertEqual(remote, handoff.SETUP_REQUEST)
+                payload = state["account" if phase == "account-request" else "signing"]
+            local.write_bytes(handoff.wrap(state["secret"], state["id"], phase, payload))
+        self.device.copy_to_app.side_effect = copy_to
+        self.device.copy_from_app.side_effect = copy_from
+        with patch.object(handoff, "encrypt_payload", return_value=b"encrypted-account") as seal, \
+             patch.object(handoff, "encrypt", return_value=b"encrypted-key"):
+            result = handoff.automatic(Path("."), self.cache, self.scratch, self.device,
+                                       "target", UDID, TEAM, self.scope, self.leaf, b"existing-key",
+                                       "openssl", {"bundleIdentifier": BUNDLE}, notify=Mock(),
+                                       account_credential=credential)
+        self.assertEqual(result, {"signing_setup": "incomplete", "signing_identity": "imported"})
+        seal.assert_called_once()
+        self.assertEqual(seal.call_args.args[-1], credential)
+        self.assertFalse((self.scratch / "account-setup-request.json").exists())
+        self.assertFalse((self.scratch / "account-setup-response.json").exists())
+
+    def test_wrong_account_candidate_is_never_delivered(self):
+        credential = json.dumps({"token": {"accountID": "99999", "token": "synthetic",
+                                            "expiresAtMs": int((time.time() + 300) * 1000)}}).encode()
+        with self.assertRaisesRegex(ValueError, "portable developer credential"):
+            handoff.automatic(Path("."), self.cache, self.scratch, self.device,
+                              "target", UDID, TEAM, self.scope, self.leaf, b"key",
+                              "openssl", {"bundleIdentifier": BUNDLE}, notify=Mock(),
+                              account_credential=credential)
+        self.device.copy_to_app.assert_not_called()
+
     def test_automatic_wire_rejects_tampering_replay_and_unrelated_phase(self):
         secret = b"1" * 32
         wire = handoff.wrap(secret, "original", "request", b"payload")

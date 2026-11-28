@@ -120,14 +120,19 @@ def verify_key(openssl, key, certificate):
                                          certificate, "Check the iPhone signing certificate")
     desktop.require(public == certificate_public, "The desktop private key does not match the iPhone certificate")
 
-def encrypt(repo, cache, openssl, request, key):
+def encrypt_payload(repo, cache, request, payload):
+    desktop.require(isinstance(payload, bytes) and 0 < len(payload) <= 4096, "Invalid encrypted setup payload")
     helper = cache.build_swift("handoff", [
         Path(__file__).with_name("DesktopHandoff.swift"),
         repo / "Feather/Utilities/ZagIdentityHandoffEnvelope.swift",
     ])
+    return desktop.command([helper, request], payload, "Encrypt private setup payload for the iPhone")
+
+
+def encrypt(repo, cache, openssl, request, key):
     # The RSA key travels through local pipes only. Only ciphertext is staged.
     der = desktop.command([openssl, "rsa", "-traditional", "-outform", "DER"], key, "Encode desktop RSA key")
-    ciphertext = desktop.command([helper, request], der, "Encrypt signing identity for the iPhone")
+    ciphertext = encrypt_payload(repo, cache, request, der)
     del der
     return ciphertext
 
@@ -185,7 +190,7 @@ def retry(repo, cache, scratch, device, team):
 
 
 def automatic(repo, cache, scratch, device, target, udid, team, item, certificate, key, openssl,
-              installed, notify=print):
+              installed, notify=print, *, account_credential=None):
     """Shared desktop rendezvous. The device adapter supplies paired USB I/O."""
     bundle = "app.zagstore.ios." + team
 
@@ -221,6 +226,19 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
             time.sleep(2)
         raise ValueError("iPhone setup did not complete. Reconnect and use setup to retry.")
 
+    if account_credential is not None:
+        desktop.require(isinstance(account_credential, bytes) and 0 < len(account_credential) <= 4096,
+                        "Invalid portable developer credential")
+        try:
+            credential = json.loads(account_credential)["token"]
+            desktop.require(desktop.scope("signing-key", credential["accountID"], team) == item
+                            and type(credential["expiresAtMs"]) is int
+                            and credential["expiresAtMs"] > int(time.time() * 1000),
+                            "Portable credential does not match this signing account")
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Invalid or expired portable developer credential") from None
+        finally:
+            credential = None
     secret = secrets.token_bytes(32)
     transaction = str(uuid.uuid4())
     deadline = time.monotonic() + 600
@@ -231,6 +249,7 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
             "id": transaction, "expires": time.time() + 600, "secret": base64.b64encode(secret).decode(),
             "udid": udid, "bundle": bundle, "team": team, "keyScope": item,
             "certificate": base64.b64encode(certificate).decode(),
+            "accountTransfer": account_credential is not None,
         }).encode())
         device.copy_to_app(target, bundle, bootstrap, BOOTSTRAP)
         notify("Verified USB bootstrap delivery to the installed Personal Team app.")
@@ -242,7 +261,33 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
         notify("Unlock the iPhone and open the newly installed Zag Store.")
     notify("Complete any prerequisites on the iPhone and authorize Signing Setup there.")
     notify("Local installation pairing may still be required for renewal. Do not change pairing in the AppTesters copy.")
-    phase, request_bytes = poll([(SETUP_REQUEST, ("request",)), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
+    labels = ("request", "account-request") if account_credential is not None else ("request",)
+    phase, request_bytes = poll([(SETUP_REQUEST, labels), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
+    if phase == "account-request":
+        scope, leaf = validate_request(request_bytes, udid, bundle, team)
+        desktop.require(scope == item and leaf == certificate, "Account request does not match the installed signing identity")
+        check_target()
+        account_request = scratch / "account-setup-request.json"
+        account_response = scratch / "account-setup-response.json"
+        try:
+            private_write(account_request, request_bytes)
+            ciphertext = encrypt_payload(repo, cache, account_request, account_credential)
+            private_write(account_response, wrap(secret, transaction, "account-response", ciphertext))
+            while time.monotonic() < deadline:
+                try:
+                    check_target()
+                    device.copy_to_app(target, bundle, account_response, SETUP_RESPONSE)
+                    break
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    time.sleep(2)
+            else:
+                raise ValueError("Could not deliver the encrypted Apple ID session")
+            notify("Encrypted Apple ID session delivered. Zag Store will validate it with Apple.")
+        finally:
+            account_request.unlink(missing_ok=True)
+            account_response.unlink(missing_ok=True)
+            account_credential = None
+        phase, request_bytes = poll([(SETUP_REQUEST, ("request",)), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
     if phase == "existing":
         desktop.require(hmac.compare_digest(request_bytes, hashlib.sha256(certificate).digest()),
                         "Existing setup acknowledgement does not match the installed certificate")
