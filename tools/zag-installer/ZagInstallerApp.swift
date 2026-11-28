@@ -551,7 +551,32 @@ private struct InstallerView: View {
             if installer.busy {
                 Text(installer.status).font(.headline).frame(maxWidth: .infinity)
                 Text("Keep your iPhone connected.").font(.caption).foregroundStyle(muted).frame(maxWidth: .infinity)
+                if let stage = installer.stage {
+                    let steps = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
+                    let labels = ["Checking release and device", "Apple ID authentication", "Preparing signing credentials", "Signing Zag Store", "Installing on iPhone", "Transferring signing identity"]
+                    if let current = steps.firstIndex(of: stage) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(steps.indices, id: \.self) { index in
+                                HStack(spacing: 10) {
+                                    Image(systemName: index < current ? "checkmark.circle.fill" : (index == current ? "circle.dotted" : "circle"))
+                                        .foregroundStyle(index < current ? success : (index == current ? ZagPalette.blue : muted))
+                                    Text(labels[index]).foregroundStyle(index == current ? Color.primary : muted)
+                                    Spacer()
+                                    if index == current { Text("In progress").font(.caption).foregroundStyle(muted) }
+                                }.accessibilityElement(children: .combine)
+                            }
+                        }.font(.callout).padding(12)
+                            .background(surface, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
             } else if !installer.installedBundle.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 48, weight: .light)).foregroundStyle(success)
+                        .accessibilityHidden(true)
+                    Text(installer.identityImported ? "You're all set!" : "Installation complete").font(.title2.bold())
+                    Text("Zag Store installed on your iPhone.").foregroundStyle(muted)
+                }.frame(maxWidth: .infinity)
                 Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
                 if installer.identityImported {
                     Label("Signing identity ready", systemImage: "checkmark.circle.fill").foregroundStyle(success)
