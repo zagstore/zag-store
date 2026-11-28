@@ -501,8 +501,8 @@ private struct InstallerView: View {
                 Spacer()
                 let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
                 let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
-                Text("Zag Installer \(version) (\(build))")
-                    .font(.caption).foregroundStyle(muted)
+                Text("v\(version) (\(build))")
+                    .font(.system(size: 14, weight: .medium)).monospacedDigit().foregroundStyle(muted)
             }
         }
         .task {
