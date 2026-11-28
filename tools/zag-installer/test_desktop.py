@@ -1,4 +1,6 @@
 import base64
+import io
+import json
 import datetime as dt
 from pathlib import Path
 import plistlib
@@ -57,6 +59,59 @@ class IdentityTests(unittest.TestCase):
         other_account = desktop.Identity(store, "different-account", TEAM, "openssl", approve)
         self.assertIsNone(other_account.key)
         approve.assert_called_once()
+
+
+class CredentialLifecycleTests(unittest.TestCase):
+    def portal(self, replies):
+        from ui_protocol import Channel
+        wire = b"".join((json.dumps({"value": value}) + "\n").encode()
+                        for value in replies)
+        output = io.BytesIO()
+        channel = Channel(input_stream=io.BytesIO(wire), event_stream=output,
+                          isolate_output=False)
+        portal = desktop.Provisioning(None, "test-device", Mock(), "openssl",
+                                      Mock(), channel.ask, native_helper="helper")
+        return portal, output
+
+    def test_combined_password_consumed_once_then_secure_retry(self):
+        portal, output = self.portal([
+            json.dumps({"email": "test@example.com", "password": "first-secret"}),
+            "retry-secret",
+        ])
+        self.assertEqual(portal.handle({"event": "configuration"})["email"],
+                         "test@example.com")
+        self.assertEqual(portal.handle({"event": "password"}), "first-secret")
+        self.assertIsNone(portal._pending_password)
+        self.assertEqual(portal.handle({"event": "password"}), "retry-secret")
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([e["message"] for e in events],
+                         ["Apple ID credentials: ", "Apple ID password: "])
+        self.assertTrue(all(e["secure"] for e in events))
+        self.assertNotIn(b"secret", output.getvalue())
+
+    def test_provisioning_exception_clears_pending_password(self):
+        portal, _ = self.portal([
+            json.dumps({"email": "test@example.com", "password": "first-secret"}),
+        ])
+        child = Mock()
+        child.stdout = iter(['{"event":"configuration"}', '{"event":"invalid"}'])
+        child.poll.return_value = None
+        from unittest.mock import MagicMock
+        context = MagicMock()
+        context.__enter__.return_value = child
+        with patch.object(desktop.subprocess, "Popen", return_value=context):
+            with self.assertRaisesRegex(ValueError, "Unknown desktop provisioning event"):
+                portal.run("unused-helper")
+        self.assertIsNone(portal._pending_password)
+        child.kill.assert_called_once()
+
+    def test_launch_failure_clears_previous_password(self):
+        portal, _ = self.portal([])
+        portal._pending_password = "stale-secret"
+        with patch.object(desktop.subprocess, "Popen", side_effect=OSError("launch failed")):
+            with self.assertRaises(OSError):
+                portal.run("unused-helper")
+        self.assertIsNone(portal._pending_password)
 
 
 class DesktopTests(unittest.TestCase):
