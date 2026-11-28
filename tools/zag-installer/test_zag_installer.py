@@ -356,7 +356,7 @@ class NativeUSBAdapterTests(unittest.TestCase):
         dev = self.make_adapter()
         for operation, args in ((dev.install, (self.UDID, Path("signed.app"))),
                                 (dev.launch_app, (self.UDID, DESTINATION))):
-            with self.assertRaisesRegex(ValueError, "disabled|not.*validated"):
+            with self.assertRaisesRegex(ValueError, "disabled|not.*validated|verified IPA in an opted-in developer build"):
                 operation(*args)
 
     def test_standalone_cli_blocks_before_provisioning_or_download(self):
