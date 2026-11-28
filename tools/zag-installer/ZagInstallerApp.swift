@@ -572,6 +572,18 @@ private struct InstallerView: View {
         .accessibilityHidden(true)
     }
     @Environment(\.colorScheme) private var colorScheme
+    @State private var discoveringDevices = false
+    @State private var hoveringRefresh = false
+
+    @MainActor private func refreshDevices() async {
+        guard !discoveringDevices, !installer.busy else { return }
+        discoveringDevices = true
+        defer { discoveringDevices = false }
+        let result = await Task.detached(priority: .utility) { WiredDevice.inspect() }.value
+        guard !Task.isCancelled, !installer.busy else { return }
+        device = result
+    }
+
     @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
     @State private var showDiagnostics = false
     @State private var showAdvanced = false
@@ -700,6 +712,28 @@ private struct InstallerView: View {
                     }
                     Spacer()
                     connectionLight
+                    Button {
+                        Task { await refreshDevices() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(ZagPalette.spectrum)
+                            .rotationEffect(.degrees(discoveringDevices && !reduceMotion ? 360 : 0))
+                            .animation(discoveringDevices && !reduceMotion ? .linear(duration: 0.9).repeatForever(autoreverses: false) : nil, value: discoveringDevices)
+                            .frame(width: 32, height: 32)
+                            .background(surface.opacity(hoveringRefresh ? 1 : 0.5), in: Circle())
+                            .overlay { Circle().strokeBorder(border, lineWidth: 1) }
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(discoveringDevices || installer.busy)
+                    .help("Refresh USB and Wi-Fi device discovery")
+                    .accessibilityLabel(discoveringDevices ? "Discovering devices" : "Refresh devices")
+                    .onHover { inside in
+                        hoveringRefresh = inside
+                        if inside && !discoveringDevices && !installer.busy { NSCursor.pointingHand.set() }
+                        else { NSCursor.arrow.set() }
+                    }
                     Button { showDeviceDetails.toggle() } label: {
                         Image(systemName: showDeviceDetails ? "chevron.down" : "chevron.right")
                             .frame(width: 28, height: 28)
@@ -992,9 +1026,7 @@ private struct InstallerView: View {
         }
         .task {
             while !Task.isCancelled {
-                if !installer.busy {
-                    device = await Task.detached(priority: .utility) { WiredDevice.inspect() }.value
-                }
+                await refreshDevices()
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
