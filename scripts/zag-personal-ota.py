@@ -203,7 +203,8 @@ def validate_profile(profile, entitlements, signer, team, identifier, udid, now)
     return expires
 
 
-def validate(ipa, team, udid, root, probe=False, expected_signer=None, *, imported_destination=None):
+def validate(ipa, team, udid, root, probe=False, expected_signer=None, *,
+             imported_destination=None, imported_components=None):
     if imported_destination is not None:
         require(not probe and expected_signer is not None and TEAM.fullmatch(team)
                 and re.fullmatch(r"app\.zloader\.imported\.[a-f0-9]{32}\." + team, imported_destination),
@@ -225,7 +226,7 @@ def validate(ipa, team, udid, root, probe=False, expected_signer=None, *, import
                 bundle = metadata.get("CFBundleIdentifier")
                 build = metadata.get("CFBundleVersion")
                 require(bundle == imported_destination and isinstance(build, str)
-                        and re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", build), "Imported signed identity mismatch")
+                        and re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){0,3}", build), "Imported signed identity mismatch")
             extract(archive, directory)
         app = directory / relative
         command("codesign", "--verify", "--deep", "--strict", str(app),
@@ -237,7 +238,31 @@ def validate(ipa, team, udid, root, probe=False, expected_signer=None, *, import
         expiry = []
         components = [app] + sorted(p for p in app.rglob("*") if p.is_dir() and p.suffix in (".appex", ".app"))
         if imported_destination is not None:
-            require(len(components) == 1 and not any(app.rglob("*.xpc")), "Unexpected imported nested application")
+            require(1 <= len(components) <= 32 and not any(app.rglob("*.xpc")),
+                    "Unexpected imported nested application")
+            observed = {}
+            seen = set()
+            for component in components:
+                relative_component = component.relative_to(app)
+                path = "" if component == app else str(relative_component)
+                info = plistlib.loads((component / "Info.plist").read_bytes())
+                identifier = info.get("CFBundleIdentifier")
+                if component == app:
+                    require(identifier == bundle, "Imported signed identity mismatch")
+                    suffix = ""
+                else:
+                    require(component.suffix == ".appex" and len(relative_component.parts) == 2
+                            and relative_component.parts[0] == "PlugIns"
+                            and isinstance(identifier, str) and identifier.startswith(bundle + "."),
+                            "Unexpected imported nested application")
+                    suffix = identifier[len(bundle):]
+                    require(len(suffix) <= 180 and re.fullmatch(r"(?:\\.[A-Za-z0-9-]+)+", suffix),
+                            "Invalid imported extension identifier")
+                require(suffix.casefold() not in seen, "Duplicate signed component identifier")
+                seen.add(suffix.casefold())
+                observed[path] = suffix
+            if imported_components is not None:
+                require(observed == imported_components, "Signed imported component inventory changed")
         if probe:
             require(len(components) == 1 and not any(app.rglob("*.framework")), "Unexpected nested probe code")
         for index, component in enumerate(components):

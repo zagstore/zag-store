@@ -409,7 +409,9 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
         let digest = prefix.strip_prefix("app.zloader.imported.")
             .ok_or_else(|| report!("Invalid imported namespace"))?;
         if digest.len() != 32 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || suffixes.len() != 1 || !suffixes[0].is_empty()
+            || suffixes.iter().filter(|s| s.is_empty()).count() != 1
+            || suffixes.iter().any(|s| s.len() > 180)
+            || suffixes.iter().map(|s| s.to_ascii_lowercase()).collect::<std::collections::HashSet<_>>().len() != suffixes.len()
             || config["provider"] != "native" || config["account_bootstrap"] == true
         {
             bail!("Invalid imported provisioning configuration");
@@ -606,7 +608,14 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
             app_id
         } else {
             let name = if let Some(prefix) = imported_prefix {
-                format!("zLoader {}", &prefix[prefix.len() - 12..])
+                if suffix.is_empty() {
+                    format!("zLoader {}", &prefix[prefix.len() - 12..])
+                } else {
+                    // Distinguish App ID display names without exposing the source app name.
+                    let index = suffix[1..].replace(['.', '-'], " ");
+                    let short: String = index.chars().take(40).collect();
+                    format!("zLoader {} {}", &prefix[prefix.len() - 12..], short)
+                }
             } else if suffix.is_empty() {
                 "Zag Store".to_string()
             } else {

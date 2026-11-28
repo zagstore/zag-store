@@ -116,19 +116,55 @@ def stage_for_signing(source, destination, artifact):
         for item in entries:
             if item.flag_bits & 1:
                 raise ValueError("Encrypted ZIP member")
-        # First installation scope: one main application, no extensions or nested apps.
-        # Reject instead of silently removing capabilities.
-        prefix = str(relative) + "/"
-        for item in entries:
-            if item.filename.startswith(prefix):
-                parts = item.filename[len(prefix):].split("/")
-                if any(part.endswith((".appex", ".app", ".xpc")) for part in parts):
-                    raise ValueError("Nested applications and extensions are not supported yet")
         folder = destination.parent / "imported-unsigned"
         folder.mkdir(mode=0o700)
         artifact.extract(archive, folder)
-    return {"metadata": preview, "sha256": digest.hexdigest(), "app": folder / relative,
-            "relative": relative, "info": info}
+    app = folder / relative
+    components = imported_components(app, original)
+    return {"metadata": preview, "sha256": digest.hexdigest(), "app": app,
+            "relative": relative, "info": info, "components": components}
+
+
+def imported_components(app, original):
+    """Only direct PlugIns/*.appex with unique child identifiers; never strip code."""
+    mapped_import_bundle(original, "AAAAAAAAAA")
+    components = {"": ""}
+    for path in sorted(app.rglob("*")):
+        if path.suffix.casefold() not in (".app", ".appex", ".xpc"):
+            continue
+        relative = path.relative_to(app)
+        if (not path.is_dir() or path.is_symlink() or path.suffix != ".appex"
+                or len(relative.parts) != 2 or relative.parts[0] != "PlugIns"):
+            raise ValueError("Unsupported imported nested application layout")
+        plist = path / "Info.plist"
+        if not plist.is_file() or plist.is_symlink() or not 0 < plist.stat().st_size <= MAX_PLIST:
+            raise ValueError("Invalid imported extension metadata")
+        info = plistlib.loads(plist.read_bytes())
+        identifier = info.get("CFBundleIdentifier") if isinstance(info, dict) else None
+        if not isinstance(identifier, str) or not identifier.startswith(original + "."):
+            raise ValueError("Imported extension identifier is not a child of the main app")
+        suffix = identifier[len(original):]
+        if (not re.fullmatch(r"(?:\\.[A-Za-z0-9-]+)+", suffix) or len(suffix) > 180
+                or suffix.casefold() in {v.casefold() for v in components.values()}):
+            raise ValueError("Invalid or duplicate imported extension identifier")
+        components[str(relative)] = suffix
+    validate_imported_components(components)
+    return components
+
+
+def validate_imported_components(components):
+    if (not isinstance(components, dict) or not 1 <= len(components) <= 32
+            or components.get("") != ""):
+        raise ValueError("Invalid imported component list")
+    seen = {""}
+    for path, suffix in components.items():
+        if path == "":
+            continue
+        if (not isinstance(path, str) or not re.fullmatch(r"PlugIns/[^/]+\\.appex", path)
+                or not isinstance(suffix, str) or not re.fullmatch(r"(?:\\.[A-Za-z0-9-]+)+", suffix)
+                or len(suffix) > 180 or suffix.casefold() in seen):
+            raise ValueError("Invalid or duplicate imported extension identifier")
+        seen.add(suffix.casefold())
 
 def mapped_import_bundle(original, team):
     """Separate namespace from official Zag Store; deterministic per app and team."""

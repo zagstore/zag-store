@@ -217,10 +217,10 @@ class Provisioning:
         self.components = components if components is not None else {"": ""}
         self.imported_bundle = imported_bundle
         if imported_bundle is not None:
-            from ipa_preview import mapped_import_bundle
+            from ipa_preview import mapped_import_bundle, validate_imported_components
             mapped_import_bundle(imported_bundle, "AAAAAAAAAA")
-            require(not upgrade and self.components == {"": ""},
-                    "Imported provisioning currently supports fresh single-app installs only")
+            validate_imported_components(self.components)
+            require(not upgrade, "Imported provisioning currently supports fresh installs only")
             require(self.native is not None and endpoint is None,
                     "Imported provisioning requires native anisette")
         self.profiles = {}
@@ -362,8 +362,10 @@ class Provisioning:
 def personal_entitlements(artifact, profile, certificate, team, udid, suffix="", *, imported_bundle=None):
     if imported_bundle is not None:
         from ipa_preview import mapped_import_bundle
-        require(not suffix, "Imported extensions are not supported")
-        identifier = mapped_import_bundle(imported_bundle, team)
+        require(not suffix or (isinstance(suffix, str) and len(suffix) <= 180
+                               and re.fullmatch(r"(?:\\.[A-Za-z0-9-]+)+", suffix)),
+                "Invalid imported extension identifier")
+        identifier = mapped_import_bundle(imported_bundle, team) + suffix
     else:
         identifier = artifact.mapped_bundle(team) + suffix
     qualified = f"{team}.{identifier}"
@@ -410,8 +412,9 @@ def signing_components(app, original):
 
 def sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch, *, imported_bundle=None):
     if imported_bundle is not None:
-        from ipa_preview import mapped_import_bundle
-        require(components == {"": ""} and set(profiles) == {""}, "Unexpected imported components")
+        from ipa_preview import mapped_import_bundle, imported_components
+        require(components == imported_components(app, imported_bundle)
+                and set(profiles) == set(components.values()), "Unexpected imported components")
         require(plistlib.loads((app / "Info.plist").read_bytes()).get("CFBundleIdentifier") == imported_bundle,
                 "Imported source identity mismatch")
         destination = mapped_import_bundle(imported_bundle, team)

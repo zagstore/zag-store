@@ -534,6 +534,7 @@ def install_imported(source, expected_bundle, expected_version, expected_build, 
     snapshot = scratch / "imported.ipa"
     staged = ipa_preview.stage_for_signing(source, snapshot, artifact)
     metadata, info = staged["metadata"], staged["info"]
+    components = staged["components"]
     original = metadata["bundle"]
     artifact.require((original, metadata["version"], metadata["build"]) ==
                      (expected_bundle, expected_version, expected_build),
@@ -548,7 +549,8 @@ def install_imported(source, expected_bundle, expected_version, expected_build, 
     desktop.prepare_profile_root(artifact, ROOT, root)
     artifact.require(confirm_action(approve,
         f"Sign {metadata['name']} ({original}) with your Apple ID? "
-        "A new app identifier will be registered. Unsupported original capabilities may not work. "
+        f"Up to {len(components)} app identifiers may be registered (including extensions). "
+        "Unsupported original capabilities may not work. "
         "Only install IPAs you trust.", "IMPORT-PROVISION", "Continue") == "IMPORT-PROVISION",
         "Installation cancelled")
     def check_snapshot(_):
@@ -573,20 +575,21 @@ def install_imported(source, expected_bundle, expected_version, expected_build, 
     auth, helper, openssl, anisette = cache.installer_tools(ROOT, native=True)
     store = desktop.Keychain(helper)
     portal = desktop.Provisioning(None, udid, store, openssl, choose_team, approve, anisette,
-                                  imported_bundle=original)
+                                  components=components, imported_bundle=original)
     channel.progress("authentication")
     team, identity, profiles = portal.run(auth)
     destination = ipa_preview.mapped_import_bundle(original, team)
     channel.progress("signing")
     signed = desktop.sign(artifact, staged["app"], staged["relative"], team, udid, identity,
-                          profiles, {"": ""}, root, helper, scratch, imported_bundle=original)
+                          profiles, components, root, helper, scratch, imported_bundle=original)
     evidence = artifact.validate(signed, team, udid, root, expected_signer=identity.certificate,
-                                 imported_destination=destination)
+                                 imported_destination=destination, imported_components=components)
     artifact.require(evidence["bundle_identifier"] == destination and evidence["build"] == release["build"],
                      "Signed imported identity mismatch")
     channel.progress("installation")
     earlier = device.preflight_signed(signed, release, team, root, identity.certificate,
                                        check_authorization=check_snapshot, imported_bundle=original)
+    artifact.require(earlier["sha256"] == evidence["sha256"], "Signed imported IPA changed after component verification")
     artifact.require(confirm_action(approve, f"Install {metadata['name']} as a separate application?",
                                      "IMPORT-INSTALL", "Install") == "IMPORT-INSTALL", "Installation cancelled")
     artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")

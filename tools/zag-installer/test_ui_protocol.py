@@ -162,6 +162,30 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ipa_preview.mapped_import_bundle(protected, team)
 
+    def test_imported_component_inventory_preserves_airbrush_style_extensions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Example.app"
+            for name, identifier in (("Notification.appex", "com.example.app.Notification"),
+                                     ("Share.appex", "com.example.app.ShareExtension")):
+                folder = app / "PlugIns" / name
+                folder.mkdir(parents=True)
+                (folder / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": identifier}))
+            expected = {"": "", "PlugIns/Notification.appex": ".Notification",
+                        "PlugIns/Share.appex": ".ShareExtension"}
+            self.assertEqual(ipa_preview.imported_components(app, "com.example.app"), expected)
+            (app / "PlugIns" / "Share.appex" / "Info.plist").write_bytes(
+                plistlib.dumps({"CFBundleIdentifier": "com.example.app.notification"}))
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                ipa_preview.imported_components(app, "com.example.app")
+
+    def test_imported_failure_guidance_is_safe(self):
+        channel, out = self.make_channel(b"")
+        channel.failure("Invalid imported extension metadata")
+        self.assertIn("Invalid imported extension metadata", json.loads(out.getvalue())["message"])
+        channel, out = self.make_channel(b"")
+        channel.failure("secret@example.com")
+        self.assertNotIn(b"secret@example.com", out.getvalue())
+
     def test_ipa_metadata_uses_main_application_name(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "unrelated-file-name.ipa"

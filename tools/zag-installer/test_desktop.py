@@ -135,6 +135,11 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(config["imported_prefix"] + "." + TEAM,
                          ipa_preview.mapped_import_bundle("com.example.app", TEAM))
         self.assertEqual(config["suffixes"], [""])
+        multi = desktop.Provisioning(None, "udid", store, "openssl", lambda _: TEAM,
+                                     lambda _: "test@example.com", native_helper="native",
+                                     components={"": "", "PlugIns/Share.appex": ".ShareExtension"},
+                                     imported_bundle="com.example.app")
+        self.assertEqual(multi.handle({"event": "configuration"})["suffixes"], ["", ".ShareExtension"])
         self.assertNotIn("account_bootstrap", config)
         portal.handle({"event": "team", "account": "test-account", "teams": []})
         self.assertNotEqual(portal.receipt_item, desktop.scope("installed-leaf", "udid", TEAM))

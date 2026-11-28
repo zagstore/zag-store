@@ -95,6 +95,7 @@ final class InstallerController: ObservableObject {
     @Published var prompt: InstallerPrompt?
     @Published var log = "Connect and unlock your iPhone, trust this Mac and enable Developer Mode.\n"
     @Published var status = "Ready"
+    @Published private(set) var safeFailure = ""
     @Published var installedBundle = ""
     @Published var identityImported = false
     @Published private(set) var importedInstallation = false
@@ -261,6 +262,7 @@ final class InstallerController: ObservableObject {
         eventStreamEnded = false
         exitCode = nil
         receivedError = false
+        safeFailure = ""
         cancellationRequested = false
         installingImported = importedURL != nil
         importedInstallation = false
@@ -273,8 +275,8 @@ final class InstallerController: ObservableObject {
         log = ""
         progressFraction = resumeSetup ? 5.0 / 6.0 : 0
         measuredPercent = nil
-        milestone = resumeSetup ? "Checking signing receipt" : "Checking release and device"
-        status = resumeSetup ? "Checking the existing installation and signing receipt" : "Verifying the signed release and connected iPhone"
+        milestone = resumeSetup ? "Checking signing receipt" : (installingImported ? "Checking IPA and device" : "Checking release and device")
+        status = resumeSetup ? "Checking the existing installation and signing receipt" : (installingImported ? "Verifying selected IPA and connected iPhone" : "Verifying the signed release and connected iPhone")
         busy = true
         task = process
 
@@ -388,6 +390,8 @@ final class InstallerController: ObservableObject {
             case "error":
                 receivedError = true
                 status = (object["message"] as? String) ?? "Installation failed"
+                // Engine error events contain fixed local guidance, not raw child output.
+                safeFailure = String(status.prefix(512))
             default:
                 status = "Unknown installer response"
                 task?.terminate()
@@ -1235,6 +1239,7 @@ private struct InstallerView: View {
                     "Developer Mode verified: \(device.ready)",
                     "Operation active: \(installer.busy)",
                     "Stage: \(stage)",
+                    "Failure: \(installer.safeFailure.isEmpty ? "none" : installer.safeFailure)",
                     "Installation reported: \(!installer.installedBundle.isEmpty)",
                     "Signing identity ready: \(installer.identityImported)",
                     "Signing Setup verified: \(installer.setupVerified)"
@@ -1242,7 +1247,7 @@ private struct InstallerView: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(report, forType: .string)
             }
-            Text("Copies only status flags and software versions, not raw logs or account identifiers.")
+            Text("Copies status flags, software versions and safe error guidance, not raw logs or account identifiers.")
                 .font(.caption).foregroundStyle(muted)
             ScrollView {
                 Text(installer.log.isEmpty ? "Installer diagnostics appear here." : installer.log)
