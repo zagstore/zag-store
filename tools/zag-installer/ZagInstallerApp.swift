@@ -300,12 +300,52 @@ final class InstallerController: ObservableObject {
     }
 }
 
+private struct DeviceIllustration: View {
+    let identifier: String?
+    private var homeButton: Bool {
+        ["iPhone10,1", "iPhone10,2", "iPhone10,4", "iPhone10,5", "iPhone12,8", "iPhone14,6"].contains(identifier ?? "")
+    }
+    private var island: Bool {
+        ["iPhone15,2", "iPhone15,3", "iPhone15,4", "iPhone15,5", "iPhone16,1", "iPhone16,2", "iPhone17,1", "iPhone17,2", "iPhone17,3", "iPhone17,4"].contains(identifier ?? "")
+    }
+    private var notch: Bool {
+        ["iPhone10,3", "iPhone10,6", "iPhone11,2", "iPhone11,4", "iPhone11,6", "iPhone11,8", "iPhone12,1", "iPhone12,3", "iPhone12,5", "iPhone13,1", "iPhone13,2", "iPhone13,3", "iPhone13,4", "iPhone14,2", "iPhone14,3", "iPhone14,4", "iPhone14,5", "iPhone14,7", "iPhone14,8", "iPhone17,5"].contains(identifier ?? "")
+    }
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 7)
+                .fill(ZagPalette.spectrum).opacity(0.12)
+            RoundedRectangle(cornerRadius: 7)
+                .strokeBorder(ZagPalette.spectrum, lineWidth: 2)
+            VStack(spacing: 0) {
+                if island {
+                    Capsule().fill(ZagPalette.spectrum).frame(width: 11, height: 4).padding(.top, 5)
+                } else if notch {
+                    UnevenRoundedRectangle(bottomLeadingRadius: 3, bottomTrailingRadius: 3)
+                        .fill(ZagPalette.spectrum).frame(width: 14, height: 5).padding(.top, 2)
+                } else if homeButton {
+                    Capsule().fill(ZagPalette.spectrum).frame(width: 8, height: 2).padding(.top, 5)
+                }
+                Spacer(minLength: 0)
+                if homeButton {
+                    Circle().strokeBorder(ZagPalette.spectrum, lineWidth: 1.3).frame(width: 6, height: 6).padding(.bottom, 4)
+                } else {
+                    Capsule().fill(ZagPalette.spectrum).frame(width: 12, height: 2).padding(.bottom, 4)
+                }
+            }
+        }.frame(width: 29, height: 51)
+            .frame(width: 42, height: 54)
+            .accessibilityHidden(true)
+    }
+}
+
 private struct WiredDevice: Sendable {
     let title: String
     let detail: String
     let ready: Bool
     var developerModeRequired = false
     var trusted = false
+    var modelIdentifier: String? = nil
 
     static func friendlyModel(_ identifier: String) -> String {
         let models = [
@@ -385,7 +425,7 @@ private struct WiredDevice: Sendable {
                                detail: ((modelAlreadyInName ? [] : [modelName]) + ["iOS \(version)",
                                         ready ? "Trusted USB connection" : (developerMode == false ? "Developer Mode required" : "Developer Mode status unavailable")])
                                    .joined(separator: " · "),
-                               ready: ready, developerModeRequired: developerMode == false, trusted: true)
+                               ready: ready, developerModeRequired: developerMode == false, trusted: true, modelIdentifier: model)
         } catch {
             return WiredDevice(title: "No trusted wired iPhone",
                                detail: "Connect and unlock one iPhone; confirm Trust and Developer Mode.",
@@ -505,8 +545,7 @@ private struct InstallerView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Label("Your password stays between this Mac and Apple. Signing credentials can be transferred privately to your iPhone.", systemImage: "lock.shield")
                 HStack(spacing: 12) {
-                    Image(systemName: "iphone").font(.system(size: 42, weight: .light)).foregroundStyle(ZagPalette.spectrum)
-                        .accessibilityHidden(true)
+                    DeviceIllustration(identifier: device.modelIdentifier)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(device.title).font(.system(size: 19, weight: .semibold))
                         Text(device.detail).font(.system(size: 13)).foregroundStyle(muted)
