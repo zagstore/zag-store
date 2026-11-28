@@ -379,6 +379,7 @@ private struct InstallerView: View {
         return NSImage(contentsOf: url)
     }
     @ObservedObject var installer: InstallerController
+    @State private var showRecovery = false
     @State private var upgrade = false
     @State private var team = ""
     @State private var reply = ""
@@ -402,7 +403,7 @@ private struct InstallerView: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
-                Label("Your Apple ID stays between this Mac and Apple.", systemImage: "lock.shield")
+                Label("Your password stays between this Mac and Apple. Signing credentials can be transferred privately to your iPhone.", systemImage: "lock.shield")
                 HStack(spacing: 12) {
                     Image(systemName: "iphone").font(.system(size: 28))
                     VStack(alignment: .leading, spacing: 4) {
@@ -429,7 +430,7 @@ private struct InstallerView: View {
 
             Toggle("Upgrade an existing Personal Team copy", isOn: $upgrade)
                 .disabled(installer.busy)
-            if upgrade || nativeDevelopment {
+            if upgrade {
                 TextField("Original Personal Team ID (10 characters)", text: $team)
                     .textFieldStyle(.roundedBorder)
                     .disabled(installer.busy)
@@ -458,10 +459,17 @@ private struct InstallerView: View {
                 }
             }
             if nativeDevelopment {
-                Button("Resume Signing Setup") {
-                    installer.begin(upgrade: false, team: team, resumeSetup: true)
+                DisclosureGroup("Signing Setup Recovery", isExpanded: $showRecovery) {
+                    if !upgrade {
+                        TextField("Original Personal Team ID (10 characters)", text: $team)
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(installer.busy)
+                    }
+                    Button("Resume Signing Setup") {
+                        installer.begin(upgrade: false, team: team, resumeSetup: true)
+                    }
+                    .disabled(installer.busy || !device.ready || team.trimmingCharacters(in: .whitespacesAndNewlines).range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil)
                 }
-                .disabled(installer.busy || !device.ready || team.trimmingCharacters(in: .whitespacesAndNewlines).range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil)
             }
             Divider()
             HStack {
@@ -489,6 +497,11 @@ private struct InstallerView: View {
             .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(border, lineWidth: 1) }
             }
             Spacer(minLength: 0)
+            HStack {
+                Spacer()
+                Text("Zag Installer \(Bundle.main.object(forInfoDictionaryKey: \"CFBundleShortVersionString\") as? String ?? \"—\") (\(Bundle.main.object(forInfoDictionaryKey: \"CFBundleVersion\") as? String ?? \"—\"))")
+                    .font(.caption).foregroundStyle(muted)
+            }
         }
         .task {
             while !Task.isCancelled {
