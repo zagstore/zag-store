@@ -393,6 +393,18 @@ private enum ZagPalette {
     static let spectrum = LinearGradient(colors: [cyan, blue, violet, magenta], startPoint: .leading, endPoint: .trailing)
 }
 
+private enum RememberedAccounts {
+    static func decode(_ data: String) -> [String] {
+        guard let bytes = data.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String].self, from: bytes) else { return [] }
+        return Array(values.prefix(20))
+    }
+    static func encode(_ values: [String]) -> String {
+        guard let data = try? JSONEncoder().encode(Array(values.prefix(20))) else { return "[]" }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 private struct InstallerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var dark: Bool { colorScheme == .dark }
@@ -443,6 +455,7 @@ private struct InstallerView: View {
     @State private var team = ""
     @State private var reply = ""
     @AppStorage("rememberedAppleID") private var rememberedAppleID = ""
+    @AppStorage("rememberedAppleIDs") private var rememberedAppleIDs = "[]"
     @State private var rememberAccount = false
     @State private var revealPassword = false
     @FocusState private var promptFocused: Bool
@@ -709,6 +722,16 @@ private struct InstallerView: View {
                     TextField(accountPrompt ? "name@example.com" : "Response", text: $reply)
                         .textFieldStyle(.roundedBorder).focused($promptFocused)
                     if accountPrompt {
+                        let accounts = RememberedAccounts.decode(rememberedAppleIDs)
+                        if !accounts.isEmpty {
+                            Menu("Choose remembered Apple ID") {
+                                ForEach(accounts, id: \.self) { account in
+                                    Button(account) { reply = account; rememberAccount = true }
+                                }
+                                Divider()
+                                Button("Use another Apple ID") { reply = ""; rememberAccount = false; promptFocused = true }
+                            }
+                        }
                         Toggle("Remember this Apple ID on this Mac", isOn: $rememberAccount)
                         Text("Only the account identifier is saved, never your password.").font(.caption).foregroundStyle(.secondary)
                     }
@@ -722,7 +745,14 @@ private struct InstallerView: View {
                     Button(prompt.action ?? "Continue") {
                         let answer = prompt.confirmation ?? reply
                         if accountPrompt {
-                            rememberedAppleID = rememberAccount ? answer.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                            let account = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+                            var accounts = RememberedAccounts.decode(rememberedAppleIDs)
+                            accounts.removeAll { $0.caseInsensitiveCompare(account) == .orderedSame }
+                            if rememberAccount && !account.isEmpty && account.utf8.count <= 320 {
+                                accounts.insert(account, at: 0)
+                            }
+                            rememberedAppleIDs = RememberedAccounts.encode(accounts)
+                            rememberedAppleID = ""
                         }
                         reply = "" // Do not retain passwords in UI state
                         installer.answer(answer)
@@ -735,8 +765,16 @@ private struct InstallerView: View {
             .padding(24)
             .frame(width: 440)
             .onAppear {
-                reply = prompt.message == "Apple ID: " ? rememberedAppleID : ""
-                rememberAccount = !rememberedAppleID.isEmpty
+                if !rememberedAppleID.isEmpty {
+                    var accounts = RememberedAccounts.decode(rememberedAppleIDs)
+                    if !accounts.contains(where: { $0.caseInsensitiveCompare(rememberedAppleID) == .orderedSame }) {
+                        accounts.insert(rememberedAppleID, at: 0)
+                    }
+                    rememberedAppleIDs = RememberedAccounts.encode(accounts)
+                    rememberedAppleID = ""
+                }
+                reply = ""
+                rememberAccount = false
                 revealPassword = false
                 promptFocused = true
             }
@@ -748,13 +786,34 @@ private struct InstallerView: View {
 
 private struct InstallerGeneralSettingsView: View {
     @AppStorage("rememberedAppleID") private var rememberedAppleID = ""
+    @AppStorage("rememberedAppleIDs") private var rememberedAppleIDs = "[]"
     var body: some View {
         Form {
             Section("Apple ID") {
-                Text(rememberedAppleID.isEmpty ? "No remembered Apple ID" : rememberedAppleID)
-                    .textSelection(.enabled)
-                Button("Forget Apple ID") { rememberedAppleID = "" }
-                    .disabled(rememberedAppleID.isEmpty)
+                let accounts = RememberedAccounts.decode(rememberedAppleIDs)
+                if accounts.isEmpty && rememberedAppleID.isEmpty {
+                    Text("No remembered Apple IDs")
+                }
+                ForEach(accounts, id: \.self) { account in
+                    HStack {
+                        Text(account).textSelection(.enabled)
+                        Spacer()
+                        Button("Forget") {
+                            rememberedAppleIDs = RememberedAccounts.encode(accounts.filter { $0 != account })
+                        }.accessibilityLabel("Forget \(account)")
+                    }
+                }
+                if !rememberedAppleID.isEmpty {
+                    HStack {
+                        Text(rememberedAppleID)
+                        Spacer()
+                        Button("Forget") { rememberedAppleID = "" }
+                    }
+                }
+                Button("Forget All Apple IDs") {
+                    rememberedAppleIDs = "[]"
+                    rememberedAppleID = ""
+                }.disabled(accounts.isEmpty && rememberedAppleID.isEmpty)
                 Text("Only the account identifier is remembered. Passwords are not saved by this preference.")
                     .font(.caption).foregroundStyle(.secondary)
             }
