@@ -632,6 +632,7 @@ private struct InstallerView: View {
         }
         .padding(16)
         .frame(width: 290)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(surface.opacity(0.65), in: RoundedRectangle(cornerRadius: 16))
         .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(border, lineWidth: 1) }
         .disabled(installer.busy)
@@ -640,6 +641,7 @@ private struct InstallerView: View {
     var body: some View {
         VStack(spacing: 0) {
         ScrollView {
+        VStack(alignment: .leading, spacing: 16) {
         HStack(alignment: .top, spacing: 20) {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
@@ -651,19 +653,18 @@ private struct InstallerView: View {
                     Text("Z").font(.largeTitle.bold()).frame(width: 64, height: 64)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Loader").font(.system(size: 38, weight: .bold)).foregroundStyle(dark ? Color.white : Color.primary).accessibilityLabel("zLoader")
+                    Text("Loader").font(.system(size: 35, weight: .bold)).foregroundStyle(dark ? Color.white : Color.primary).accessibilityLabel("zLoader")
                     Text("Your Device. Your Apps.")
                         .font(.system(size: 16, weight: .medium)).foregroundStyle(muted)
-                }
+                }.frame(height: 64, alignment: .center)
                 Spacer()
             }
 
             VStack(alignment: .leading, spacing: 12) {
-                Label("Your password stays between this Mac and Apple. Signing credentials can be transferred privately to your iPhone.", systemImage: "lock.shield")
                 HStack(spacing: 12) {
                     DeviceIllustration(identifier: device.modelIdentifier)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(device.title).font(.system(size: 21, weight: .semibold))
+                        Text(device.title).font(.system(size: 19, weight: .semibold))
                             .foregroundStyle(dark ? ZagPalette.rgb(0xe8edf5) : Color.primary)
                         Text(device.detail).font(.system(size: 13)).foregroundStyle(muted)
                     }
@@ -681,6 +682,7 @@ private struct InstallerView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Label(device.trusted ? "USB trust verified" : "USB trust not verified", systemImage: device.trusted ? "checkmark.shield" : "shield")
                         Label(device.ready ? "Developer Mode enabled" : (device.developerModeRequired ? "Developer Mode disabled" : "Developer Mode not verified"), systemImage: "gearshape")
+                        Label("Pairing can be configured later in Zag Store for local installation and renewal.", systemImage: "arrow.triangle.2.circlepath")
                     }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if device.developerModeRequired {
@@ -696,7 +698,6 @@ private struct InstallerView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(surface, in: RoundedRectangle(cornerRadius: 12))
                 }
-                Label("Pairing can be configured later in Zag Store for local installation and renewal.", systemImage: "arrow.triangle.2.circlepath")
                 if nativeUSBPreview {
                     Label("Native USB verified. Installation remains disabled until the USB transfer path is validated.", systemImage: "wrench.and.screwdriver")
                         .foregroundStyle(attention)
@@ -749,6 +750,7 @@ private struct InstallerView: View {
             .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(border, lineWidth: 1) }
             .accessibilityLabel("Release channel")
             .disabled(installer.busy)
+            Spacer(minLength: 0)
             HStack {
                 Button {
                     if completed {
@@ -788,13 +790,14 @@ private struct InstallerView: View {
                 }
                 .accessibilityLabel(installer.busy ? "Installation in progress" : actionTitle)
             }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        accountColumn
+            .frame(maxHeight: .infinity, alignment: .top)
+        }
+        .fixedSize(horizontal: false, vertical: true)
             if installer.busy {
                 Button("Cancel installation") { installer.cancel() }.frame(maxWidth: .infinity)
-            }
-            if nativeDevelopment && !installer.busy && installer.installedBundle.isEmpty {
-                Text("Install, update or recover Zag Store using your Apple ID. Existing installations are checked before any changes.")
-                    .font(.caption).foregroundStyle(muted).multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
             }
             Divider()
             Button {
@@ -939,8 +942,6 @@ private struct InstallerView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        accountColumn
-        }
         .padding(24)
         }
         Divider()
