@@ -71,5 +71,23 @@ class Channel:
             raise ValueError("Invalid installer stage")
         self.send({"type": "progress", "stage": stage})
 
+    def failure(self, message):
+        # Exact local validation messages only; never infer Apple error codes
+        # or display arbitrary authentication payloads in the main interface.
+        guidance = {
+            "Expected a six-digit Apple verification code":
+                "Enter the six-digit verification code from Apple and try again.",
+            "Apple returned no matching Personal Team":
+                "No matching Personal Team was found. Check the Apple ID and team used for this installation.",
+            "Upgrade requires an active Apple certificate for the existing local signing key":
+                "The original signing certificate is unavailable. Use the original Apple ID and Mac signing identity. No certificate was revoked.",
+            "Another desktop installer session is active":
+                "Close the other Zag Installer session before trying again.",
+            "Installation cancelled": "Installation cancelled.",
+            "Signing Setup cancelled": "Signing Setup cancelled.",
+        }
+        self.send({"type": "error", "message": guidance.get(
+            message, "Zag Installer could not complete this operation. Review Advanced → Diagnostics before retrying.")})
+
     def confirm(self, message, expected, action):
         return self.ask(message, confirmation=expected, action=action)

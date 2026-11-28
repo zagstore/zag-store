@@ -820,7 +820,7 @@ def main():
     except (OSError, ValueError, KeyError, TypeError, EOFError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         message = str(error) if type(error) is ValueError else type(error).__name__
         if channel is not None:
-            channel.send({"type": "error", "message": f"Zag Installer stopped. {message}"})
+            channel.failure(message)
         print(f"Zag Installer stopped. {message}", file=sys.stderr)
         return 1
     return 0

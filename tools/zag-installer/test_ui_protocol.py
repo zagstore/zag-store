@@ -65,6 +65,15 @@ class ProtocolTests(unittest.TestCase):
             channel.progress("private-password")
         self.assertNotIn(b"private-password", out.getvalue())
 
+    def test_failure_guidance_is_allowlisted(self):
+        channel, out = self.make_channel(b"")
+        channel.failure("Expected a six-digit Apple verification code")
+        self.assertIn("six-digit", json.loads(out.getvalue())["message"])
+        channel, out = self.make_channel(b"")
+        channel.failure("unexpected private-token-value")
+        self.assertNotIn(b"private-token-value", out.getvalue())
+        self.assertIn("Diagnostics", json.loads(out.getvalue())["message"])
+
     def test_event_contract_is_one_json_object_per_line(self):
         channel, out = self.make_channel(b"")
         channel.send({"type": "finished", "result": {"build": "5"}})
