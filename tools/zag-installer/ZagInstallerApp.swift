@@ -1143,7 +1143,7 @@ private struct InstallerView: View {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
-        .frame(minWidth: 860, idealWidth: 1000, minHeight: 460, idealHeight: 650)
+        .frame(minWidth: 860, idealWidth: 1120, minHeight: 460, idealHeight: 800)
         .background { atmosphere.ignoresSafeArea() }
         .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
@@ -1347,6 +1347,7 @@ struct ZagInstallerApp: App {
             InstallerView(installer: installer)
                 .onAppear { updates.checkOnLaunchIfAllowed(installerBusy: installer.busy) }
         }
+        .defaultSize(width: 1120, height: 800)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .appInfo) {
