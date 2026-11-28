@@ -4,7 +4,7 @@ import io
 import json
 import unittest
 
-from ui_protocol import Channel
+from ui_protocol import Channel, AppleFailure
 
 
 class ProtocolTests(unittest.TestCase):
@@ -64,6 +64,18 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             channel.progress("private-password")
         self.assertNotIn(b"private-password", out.getvalue())
+
+    def test_structured_apple_failure(self):
+        channel, out = self.make_channel(b"")
+        channel.apple_failure(AppleFailure("Apple Personal Team profile", 123,
+            "The server is rate limiting requests. Wait and retry."))
+        message = json.loads(out.getvalue())["message"]
+        self.assertIn("provisioning profile", message)
+        self.assertIn("rate limiting", message)
+        self.assertIn("123", message)
+        channel, out = self.make_channel(b"")
+        channel.apple_failure(AppleFailure("private-token", "private-code", "private-hint"))
+        self.assertNotIn(b"private-", out.getvalue())
 
     def test_failure_guidance_is_allowlisted(self):
         channel, out = self.make_channel(b"")

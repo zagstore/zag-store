@@ -13,6 +13,34 @@ import sys
 MAX_REPLY = 4096
 
 
+class AppleFailure(ValueError):
+    def __init__(self, stage, code, hint):
+        super().__init__("Apple operation failed")
+        self.stage, self.code, self.hint = stage, code, hint
+
+
+APPLE_GUIDANCE = {
+    "anisette preflight": "Authentication preparation failed. Check connectivity.",
+    "Apple sign-in or verification": "Apple sign-in or verification failed. Check your account and verification method.",
+    "Apple developer session": "Developer access failed. Sign in again and check your Personal Team.",
+    "development certificate inventory": "Certificate inventory could not be read. Try again before changing certificates.",
+    "Apple certificate submission or issuance lookup": "Certificate issuance could not be confirmed. Check certificate availability before retrying.",
+    "Apple device registration": "Device registration failed. Check Personal Team device eligibility.",
+    "Apple app identifier registration": "App ID registration failed. Check Personal Team availability and limits.",
+    "Apple Personal Team profile": "Apple provisioning profile unavailable. Check team, device and certificate eligibility.",
+}
+NETWORK_GUIDANCE = frozenset((
+    "The server rejected access. Check the provider or sign in again before retrying.",
+    "The server is rate limiting requests. Wait and retry.",
+    "The server is temporarily unavailable. Try again later.",
+    "The server returned an unexpected HTTP response.",
+    "The request timed out. Check connectivity and retry.",
+    "TLS failed. Check the Mac's date, macOS trust settings, or an intercepting proxy.",
+    "The server could not be reached. Check DNS, connectivity, and firewall settings.",
+    "The network response could not be processed. Try again on a stable connection.",
+))
+
+
 class Channel:
     def __init__(self, *, input_stream=None, event_stream=None, isolate_output=True):
         self.input = sys.stdin.buffer if input_stream is None else input_stream
@@ -70,6 +98,14 @@ class Channel:
         if stage not in ("preflight", "authentication", "provisioning", "signing", "installation", "handoff"):
             raise ValueError("Invalid installer stage")
         self.send({"type": "progress", "stage": stage})
+
+    def apple_failure(self, error):
+        message = APPLE_GUIDANCE.get(error.stage, "Apple operation failed.") if isinstance(error.stage, str) else "Apple operation failed."
+        if isinstance(error.hint, str) and error.hint in NETWORK_GUIDANCE:
+            message += " " + error.hint
+        if type(error.code) is int and -(2**31) <= error.code < 2**31:
+            message += f" (Apple code {error.code})"
+        self.send({"type": "error", "message": message})
 
     def failure(self, message):
         # Exact local validation messages only; never infer Apple error codes

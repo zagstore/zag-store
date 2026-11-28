@@ -289,10 +289,8 @@ class Provisioning:
             return True
         if event == "failure":
             code = message.get("code")
-            suffix = f" (Apple code {code})" if type(code) is int else ""
-            hint = message.get("network_hint")
-            detail = f" {hint}" if isinstance(hint, str) else ""
-            raise ValueError(f"{message['stage']} failed{suffix}.{detail} Existing certificates were preserved.")
+            from ui_protocol import AppleFailure
+            raise AppleFailure(message.get("stage"), code, message.get("network_hint"))
         require(self.identity is not None, "Missing authenticated signing identity")
         if event == "certificate":
             return self.identity.select(message["certificates"])

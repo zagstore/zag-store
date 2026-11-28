@@ -820,7 +820,10 @@ def main():
     except (OSError, ValueError, KeyError, TypeError, EOFError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         message = str(error) if type(error) is ValueError else type(error).__name__
         if channel is not None:
-            channel.failure(message)
+            if isinstance(error, ui_protocol.AppleFailure):
+                channel.apple_failure(error)
+            else:
+                channel.failure(message)
         print(f"Zag Installer stopped. {message}", file=sys.stderr)
         return 1
     return 0
