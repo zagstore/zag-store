@@ -12,6 +12,8 @@ pub struct AppEntry {
     pub build: String,
 }
 
+pub const APPTESTERS_LEGACY: &str = "com.cwd43.gu29";
+
 pub fn zag_bundle(bundle: &str) -> bool {
     if bundle == "app.zagstore.ios" { return true; }
     let Some(team) = bundle.strip_prefix("app.zagstore.ios.") else { return false; };
@@ -32,6 +34,24 @@ fn decode(bundle: &str, info: &Value) -> Result<Option<AppEntry>, Box<dyn Error>
         bundle: bundle.to_owned(),
         version: version.to_owned(),
         build: build.to_owned(),
+    }))
+}
+
+fn decode_legacy(info: &Value) -> Result<Option<AppEntry>, Box<dyn Error>> {
+    // Reuse the same strict metadata validation, but do not ever add this to
+    // the Personal Team installation target map.
+    let value = info.as_dictionary().ok_or("Malformed legacy app metadata")?;
+    let version = value.get("CFBundleShortVersionString").and_then(Value::as_string)
+        .ok_or("Legacy Zag Store version missing")?;
+    let build = value.get("CFBundleVersion").and_then(Value::as_string)
+        .ok_or("Legacy Zag Store build missing")?;
+    if version.is_empty() || build.is_empty() || version.len() > 64 || build.len() > 64 {
+        return Err("Invalid legacy Zag Store version/build".into());
+    }
+    Ok(Some(AppEntry {
+        bundle: APPTESTERS_LEGACY.to_owned(),
+        version: version.to_owned(),
+        build: build.to_owned()
     }))
 }
 
@@ -64,6 +84,7 @@ pub struct Snapshot {
     /// This is NOT inferred from a zero-match full-device scan.
     pub targeted: BTreeMap<String, AppEntry>,
     pub targeted_checked: bool,
+    pub legacy_app: Option<AppEntry>,
 }
 
 impl Snapshot {
@@ -83,6 +104,12 @@ impl Snapshot {
             } else {
                 "At least one inventory source reported the listed Zag Store identifier"
             },
+            "legacy_app":self.legacy_app.as_ref().map(|app| json!({
+                "bundleIdentifier":app.bundle,
+                "version":app.version,
+                "bundleVersion":app.build,
+                "signing_class":"AppTesters legacy"
+            })),
             "targeted_checked":self.targeted_checked,
             "targeted_apps": self.targeted.values().map(|app|
                 json!({"bundleIdentifier":app.bundle,"version":app.version,"bundleVersion":app.build})
@@ -133,6 +160,30 @@ pub async fn inspect(proxy: &mut InstallationProxyClient, team: Option<&str>) ->
         if zag_bundle(bundle) { counts[2] += 1; }
         merge(&mut apps, bundle, info)?;
     }
+    // The AppTesters copy uses a different bundle identifier. Report it
+    // separately: it is never an authorised Personal Team upgrade target.
+    let mut legacy_app: Option<AppEntry> = None;
+    for source in [&user, &all] {
+        if let Some(info) = source.get(APPTESTERS_LEGACY) {
+            if let Some(candidate) = decode_legacy(info)? {
+                if legacy_app.as_ref().is_some_and(|old| old != &candidate) {
+                    return Err("Conflicting AppTesters inventory record".into());
+                }
+                legacy_app = Some(candidate);
+            }
+        }
+    }
+    for info in &browse {
+        let Some(dict) = info.as_dictionary() else { continue };
+        if dict.get("CFBundleIdentifier").and_then(Value::as_string) == Some(APPTESTERS_LEGACY) {
+            if let Some(candidate) = decode_legacy(info)? {
+                if legacy_app.as_ref().is_some_and(|old| old != &candidate) {
+                    return Err("Conflicting AppTesters browse record".into());
+                }
+                legacy_app = Some(candidate);
+            }
+        }
+    }
     let targeted = match team {
         Some(value) => targeted_lookup(proxy, value).await?,
         None => BTreeMap::new()
@@ -147,7 +198,7 @@ pub async fn inspect(proxy: &mut InstallationProxyClient, team: Option<&str>) ->
     Ok(Snapshot {
         apps, user_count:user.len(), all_count:all.len(), browse_count:browse.len(),
         user_matches:counts[0], all_matches:counts[1], browse_matches:counts[2],
-        targeted, targeted_checked: team.is_some()
+        targeted, targeted_checked: team.is_some(), legacy_app
     })
 }
 
@@ -177,6 +228,18 @@ mod tests {
         merge(&mut apps, "com.other.app", &info("1.0.0","1")).unwrap();
         assert_eq!(apps.len(), 1);
     }
+    #[test]
+    fn apptesters_legacy_is_diagnostic_not_personal_team() {
+        assert!(!zag_bundle(APPTESTERS_LEGACY));
+        let old = decode_legacy(&info("1.0.0", "1")).unwrap().unwrap();
+        assert_eq!(old.bundle, "com.cwd43.gu29");
+        assert_eq!(old.version, "1.0.0");
+        assert_eq!(old.build, "1");
+        let mut personal = BTreeMap::new();
+        merge(&mut personal, APPTESTERS_LEGACY, &info("1.0.0", "1")).unwrap();
+        assert!(personal.is_empty());
+    }
+
     #[test]
     fn team_identifier_must_be_exactly_ten_ascii_characters() {
         for valid in ["FTB8PRW638", "0123456789"] {

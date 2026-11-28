@@ -207,6 +207,25 @@ class NativeUSBAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot confirm"):
                 dev.apps(self.UDID)
 
+    def test_apptesters_legacy_cannot_be_a_personal_team_destination(self):
+        dev = self.make_adapter()
+        with patch.object(installer.subprocess, "run") as run:
+            status = self.reply()
+            legacy = __import__("json").loads(self.reply(mode="inventory").stdout)
+            legacy["legacy_app"] = {
+                "bundleIdentifier": "com.cwd43.gu29",
+                "version": "1.0.0",
+                "bundleVersion": "1",
+                "signing_class": "AppTesters legacy"
+            }
+            run.side_effect = [
+                status,
+                subprocess.CompletedProcess([], 0, __import__("json").dumps(legacy).encode(), b"")
+            ]
+            dev.usb_device()
+            with self.assertRaisesRegex(ValueError, "AppTesters copy detected separately"):
+                dev.apps(self.UDID)
+
     def test_usb_adapter_does_not_expose_device_writes(self):
         dev = self.make_adapter()
         for operation, args in ((dev.install, (self.UDID, Path("signed.app"))),

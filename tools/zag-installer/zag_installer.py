@@ -97,6 +97,15 @@ class StandaloneUSB:
                          "The trusted USB device changed")
         _, _, record = self._run("inventory")
         apps = record.get("zag_apps")
+        legacy = record.get("legacy_app")
+        if legacy is not None:
+            artifact.require(isinstance(legacy, dict)
+                             and legacy.get("bundleIdentifier") == "com.cwd43.gu29"
+                             and isinstance(legacy.get("version"), str)
+                             and isinstance(legacy.get("bundleVersion"), str),
+                             "Malformed AppTesters legacy inventory")
+            version_number(legacy["version"])
+            version_number(legacy["bundleVersion"])
         # Absence is ambiguous even after three successful Apple queries.
         # Never treat it as an unoccupied destination in standalone mode.
         artifact.require(isinstance(apps, list) and len(apps) <= 32,
@@ -120,7 +129,11 @@ class StandaloneUSB:
             version_number(build)
             result.append({"bundleIdentifier": bundle, "version": version, "bundleVersion": build})
         if not result:
-            raise ValueError("Native USB inventory cannot confirm a Zag Store installation or vacant destination")
+            raise ValueError(
+                "Native USB found no mapped Personal Team Zag Store installation"
+                + (" (AppTesters copy detected separately)" if legacy else "")
+                + "; destination occupancy is unconfirmed"
+            )
         return result
 
     def install(self, identifier, path):

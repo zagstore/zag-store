@@ -43,6 +43,7 @@ async fn inspect(mode: &str) -> Result<serde_json::Value, Box<dyn std::error::Er
         result["zag_apps"] = diagnostics["zag_apps"].clone();
         result["inventory_sources"] = diagnostics["inventory_sources"].clone();
         result["inventory_note"] = diagnostics["inventory_note"].clone();
+        result["legacy_app"] = diagnostics["legacy_app"].clone();
     }
     Ok(result)
 }
