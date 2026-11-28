@@ -449,12 +449,14 @@ private struct InstallerView: View {
             .font(.callout)
             .foregroundStyle(muted)
 
-            Toggle("Upgrade an existing Personal Team copy", isOn: $upgrade)
-                .disabled(installer.busy)
-            if upgrade {
-                TextField("Original Personal Team ID (10 characters)", text: $team)
-                    .textFieldStyle(.roundedBorder)
+            if !nativeDevelopment {
+                Toggle("Upgrade an existing Personal Team copy", isOn: $upgrade)
                     .disabled(installer.busy)
+                if upgrade {
+                    TextField("Original Personal Team ID (10 characters)", text: $team)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(installer.busy)
+                }
             }
             HStack {
                 Button {

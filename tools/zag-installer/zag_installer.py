@@ -538,7 +538,10 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
         installed = installed_app(device, target, artifact.mapped_bundle(upgrade_team))
         check_destination(installed, release, upgrade, replace_same_build=replace_same_build)
 
+    auto_upgrade = defer_setup and upgrade_team is None and not fresh_local
+
     def choose_team(teams):
+        nonlocal installed, upgrade
         teams = [team for team in teams if isinstance(team["id"], str) and artifact.TEAM.fullmatch(team["id"])
                  and (upgrade_team is None or team["id"] == upgrade_team)]
         artifact.require(teams, "Apple returned no matching Personal Team")
@@ -554,6 +557,15 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
             team = teams[int(choice) - 1]["id"]
         artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
         current = installed_app(device, target, artifact.mapped_bundle(team))
+        if auto_upgrade and current is not None:
+            check_destination(current, release, True)
+            artifact.require(confirm_action(approve,
+                f"Existing Personal Team copy detected: {artifact.mapped_bundle(team)}. "
+                "Prepare an in-place upgrade using its existing signing identity?",
+                "AUTO-UPGRADE", "Upgrade") == "AUTO-UPGRADE", "Upgrade cancelled")
+            installed = current
+            upgrade = True
+            portal.upgrade = True
         check_destination(current, release, upgrade, replace_same_build=replace_same_build)
         artifact.require(current == installed, "Destination inventory changed before provisioning")
         check_authorization(release)
@@ -595,7 +607,8 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     except (OSError, ValueError, subprocess.SubprocessError):
         result["signing_receipt_saved"] = False
     if info.get("ZagAutomaticSigningSetup") is True:
-        if defer_setup and not (account_bootstrap and portal.account_credential):
+        if defer_setup and (upgrade or not (account_bootstrap and portal.account_credential)):
+            portal.account_credential = None
             result["signing_setup"] = "incomplete"
             print("Installation verified. Use Resume Signing Setup when ready; no pairing changes have been requested.", flush=True)
             return result
