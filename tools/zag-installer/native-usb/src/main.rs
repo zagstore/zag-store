@@ -2,6 +2,7 @@ mod transfer;
 mod installation;
 mod inventory;
 mod preflight;
+mod app_container;
 use idevice::{IdeviceService, lockdown::LockdownClient, provider::{IdeviceProvider, UsbmuxdProvider}, usbmuxd::{Connection, UsbmuxdAddr}, installation_proxy::InstallationProxyClient, amfi::AmfiClient};
 use serde_json::json;
 use std::time::Duration;
