@@ -17,6 +17,8 @@ final class InstallerController: ObservableObject {
     @Published var log = "Connect and unlock your iPhone, trust this Mac and enable Developer Mode.\n"
     @Published var status = "Ready"
     @Published var installedBundle = ""
+    @Published var identityImported = false
+    @Published var setupVerified = false
 
     private var task: Process?
     private var input: FileHandle?
@@ -121,6 +123,8 @@ final class InstallerController: ObservableObject {
         stderr = logsPipe
         events.removeAll()
         installedBundle = ""
+        identityImported = false
+        setupVerified = false
         prompt = nil
         log = ""
         status = resumeSetup ? "Checking the existing installation and signing receipt" : "Verifying the signed release and connected iPhone"
@@ -196,7 +200,9 @@ final class InstallerController: ObservableObject {
             case "finished":
                 if let result = object["result"] as? [String: Any] {
                     installedBundle = result["installed_bundle"] as? String ?? ""
-                    if result["signing_setup"] as? String == "verified" {
+                    setupVerified = result["signing_setup"] as? String == "verified"
+                    identityImported = setupVerified || result["signing_identity"] as? String == "imported"
+                    if setupVerified {
                         status = "Installed and Signing Setup verified"
                     } else if result["signing_identity"] as? String == "imported" {
                         status = "Installed · Signing identity ready · Pairing optional"
@@ -372,6 +378,7 @@ private struct InstallerView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
     @State private var showDiagnostics = false
+    @State private var showAdvanced = false
 
     private var brandImage: NSImage? {
         let name = colorScheme == .dark ? "zagstore_dark" : "zagstore"
@@ -454,10 +461,26 @@ private struct InstallerView: View {
                 .buttonStyle(.plain)
                 .disabled(installer.busy || !device.ready || nativeUSBPreview)
                 if installer.busy {
-                    ProgressView().controlSize(.small)
                     Button("Cancel") { installer.cancel() }
                 }
             }
+            Divider()
+            if installer.busy {
+                ProgressView().controlSize(.small)
+                Text(installer.status).font(.headline)
+            } else if !installer.installedBundle.isEmpty {
+                Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
+                if installer.identityImported {
+                    Label("Signing identity ready", systemImage: "checkmark.circle.fill").foregroundStyle(success)
+                    Label(installer.setupVerified ? "Local installation verified" : "Pairing can be configured later", systemImage: installer.setupVerified ? "checkmark.circle.fill" : "shield")
+                        .foregroundStyle(installer.setupVerified ? success : muted)
+                } else {
+                    Text(installer.status).foregroundStyle(muted)
+                }
+            } else {
+                Text(installer.status).font(.headline)
+            }
+            DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
             if nativeDevelopment {
                 DisclosureGroup("Signing Setup Recovery", isExpanded: $showRecovery) {
                     if !upgrade {
@@ -471,19 +494,6 @@ private struct InstallerView: View {
                     .disabled(installer.busy || !device.ready || team.trimmingCharacters(in: .whitespacesAndNewlines).range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil)
                 }
             }
-            Divider()
-            HStack {
-                Text(installer.status).font(.headline)
-                Spacer()
-                if !installer.installedBundle.isEmpty {
-                    Label("Verified install", systemImage: "checkmark.seal.fill")
-                        .foregroundStyle(success)
-                }
-            }
-            if !installer.installedBundle.isEmpty {
-                Text(installer.installedBundle).font(.caption.monospaced())
-                    .textSelection(.enabled)
-            }
             DisclosureGroup("Diagnostics", isExpanded: $showDiagnostics) {
             ScrollView {
                 Text(installer.log.isEmpty ? "Installer diagnostics appear here." : installer.log)
@@ -495,6 +505,7 @@ private struct InstallerView: View {
             .padding(12)
             .background(surface, in: RoundedRectangle(cornerRadius: 10))
             .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(border, lineWidth: 1) }
+            }
             }
             Spacer(minLength: 0)
             HStack {
