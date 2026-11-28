@@ -34,7 +34,7 @@ class StandaloneUSB:
     Only an explicitly opted-in, developer-feature Rust build may install.
     Apple's signing and release checks always happen in the macOS frontend.
     """
-    def __init__(self, scratch, executable, *, native_install_dev=False):
+    def __init__(self, scratch, executable, *, native_install_dev=False, target_udid=None, target_transport=None):
         self.scratch = scratch
         self.executable = Path(executable)
         if self.executable.is_symlink() or not self.executable.is_file() or not os.access(self.executable, os.X_OK):
@@ -42,19 +42,32 @@ class StandaloneUSB:
         mode = self.executable.stat()
         if not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid() or mode.st_mode & 0o022:
             raise ValueError("Standalone USB helper has insecure ownership or permissions")
-        self.identity = None
+        artifact.require((target_udid is None and target_transport is None) or
+                         (isinstance(target_udid, str) and
+                          re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})", target_udid)
+                          and target_transport in ("usb", "network")),
+                         "Invalid explicit device binding")
+        self.target_udid = target_udid
+        self.target_transport = target_transport
+        self.identity = target_udid
         self.device_info = None
         self.native_install_dev = native_install_dev
+
+    def _command(self, *args):
+        prefix = [str(self.executable)]
+        if self.target_udid is not None:
+            prefix += ["--target", self.target_udid, self.target_transport]
+        return prefix + list(args)
 
     def _run(self, mode, team=None):
         if mode == "inventory-team":
             artifact.require(isinstance(team, str) and re.fullmatch(r"[A-Z0-9]{10}", team),
                              "Invalid Personal Team for targeted native inventory")
-            command = [str(self.executable), mode, team]
+            command = self._command(mode, team)
         else:
             artifact.require(team is None and mode in ("status", "inventory"),
                              "Only approved native USB read operations are available")
-            command = [str(self.executable), mode]
+            command = self._command(mode)
         try:
             result = subprocess.run(command, capture_output=True, timeout=45, check=False)
         except subprocess.TimeoutExpired as error:
@@ -69,6 +82,9 @@ class StandaloneUSB:
                          and record.get("trust_verified") is True
                          and record.get("developer_mode") is True,
                          "USB trust or Developer Mode is unavailable")
+        if self.target_transport is not None:
+            artifact.require(record.get("connection") == self.target_transport,
+                             "The selected device transport changed")
         udid = record.get("udid")
         artifact.require(isinstance(udid, str) and
                          re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})", udid),
@@ -193,7 +209,7 @@ class StandaloneUSB:
         intent_file = native_preflight.write_private(intent, self.scratch)
         try:
             try:
-                result = subprocess.run([str(self.executable), "preflight", str(intent_file)],
+                result = subprocess.run(self._command("preflight", str(intent_file)),
                                         capture_output=True, timeout=95, check=False)
             except subprocess.TimeoutExpired as error:
                 raise ValueError("Native IPA preflight timed out") from error
@@ -256,8 +272,7 @@ class StandaloneUSB:
             token = secrets.token_hex(16)
             try:
                 response = subprocess.run(
-                    [str(self.executable), "install-signed-dev", str(intent_file),
-                     token, phrase], capture_output=True, timeout=1800, check=False)
+                    self._command("install-signed-dev", str(intent_file), token, phrase), capture_output=True, timeout=1800, check=False)
             except subprocess.TimeoutExpired as error:
                 raise ValueError("Native developer installation timed out; check device inventory") from error
             artifact.require(response.returncode == 0 and len(response.stdout) <= 4096,
@@ -295,8 +310,8 @@ class StandaloneUSB:
         artifact.require(isinstance(path, (str, Path)), "Invalid local handoff path")
         # Check the original trusted iPhone immediately before every I/O operation.
         self._run("status")
-        command = [str(self.executable), operation, identifier, bundle,
-                   remote, str(Path(path).absolute()), f"HANDOFF {bundle}"]
+        command = self._command(operation, identifier, bundle,
+                   remote, str(Path(path).absolute()), f"HANDOFF {bundle}")
         try:
             result = subprocess.run(command, capture_output=True, timeout=50, check=False)
         except subprocess.TimeoutExpired as error:
@@ -722,6 +737,8 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--native-dev-helper", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--native-gui-dev", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--target-udid", help=argparse.SUPPRESS)
+    parser.add_argument("--target-transport", choices=("usb", "network"), help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode", required=True)
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
@@ -770,6 +787,9 @@ def main():
         artifact.require(not local_account_dev or developer_native,
                          "Account bootstrap testing requires interactive native developer USB and a newer local build")
         gui_helper = native_gui_helper(args) if args.native_gui_dev else None
+        artifact.require((args.target_udid is None and args.target_transport is None) or
+                         (gui_helper is not None and args.target_udid is not None and args.target_transport is not None),
+                         "Explicit device selection requires the native GUI development build")
         artifact.require(args.usb_transport != "standalone"
                          or args.mode == "prepare" or developer_native or gui_helper is not None,
                          "Native USB installation and signing handoff are not yet enabled")
@@ -799,7 +819,8 @@ def main():
                     device = (CoreDevice(scratch) if args.usb_transport == "coredevice"
                               else StandaloneUSB(scratch, args.native_dev_helper if developer_native else
                                                  (gui_helper if gui_helper is not None else helper_root / "zag-usb"),
-                                                 native_install_dev=developer_native or gui_helper is not None))
+                                                 native_install_dev=developer_native or gui_helper is not None,
+                                                 target_udid=args.target_udid, target_transport=args.target_transport))
                     if args.mode in ("handoff", "setup"):
                         artifact.mapped_bundle(args.team)
                         command = handoff.send if args.mode == "handoff" else handoff.retry

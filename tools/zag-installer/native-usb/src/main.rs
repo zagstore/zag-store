@@ -11,16 +11,27 @@ fn diagnostic(code: &str) -> serde_json::Value {
     json!({"transport":"system-usbmuxd","trust_verified":false,"diagnostic":code})
 }
 
-async fn inspect(mode: &str, team: Option<&str>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+// Explicit target is immutable for one installer operation. Legacy CLI stays sole-USB.
+type Target<'a> = Option<(&'a str, &'a str)>;
+
+fn matches_target(udid: &str, usb: bool, target: Target<'_>) -> bool {
+    match target {
+        None => usb,
+        Some((id, transport)) => udid.eq_ignore_ascii_case(id)
+            && ((transport == "usb" && usb) || (transport == "network" && !usb)),
+    }
+}
+
+async fn inspect(mode: &str, team: Option<&str>, target: Target<'_>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
     let devices: Vec<_> = mux.get_devices().await?.into_iter()
-        .filter(|d| d.connection_type == Connection::Usb).collect();
+        .filter(|d| matches_target(&d.udid, d.connection_type == Connection::Usb, target)).collect();
     if devices.len() != 1 {
         if mode == "status" {
             return Ok(diagnostic(if devices.is_empty() { "no_device" } else { "multiple_devices" }));
         }
-        return Err("Exactly one wired device required".into());
+        return Err("Exactly one matching device required".into());
     }
     let d = &devices[0];
     let provider = UsbmuxdProvider { addr, tag: 2, udid: d.udid.clone(), device_id: d.device_id, label: "Zag Installer".into() };
@@ -51,7 +62,8 @@ async fn inspect(mode: &str, team: Option<&str>) -> Result<serde_json::Value, Bo
     let mut amfi = AmfiClient::connect(&provider).await?;
     let developer_mode = amfi.get_developer_mode_status().await?;
     let mut result = json!({"transport":"system-usbmuxd","trust_verified":true,
-        "developer_mode":developer_mode,"udid":d.udid,"device":info});
+        "developer_mode":developer_mode,"udid":d.udid,"device":info,
+        "connection":if d.connection_type == Connection::Usb { "usb" } else { "network" }});
     // Lightweight authenticated status for the GUI poller. No app enumeration.
     if mode == "status" { return Ok(result); }
     let mut proxy = InstallationProxyClient::connect(&provider).await?;
@@ -76,7 +88,7 @@ async fn inspect(mode: &str, team: Option<&str>) -> Result<serde_json::Value, Bo
 
 /// Handle only the existing, explicitly requested encrypted signing-setup
 /// transport. No app installation, arbitrary file path, or other bundle access.
-async fn handoff_command(args: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+async fn handoff_command(args: &[String], target: Target<'_>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     use std::{fs, io::Write, os::unix::fs::{MetadataExt, OpenOptionsExt}, path::Path};
     use sha2::{Digest, Sha256};
 
@@ -106,9 +118,9 @@ async fn handoff_command(args: &[String]) -> Result<serde_json::Value, Box<dyn s
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
     let devices: Vec<_> = mux.get_devices().await?.into_iter()
-        .filter(|d| d.connection_type == Connection::Usb).collect();
+        .filter(|d| matches_target(&d.udid, d.connection_type == Connection::Usb, target)).collect();
     if devices.len() != 1 || !devices[0].udid.eq_ignore_ascii_case(expected_udid) {
-        return Err("Signing handoff target is not the sole wired iPhone".into());
+        return Err("Signing handoff target is unavailable or ambiguous".into());
     }
     let dev = &devices[0];
     let provider = UsbmuxdProvider { addr, tag: 2, udid: dev.udid.clone(),
@@ -166,7 +178,7 @@ fn install_dev_confirmation(bundle: &str, udid: &str, upgrading: bool) -> String
 }
 
 #[cfg(feature = "native-install-dev")]
-async fn install_developer(args: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+async fn install_developer(args: &[String], target: Target<'_>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     // NEVER an ordinary release command: this developer-only entry point
     // assumes the calling macOS signer has already verified Apple's IPA
     // signature, certificate, profile, exact device and signed release.
@@ -183,7 +195,7 @@ async fn install_developer(args: &[String]) -> Result<serde_json::Value, Box<dyn
     }
     let team = plan.bundle_identifier.strip_prefix("app.zagstore.ios.")
         .ok_or("Invalid mapped Zag Store bundle")?;
-    let observed = inspect("inventory", Some(team)).await?;
+    let observed = inspect("inventory", Some(team), target).await?;
     let _ = preflight::device_binding(&plan, &observed)?;
     let apps = observed["zag_apps"].as_array().ok_or("Native application inventory unavailable")?;
     let existing = apps.iter().find(|app|
@@ -202,9 +214,9 @@ async fn install_developer(args: &[String]) -> Result<serde_json::Value, Box<dyn
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
     let devices: Vec<_> = mux.get_devices().await?.into_iter()
-        .filter(|d| d.connection_type == Connection::Usb).collect();
+        .filter(|d| matches_target(&d.udid, d.connection_type == Connection::Usb, target)).collect();
     if devices.len() != 1 || !devices[0].udid.eq_ignore_ascii_case(&plan.device_udid) {
-        return Err("The original, sole wired iPhone is no longer connected".into());
+        return Err("The original device and transport are no longer available".into());
     }
     let device = &devices[0];
     let provider = UsbmuxdProvider {addr, tag:2, udid:device.udid.clone(),
@@ -276,6 +288,14 @@ fn group_transports(devices: impl IntoIterator<Item = (String, bool)>) -> Vec<se
 mod grouped_discovery_tests {
     use super::*;
     #[test]
+    fn exact_binding_rejects_other_devices_and_transport_changes() {
+        assert!(matches_target("ABC", false, Some(("abc", "network"))));
+        assert!(!matches_target("ABC", true, Some(("abc", "network"))));
+        assert!(!matches_target("DEF", false, Some(("abc", "network"))));
+        assert!(!matches_target("ABC", false, None));
+        assert!(matches_target("ABC", true, None));
+    }
+    #[test]
     fn merges_case_insensitive_identity_and_prefers_usb() {
         let rows = group_transports([("ABC".into(), false), ("abc".into(), true),
             ("ABC".into(), true), ("DEF".into(), false)]);
@@ -287,15 +307,29 @@ mod grouped_discovery_tests {
 
 #[tokio::main(flavor="current_thread")]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let binding = if args.first().is_some_and(|s| s == "--target") {
+        if args.len() < 4 || !matches!(args[2].as_str(), "usb" | "network")
+            || !((args[1].len() == 40 && args[1].bytes().all(|b| b.is_ascii_hexdigit()))
+                || (args[1].len() == 25 && args[1].as_bytes()[8] == b'-'
+                    && args[1].bytes().enumerate().all(|(i,b)| i == 8 || b.is_ascii_hexdigit()))) {
+            eprintln!("Invalid explicit device binding");
+            std::process::exit(2);
+        }
+        let prefix: Vec<_> = args.drain(..3).collect();
+        Some((prefix[1].clone(), prefix[2].clone()))
+    } else { None };
+    let target = binding.as_ref().map(|(id, transport)| (id.as_str(), transport.as_str()));
     // Explicit read-only inspection of one advertised device. Never pair or install.
-    if args.len() == 2 && args[0] == "device-status" {
-        let target = &args[1];
+    if matches!(args.len(), 2 | 3) && args[0] == "device-status" {
+        let requested = &args[1];
+        let requested_transport = args.get(2).map(String::as_str);
         let job = async {
             let addr = UsbmuxdAddr::default();
             let mut mux = addr.connect(1).await?;
             let devices = mux.get_devices().await?;
-            let d = devices.iter().filter(|d| d.udid.eq_ignore_ascii_case(target))
+            let d = devices.iter().filter(|d| d.udid.eq_ignore_ascii_case(requested)
+                && requested_transport.map_or(true, |t| matches_target(&d.udid, d.connection_type == Connection::Usb, Some((requested.as_str(), t)))))
                 .min_by_key(|d| if d.connection_type == Connection::Usb { 0 } else { 1 })
                 .ok_or("Device no longer advertised")?;
             let connection = if d.connection_type == Connection::Usb { "usb" } else { "network" };
@@ -309,8 +343,12 @@ async fn main() {
                 let value = lockdown.get_value(Some(key), None).await?;
                 info.insert(key.into(), json!(value.as_string().ok_or("Unexpected device metadata")?));
             }
+            let developer_mode = match AmfiClient::connect(&provider).await {
+                Ok(mut amfi) => amfi.get_developer_mode_status().await.ok(),
+                Err(_) => None,
+            };
             Ok::<_, Box<dyn std::error::Error>>(json!({"connection":connection,
-                "trust_verified":true,"device":info}))
+                "trust_verified":true,"developer_mode":developer_mode,"device":info}))
         };
         match tokio::time::timeout(Duration::from_secs(10), job).await {
             Ok(Ok(result)) => println!("{}", result),
@@ -359,7 +397,7 @@ async fn main() {
         // This feature is never compiled into default / GUI release builds.
         // No fixed short timeout on device installation: a large IPA can take
         // longer than a USB status poll; errors are still propagated.
-        match install_developer(&args).await {
+        match install_developer(&args, target).await {
             Ok(result) => println!("{}", result),
             Err(err) => { eprintln!("Native developer installation failed: {err}");
                           std::process::exit(1); }
@@ -367,7 +405,7 @@ async fn main() {
         return;
     }
     if matches!(args.first().map(String::as_str), Some("handoff-read" | "handoff-write")) {
-        let job = handoff_command(&args);
+        let job = handoff_command(&args, target);
         match tokio::time::timeout(Duration::from_secs(45), job).await {
             Ok(Ok(result)) => println!("{}", result),
             _ => { eprintln!("Native signing handoff failed; verify USB trust and the exact Personal Team app");
@@ -381,7 +419,7 @@ async fn main() {
             eprintln!("Invalid Personal Team identifier");
             std::process::exit(2);
         }
-        match tokio::time::timeout(Duration::from_secs(45), inspect("inventory", Some(team))).await {
+        match tokio::time::timeout(Duration::from_secs(45), inspect("inventory", Some(team), target)).await {
             Ok(Ok(result)) => println!("{}", result),
             _ => { eprintln!("Targeted native inventory failed; no device writes performed");
                    std::process::exit(1); }
@@ -394,7 +432,7 @@ async fn main() {
         let job = async {
             let plan = preflight::verify(std::path::Path::new(&args[1])).await?;
             let team = plan.bundle_identifier.strip_prefix("app.zagstore.ios.").ok_or("Invalid destination")?;
-            let status = inspect("inventory", Some(team)).await?;
+            let status = inspect("inventory", Some(team), target).await?;
             let mut report = preflight::device_binding(&plan, &status)?;
             let apps = status["zag_apps"].as_array().ok_or("Missing inventory")?;
             let existing = apps.iter().find(|app| app["bundleIdentifier"].as_str() == Some(plan.bundle_identifier.as_str()));
@@ -419,7 +457,7 @@ async fn main() {
         eprintln!("Signing transport: handoff-read|handoff-write UDID BUNDLE REMOTE LOCAL \"HANDOFF BUNDLE\"");
         std::process::exit(2);
     }
-    match tokio::time::timeout(Duration::from_secs(30), inspect(&args[0], None)).await {
+    match tokio::time::timeout(Duration::from_secs(30), inspect(&args[0], None, target)).await {
         Ok(Ok(result)) => println!("{}", result),
         _ => { eprintln!("Trusted USB inspection failed; check pairing, unlock and USB connection"); std::process::exit(1); }
     }

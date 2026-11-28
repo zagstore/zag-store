@@ -34,12 +34,19 @@ final class InstallerController: ObservableObject {
     private var receivedError = false
     private var cancellationRequested = false
 
-    func begin(upgrade: Bool, team: String, resumeSetup: Bool = false, channel: String = "beta") {
+    func begin(upgrade: Bool, team: String, resumeSetup: Bool = false, channel: String = "beta", targetID: String? = nil, targetTransport: String? = nil) {
         guard !busy else { return }
         let environment = ProcessInfo.processInfo.environment
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
         let nativeDev = bundled && Bundle.main.object(forInfoDictionaryKey: "ZagNativeInstallDevelopment") as? Bool == true
         guard !resumeSetup || nativeDev else { return }
+        if nativeDev {
+            guard let targetID, targetID.range(of: #"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})$"#, options: .regularExpression) != nil,
+                  let targetTransport, ["usb", "network"].contains(targetTransport) else {
+                status = "Select a trusted device first"
+                return
+            }
+        }
         let resource = Bundle.main.resourceURL?.appendingPathComponent("DesktopEngine", isDirectory: true)
         let fileManager = FileManager.default
         let root: String
@@ -88,7 +95,7 @@ final class InstallerController: ObservableObject {
             process.executableURL = URL(fileURLWithPath: privatePython)
             process.arguments = [script, "--ui-pipe", "--precompiled-helpers",
                                  root + "/helpers", "--usb-transport", "standalone"]
-                + (nativeDev ? ["--native-gui-dev"] : [])
+                + (nativeDev ? ["--native-gui-dev", "--target-udid", targetID ?? "", "--target-transport", targetTransport ?? ""] : [])
                 + (resumeSetup ? ["setup", "--team", selectedTeam] :
                     ["install", "--channel", channel] + (upgrade ? ["--upgrade", selectedTeam] : []))
         } else {
@@ -439,13 +446,15 @@ private struct WiredDevice: Sendable {
                 item.wifi = wifi
                 return item
             }
-            let report = query(["device-status", id])
+            let report = query(["device-status", id, usb ? "usb" : "network"])
             let trusted = report?["trust_verified"] as? Bool == true
             let info = report?["device"] as? [String: Any]
             let model = info?["ProductType"] as? String
             let name = info?["DeviceName"] as? String ?? "Unverified device"
             let version = info?["ProductVersion"] as? String
-            return WiredDevice(title: name, detail: [version.map { "iOS " + $0 }, trusted ? "Trusted connection" : "Trust not verified"].compactMap { $0 }.joined(separator: " · "), ready: false, trusted: trusted, modelIdentifier: model, udid: id, usb: usb, wifi: wifi)
+            let developerMode = report?["developer_mode"] as? Bool
+            let ready = trusted && developerMode == true && info?["DeviceClass"] as? String == "iPhone"
+            return WiredDevice(title: name, detail: [version.map { "iOS " + $0 }, trusted ? "Trusted connection" : "Trust not verified"].compactMap { $0 }.joined(separator: " · "), ready: ready, developerModeRequired: developerMode == false, trusted: trusted, modelIdentifier: model, udid: id, usb: usb, wifi: wifi)
         }
     }
 
@@ -689,7 +698,7 @@ private struct InstallerView: View {
             }
             Button {
                 preferredAccount = nil
-                installer.begin(upgrade: upgrade, team: team, channel: releaseChannel)
+                installer.begin(upgrade: upgrade, team: team, channel: releaseChannel, targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
             } label: {
                 Label("Use another Apple ID", systemImage: "plus.circle")
                     .frame(maxWidth: .infinity)
@@ -873,7 +882,7 @@ private struct InstallerView: View {
                     if completed {
                         installer.dismissCompletion()
                     } else {
-                        installer.begin(upgrade: upgrade, team: team, channel: releaseChannel)
+                        installer.begin(upgrade: upgrade, team: team, channel: releaseChannel, targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
                     }
                 } label: {
                     Text(actionTitle)
@@ -996,7 +1005,7 @@ private struct InstallerView: View {
                        installer.installedBundle.range(of: #"^app\.zagstore\.ios\.[A-Z0-9]{10}$"#, options: .regularExpression) != nil {
                         let recoveryTeam = String(installer.installedBundle.suffix(10))
                         Button("Resume Signing Setup") {
-                            installer.begin(upgrade: false, team: recoveryTeam, resumeSetup: true)
+                            installer.begin(upgrade: false, team: recoveryTeam, resumeSetup: true, targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
                         }
                         .disabled(!device.ready)
                         Text("Uses the saved signing identity for this installation. No reinstall is required. Apple ID sign-in may still be needed on your iPhone.")
@@ -1018,7 +1027,7 @@ private struct InstallerView: View {
                             .disabled(installer.busy)
                     }
                     Button("Resume Signing Setup") {
-                        installer.begin(upgrade: false, team: team, resumeSetup: true)
+                        installer.begin(upgrade: false, team: team, resumeSetup: true, targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
                     }
                     .disabled(installer.busy || !device.ready || team.trimmingCharacters(in: .whitespacesAndNewlines).range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil)
                 }
