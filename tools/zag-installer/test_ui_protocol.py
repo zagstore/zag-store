@@ -25,6 +25,40 @@ class ProtocolTests(unittest.TestCase):
         })
         self.assertNotIn(b"private-password", output.getvalue())
 
+    def test_combined_credentials_are_not_echoed(self):
+        fields = {"email": " example@example.com ", "password": "private-password"}
+        wire = (json.dumps({"value": json.dumps(fields)}) + "\n").encode()
+        channel, output = self.make_channel(wire)
+        self.assertEqual(channel.credentials(), ("example@example.com", "private-password"))
+        self.assertEqual(json.loads(output.getvalue()), {
+            "type": "prompt", "message": "Apple ID credentials: ", "secure": True
+        })
+        self.assertNotIn(b"private-password", output.getvalue())
+        self.assertNotIn(b"example@example.com", output.getvalue())
+
+    def test_combined_credentials_reject_invalid_fields(self):
+        for fields in (
+            {}, [], {"email": "a", "password": ""},
+            {"email": " ", "password": "secret"},
+            {"email": "a", "password": 123},
+            {"email": "a", "password": "secret", "extra": True},
+            {"email": "a" * 321, "password": "secret"},
+            {"email": "a", "password": "x" * 1025},
+        ):
+            with self.subTest(kind=type(fields).__name__):
+                wire = (json.dumps({"value": json.dumps(fields)}) + "\n").encode()
+                channel, output = self.make_channel(wire)
+                with self.assertRaisesRegex(ValueError, "^Invalid credential reply$"):
+                    channel.credentials()
+                self.assertNotIn(b"secret", output.getvalue())
+
+    def test_combined_credentials_cancel_or_disconnect(self):
+        for wire in (b'{"cancel":true}\n', b"", b'{"value":"not-json"}\n'):
+            channel, output = self.make_channel(wire)
+            with self.assertRaises(ValueError):
+                channel.credentials()
+            self.assertNotIn(b"not-json", output.getvalue())
+
     def test_plain_prompt_preserves_exact_response(self):
         channel, output = self.make_channel(b'{"value":"PROVISION"}\n')
         self.assertEqual(channel.ask("Confirm Apple provisioning"), "PROVISION")
