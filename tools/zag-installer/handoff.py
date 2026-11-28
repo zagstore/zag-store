@@ -65,13 +65,24 @@ def validate_request(raw, udid, bundle, team):
     return request["keyScope"], certificate
 
 
+def exact_destination(device, target, bundle):
+    # Native Installation Proxy can omit development apps in broad inventory.
+    # Use the exact targeted lookup when the adapter supports it; never infer
+    # installation from a receipt or from the presence of the legacy copy.
+    lookup = getattr(type(device), "destination_app", None)
+    if callable(lookup):
+        app = lookup(device, target, bundle)
+        return [app] if app is not None else []
+    return [app for app in device.apps(target) if app.get("bundleIdentifier") == bundle]
+
+
 def send(repo, cache, scratch, device, team, approve=input):
     bundle = "app.zagstore.ios." + team
     target, udid = device.usb_device()
 
     def check_destination():
         desktop.require(device.usb_device() == (target, udid), "The trusted USB device changed")
-        apps = [app for app in device.apps(target) if app.get("bundleIdentifier") == bundle]
+        apps = exact_destination(device, target, bundle)
         desktop.require(len(apps) == 1, "The selected Personal Team copy is not installed on the USB device")
         return apps[0]
 
@@ -155,7 +166,7 @@ def save_receipt(store, udid, team, item, certificate, result):
 def retry(repo, cache, scratch, device, team):
     target, udid = device.usb_device()
     bundle = "app.zagstore.ios." + team
-    installed = [app for app in device.apps(target) if app.get("bundleIdentifier") == bundle]
+    installed = exact_destination(device, target, bundle)
     desktop.require(len(installed) == 1, "The selected Personal Team copy is not installed on the USB device")
     signer, openssl = cache.signer_tools(repo)
     store = desktop.Keychain(signer)
@@ -180,7 +191,7 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
 
     def check_target():
         desktop.require(device.usb_device() == (target, udid), "Reconnect the original trusted iPhone")
-        matches = [app for app in device.apps(target) if app.get("bundleIdentifier") == bundle]
+        matches = exact_destination(device, target, bundle)
         desktop.require(matches == [installed], "The installed Personal Team copy changed")
 
     def poll(paths):
