@@ -310,6 +310,70 @@ class NativeSignedIpaPreflightTests(unittest.TestCase):
         validator.assert_called_once_with(
             self.ipa, TEAM, self.udid, self.root_pem, expected_signer=self.cert)
 
+    def test_native_preflight_calls_real_validator_and_binds_exact_receipt(self):
+        device = installer.StandaloneUSB(self.root, self._helper())
+        device.identity = self.udid
+        approved = {
+            "preflight":"validated_local_digest_and_device",
+            "writes_performed":False, "installation_authorized":False,
+            "bundleIdentifier":DESTINATION, "version":"1.0.0", "build":"4",
+            "sha256":hashlib.sha256(self.ipa.read_bytes()).hexdigest(),
+            "operation":"fresh_install", "destination_state":"not_reported_by_inventory"
+        }
+        status = {
+            "transport":"system-usbmuxd","trust_verified":True,"developer_mode":True,
+            "udid":self.udid,"device":{
+                "DeviceClass":"iPhone","ProductType":"iPhone16,2","ProductVersion":"27.2.1"
+            }
+        }
+        with patch.object(installer.artifact, "validate", return_value={
+            "bundle_identifier":DESTINATION,"build":"4"
+        }) as validator, patch.object(installer.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, __import__("json").dumps(status).encode(), b""),
+                subprocess.CompletedProcess([], 0, __import__("json").dumps(approved).encode(), b"")
+            ]
+            self.assertEqual(device.preflight_signed(
+                self.ipa, RELEASE, TEAM, self.root_pem, self.cert,
+                check_authorization=lambda _: None), approved)
+        validator.assert_called_once()
+        self.assertEqual(run.call_args.args[0][1], "preflight")
+        self.assertFalse((self.root / "native-ipa-preflight.json").exists())
+
+    def test_native_preflight_rejects_claimed_approval_or_changed_destination(self):
+        device = installer.StandaloneUSB(self.root, self._helper())
+        device.identity = self.udid
+        status = {
+            "transport":"system-usbmuxd","trust_verified":True,"developer_mode":True,
+            "udid":self.udid,"device":{
+                "DeviceClass":"iPhone","ProductType":"iPhone16,2","ProductVersion":"27.2.1"
+            }
+        }
+        invalid = {
+            "preflight":"validated_local_digest_and_device",
+            "writes_performed":False, "installation_authorized":True,
+            "bundleIdentifier":DESTINATION,"version":"1.0.0","build":"4",
+            "sha256":hashlib.sha256(self.ipa.read_bytes()).hexdigest(),
+            "operation":"fresh_install","destination_state":"expected_upgrade_detected"
+        }
+        with patch.object(installer.artifact, "validate", return_value={
+            "bundle_identifier":DESTINATION,"build":"4"
+        }), patch.object(installer.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, __import__("json").dumps(status).encode(), b""),
+                subprocess.CompletedProcess([], 0, __import__("json").dumps(invalid).encode(), b"")
+            ]
+            with self.assertRaisesRegex(ValueError, "inconsistent"):
+                device.preflight_signed(self.ipa, RELEASE, TEAM, self.root_pem,
+                                        self.cert, check_authorization=lambda _: None)
+        self.assertFalse((self.root / "native-ipa-preflight.json").exists())
+
+    def _helper(self):
+        path = self.root / "zag-usb"
+        path.write_bytes(b"mock native helper")
+        path.chmod(0o700)
+        return path
+
     def test_bad_apple_signature_never_generates_plan(self):
         with patch.object(installer.artifact, "validate", side_effect=ValueError("bad profile")):
             with self.assertRaisesRegex(ValueError, "bad profile"):
