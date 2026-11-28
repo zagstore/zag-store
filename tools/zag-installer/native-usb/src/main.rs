@@ -149,6 +149,19 @@ async fn main() {
         }
         return;
     }
+    if args.len() == 2 && args[0] == "inventory-team" {
+        let team = &args[1];
+        if team.len() != 10 || !team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+            eprintln!("Invalid Personal Team identifier");
+            std::process::exit(2);
+        }
+        match tokio::time::timeout(Duration::from_secs(45), inspect("inventory", Some(team))).await {
+            Ok(Ok(result)) => println!("{}", result),
+            _ => { eprintln!("Targeted native inventory failed; no device writes performed");
+                   std::process::exit(1); }
+        }
+        return;
+    }
     if args.len() == 2 && args[0] == "preflight" {
         // Read-only, bounded digest and USB identity check. The plan is
         // untrusted input and never authorizes a device installation.
