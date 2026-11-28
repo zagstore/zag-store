@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -28,13 +29,12 @@ spec.loader.exec_module(artifact)
 
 
 class StandaloneUSB:
-    """Read-only native transport adapter for the verified standalone package.
+    """Native USB adapter; installation is disabled in ordinary builds.
 
-    Device identity and app inventory are acquired over paired usbmuxd and
-    Lockdown, with no Xcode/compilation fallback. Installation and handoff
-    deliberately remain disabled until their native transport is validated.
+    Only an explicitly opted-in, developer-feature Rust build may install.
+    Apple's signing and release checks always happen in the macOS frontend.
     """
-    def __init__(self, scratch, executable):
+    def __init__(self, scratch, executable, *, native_install_dev=False):
         self.scratch = scratch
         self.executable = Path(executable)
         if self.executable.is_symlink() or not self.executable.is_file() or not os.access(self.executable, os.X_OK):
@@ -44,6 +44,7 @@ class StandaloneUSB:
             raise ValueError("Standalone USB helper has insecure ownership or permissions")
         self.identity = None
         self.device_info = None
+        self.native_install_dev = native_install_dev
 
     def _run(self, mode, team=None):
         if mode == "inventory-team":
@@ -220,8 +221,65 @@ class StandaloneUSB:
         finally:
             intent_file.unlink(missing_ok=True)
 
+    def install_signed_developer(self, identifier, signed, release, team, root, certificate,
+                                 *, previous=None, check_authorization=releases.check_fresh,
+                                 earlier=None):
+        """Developer-feature-only native installation of the exact verified IPA.
+
+        A preflight record is only a checksum/device binding. The authorization
+        is the current validated Apple signing result + user approval + pinned
+        release check, NOT the mutable JSON record.
+        """
+        artifact.require(self.native_install_dev is True,
+                         "Native USB installation is disabled in the packaged installer")
+        artifact.require(self.identity is not None
+                         and identifier.casefold() == self.identity.casefold(),
+                         "The trusted USB device changed")
+        check_authorization(release)
+        self._run("status")
+        plan = native_preflight.create(signed, release, team, self.identity,
+                                       certificate, root, artifact,
+                                       check_authorization, previous=previous)
+        if earlier is not None:
+            artifact.require(
+                isinstance(earlier, dict)
+                and earlier.get("sha256") == plan["ipa_sha256"]
+                and earlier.get("bundleIdentifier") == plan["bundle_identifier"]
+                and earlier.get("version") == plan["version"]
+                and earlier.get("build") == plan["build"]
+                and earlier.get("installation_authorized") is False,
+                "Signed IPA changed after the approved native preflight")
+        intent_file = native_preflight.write_private(plan, self.scratch)
+        try:
+            operation = "UPGRADE" if previous is not None else "INSTALL"
+            phrase = f"{operation} {plan['bundle_identifier']} ON {self.identity}"
+            token = secrets.token_hex(16)
+            try:
+                response = subprocess.run(
+                    [str(self.executable), "install-signed-dev", str(intent_file),
+                     token, phrase], capture_output=True, timeout=1800, check=False)
+            except subprocess.TimeoutExpired as error:
+                raise ValueError("Native developer installation timed out; check device inventory") from error
+            artifact.require(response.returncode == 0 and len(response.stdout) <= 4096,
+                             "Native developer installation failed; check USB and device inventory")
+            try:
+                report = json.loads(response.stdout)
+            except (ValueError, UnicodeError) as error:
+                raise ValueError("Native installation returned invalid JSON") from error
+            artifact.require(
+                isinstance(report, dict)
+                and report.get("mode") == "native-install-dev"
+                and report.get("installed") is True
+                and report.get("installed_bundle") == plan["bundle_identifier"]
+                and report.get("version") == plan["version"]
+                and report.get("build") == plan["build"],
+                "Native installation completion did not verify expected bundle and build")
+            return report
+        finally:
+            intent_file.unlink(missing_ok=True)
+
     def install(self, identifier, path):
-        raise ValueError("Native USB installation is disabled pending validated release-to-transfer integration")
+        raise ValueError("Native USB installation accepts only a verified IPA in an opted-in developer build")
 
     def launch_app(self, identifier, bundle):
         raise ValueError("Native app launch has not been validated")
@@ -378,13 +436,16 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     artifact.require(evidence["bundle_identifier"] == expected and evidence["build"] == release["build"],
                      "Signed artifact differs from the authorized bundle or build")
     staged = scratch / "staged"
-    staged.mkdir()
     with zipfile.ZipFile(signed) as archive:
         relative, info = artifact.main_bundle(archive)
         artifact.require(info.get("CFBundleShortVersionString") == release["version"]
                          and info.get("MinimumOSVersion") == release["minimum_os"],
                          "Signed artifact differs from the authorized version or minimum OS")
-        artifact.extract(archive, staged)
+        if not isinstance(device, StandaloneUSB):
+            # CoreDevice installs the extracted .app directory; native AFC
+            # stages the intact Apple-signed IPA without rewriting its bytes.
+            staged.mkdir()
+            artifact.extract(archive, staged)
     check_destination(installed, release, installed is not None, replace_same_build=replace_same_build)
     label = f"{expected} {release['version']} ({release['build']})"
     if replace_same_build:
@@ -394,14 +455,17 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
         confirmation = f"UPGRADE {expected}" if installed is not None else "INSTALL"
         operation = "Upgrade in place" if installed is not None else "Install as a separate app"
     check_authorization(release)
+    native_receipt = None
+    prior = None
     if isinstance(device, StandaloneUSB):
         # The signing validator has already passed. Independently verify the
         # exact signed IPA checksum, wired device, minimum iOS, and targeted
         # destination before asking the user to approve any device write.
         prior = ({"version": installed["version"], "build": installed["bundleVersion"]}
                  if installed is not None else None)
-        device.preflight_signed(signed, release, team, apple_root, certificate,
-                                previous=prior, check_authorization=check_authorization)
+        native_receipt = device.preflight_signed(
+            signed, release, team, apple_root, certificate,
+            previous=prior, check_authorization=check_authorization)
     artifact.require(approve(f"{operation} {label}? Type {confirmation}: ") == confirmation,
                      "Installation cancelled")
     artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
@@ -409,7 +473,12 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     artifact.require(installed_app(device, target, expected) == installed,
                      "Destination inventory changed. Installation cancelled.")
     check_authorization(release)
-    device.install(target, staged / relative)
+    if isinstance(device, StandaloneUSB):
+        device.install_signed_developer(
+            target, signed, release, team, apple_root, certificate,
+            previous=prior, check_authorization=check_authorization, earlier=native_receipt)
+    else:
+        device.install(target, staged / relative)
     observed = installed_app(device, target, expected)
     artifact.require(observed and observed.get("bundleVersion") == release["build"]
                      and observed.get("version") == release["version"],
@@ -550,6 +619,8 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--usb-transport", choices=("coredevice", "standalone"),
                         default="coredevice", help=argparse.SUPPRESS)
+    parser.add_argument("--native-install-dev", action="store_true",
+                        help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode", required=True)
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
@@ -584,8 +655,15 @@ def main():
             approve = input
         # In standalone preview, no Apple sign-in, certificate issuance, profile
         # registration or download may begin while device writes are disabled.
-        artifact.require(args.usb_transport != "standalone" or args.mode == "prepare",
+        developer_native = (
+            args.usb_transport == "standalone" and args.native_install_dev
+            and args.mode == "install" and not args.ui_pipe and sys.stdin.isatty()
+        )
+        artifact.require(args.usb_transport != "standalone"
+                         or args.mode == "prepare" or developer_native,
                          "Native USB installation and signing handoff are not yet enabled")
+        artifact.require(not args.native_install_dev or developer_native,
+                         "Native installation developer mode requires interactive standalone install")
         with desktop.locked_cache(precompiled=args.precompiled_helpers) as cache:
             if args.mode == "prepare":
                 release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
@@ -600,7 +678,8 @@ def main():
                     helper_root = (args.precompiled_helpers if args.precompiled_helpers is not None
                                    else ROOT / "tools/zag-installer/native-usb/target/release")
                     device = (CoreDevice(scratch) if args.usb_transport == "coredevice"
-                              else StandaloneUSB(scratch, helper_root / "zag-usb"))
+                              else StandaloneUSB(scratch, helper_root / "zag-usb",
+                                                 native_install_dev=developer_native))
                     if args.mode in ("handoff", "setup"):
                         artifact.mapped_bundle(args.team)
                         command = handoff.send if args.mode == "handoff" else handoff.retry
