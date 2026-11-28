@@ -507,7 +507,9 @@ def install_release(release, release_helper, apple_root, endpoint, upgrade_team,
 
 def install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
                      approve, check_authorization, *, replace_same_build=False, defer_setup=False,
-                     account_bootstrap_dev=False):
+                     account_bootstrap_dev=False, fresh_local=False):
+    artifact.require(not fresh_local or (account_bootstrap_dev and upgrade_team == LOCAL_UPGRADE_TEAM and not replace_same_build),
+                     "Fresh local installation requires the exact experimental team")
     artifact.require(not replace_same_build or upgrade_team == LOCAL_UPGRADE_TEAM,
                      "Same-build replacement is restricted to the experimental Personal Team copy")
     endpoint = desktop.provider_origin(endpoint) if endpoint else None
@@ -525,15 +527,15 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     components = desktop.signing_components(app, artifact.ORIGINAL)
     target, udid = device.usb_device()
     device.check_compatibility(info)
-    upgrade = upgrade_team is not None
+    upgrade = upgrade_team is not None and not fresh_local
     installed = None
-    if upgrade:
+    if upgrade or fresh_local:
         installed = installed_app(device, target, artifact.mapped_bundle(upgrade_team))
         check_destination(installed, release, upgrade, replace_same_build=replace_same_build)
 
     def choose_team(teams):
         teams = [team for team in teams if isinstance(team["id"], str) and artifact.TEAM.fullmatch(team["id"])
-                 and (not upgrade or team["id"] == upgrade_team)]
+                 and (upgrade_team is None or team["id"] == upgrade_team)]
         artifact.require(teams, "Apple returned no matching Personal Team")
         if len(teams) == 1:
             team = teams[0]["id"]
@@ -556,7 +558,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
 
     auth, helper, openssl, anisette = cache.installer_tools(ROOT, native=endpoint is None)
     store = desktop.Keychain(helper)
-    portal = desktop.Provisioning(endpoint, udid, store, openssl, choose_team, approve, anisette, upgrade, components)
+    portal = desktop.Provisioning(endpoint, udid, store, openssl, choose_team, approve, anisette, upgrade or fresh_local, components)
     # The native development GUI may offer portability for a fresh release.
     # A separately opted-in, exact-team local candidate upgrade can test it
     # without publishing a release or removing the experimental app.
@@ -637,7 +639,8 @@ def stage_local_candidate(source, candidate, expected_sha, version, build):
 
 
 def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch, device, cache, approve=input,
-                            *, replace_same_build=False, account_bootstrap_dev=False):
+                            *, replace_same_build=False, account_bootstrap_dev=False, fresh_local=False):
+    artifact.require(not fresh_local or account_bootstrap_dev, "Fresh local installation requires account bootstrap opt-in")
     artifact.require(not account_bootstrap_dev or
                      (isinstance(device, StandaloneUSB) and device.native_install_dev and not replace_same_build),
                      "Account bootstrap testing requires a newer local candidate and native developer USB")
@@ -649,7 +652,7 @@ def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch,
 
     return install_verified(release, candidate, apple_root, None, LOCAL_UPGRADE_TEAM,
                             scratch, device, cache, approve, check_digest, replace_same_build=replace_same_build,
-                            account_bootstrap_dev=account_bootstrap_dev)
+                            account_bootstrap_dev=account_bootstrap_dev, fresh_local=fresh_local)
 
 
 def native_gui_helper(args):
@@ -696,6 +699,7 @@ def main():
     local.add_argument("--replace-same-build", action="store_true",
                        help="Explicitly replace the experimental copy at the exact installed version and build")
     local.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
+    local.add_argument("--fresh-install", action="store_true", help="Require the exact experimental copy to be absent; reuse its existing signing identity")
     local.add_argument("--account-bootstrap-dev", action="store_true",
                        help="Test Apple ID bootstrap on the exact experimental copy over native developer USB")
     setup = modes.add_parser("setup", help="Retry automatic signing setup without reinstalling")
@@ -773,7 +777,7 @@ def main():
                             result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
                                                              args.apple_root, scratch, device, cache,
                                                              replace_same_build=args.replace_same_build,
-                                                             account_bootstrap_dev=local_account_dev)
+                                                             account_bootstrap_dev=local_account_dev, fresh_local=args.fresh_install)
                         else:
                             release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                             result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
