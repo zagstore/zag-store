@@ -658,6 +658,27 @@ private struct InstallerView: View {
                 }
             }
             DisclosureGroup("Diagnostics", isExpanded: $showDiagnostics) {
+            Button("Copy safe diagnostic summary") {
+                let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown"
+                let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"
+                let allowedStages = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
+                let stage = installer.stage.flatMap { allowedStages.contains($0) ? $0 : nil } ?? "none"
+                let report = [
+                    "Zag Installer \(version) (\(build))",
+                    "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)",
+                    "USB trust verified: \(device.trusted)",
+                    "Developer Mode verified: \(device.ready)",
+                    "Operation active: \(installer.busy)",
+                    "Stage: \(stage)",
+                    "Installation reported: \(!installer.installedBundle.isEmpty)",
+                    "Signing identity ready: \(installer.identityImported)",
+                    "Signing Setup verified: \(installer.setupVerified)"
+                ].joined(separator: "\n")
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(report, forType: .string)
+            }
+            Text("Copies only status flags and software versions, not raw logs or account identifiers.")
+                .font(.caption).foregroundStyle(muted)
             ScrollView {
                 Text(installer.log.isEmpty ? "Installer diagnostics appear here." : installer.log)
                     .font(.system(.caption, design: .monospaced))
