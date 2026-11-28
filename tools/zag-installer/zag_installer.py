@@ -508,6 +508,11 @@ def install_release(release, release_helper, apple_root, endpoint, upgrade_team,
 def install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
                      approve, check_authorization, *, replace_same_build=False, defer_setup=False,
                      account_bootstrap_dev=False, fresh_local=False):
+    channel = getattr(approve, "__self__", None)
+    def progress(stage):
+        if isinstance(channel, ui_protocol.Channel):
+            channel.progress(stage)
+    progress("preflight")
     artifact.require(not fresh_local or (account_bootstrap_dev and upgrade_team == LOCAL_UPGRADE_TEAM and not replace_same_build),
                      "Fresh local installation requires the exact experimental team")
     artifact.require(not replace_same_build or upgrade_team == LOCAL_UPGRADE_TEAM,
@@ -554,6 +559,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
         check_authorization(release)
         artifact.require(confirm_action(approve, f"Use {team} as your Personal Team and allow Apple provisioning?", "PROVISION", "Continue")
                          == "PROVISION", "Apple provisioning cancelled")
+        progress("provisioning")
         return team
 
     auth, helper, openssl, anisette = cache.installer_tools(ROOT, native=endpoint is None)
@@ -574,8 +580,11 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
             "Only its developer session and signing identity will be transferred privately over USB.",
             "ACCOUNT", "Continue") == "ACCOUNT", "Apple ID transfer cancelled")
         portal.account_bootstrap = True
+    progress("authentication")
     team, identity, profiles = portal.run(auth)
+    progress("signing")
     signed = desktop.sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch)
+    progress("installation")
     result = validate_and_install(signed, release, team, root, scratch, device, target, udid,
                                   approve, identity.certificate, installed, check_authorization,
                                   replace_same_build=replace_same_build)
@@ -590,6 +599,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
             result["signing_setup"] = "incomplete"
             print("Installation verified. Use Resume Signing Setup when ready; no pairing changes have been requested.", flush=True)
             return result
+        progress("handoff")
         print(f"Installed {result['installed_bundle']}. Starting Signing Setup.", flush=True)
         try:
             observed = installed_app(device, target, result["installed_bundle"])

@@ -57,6 +57,14 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 channel.ask("Choose your Personal Team")
 
+    def test_progress_contract(self):
+        channel, out = self.make_channel(b"")
+        channel.progress("signing")
+        self.assertEqual(json.loads(out.getvalue()), {"type": "progress", "stage": "signing"})
+        with self.assertRaises(ValueError):
+            channel.progress("private-password")
+        self.assertNotIn(b"private-password", out.getvalue())
+
     def test_event_contract_is_one_json_object_per_line(self):
         channel, out = self.make_channel(b"")
         channel.send({"type": "finished", "result": {"build": "5"}})

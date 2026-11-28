@@ -66,5 +66,10 @@ class Channel:
             raise ValueError("Installation cancelled")
         return reply["value"]
 
+    def progress(self, stage):
+        if stage not in ("preflight", "authentication", "provisioning", "signing", "installation", "handoff"):
+            raise ValueError("Invalid installer stage")
+        self.send({"type": "progress", "stage": stage})
+
     def confirm(self, message, expected, action):
         return self.ask(message, confirmation=expected, action=action)

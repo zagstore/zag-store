@@ -19,6 +19,7 @@ final class InstallerController: ObservableObject {
     @Published var installedBundle = ""
     @Published var identityImported = false
     @Published var setupVerified = false
+    @Published var stage: String?
 
     private var task: Process?
     private var input: FileHandle?
@@ -125,6 +126,7 @@ final class InstallerController: ObservableObject {
         installedBundle = ""
         identityImported = false
         setupVerified = false
+        stage = nil
         prompt = nil
         log = ""
         status = resumeSetup ? "Checking the existing installation and signing receipt" : "Verifying the signed release and connected iPhone"
@@ -197,6 +199,17 @@ final class InstallerController: ObservableObject {
                 }
                 prompt = InstallerPrompt(message: message, secure: secure, confirmation: confirmation, action: action)
                 status = "Your confirmation is required"
+            case "progress":
+                let labels = ["preflight": "Checking release and device", "authentication": "Authenticating Apple ID",
+                              "provisioning": "Preparing signing credentials", "signing": "Signing Zag Store",
+                              "installation": "Installing Zag Store", "handoff": "Transferring signing setup"]
+                guard let next = object["stage"] as? String, let label = labels[next] else {
+                    status = "Invalid installer stage"
+                    task?.terminate()
+                    return
+                }
+                stage = next
+                status = label
             case "finished":
                 if let result = object["result"] as? [String: Any] {
                     installedBundle = result["installed_bundle"] as? String ?? ""
@@ -468,6 +481,16 @@ private struct InstallerView: View {
             if installer.busy {
                 ProgressView().controlSize(.small)
                 Text(installer.status).font(.headline)
+                if let stage = installer.stage {
+                    let stages = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
+                    HStack(spacing: 5) {
+                        ForEach(stages, id: \.self) { item in
+                            Capsule().fill((stages.firstIndex(of: item) ?? 0) <= (stages.firstIndex(of: stage) ?? 0) ? success : border)
+                                .frame(height: 4)
+                        }
+                    }
+                    .accessibilityHidden(true)
+                }
             } else if !installer.installedBundle.isEmpty {
                 Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
                 if installer.identityImported {
