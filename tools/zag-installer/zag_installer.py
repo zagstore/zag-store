@@ -19,6 +19,7 @@ import desktop
 import handoff
 import releases
 import native_preflight
+import ipa_preview
 import ui_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -64,6 +65,9 @@ class StandaloneUSB:
         if mode == "inventory-team":
             artifact.require(isinstance(team, str) and re.fullmatch(r"[A-Z0-9]{10}", team),
                              "Invalid Personal Team for targeted native inventory")
+            command = self._command(mode, team)
+        elif mode == "inventory-imported":
+            artifact.require(self.native_install_dev and isinstance(team, str) and re.fullmatch(r"app\.zloader\.imported\.[a-f0-9]{32}\.[A-Z0-9]{10}", team), "Invalid imported inventory scope")
             command = self._command(mode, team)
         else:
             artifact.require(team is None and mode in ("status", "inventory"),
@@ -173,10 +177,13 @@ class StandaloneUSB:
                          and identifier.casefold() == self.identity.casefold(),
                          "The trusted USB device changed")
         prefix = artifact.ORIGINAL + "."
-        artifact.require(isinstance(bundle, str) and bundle.startswith(prefix)
-                         and re.fullmatch(r"[A-Z0-9]{10}", bundle[len(prefix):]),
-                         "Only a mapped Personal Team destination can be selected")
-        _, _, response = self._run("inventory-team", bundle[len(prefix):])
+        if self.native_install_dev and isinstance(bundle, str) and re.fullmatch(r"app\.zloader\.imported\.[a-f0-9]{32}\.[A-Z0-9]{10}", bundle):
+            _, _, response = self._run("inventory-imported", bundle)
+        else:
+            artifact.require(isinstance(bundle, str) and bundle.startswith(prefix)
+                             and re.fullmatch(r"[A-Z0-9]{10}", bundle[len(prefix):]),
+                             "Only a mapped Personal Team destination can be selected")
+            _, _, response = self._run("inventory-team", bundle[len(prefix):])
         artifact.require(response.get("targeted_checked") is True,
                          "Targeted native inventory did not complete")
         apps = response.get("targeted_apps")
@@ -196,7 +203,7 @@ class StandaloneUSB:
                 "version":record["version"], "bundleVersion":record["bundleVersion"]}
 
     def preflight_signed(self, signed, release, team, root, certificate, *,
-                         previous=None, check_authorization=releases.check_fresh):
+                         previous=None, check_authorization=releases.check_fresh, imported_bundle=None):
         """Validate Apple signing on macOS, then independently bind IPA/device.
 
         This method performs ONLY local reads and native USB inventory.
@@ -206,7 +213,7 @@ class StandaloneUSB:
         self._run("status")
         intent = native_preflight.create(signed, release, team, self.identity,
                                          certificate, root, artifact,
-                                         check_authorization, previous=previous)
+                                         check_authorization, previous=previous, **({"imported_bundle": imported_bundle} if imported_bundle is not None else {}))
         intent_file = native_preflight.write_private(intent, self.scratch)
         try:
             try:
@@ -240,7 +247,7 @@ class StandaloneUSB:
 
     def install_signed_developer(self, identifier, signed, release, team, root, certificate,
                                  *, previous=None, check_authorization=releases.check_fresh,
-                                 earlier=None):
+                                 earlier=None, imported_bundle=None):
         """Developer-feature-only native installation of the exact verified IPA.
 
         A preflight record is only a checksum/device binding. The authorization
@@ -256,7 +263,7 @@ class StandaloneUSB:
         self._run("status")
         plan = native_preflight.create(signed, release, team, self.identity,
                                        certificate, root, artifact,
-                                       check_authorization, previous=previous)
+                                       check_authorization, previous=previous, **({"imported_bundle": imported_bundle} if imported_bundle is not None else {}))
         if earlier is not None:
             artifact.require(
                 isinstance(earlier, dict)
@@ -516,6 +523,83 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     return result
 
 
+def install_imported(source, expected_bundle, expected_version, expected_build, scratch, device, cache, approve):
+    """Explicitly selected local IPA; never enters signed-channel or handoff paths."""
+    artifact.require(isinstance(device, StandaloneUSB) and device.native_install_dev,
+                     "Imported installation requires the native development GUI")
+    channel = getattr(approve, "__self__", None)
+    artifact.require(isinstance(channel, ui_protocol.Channel), "Imported installation requires interactive GUI")
+    channel.progress("preflight")
+    device.progress_callback = channel.installation_progress
+    snapshot = scratch / "imported.ipa"
+    staged = ipa_preview.stage_for_signing(source, snapshot, artifact)
+    metadata, info = staged["metadata"], staged["info"]
+    original = metadata["bundle"]
+    artifact.require((original, metadata["version"], metadata["build"]) ==
+                     (expected_bundle, expected_version, expected_build),
+                     "IPA metadata changed after selection")
+    release = {"version": info.get("CFBundleShortVersionString"), "build": info.get("CFBundleVersion"),
+               "minimum_os": info.get("MinimumOSVersion")}
+    for value in release.values():
+        version_number(value)
+    target, udid = device.usb_device()
+    device.check_compatibility(info)
+    root = scratch / "apple-root.pem"
+    desktop.prepare_profile_root(artifact, ROOT, root)
+    artifact.require(confirm_action(approve,
+        f"Sign {metadata['name']} ({original}) with your Apple ID? "
+        "A new app identifier will be registered. Unsupported original capabilities may not work. "
+        "Only install IPAs you trust.", "IMPORT-PROVISION", "Continue") == "IMPORT-PROVISION",
+        "Installation cancelled")
+    def check_snapshot(_):
+        artifact.require(artifact.sha(snapshot) == staged["sha256"], "Selected IPA snapshot changed")
+    def choose_team(teams):
+        teams = [entry for entry in teams if isinstance(entry.get("id"), str) and artifact.TEAM.fullmatch(entry["id"])]
+        artifact.require(teams, "Apple returned no matching Personal Team")
+        if len(teams) == 1:
+            team = teams[0]["id"]
+        else:
+            options = "\n".join(f"{index}. {json.dumps(entry['name'])} ({entry['id']})"
+                                for index, entry in enumerate(teams, 1))
+            choice = approve("Select your Personal Team by number, or Enter to cancel:\n" + options).strip()
+            artifact.require(re.fullmatch(r"[0-9]{1,5}", choice) and 1 <= int(choice) <= len(teams), "Team selection cancelled")
+            team = teams[int(choice) - 1]["id"]
+        destination = ipa_preview.mapped_import_bundle(original, team)
+        artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
+        artifact.require(installed_app(device, target, destination) is None, "Imported destination already installed")
+        check_snapshot(release)
+        channel.progress("provisioning")
+        return team
+    auth, helper, openssl, anisette = cache.installer_tools(ROOT, native=True)
+    store = desktop.Keychain(helper)
+    portal = desktop.Provisioning(None, udid, store, openssl, choose_team, approve, anisette,
+                                  imported_bundle=original)
+    channel.progress("authentication")
+    team, identity, profiles = portal.run(auth)
+    destination = ipa_preview.mapped_import_bundle(original, team)
+    channel.progress("signing")
+    signed = desktop.sign(artifact, staged["app"], staged["relative"], team, udid, identity,
+                          profiles, {"": ""}, root, helper, scratch, imported_bundle=original)
+    evidence = artifact.validate(signed, team, udid, root, expected_signer=identity.certificate,
+                                 imported_destination=destination)
+    artifact.require(evidence["bundle_identifier"] == destination and evidence["build"] == release["build"],
+                     "Signed imported identity mismatch")
+    channel.progress("installation")
+    earlier = device.preflight_signed(signed, release, team, root, identity.certificate,
+                                       check_authorization=check_snapshot, imported_bundle=original)
+    artifact.require(confirm_action(approve, f"Install {metadata['name']} as a separate application?",
+                                     "IMPORT-INSTALL", "Install") == "IMPORT-INSTALL", "Installation cancelled")
+    artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
+    artifact.require(installed_app(device, target, destination) is None, "Imported destination already installed")
+    device.install_signed_developer(target, signed, release, team, root, identity.certificate,
+                                   check_authorization=check_snapshot, earlier=earlier, imported_bundle=original)
+    observed = installed_app(device, target, destination)
+    artifact.require(observed and observed["version"] == release["version"]
+                     and observed["bundleVersion"] == release["build"], "Imported installation readback failed")
+    return {"installed_bundle": destination, "version": release["version"], "build": release["build"],
+            "imported_application": True}
+
+
 def install_release(release, release_helper, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input,
                     *, defer_setup=False):
     local_source = scratch / "official.ipa"
@@ -719,7 +803,7 @@ def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch,
 def native_gui_helper(args):
     """Only the explicitly opted-in, bundled development GUI may use writes."""
     artifact.require(args.ui_pipe and args.usb_transport == "standalone"
-                     and args.mode in ("install", "setup")
+                     and args.mode in ("install", "setup", "install-imported")
                      and not args.native_install_dev and args.native_dev_helper is None,
                      "Native GUI developer mode requires bundled standalone install or setup")
     expected = ROOT / "helpers"
@@ -754,6 +838,11 @@ def main():
     install = modes.add_parser("install", help="Provision, sign, validate and install the latest authorized release")
     install.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
     install.add_argument("--upgrade", metavar="TEAM", help="Require an existing copy for this Personal Team")
+    imported = modes.add_parser("install-imported", help=argparse.SUPPRESS)
+    imported.add_argument("ipa", type=Path)
+    imported.add_argument("--bundle", required=True)
+    imported.add_argument("--version", required=True)
+    imported.add_argument("--build", required=True)
     local = modes.add_parser("upgrade-local-candidate", help="Developer-only upgrade of the experimental Personal Team copy")
     local.add_argument("ipa", type=Path)
     local.add_argument("--sha256", required=True, help="Expected SHA-256 obtained independently of the IPA")
@@ -777,7 +866,7 @@ def main():
     try:
         artifact.require(sys.platform == "darwin", "Use macOS")
         if args.ui_pipe:
-            artifact.require(args.mode == "install" or (args.mode == "setup" and args.native_gui_dev),
+            artifact.require(args.mode == "install" or (args.mode in ("setup", "install-imported") and args.native_gui_dev),
                              "Graphical transport only supports official installation or native setup recovery")
             channel = ui_protocol.Channel()
             desktop.secret = lambda prompt: channel.ask(prompt, secret=True)
@@ -796,6 +885,8 @@ def main():
         artifact.require(not local_account_dev or developer_native,
                          "Account bootstrap testing requires interactive native developer USB and a newer local build")
         gui_helper = native_gui_helper(args) if args.native_gui_dev else None
+        artifact.require(args.mode != "install-imported" or (gui_helper is not None and args.target_udid is not None and args.target_transport is not None),
+                         "Imported installation requires an explicitly selected native GUI target")
         artifact.require((args.target_udid is None and args.target_transport is None) or
                          (gui_helper is not None and args.target_udid is not None and args.target_transport is not None),
                          "Explicit device selection requires the native GUI development build")
@@ -840,6 +931,8 @@ def main():
                         result = command(ROOT, cache, scratch, device, args.team)
                         if gui_helper is not None:
                             result["installed_bundle"] = bundle
+                    elif args.mode == "install-imported":
+                        result = install_imported(args.ipa, args.bundle, args.version, args.build, scratch, device, cache, approve)
                     else:
                         if args.mode == "upgrade-local-candidate":
                             result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
