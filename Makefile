@@ -7,6 +7,8 @@ PLATFORMS := iphoneos maccatalyst
 # checkout wiped the other's cache.
 TMP := $(TMPDIR)/$(NAME)-$(notdir $(CURDIR))
 CERT_JSON_URL := https://backloop.dev/pack.json
+# Optional local candidate only; the project and release defaults stay intact.
+ZAG_BUILD_NUMBER ?=
 
 .PHONY: all clean $(PLATFORMS) apple-bridge-iphoneos
 
@@ -44,7 +46,7 @@ $(PLATFORMS):
 		-derivedDataPath $(TMP)/$@ \
 		-skipPackagePluginValidation \
 		CODE_SIGNING_ALLOWED=NO \
-		ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=NO
+		ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=NO $(if $(ZAG_BUILD_NUMBER),CURRENT_PROJECT_VERSION=$(ZAG_BUILD_NUMBER))
 
 	mkdir -p _build/Payload
 	cp -R _build/Applications/*.app _build/Payload/Feather.app

@@ -153,7 +153,7 @@ if [[ -n "$ENGINE_STAGE" ]]; then
 fi
 if [[ "$NATIVE_DEV" == 1 ]]; then
     /usr/libexec/PlistBuddy -c "Add :ZagNativeInstallDevelopment bool true" "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 7" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 8" "$APP/Contents/Info.plist"
 fi
 plutil -lint "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP"

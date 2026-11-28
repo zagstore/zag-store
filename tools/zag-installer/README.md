@@ -155,7 +155,31 @@ The trusted, paired USB CoreDevice service delivers a one-time 256-bit bootstrap
 
 The Mac displays `"signing_setup":"verified"` only after an authenticated acknowledgement bound to the transfer request or an independently reverified existing scoped key. On the phone that requires matching key possession and the existing running-installation ownership and profile readback checks. A disconnect can be retried without reinstalling. A cancelled or expired setup cannot be reused.
 
-**Apple sign-in and pairing prerequisites.** Setup reuses a connected iPhone session for the same Apple account. On a fresh phone installation, the Rust installer holds an in-memory Xcode developer token with its desktop anisette identity. The iOS account store expects a native app-owned apple-auth session and its associated local device state. This implementation has no supported conversion or Apple session continuation between them. The iPhone therefore presents its existing Apple sign-in and verification when no matching session is connected. Developer Mode and iOS USB trust still need system approval when required. Zag Store also needs its own installation pairing for inventory and profile readback. Setup provides a direct link to that flow. It does not move pairing records, passwords, sessions or anisette state.
+**Apple sign-in and pairing prerequisites.** Normal setup reuses a connected iPhone session for the same Apple account or presents the existing sign-in UI. The experimental native developer route below additionally offers a portable, expiring Xcode developer token from the authenticated Mac. It does not transfer the full GrandSlam session, password, 2FA, ADI state or pairing record. Developer Mode and iOS USB trust still need system approval when required. Local installation pairing is independently required to verify inventory/profile readback and enable renewal; an imported key alone is not proof of renewable ownership.
+
+### Experimental Apple ID bootstrap (native development only)
+
+A new build advertises `ZagDesktopAccountBootstrap`. The native development GUI offers this capability for fresh installs only after explicit consent. The existing exact-team local-candidate command also offers an opt-in test against the already installed experimental copy, without changing the AppTesters copy. A private pre-launch bootstrap is delivered over trusted USB. On launch, the app creates a fresh X25519 challenge scoped to the exact bundle, UDID, team, account and certificate. The desktop sends the developer token in a separately authenticated encrypted response; no cleartext credential is staged. The app provisions its own local ADI identity if needed, verifies the token against Apple's read-only team and certificate inventory, and imports it only into an empty account catalog. An existing account or a signed-out identity cannot be overwritten or resurrected. If Apple rejects the candidate, the app falls back to ordinary sign-in.
+
+After successful import the app automatically starts the existing encrypted signing-key exchange. An unpaired app may import the scoped signing identity after validating its embedded profile, running signer and live Apple certificate; it reports `signing_identity: imported`, not `signing_setup: verified`. The original ownership checks remain mandatory for renewal. The developer token's expiry still applies: without a full native GrandSlam session, a later sign-in may be necessary. Cross-device session acceptance, runtime compatibility and physical renewal are not yet verified. Do not publish this development build until they have been tested.
+
+Build a newer local candidate (for example build 6 if build 5 is installed):
+
+```sh
+make iphoneos ZAG_BUILD_NUMBER=6
+```
+
+Test it only on the already installed experimental copy using the same desktop signing identity, an independently verified SHA-256 and the explicit native developer helper:
+
+```sh
+PATH="$(brew --prefix openssl@3)/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 \
+python3 tools/zag-installer/zag_installer.py --usb-transport standalone --native-install-dev \
+  --native-dev-helper /tmp/zag-native-dev-build/release/zag-usb \
+  upgrade-local-candidate packages/ZagStore.ipa --sha256 "$zag_setup_sha" \
+  --version 1.0.0 --build 6 --account-bootstrap-dev
+```
+
+The candidate must be newer, the exact mapped experimental app must be present, and its existing Apple-listed certificate and desktop key must match. Do not uninstall either copy. Keep USB connected and open the updated experimental app when requested. No local pairing action is required to test account and key import.
 
 ### Physical acceptance for the experimental copy
 

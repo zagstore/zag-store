@@ -198,6 +198,8 @@ final class InstallerController: ObservableObject {
                     installedBundle = result["installed_bundle"] as? String ?? ""
                     if result["signing_setup"] as? String == "verified" {
                         status = "Installed and Signing Setup verified"
+                    } else if result["signing_identity"] as? String == "imported" {
+                        status = "Installed. Signing identity imported; local installation verification is pending."
                     } else if result["signing_setup"] as? String == "incomplete" {
                         status = "Installed. Signing Setup can be resumed separately."
                     } else {

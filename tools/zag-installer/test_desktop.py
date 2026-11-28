@@ -115,6 +115,13 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unexpected account"):
             portal.handle(event)
 
+    def test_local_account_bootstrap_refuses_non_native_or_same_build(self):
+        with patch.object(installer, "stage_local_candidate") as stage:
+            with self.assertRaisesRegex(ValueError, "newer local candidate"):
+                installer.upgrade_local_candidate(Path("candidate.ipa"), "a" * 64, "1.0.0", "6",
+                    None, Path("."), Mock(), Mock(), account_bootstrap_dev=True)
+            stage.assert_not_called()
+
     def test_unknown_second_factor_requires_a_delivery_method(self):
         event = {"retry": False, "unknown": True, "sms": False,
                  "numbers": [{"id": 77, "last_two": "12"}]}

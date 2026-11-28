@@ -506,7 +506,8 @@ def install_release(release, release_helper, apple_root, endpoint, upgrade_team,
 
 
 def install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
-                     approve, check_authorization, *, replace_same_build=False, defer_setup=False):
+                     approve, check_authorization, *, replace_same_build=False, defer_setup=False,
+                     account_bootstrap_dev=False):
     artifact.require(not replace_same_build or upgrade_team == LOCAL_UPGRADE_TEAM,
                      "Same-build replacement is restricted to the experimental Personal Team copy")
     endpoint = desktop.provider_origin(endpoint) if endpoint else None
@@ -556,14 +557,18 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     auth, helper, openssl, anisette = cache.installer_tools(ROOT, native=endpoint is None)
     store = desktop.Keychain(helper)
     portal = desktop.Provisioning(endpoint, udid, store, openssl, choose_team, approve, anisette, upgrade, components)
-    # Only the separately packaged native development GUI can offer account
-    # portability, and only to a fresh, capability-advertising signed release.
-    account_bootstrap = (defer_setup and not upgrade and endpoint is None and anisette is not None
+    # The native development GUI may offer portability for a fresh release.
+    # A separately opted-in, exact-team local candidate upgrade can test it
+    # without publishing a release or removing the experimental app.
+    account_bootstrap = ((defer_setup and not upgrade or account_bootstrap_dev)
+                         and endpoint is None and anisette is not None
                          and info.get("ZagAutomaticSigningSetup") is True
                          and info.get("ZagDesktopAccountBootstrap") is True)
+    artifact.require(not account_bootstrap_dev or account_bootstrap,
+                     "Local candidate does not advertise experimental account bootstrap")
     if account_bootstrap:
         artifact.require(confirm_action(approve,
-            "Use the Apple ID from this Mac in the new Zag Store installation? "
+            "Use the Apple ID from this Mac in Zag Store if its account library is empty? "
             "Only its developer session and signing identity will be transferred privately over USB.",
             "ACCOUNT", "Continue") == "ACCOUNT", "Apple ID transfer cancelled")
         portal.account_bootstrap = True
@@ -632,7 +637,10 @@ def stage_local_candidate(source, candidate, expected_sha, version, build):
 
 
 def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch, device, cache, approve=input,
-                            *, replace_same_build=False):
+                            *, replace_same_build=False, account_bootstrap_dev=False):
+    artifact.require(not account_bootstrap_dev or
+                     (isinstance(device, StandaloneUSB) and device.native_install_dev and not replace_same_build),
+                     "Account bootstrap testing requires a newer local candidate and native developer USB")
     candidate = scratch / "local-candidate.ipa"
     release = stage_local_candidate(source, candidate, sha256, version, build)
 
@@ -640,7 +648,8 @@ def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch,
         artifact.require(artifact.sha(candidate) == authorized["sha256"], "Local candidate changed after verification")
 
     return install_verified(release, candidate, apple_root, None, LOCAL_UPGRADE_TEAM,
-                            scratch, device, cache, approve, check_digest, replace_same_build=replace_same_build)
+                            scratch, device, cache, approve, check_digest, replace_same_build=replace_same_build,
+                            account_bootstrap_dev=account_bootstrap_dev)
 
 
 def native_gui_helper(args):
@@ -687,6 +696,8 @@ def main():
     local.add_argument("--replace-same-build", action="store_true",
                        help="Explicitly replace the experimental copy at the exact installed version and build")
     local.add_argument("--apple-root", type=Path, help="Optional PEM copy of the pinned Apple Root CA")
+    local.add_argument("--account-bootstrap-dev", action="store_true",
+                       help="Test Apple ID bootstrap on the exact experimental copy over native developer USB")
     setup = modes.add_parser("setup", help="Retry automatic signing setup without reinstalling")
     setup.add_argument("--team", required=True)
     recovery = modes.add_parser("handoff", help="Send the existing signing identity to an installed Personal Team copy")
@@ -708,10 +719,14 @@ def main():
             approve = input
         # In standalone preview, no Apple sign-in, certificate issuance, profile
         # registration or download may begin while device writes are disabled.
+        local_account_dev = args.mode == "upgrade-local-candidate" and args.account_bootstrap_dev
         developer_native = (
             args.usb_transport == "standalone" and args.native_install_dev
-            and args.mode in ("install", "setup") and not args.ui_pipe and sys.stdin.isatty()
+            and (args.mode in ("install", "setup") or (local_account_dev and not args.replace_same_build))
+            and not args.ui_pipe and sys.stdin.isatty()
         )
+        artifact.require(not local_account_dev or developer_native,
+                         "Account bootstrap testing requires interactive native developer USB and a newer local build")
         gui_helper = native_gui_helper(args) if args.native_gui_dev else None
         artifact.require(args.usb_transport != "standalone"
                          or args.mode == "prepare" or developer_native or gui_helper is not None,
@@ -757,7 +772,8 @@ def main():
                         if args.mode == "upgrade-local-candidate":
                             result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
                                                              args.apple_root, scratch, device, cache,
-                                                             replace_same_build=args.replace_same_build)
+                                                             replace_same_build=args.replace_same_build,
+                                                             account_bootstrap_dev=local_account_dev)
                         else:
                             release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                             result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
