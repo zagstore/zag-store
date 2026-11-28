@@ -145,6 +145,32 @@ class DesktopTests(unittest.TestCase):
         self.assertNotEqual(portal.receipt_item, desktop.scope("installed-leaf", "udid", TEAM))
 
 
+    def test_imported_app_id_inventory_requires_explicit_consent(self):
+        from ui_protocol import Channel
+        store = Mock()
+        store.read.return_value = None
+        out = io.BytesIO()
+        channel = Channel(input_stream=io.BytesIO(b'{"value":"IMPORT-APP-IDS"}\n'),
+                          event_stream=out, isolate_output=False)
+        portal = desktop.Provisioning(None, "udid", store, "openssl", lambda _: TEAM,
+                                     channel.ask, native_helper="native",
+                                     components={"": "", "PlugIns/Share.appex": ".ShareExtension"},
+                                     imported_bundle="com.example.app")
+        portal.handle({"event": "team", "account": "test-account", "teams": []})
+        event = {"event": "app_id_inventory", "registered": 10, "reused": 1, "needed": 1}
+        self.assertTrue(portal.handle(event))
+        prompt = json.loads(out.getvalue())
+        self.assertEqual(prompt["confirmation"], "IMPORT-APP-IDS")
+        self.assertIn("1 reusable, 1 new", prompt["message"])
+        self.assertIn("insufficient capacity", prompt["message"])
+        with self.assertRaisesRegex(ValueError, "Invalid App ID inventory counts"):
+            portal.handle(dict(event, needed=2))
+        with self.assertRaisesRegex(ValueError, "Invalid App ID inventory counts"):
+            portal.handle(dict(event, registered=True))
+        channel.input = io.BytesIO(b'{"cancel":true}\n')
+        with self.assertRaisesRegex(ValueError, "Installation cancelled"):
+            portal.handle(event)
+
     def test_bundled_profile_root_matches_existing_pin(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder) / "apple-root.pem"
