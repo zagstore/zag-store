@@ -389,6 +389,9 @@ private struct WiredDevice: Sendable {
     var trusted = false
     var modelIdentifier: String? = nil
     var networkOnlyCount = 0
+    var udid: String? = nil
+    var usb = false
+    var wifi = false
 
     static func friendlyModel(_ identifier: String) -> String {
         let models = [
@@ -406,33 +409,44 @@ private struct WiredDevice: Sendable {
         return models[identifier] ?? identifier
     }
 
-    static func inspect() -> WiredDevice {
-        var result = inspectUSB()
-        result.networkOnlyCount = discoverNetworkOnlyCount()
-        return result
-    }
-
-    private static func discoverNetworkOnlyCount() -> Int {
+    static func discover() -> [WiredDevice]? {
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
         let helper = bundled ? Bundle.main.resourceURL?.appendingPathComponent("DesktopEngine/helpers/zag-usb") : URL(fileURLWithPath: ProcessInfo.processInfo.environment["ZAG_INSTALLER_ROOT"] ?? NSHomeDirectory() + "/Documents/ZagStore-claude").appendingPathComponent("tools/zag-installer/native-usb/target/release/zag-usb")
-        guard let helper, FileManager.default.isExecutableFile(atPath: helper.path) else { return 0 }
-        do {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = helper
-            process.arguments = ["discover-devices"]
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0, data.count <= 65536,
-                  let report = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let rows = report["devices"] as? [[String: String]] else { return 0 }
-            let usb = Set(rows.filter { $0["connection"] == "usb" }.compactMap { $0["udid"]?.lowercased() })
-            let network = Set(rows.filter { $0["connection"] == "network" }.compactMap { $0["udid"]?.lowercased() })
-            return network.subtracting(usb).count
-        } catch { return 0 }
+        guard let helper, FileManager.default.isExecutableFile(atPath: helper.path) else { return nil }
+        func query(_ args: [String]) -> [String: Any]? {
+            do {
+                let process = Process()
+                let pipe = Pipe()
+                process.executableURL = helper
+                process.arguments = args
+                process.standardOutput = pipe
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0, data.count <= 65536 else { return nil }
+                return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            } catch { return nil }
+        }
+        guard let rows = query(["discover-grouped"])?["devices"] as? [[String: Any]] else { return nil }
+        let wired = inspectUSB()
+        return rows.compactMap { row in
+            guard let id = row["udid"] as? String, let usb = row["usb"] as? Bool,
+                  let wifi = row["network"] as? Bool else { return nil }
+            if wired.udid?.lowercased() == id.lowercased(), usb {
+                var item = wired
+                item.usb = usb
+                item.wifi = wifi
+                return item
+            }
+            let report = query(["device-status", id])
+            let trusted = report?["trust_verified"] as? Bool == true
+            let info = report?["device"] as? [String: Any]
+            let model = info?["ProductType"] as? String
+            let name = info?["DeviceName"] as? String ?? "Unverified device"
+            let version = info?["ProductVersion"] as? String
+            return WiredDevice(title: name, detail: [version.map { "iOS " + $0 }, trusted ? "Trusted · USB installation not ready" : "Trust not verified"].compactMap { $0 }.joined(separator: " · "), ready: false, trusted: trusted, modelIdentifier: model, udid: id, usb: usb, wifi: wifi)
+        }
     }
 
     private static func inspectUSB() -> WiredDevice {
@@ -497,7 +511,7 @@ private struct WiredDevice: Sendable {
                                detail: ((modelAlreadyInName ? [] : [modelName]) + ["iOS \(version)",
                                         ready ? "Trusted USB connection" : (developerMode == false ? "Developer Mode required" : "Developer Mode status unavailable")])
                                    .joined(separator: " · "),
-                               ready: ready, developerModeRequired: developerMode == false, trusted: true, modelIdentifier: model)
+                               ready: ready, developerModeRequired: developerMode == false, trusted: true, modelIdentifier: model, udid: root["udid"] as? String, usb: true)
         } catch {
             return WiredDevice(title: "No trusted wired iPhone",
                                detail: "Connect and unlock one iPhone; confirm Trust and Developer Mode.",
@@ -572,6 +586,9 @@ private struct InstallerView: View {
         .accessibilityHidden(true)
     }
     @Environment(\.colorScheme) private var colorScheme
+    @State private var devices: [WiredDevice] = []
+    @State private var selectedDeviceID: String?
+    @State private var discoveryFailed = false
     @State private var discoveringDevices = false
     @State private var hoveringRefresh = false
 
@@ -579,9 +596,18 @@ private struct InstallerView: View {
         guard !discoveringDevices, !installer.busy else { return }
         discoveringDevices = true
         defer { discoveringDevices = false }
-        let result = await Task.detached(priority: .utility) { WiredDevice.inspect() }.value
+        let result = await Task.detached(priority: .utility) { WiredDevice.discover() }.value
         guard !Task.isCancelled, !installer.busy else { return }
-        device = result
+        guard let result else {
+            discoveryFailed = true
+            device = WiredDevice(title: "Discovery unavailable", detail: "Refresh to retry.", ready: false)
+            return
+        }
+        discoveryFailed = false
+        devices = result
+        if selectedDeviceID == nil, result.count == 1 { selectedDeviceID = result[0].udid }
+        device = result.first { $0.udid?.lowercased() == selectedDeviceID?.lowercased() }
+            ?? WiredDevice(title: result.isEmpty ? "No connected devices" : "Select a device", detail: "Choose an available device.", ready: false)
     }
 
     @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
@@ -711,6 +737,8 @@ private struct InstallerView: View {
                         Text(device.detail).font(.system(size: 13)).foregroundStyle(muted)
                     }
                     Spacer()
+                    if device.usb { Image(systemName: "cable.connector").foregroundStyle(muted).help("USB available") }
+                    if device.wifi { Image(systemName: "wifi").foregroundStyle(muted).help("Wi-Fi advertised") }
                     connectionLight
                     Button {
                         Task { await refreshDevices() }
@@ -742,9 +770,29 @@ private struct InstallerView: View {
                 .padding(12)
                 .background(surface, in: RoundedRectangle(cornerRadius: 12))
                 .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
-                if device.networkOnlyCount > 0 {
-                    Label("\(device.networkOnlyCount) network device\(device.networkOnlyCount == 1 ? "" : "s") detected · USB required for installation", systemImage: "wifi")
-                        .font(.caption).foregroundStyle(muted)
+                if showDeviceDetails || devices.count > 1 || discoveryFailed {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Devices").font(.headline)
+                        if discoveryFailed { Text("Discovery unavailable · refresh to retry").font(.caption).foregroundStyle(muted) }
+                        ForEach(devices, id: \.udid) { item in
+                            Button {
+                                selectedDeviceID = item.udid
+                                device = item
+                            } label: {
+                                HStack {
+                                    DeviceIllustration(identifier: item.modelIdentifier)
+                                    VStack(alignment: .leading) {
+                                        Text(item.title).font(.system(size: 15, weight: .semibold))
+                                        Text(item.detail).font(.caption).foregroundStyle(muted)
+                                    }
+                                    Spacer()
+                                    if item.usb { Image(systemName: "cable.connector") }
+                                    if item.wifi { Image(systemName: "wifi") }
+                                    if item.udid == selectedDeviceID { Image(systemName: "checkmark.circle.fill").foregroundStyle(success) }
+                                }.padding(8).contentShape(Rectangle())
+                            }.buttonStyle(.plain).disabled(installer.busy || discoveringDevices || discoveryFailed)
+                        }
+                    }
                 }
                 if showDeviceDetails {
                     VStack(alignment: .leading, spacing: 8) {
