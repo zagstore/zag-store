@@ -442,6 +442,8 @@ private struct InstallerView: View {
     @State private var upgrade = false
     @State private var team = ""
     @State private var reply = ""
+    @AppStorage("rememberedAppleID") private var rememberedAppleID = ""
+    @State private var rememberAccount = false
     @State private var revealPassword = false
     @FocusState private var promptFocused: Bool
 
@@ -690,6 +692,10 @@ private struct InstallerView: View {
                 } else if prompt.confirmation == nil {
                     TextField(accountPrompt ? "name@example.com" : "Response", text: $reply)
                         .textFieldStyle(.roundedBorder).focused($promptFocused)
+                    if accountPrompt {
+                        Toggle("Remember this Apple ID on this Mac", isOn: $rememberAccount)
+                        Text("Only the account identifier is saved, never your password.").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 HStack {
                     Button("Cancel") {
@@ -699,6 +705,9 @@ private struct InstallerView: View {
                     Spacer()
                     Button(prompt.action ?? "Continue") {
                         let answer = prompt.confirmation ?? reply
+                        if accountPrompt {
+                            rememberedAppleID = rememberAccount ? answer.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                        }
                         reply = "" // Do not retain passwords in UI state
                         installer.answer(answer)
                     }
@@ -709,10 +718,37 @@ private struct InstallerView: View {
             }
             .padding(24)
             .frame(width: 440)
-            .onAppear { reply = ""; revealPassword = false; promptFocused = true }
+            .onAppear {
+                reply = prompt.message == "Apple ID: " ? rememberedAppleID : ""
+                rememberAccount = !rememberedAppleID.isEmpty
+                revealPassword = false
+                promptFocused = true
+            }
             .onDisappear { reply = ""; revealPassword = false }
             .interactiveDismissDisabled()
         }
+    }
+}
+
+private struct InstallerGeneralSettingsView: View {
+    @AppStorage("rememberedAppleID") private var rememberedAppleID = ""
+    var body: some View {
+        Form {
+            Section("Apple ID") {
+                Text(rememberedAppleID.isEmpty ? "No remembered Apple ID" : rememberedAppleID)
+                    .textSelection(.enabled)
+                Button("Forget Apple ID") { rememberedAppleID = "" }
+                    .disabled(rememberedAppleID.isEmpty)
+                Text("Only the account identifier is remembered. Passwords are not saved by this preference.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("About") {
+                let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+                let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+                Text("Zag Installer · Version \(version) (\(build))")
+                Link("Zag Store website", destination: URL(string: "https://zagstore.app")!)
+            }
+        }.padding(20)
     }
 }
 
@@ -737,7 +773,12 @@ struct ZagInstallerApp: App {
         }
 
         Settings {
-            InstallerUpdateSettingsView(updates: updates, installer: installer)
+            TabView {
+                InstallerGeneralSettingsView()
+                    .tabItem { Label("General", systemImage: "gearshape") }
+                InstallerUpdateSettingsView(updates: updates, installer: installer)
+                    .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
+            }.frame(minWidth: 480, minHeight: 280)
         }
     }
 }
