@@ -292,6 +292,23 @@ private struct WiredDevice: Sendable {
     let detail: String
     let ready: Bool
     var developerModeRequired = false
+    var trusted = false
+
+    static func friendlyModel(_ identifier: String) -> String {
+        let models = [
+            "iPhone10,1": "iPhone 8", "iPhone10,4": "iPhone 8",
+            "iPhone10,2": "iPhone 8 Plus", "iPhone10,5": "iPhone 8 Plus",
+            "iPhone10,3": "iPhone X", "iPhone10,6": "iPhone X",
+            "iPhone14,7": "iPhone 14", "iPhone14,8": "iPhone 14 Plus",
+            "iPhone15,2": "iPhone 14 Pro", "iPhone15,3": "iPhone 14 Pro Max",
+            "iPhone15,4": "iPhone 15", "iPhone15,5": "iPhone 15 Plus",
+            "iPhone16,1": "iPhone 15 Pro", "iPhone16,2": "iPhone 15 Pro Max",
+            "iPhone17,1": "iPhone 16 Pro", "iPhone17,2": "iPhone 16 Pro Max",
+            "iPhone17,3": "iPhone 16", "iPhone17,4": "iPhone 16 Plus",
+            "iPhone17,5": "iPhone 16e"
+        ]
+        return models[identifier] ?? identifier
+    }
 
     static func inspect() -> WiredDevice {
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
@@ -347,12 +364,13 @@ private struct WiredDevice: Sendable {
                   let name = info["DeviceName"] as? String else {
                 throw CocoaError(.fileReadCorruptFile)
             }
-            let ready = root["developer_mode"] as? Bool == true
+            let developerMode = root["developer_mode"] as? Bool
+            let ready = developerMode == true
             return WiredDevice(title: name,
-                               detail: [model, "iOS \(version)",
-                                        ready ? "Trusted USB connection" : "Developer Mode required"]
+                               detail: [friendlyModel(model), "iOS \(version)",
+                                        ready ? "Trusted USB connection" : (developerMode == false ? "Developer Mode required" : "Developer Mode status unavailable")]
                                    .joined(separator: " · "),
-                               ready: ready, developerModeRequired: !ready)
+                               ready: ready, developerModeRequired: developerMode == false, trusted: true)
         } catch {
             return WiredDevice(title: "No trusted wired iPhone",
                                detail: "Connect and unlock one iPhone; confirm Trust and Developer Mode.",
@@ -412,6 +430,7 @@ private struct InstallerView: View {
     @State private var device = WiredDevice(title: "Checking USB connection…", detail: "", ready: false)
     @State private var showDiagnostics = false
     @State private var showAdvanced = false
+    @State private var showDeviceDetails = false
 
     private var brandImage: NSImage? {
         let name = colorScheme == .dark ? "zagstore_dark" : "zagstore"
@@ -445,17 +464,27 @@ private struct InstallerView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Label("Your password stays between this Mac and Apple. Signing credentials can be transferred privately to your iPhone.", systemImage: "lock.shield")
                 HStack(spacing: 12) {
-                    Image(systemName: "iphone").font(.system(size: 28))
+                    Image(systemName: "iphone").font(.system(size: 42, weight: .light)).foregroundStyle(ZagPalette.spectrum)
+                        .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(device.title).font(.headline)
                         Text(device.detail).font(.caption).foregroundStyle(muted)
                     }
                     Spacer()
                     connectionLight
+                    Button { showDeviceDetails.toggle() } label: {
+                        Image(systemName: showDeviceDetails ? "chevron.down" : "chevron.right")
+                    }.buttonStyle(.plain).accessibilityLabel("Device details")
                 }
                 .padding(12)
                 .background(surface, in: RoundedRectangle(cornerRadius: 12))
                 .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
+                if showDeviceDetails {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(device.trusted ? "USB trust verified" : "USB trust not verified", systemImage: device.trusted ? "checkmark.shield" : "shield")
+                        Label(device.ready ? "Developer Mode enabled" : (device.developerModeRequired ? "Developer Mode disabled" : "Developer Mode not verified"), systemImage: "gearshape")
+                    }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+                }
                 if device.developerModeRequired {
                     VStack(alignment: .leading, spacing: 6) {
                         Label("Enable Developer Mode", systemImage: "exclamationmark.triangle")
@@ -472,9 +501,6 @@ private struct InstallerView: View {
                 Label("Pairing can be configured later in Zag Store for local installation and renewal.", systemImage: "arrow.triangle.2.circlepath")
                 if nativeUSBPreview {
                     Label("Native USB verified. Installation remains disabled until the USB transfer path is validated.", systemImage: "wrench.and.screwdriver")
-                        .foregroundStyle(attention)
-                } else if nativeDevelopment {
-                    Label("Native USB development build. Signing Setup is separate; existing pairing is not changed automatically.", systemImage: "wrench.and.screwdriver")
                         .foregroundStyle(attention)
                 }
             }
@@ -515,13 +541,14 @@ private struct InstallerView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(installer.busy || !device.ready || nativeUSBPreview)
-                if installer.busy {
-                    Button("Cancel") { installer.cancel() }
-                }
+            }
+            if installer.busy {
+                Button("Cancel installation") { installer.cancel() }.frame(maxWidth: .infinity)
             }
             Divider()
             if installer.busy {
                 Text(installer.status).font(.headline).frame(maxWidth: .infinity)
+                Text("Keep your iPhone connected.").font(.caption).foregroundStyle(muted).frame(maxWidth: .infinity)
             } else if !installer.installedBundle.isEmpty {
                 Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
                 if installer.identityImported {
@@ -545,6 +572,9 @@ private struct InstallerView: View {
                 Text(installer.status).font(.headline)
             }
             DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+            if nativeDevelopment {
+                Label("Development build · Existing pairing is not changed automatically.", systemImage: "wrench.and.screwdriver").foregroundStyle(attention).font(.caption)
+            }
             if nativeDevelopment {
                 DisclosureGroup("Signing Setup Recovery", isExpanded: $showRecovery) {
                     if !upgrade {
