@@ -476,6 +476,7 @@ private struct InstallerView: View {
     @FocusState private var promptFocused: Bool
 
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 12) {
                 if let image = brandImage {
@@ -663,7 +664,7 @@ private struct InstallerView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, minHeight: 100, maxHeight: 180)
             .padding(12)
             .background(surface, in: RoundedRectangle(cornerRadius: 10))
             .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(border, lineWidth: 1) }
@@ -678,6 +679,9 @@ private struct InstallerView: View {
                     .font(.system(size: 14, weight: .medium)).monospacedDigit().foregroundStyle(muted)
             }
         }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        }
         .task {
             while !Task.isCancelled {
                 if !installer.busy {
@@ -686,8 +690,7 @@ private struct InstallerView: View {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
-        .padding(24)
-        .frame(minWidth: 700, minHeight: 565)
+        .frame(minWidth: 480, idealWidth: 700, minHeight: 420, idealHeight: 565)
         .background { atmosphere.ignoresSafeArea() }
         .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
@@ -860,7 +863,15 @@ struct ZagInstallerApp: App {
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Zag Installer") {
-                    NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "Zag Installer"])
+                    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+                    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+                    let credits = NSAttributedString(string: "Install Zag Store using your own Apple ID.\n\nhttps://zagstore.app", attributes: [.font: NSFont.systemFont(ofSize: 12)])
+                    NSApp.orderFrontStandardAboutPanel(options: [
+                        .applicationName: "Zag Installer",
+                        .applicationVersion: version,
+                        .version: build,
+                        .credits: credits
+                    ])
                 }
             }
             CommandGroup(after: .appInfo) {
