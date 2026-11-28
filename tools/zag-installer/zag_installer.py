@@ -457,7 +457,7 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     label = f"{expected} {release['version']} ({release['build']})"
     if replace_same_build:
         confirmation = f"REPLACE {expected}"
-        operation = "Replace with local same-build candidate"
+        operation = "Re-sign and replace the exact installed build in place"
     else:
         confirmation = f"UPGRADE {expected}" if installed is not None else "INSTALL"
         operation = "Upgrade in place" if installed is not None else "Install as a separate app"
@@ -541,7 +541,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     auto_upgrade = defer_setup and upgrade_team is None and not fresh_local
 
     def choose_team(teams):
-        nonlocal installed, upgrade
+        nonlocal installed, upgrade, replace_same_build
         teams = [team for team in teams if isinstance(team["id"], str) and artifact.TEAM.fullmatch(team["id"])
                  and (upgrade_team is None or team["id"] == upgrade_team)]
         artifact.require(teams, "Apple returned no matching Personal Team")
@@ -558,11 +558,25 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
         artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
         current = installed_app(device, target, artifact.mapped_bundle(team))
         if auto_upgrade and current is not None:
-            check_destination(current, release, True)
-            artifact.require(confirm_action(approve,
-                f"Existing Personal Team copy detected: {artifact.mapped_bundle(team)}. "
-                "Prepare an in-place upgrade using its existing signing identity?",
-                "AUTO-UPGRADE", "Upgrade") == "AUTO-UPGRADE", "Upgrade cancelled")
+            # Official GUI recovery is limited to the exact signed release
+            # and requires a saved signer receipt for this device and team.
+            same_build = (current.get("version") == release["version"]
+                          and current.get("bundleVersion") == release["build"])
+            check_destination(current, release, True, replace_same_build=same_build)
+            receipt = store.read(desktop.scope("installed-leaf", udid.casefold(), team))
+            artifact.require(receipt is not None and re.fullmatch(rb"[0-9a-f]{64}", receipt),
+                             "Original signing receipt unavailable. In-place recovery is blocked.")
+            if same_build:
+                artifact.require(confirm_action(approve,
+                    f"Re-sign the existing {artifact.mapped_bundle(team)} using its original signing identity? "
+                    "This replaces the same official build without uninstalling it.",
+                    "AUTO-RECOVER", "Replace") == "AUTO-RECOVER", "Installation cancelled")
+                replace_same_build = True
+            else:
+                artifact.require(confirm_action(approve,
+                    f"Existing Personal Team copy detected: {artifact.mapped_bundle(team)}. "
+                    "Prepare an in-place upgrade using its existing signing identity?",
+                    "AUTO-UPGRADE", "Upgrade") == "AUTO-UPGRADE", "Upgrade cancelled")
             installed = current
             upgrade = True
             portal.upgrade = True
