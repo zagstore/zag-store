@@ -317,6 +317,25 @@ private struct WiredDevice: Sendable {
             try process.run()
             let data = stdout.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
+            if process.terminationStatus == 0, data.count <= 8192,
+               let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               report["transport"] as? String == "system-usbmuxd",
+               report["trust_verified"] as? Bool == false,
+               let code = report["diagnostic"] as? String {
+                switch code {
+                case "no_device":
+                    return WiredDevice(title: "No wired device", detail: "Connect your iPhone using a data-capable USB cable.", ready: false)
+                case "multiple_devices":
+                    return WiredDevice(title: "Multiple wired devices", detail: "Disconnect other devices and leave only the intended iPhone connected.", ready: false)
+                case "pairing_unavailable":
+                    return WiredDevice(title: "USB trust unavailable", detail: "Unlock your iPhone and confirm Trust if prompted. Existing pairing is not reset.", ready: false)
+                case "session_failed", "connection_failed":
+                    return WiredDevice(title: "USB session unavailable", detail: "Unlock your iPhone, reconnect the cable and check Trust if prompted.", ready: false)
+                case "unsupported_device":
+                    return WiredDevice(title: "Unsupported device", detail: "This installer currently requires an iPhone.", ready: false)
+                default: break
+                }
+            }
             guard process.terminationStatus == 0, data.count <= 8192,
                   let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   root["transport"] as? String == "system-usbmuxd",

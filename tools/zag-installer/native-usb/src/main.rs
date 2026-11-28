@@ -7,17 +7,37 @@ use idevice::{IdeviceService, lockdown::LockdownClient, provider::{IdeviceProvid
 use serde_json::json;
 use std::time::Duration;
 
+fn diagnostic(code: &str) -> serde_json::Value {
+    json!({"transport":"system-usbmuxd","trust_verified":false,"diagnostic":code})
+}
+
 async fn inspect(mode: &str, team: Option<&str>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
     let devices: Vec<_> = mux.get_devices().await?.into_iter()
         .filter(|d| d.connection_type == Connection::Usb).collect();
-    if devices.len() != 1 { return Err("Exactly one wired device required".into()); }
+    if devices.len() != 1 {
+        if mode == "status" {
+            return Ok(diagnostic(if devices.is_empty() { "no_device" } else { "multiple_devices" }));
+        }
+        return Err("Exactly one wired device required".into());
+    }
     let d = &devices[0];
     let provider = UsbmuxdProvider { addr, tag: 2, udid: d.udid.clone(), device_id: d.device_id, label: "Zag Installer".into() };
-    let pairing = provider.get_pairing_file().await?;
-    let mut lockdown = LockdownClient::connect(&provider).await?;
-    lockdown.start_session(&pairing).await?;
+    let pairing = match provider.get_pairing_file().await {
+        Ok(value) => value,
+        Err(_) if mode == "status" => return Ok(diagnostic("pairing_unavailable")),
+        Err(err) => return Err(err.into()),
+    };
+    let mut lockdown = match LockdownClient::connect(&provider).await {
+        Ok(value) => value,
+        Err(_) if mode == "status" => return Ok(diagnostic("connection_failed")),
+        Err(err) => return Err(err.into()),
+    };
+    if let Err(err) = lockdown.start_session(&pairing).await {
+        if mode == "status" { return Ok(diagnostic("session_failed")); }
+        return Err(err.into());
+    }
     let mut info = serde_json::Map::new();
     for key in ["DeviceName", "ProductType", "ProductVersion", "DeviceClass"] {
         let value = lockdown.get_value(Some(key), None).await?;
@@ -25,6 +45,7 @@ async fn inspect(mode: &str, team: Option<&str>) -> Result<serde_json::Value, Bo
         info.insert(key.into(), json!(value));
     }
     if info.get("DeviceClass").and_then(|v| v.as_str()) != Some("iPhone") {
+        if mode == "status" { return Ok(diagnostic("unsupported_device")); }
         return Err("Expected iPhone".into());
     }
     let mut amfi = AmfiClient::connect(&provider).await?;
