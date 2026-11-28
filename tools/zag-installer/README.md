@@ -281,3 +281,32 @@ cargo build --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
 
 Do not run `handoff-write` against a phone without an authorised on-device
 setup session. `zag-usb install` remains unsupported.
+
+
+## Exact Personal Team destination preparation
+
+The native USB helper now supports read-only `inventory-team TEAM`. This
+performs all three Apple broad inventory checks and the separate exact
+Installation Proxy User/Any lookup for `app.zagstore.ios.TEAM`.
+The Python installer uses this targeted result for its own destination
+selection. A missing record means **not reported by the checked inventories**,
+not proven vacant; a real installation would still require exact Apple
+signature/profile verification, user confirmation, a second destination
+check, and Installation Proxy acceptance.
+
+The signed IPA validation path now also calls
+`StandaloneUSB.preflight_signed` before requesting installation approval.
+The preflight record is created after the existing Apple signing validation,
+validated independently by the native USB helper against the device and
+local digest, and then deleted. A report with a claimed installation
+authorization or mismatched destination is refused.
+
+The internal Rust install state machine now accepts a separately approved
+fresh destination, while demanding a stable exact prior version/build for
+upgrades and checking the state again after remote IPA staging.
+
+**Current limitation:** This prepares the first-install flow but does not
+enable it. The macOS standalone CLI still blocks provisioning and
+installation, `StandaloneUSB.install` still rejects writes, and `zag-usb
+install` is intentionally not a supported command. The AppTesters
+installation `com.cwd43.gu29` is not an upgrade or uninstall target.
