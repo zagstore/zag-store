@@ -728,7 +728,7 @@ private struct InstallerView: View {
                 Spacer()
             }
 
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 16) {
                 HStack {
                     Button {
                         Task { await refreshDevices() }
