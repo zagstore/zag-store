@@ -224,6 +224,14 @@ class ProtocolTests(unittest.TestCase):
         channel.apple_failure(AppleFailure("private-token", "private-code", "private-hint"))
         self.assertNotIn(b"private-", out.getvalue())
 
+    def test_app_id_quota_guidance_is_specific_and_safe(self):
+        channel, out = self.make_channel(b"")
+        channel.apple_failure(AppleFailure("Apple app identifier registration", 9120, "private-hint"))
+        message = json.loads(out.getvalue())["message"]
+        for expected in ("10 App IDs", "7 days", "9120", "another eligible Apple ID"):
+            self.assertIn(expected, message)
+        self.assertNotIn("private-hint", message)
+
     def test_failure_guidance_is_allowlisted(self):
         channel, out = self.make_channel(b"")
         channel.failure("Expected a six-digit Apple verification code")
