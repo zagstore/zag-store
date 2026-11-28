@@ -21,7 +21,7 @@ pub fn zag_bundle(bundle: &str) -> bool {
 }
 
 fn decode(bundle: &str, info: &Value) -> Result<Option<AppEntry>, Box<dyn Error>> {
-    if !zag_bundle(bundle) { return Ok(None); }
+    if !zag_bundle(bundle) && !crate::installation::is_imported_bundle(bundle) { return Ok(None); }
     let dict = info.as_dictionary().ok_or("Malformed Zag Store inventory record")?;
     let version = dict.get("CFBundleShortVersionString")
         .and_then(Value::as_string).ok_or("Missing Zag Store version")?;
@@ -60,6 +60,7 @@ fn merge(
     bundle: &str,
     info: &Value,
 ) -> Result<(), Box<dyn Error>> {
+    if !zag_bundle(bundle) { return Ok(()); }
     if let Some(app) = decode(bundle, info)? {
         if let Some(previous) = entries.get(bundle) {
             if previous != &app {
@@ -138,6 +139,38 @@ pub async fn targeted_lookup(
         }
     }
     Ok(result)
+}
+
+/// Exact imported destination only; no unrelated app identities are emitted.
+pub async fn imported_lookup(proxy: &mut InstallationProxyClient, bundle: &str)
+    -> Result<Option<AppEntry>, Box<dyn Error>> {
+    if !crate::installation::is_imported_bundle(bundle) {
+        return Err("Invalid imported destination".into());
+    }
+    let mut observed: Option<AppEntry> = None;
+    fn merge_exact(observed: &mut Option<AppEntry>, bundle: &str, info: &Value) -> Result<(), Box<dyn Error>> {
+        let entry = decode(bundle, info)?.ok_or("Invalid imported inventory record")?;
+        if observed.as_ref().is_some_and(|old| old != &entry) {
+            return Err("Conflicting imported inventory".into());
+        }
+        *observed = Some(entry);
+        Ok(())
+    }
+    for kind in ["User", "Any"] {
+        let broad = proxy.get_apps(Some(kind), None).await?;
+        if let Some(info) = broad.get(bundle) { merge_exact(&mut observed, bundle, info)?; }
+        let exact = proxy.get_apps(Some(kind), Some(vec![bundle.to_owned()])).await?;
+        for (id, info) in &exact {
+            if id != bundle { return Err("Unrelated targeted inventory record".into()); }
+            merge_exact(&mut observed, bundle, info)?;
+        }
+    }
+    for info in proxy.browse(None).await? {
+        if info.as_dictionary().and_then(|d| d.get("CFBundleIdentifier")).and_then(Value::as_string) == Some(bundle) {
+            merge_exact(&mut observed, bundle, &info)?;
+        }
+    }
+    Ok(observed)
 }
 
 /// All three queries must succeed; an error is not treated as an empty library.

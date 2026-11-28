@@ -46,9 +46,10 @@ fn udid_ok(value: &str) -> bool {
 }
 
 fn validate(plan: &PreflightPlan) -> Result<(), Box<dyn Error>> {
-    if plan.schema != 1 { return Err("Unknown native preflight schema".into()); }
-    if !crate::installation::is_personal_team_bundle(&plan.bundle_identifier) {
-        return Err("Only an exact Zag Store Personal Team bundle is permitted".into());
+    match plan.schema {
+        1 if crate::installation::is_personal_team_bundle(&plan.bundle_identifier) => (),
+        2 if crate::installation::is_imported_bundle(&plan.bundle_identifier) && plan.previous.is_none() => (),
+        _ => return Err("Invalid native preflight destination or schema".into()),
     }
     if !udid_ok(&plan.device_udid) { return Err("Invalid target device UDID".into()); }
     if !version_ok(&plan.version) || !version_ok(&plan.build) || !version_ok(&plan.minimum_os) {

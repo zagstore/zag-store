@@ -35,6 +35,13 @@ pub fn is_personal_team_bundle(bundle: &str) -> bool {
     team.len() == 10 && team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+pub fn is_imported_bundle(bundle: &str) -> bool {
+    let Some(rest) = bundle.strip_prefix("app.zloader.imported.") else { return false; };
+    let Some((digest, team)) = rest.split_once('.') else { return false; };
+    digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && team.len() == 10 && team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 async fn installed(
     proxy: &mut InstallationProxyClient,
     bundle: &str,
@@ -44,6 +51,11 @@ async fn installed(
     // A zero-match result is not absolute proof of vacancy; it is only
     // sufficient to attempt a separately approved fresh install of this exact
     // mapped bundle. Installation Proxy must still reject a collision.
+    if is_imported_bundle(bundle) {
+        return Ok(inventory::imported_lookup(proxy, bundle).await?.map(|entry| VersionStamp {
+            version: entry.version, build: entry.build
+        }));
+    }
     let team = bundle.strip_prefix("app.zagstore.ios.")
         .ok_or("Unexpected destination bundle")?;
     let snapshot = inventory::inspect(proxy, Some(team)).await?;
@@ -74,7 +86,7 @@ pub async fn install_authorized(
     provider: &dyn IdeviceProvider,
     request: &AuthorizedInstall<'_>,
 ) -> Result<VersionStamp, Box<dyn Error>> {
-    if !is_personal_team_bundle(request.bundle) {
+    if !is_personal_team_bundle(request.bundle) && !(is_imported_bundle(request.bundle) && request.previous.is_none()) {
         return Err("Only a mapped Zag Store Personal Team bundle is allowed".into());
     }
     if !request.authorization_verified {
@@ -152,6 +164,14 @@ mod tests {
         assert!(require_destination(Some(&previous), Some(&previous)).is_ok());
         assert!(require_destination(Some(&previous), Some(&newer)).is_err());
         assert!(require_destination(Some(&previous), None).is_err());
+    }
+    #[test]
+    fn imported_namespace_is_exact_and_separate() {
+        let bundle = "app.zloader.imported.0123456789abcdef0123456789abcdef.FTB8PRW638";
+        assert!(is_imported_bundle(bundle));
+        assert!(!is_personal_team_bundle(bundle));
+        assert!(!is_imported_bundle("com.cwd43.gu29"));
+        assert!(!is_imported_bundle("app.zloader.imported.0123456789abcdef0123456789abcdef.FTB8PRW638.extra"));
     }
     #[test]
     fn bundle_identifier_restricted_to_zag_personal_team() {

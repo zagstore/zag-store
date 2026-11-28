@@ -92,6 +92,15 @@ async fn inspect(mode: &str, team: Option<&str>, target: Target<'_>) -> Result<s
         // Keep the original low-cost inspection contract.
         let apps = proxy.get_apps(Some("User"), None).await?;
         result["user_app_count"] = json!(apps.len());
+    } else if mode == "inventory-imported" {
+        let bundle = team.ok_or("Missing imported destination")?;
+        let entry = inventory::imported_lookup(&mut proxy, bundle).await?;
+        let apps: Vec<_> = entry.into_iter().map(|app| json!({
+            "bundleIdentifier":app.bundle, "version":app.version, "bundleVersion":app.build
+        })).collect();
+        result["targeted_checked"] = json!(true);
+        result["targeted_apps"] = json!(apps);
+        result["zag_apps"] = json!(apps);
     } else {
         let snapshot = inventory::inspect(&mut proxy, team).await?;
         result["user_app_count"] = json!(snapshot.user_count);
@@ -213,9 +222,12 @@ async fn install_developer(args: &[String], target: Target<'_>) -> Result<serde_
     if args[3] != install_dev_confirmation(&plan.bundle_identifier, &plan.device_udid, plan.previous.is_some()) {
         return Err("Exact interactive installation confirmation is required".into());
     }
-    let team = plan.bundle_identifier.strip_prefix("app.zagstore.ios.")
-        .ok_or("Invalid mapped Zag Store bundle")?;
-    let observed = inspect("inventory", Some(team), target).await?;
+    let observed = if plan.schema == 2 {
+        inspect("inventory-imported", Some(&plan.bundle_identifier), target).await?
+    } else {
+        let team = plan.bundle_identifier.strip_prefix("app.zagstore.ios.").ok_or("Invalid mapped Zag Store bundle")?;
+        inspect("inventory", Some(team), target).await?
+    };
     let _ = preflight::device_binding(&plan, &observed)?;
     let apps = observed["zag_apps"].as_array().ok_or("Native application inventory unavailable")?;
     let existing = apps.iter().find(|app|
@@ -433,6 +445,13 @@ async fn main() {
         }
         return;
     }
+    if args.len() == 2 && args[0] == "inventory-imported" {
+        match tokio::time::timeout(Duration::from_secs(45), inspect("inventory-imported", Some(&args[1]), target)).await {
+            Ok(Ok(result)) => println!("{}", result),
+            _ => { eprintln!("Imported destination inventory failed"); std::process::exit(1); }
+        }
+        return;
+    }
     if args.len() == 2 && args[0] == "inventory-team" {
         let team = &args[1];
         if team.len() != 10 || !team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
@@ -451,8 +470,12 @@ async fn main() {
         // untrusted input and never authorizes a device installation.
         let job = async {
             let plan = preflight::verify(std::path::Path::new(&args[1])).await?;
-            let team = plan.bundle_identifier.strip_prefix("app.zagstore.ios.").ok_or("Invalid destination")?;
-            let status = inspect("inventory", Some(team), target).await?;
+            let status = if plan.schema == 2 {
+                inspect("inventory-imported", Some(&plan.bundle_identifier), target).await?
+            } else {
+                let team = plan.bundle_identifier.strip_prefix("app.zagstore.ios.").ok_or("Invalid destination")?;
+                inspect("inventory", Some(team), target).await?
+            };
             let mut report = preflight::device_binding(&plan, &status)?;
             let apps = status["zag_apps"].as_array().ok_or("Missing inventory")?;
             let existing = apps.iter().find(|app| app["bundleIdentifier"].as_str() == Some(plan.bundle_identifier.as_str()));
