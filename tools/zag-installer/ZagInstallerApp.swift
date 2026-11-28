@@ -388,6 +388,7 @@ private struct WiredDevice: Sendable {
     var developerModeRequired = false
     var trusted = false
     var modelIdentifier: String? = nil
+    var networkOnlyCount = 0
 
     static func friendlyModel(_ identifier: String) -> String {
         let models = [
@@ -406,6 +407,35 @@ private struct WiredDevice: Sendable {
     }
 
     static func inspect() -> WiredDevice {
+        var result = inspectUSB()
+        result.networkOnlyCount = discoverNetworkOnlyCount()
+        return result
+    }
+
+    private static func discoverNetworkOnlyCount() -> Int {
+        let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
+        let helper = bundled ? Bundle.main.resourceURL?.appendingPathComponent("DesktopEngine/helpers/zag-usb") : URL(fileURLWithPath: ProcessInfo.processInfo.environment["ZAG_INSTALLER_ROOT"] ?? NSHomeDirectory() + "/Documents/ZagStore-claude").appendingPathComponent("tools/zag-installer/native-usb/target/release/zag-usb")
+        guard let helper, FileManager.default.isExecutableFile(atPath: helper.path) else { return 0 }
+        do {
+            let process = Process()
+            let pipe = Pipe()
+            process.executableURL = helper
+            process.arguments = ["discover-devices"]
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0, data.count <= 65536,
+                  let report = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rows = report["devices"] as? [[String: String]] else { return 0 }
+            let usb = Set(rows.filter { $0["connection"] == "usb" }.compactMap { $0["udid"]?.lowercased() })
+            let network = Set(rows.filter { $0["connection"] == "network" }.compactMap { $0["udid"]?.lowercased() })
+            return network.subtracting(usb).count
+        } catch { return 0 }
+    }
+
+    private static func inspectUSB() -> WiredDevice {
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
         let helper: URL?
         if bundled {
@@ -678,6 +708,10 @@ private struct InstallerView: View {
                 .padding(12)
                 .background(surface, in: RoundedRectangle(cornerRadius: 12))
                 .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
+                if device.networkOnlyCount > 0 {
+                    Label("\(device.networkOnlyCount) network device\(device.networkOnlyCount == 1 ? "" : "s") detected · USB required for installation", systemImage: "wifi")
+                        .font(.caption).foregroundStyle(muted)
+                }
                 if showDeviceDetails {
                     VStack(alignment: .leading, spacing: 8) {
                         Label(device.trusted ? "USB trust verified" : "USB trust not verified", systemImage: device.trusted ? "checkmark.shield" : "shield")
