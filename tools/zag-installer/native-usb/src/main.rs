@@ -264,6 +264,36 @@ mod developer_install_gate_tests {
 #[tokio::main(flavor="current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Explicit read-only inspection of one advertised device. Never pair or install.
+    if args.len() == 2 && args[0] == "device-status" {
+        let target = &args[1];
+        let job = async {
+            let addr = UsbmuxdAddr::default();
+            let mut mux = addr.connect(1).await?;
+            let devices = mux.get_devices().await?;
+            let d = devices.iter().filter(|d| d.udid.eq_ignore_ascii_case(target))
+                .min_by_key(|d| if d.connection_type == Connection::Usb { 0 } else { 1 })
+                .ok_or("Device no longer advertised")?;
+            let connection = if d.connection_type == Connection::Usb { "usb" } else { "network" };
+            let provider = UsbmuxdProvider { addr, tag: 2, udid: d.udid.clone(),
+                device_id: d.device_id, label: "zLoader device status".into() };
+            let pairing = provider.get_pairing_file().await?;
+            let mut lockdown = LockdownClient::connect(&provider).await?;
+            lockdown.start_session(&pairing).await?;
+            let mut info = serde_json::Map::new();
+            for key in ["DeviceName", "ProductType", "ProductVersion", "DeviceClass"] {
+                let value = lockdown.get_value(Some(key), None).await?;
+                info.insert(key.into(), json!(value.as_string().ok_or("Unexpected device metadata")?));
+            }
+            Ok::<_, Box<dyn std::error::Error>>(json!({"connection":connection,
+                "trust_verified":true,"device":info}))
+        };
+        match tokio::time::timeout(Duration::from_secs(10), job).await {
+            Ok(Ok(result)) => println!("{}", result),
+            _ => println!("{}", json!({"trust_verified":false,"diagnostic":"session_unavailable"})),
+        }
+        return;
+    }
     // Local capability query: never opens a device connection.
     // Read-only discovery of devices already advertised by the system mux.
     // No pairing creation, network scanning or write-capable service access.
