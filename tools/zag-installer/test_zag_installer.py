@@ -226,6 +226,46 @@ class NativeUSBAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "AppTesters copy detected separately"):
                 dev.apps(self.UDID)
 
+    def test_exact_team_inventory_separates_new_destination_from_legacy_copy(self):
+        dev = self.make_adapter()
+        dev.identity = self.UDID
+        response = __import__("json").loads(self.reply(mode="inventory").stdout)
+        response["targeted_checked"] = True
+        response["targeted_apps"] = []
+        response["legacy_app"] = {
+            "bundleIdentifier":"com.cwd43.gu29", "version":"1.0.0", "bundleVersion":"1"
+        }
+        with patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, __import__("json").dumps(response).encode(), b"")) as run:
+            self.assertIsNone(installer.installed_app(dev, self.UDID, DESTINATION))
+            self.assertEqual(run.call_args.args[0][1:], ["inventory-team", TEAM])
+
+    def test_exact_team_inventory_requires_checked_unchanged_destination(self):
+        dev = self.make_adapter()
+        dev.identity = self.UDID
+        response = __import__("json").loads(self.reply(mode="inventory").stdout)
+        response["targeted_checked"] = True
+        response["targeted_apps"] = [{
+            "bundleIdentifier":DESTINATION, "version":"1.0.0", "bundleVersion":"3"
+        }]
+        with patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, __import__("json").dumps(response).encode(), b"")):
+            self.assertEqual(installer.installed_app(dev, self.UDID, DESTINATION), INSTALLED)
+
+        response["targeted_apps"] = [{
+            "bundleIdentifier":"com.cwd43.gu29", "version":"1.0.0", "bundleVersion":"3"
+        }]
+        with patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, __import__("json").dumps(response).encode(), b"")):
+            with self.assertRaisesRegex(ValueError, "Unexpected targeted"):
+                installer.installed_app(dev, self.UDID, DESTINATION)
+        response["targeted_apps"] = []
+        response["targeted_checked"] = False
+        with patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, __import__("json").dumps(response).encode(), b"")):
+            with self.assertRaisesRegex(ValueError, "did not complete"):
+                installer.installed_app(dev, self.UDID, DESTINATION)
+
     def test_handoff_rejects_unmapped_bundle_before_helper(self):
         dev = self.make_adapter()
         dev.identity = self.UDID
