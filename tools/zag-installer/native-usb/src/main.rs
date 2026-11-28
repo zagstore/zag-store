@@ -66,7 +66,8 @@ async fn handoff_command(args: &[String]) -> Result<serde_json::Value, Box<dyn s
     let bundle = &args[2];
     let remote = &args[3];
     let local = Path::new(&args[4]);
-    // Sixth argument is an exact, separately typed confirmation string.
+    // The existing Python handoff workflow supplies this exact phrase only
+    // after its user approval / on-device authenticated setup checks.
     if args[5] != format!("HANDOFF {}",bundle) {
         return Err("Missing exact signing handoff confirmation".into());
     }
@@ -127,6 +128,9 @@ async fn handoff_command(args: &[String]) -> Result<serde_json::Value, Box<dyn s
             return Err("The encrypted handoff source must be a private regular file".into());
         }
         let data = fs::read(local)?;
+        if data.len() != meta.len() as usize || data.is_empty() || data.len() > 24 * 1024 {
+            return Err("Encrypted handoff file changed during read".into());
+        }
         let digest = app_container::write_envelope(&provider, bundle, remote, &data).await?;
         Ok(json!({"operation":"handoff-write","bundleIdentifier":bundle,
             "bytes":data.len(),"sha256":digest.iter().map(|b|format!("{b:02x}")).collect::<String>()}))
@@ -173,6 +177,7 @@ async fn main() {
     }
     if args.len() != 1 || !matches!(args[0].as_str(), "inspect" | "status" | "inventory") {
         eprintln!("Usage: zag-usb inspect|status|inventory|preflight PLAN.json");
+        eprintln!("Signing transport: handoff-read|handoff-write UDID BUNDLE REMOTE LOCAL \"HANDOFF BUNDLE\"");
         std::process::exit(2);
     }
     match tokio::time::timeout(Duration::from_secs(30), inspect(&args[0], None)).await {

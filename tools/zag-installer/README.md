@@ -242,3 +242,42 @@ The Python tests can alternatively be run from `tools/zag-installer` with
 `python3 -m unittest -q test_zag_installer`. A real signed IPA from the
 existing signing pipeline is required for meaningful complete preflight
 validation. Never mistake an arbitrary JSON file for a signed release.
+
+
+## Native House Arrest encrypted signing-setup transport
+
+The standalone Rust helper now implements `handoff-read` and `handoff-write` for
+the **existing** private signing setup protocol. Python `StandaloneUSB` maps
+`copy_from_app` and `copy_to_app` to these commands. The encrypted
+payload and bootstrap messages continue to be constructed, authenticated and
+validated by `handoff.py`; the Rust layer only transports those exact files.
+
+The implementation requires exactly one trusted USB-connected iPhone in
+Developer Mode, an affirmative exact installed Personal Team bundle inventory,
+and a limited set of existing request/response paths. It refuses the AppTesters
+bundle, arbitrary paths, oversized messages, linked files, changed local
+ciphertext and missing installed destinations. Outbound files are created by
+Python with exclusive mode 0600 and checked by Rust before writing. The
+transport verifies the delivered file byte-for-byte via SHA-256 readback.
+No private key plaintext is sent to Rust as an argument or written to
+any iPhone file. The temporary setup bootstrap does contain an authenticated
+transaction secret and is created mode 0600.
+
+**Release status:** This is a development transport. On-device House Arrest
+permissions for Personal Team copies and end-to-end encrypted setup have **not
+been physically verified** on iOS 27. The existing standalone GUI remains
+read-only, and standalone CLI installation/provisioning remains disabled by
+the top-level guard. The native launch path will require further development;
+the existing automatic handoff can instruct the user to open the app manually.
+
+Development validation (read-only):
+
+```sh
+cd "$HOME/Documents/ZagStore-claude"
+(cd tools/zag-installer && python3 -m unittest -q test_zag_installer test_handoff)
+cargo test --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
+cargo build --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
+```
+
+Do not run `handoff-write` against a phone without an authorised on-device
+setup session. `zag-usb install` remains unsupported.
