@@ -7,6 +7,11 @@ import subprocess
 import sys
 
 from ui_protocol import Channel, AppleFailure, run_native_install
+import ipa_preview
+import tempfile
+import zipfile
+import plistlib
+from pathlib import Path
 
 
 class ProtocolTests(unittest.TestCase):
@@ -145,6 +150,32 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(subprocess.TimeoutExpired):
             run_native_install([sys.executable, "-c", "import time; time.sleep(10)"],
                                lambda *_: None, timeout=0.1)
+
+    def test_ipa_metadata_uses_main_application_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unrelated-file-name.ipa"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("Payload/Example.app/Info.plist", plistlib.dumps({
+                    "CFBundleDisplayName": "Example", "CFBundleIdentifier": "com.example.app",
+                    "CFBundleShortVersionString": "2.1", "CFBundleVersion": "3"
+                }))
+                archive.writestr("Payload/Example.app/PlugIns/Extension.appex/Info.plist", b"ignored")
+            self.assertEqual(ipa_preview.inspect(path), {
+                "name": "Example", "bundle": "com.example.app", "version": "2.1", "build": "3"
+            })
+
+    def test_ipa_metadata_rejects_ambiguous_and_oversized_plists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.ipa"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("Payload/A.app/Info.plist", b"x")
+                archive.writestr("Payload/B.app/Info.plist", b"x")
+            with self.assertRaises(ValueError):
+                ipa_preview.inspect(path)
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("Payload/A.app/Info.plist", b"x" * (ipa_preview.MAX_PLIST + 1))
+            with self.assertRaises(ValueError):
+                ipa_preview.inspect(path)
 
     def test_structured_apple_failure(self):
         channel, out = self.make_channel(b"")

@@ -15,7 +15,7 @@ trap 'rm -rf "$TEMP"' EXIT
 
 mkdir -p "$TEMP/package/tools/zag-installer" "$TEMP/package/scripts" "$TEMP/package/helpers" \
     "$TEMP/package/AppleAuthCore/zag-isideload/src/assets"
-for name in zag_installer.py desktop.py handoff.py releases.py ui_protocol.py native_preflight.py; do
+for name in zag_installer.py desktop.py handoff.py releases.py ui_protocol.py native_preflight.py ipa_preview.py; do
     cp "$ROOT/tools/zag-installer/$name" "$TEMP/package/tools/zag-installer/$name"
 done
 cp "$ROOT/scripts/zag-personal-ota.py" "$TEMP/package/scripts/zag-personal-ota.py"
@@ -42,7 +42,7 @@ import sys
 
 root = Path(sys.argv[1]).resolve(strict=True)
 module_root = root / "tools" / "zag-installer"
-for name in ("zag_installer", "desktop", "handoff", "releases", "ui_protocol", "native_preflight"):
+for name in ("zag_installer", "desktop", "handoff", "releases", "ui_protocol", "native_preflight", "ipa_preview"):
     path = module_root / f"{name}.py"
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 ast.parse((root / "scripts" / "zag-personal-ota.py").read_text(encoding="utf-8"))

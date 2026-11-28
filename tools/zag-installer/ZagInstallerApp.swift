@@ -35,6 +35,8 @@ private struct InstallerProgressControl: View {
                 Button(action: action) {
                     Text(title)
                         .font(.system(size: 21, weight: .semibold))
+                        .lineLimit(1).minimumScaleFactor(0.65)
+                        .padding(.horizontal, 12)
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity, minHeight: 54)
                         .contentShape(Capsule())
@@ -664,6 +666,38 @@ private enum RememberedAccounts {
     }
 }
 
+private struct ImportedApplication: Decodable, Sendable {
+    let name: String
+    let bundle: String
+    let version: String
+    let build: String
+    let icon: String?
+
+    static func inspect(_ url: URL) -> ImportedApplication? {
+        let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
+        let root = bundled
+            ? Bundle.main.resourceURL?.appendingPathComponent("DesktopEngine")
+            : URL(fileURLWithPath: ProcessInfo.processInfo.environment["ZAG_INSTALLER_ROOT"]
+                ?? NSHomeDirectory() + "/Documents/ZagStore-claude")
+        guard let root else { return nil }
+        let script = root.appendingPathComponent("tools/zag-installer/ipa_preview.py")
+        let process = Process()
+        process.executableURL = bundled ? root.appendingPathComponent("python/bin/python3")
+            : URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-I", "-B", script.path, url.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0, data.count <= 512 * 1024 else { return nil }
+            return try JSONDecoder().decode(ImportedApplication.self, from: data)
+        } catch { return nil }
+    }
+}
+
 private struct InstallerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var dark: Bool { colorScheme == .dark }
@@ -671,6 +705,9 @@ private struct InstallerView: View {
     private var successfulSetup: Bool { completed && installer.identityImported }
     private var actionTitle: String {
         if completed { return "Done" }
+        if inspectingIPA { return "Reading IPA…" }
+        if let importedApplication { return "Install \(importedApplication.name)" }
+        if importedIPA != nil { return "Install IPA" }
         return upgrade ? "Upgrade Zag Store" : "Install Zag Store"
     }
     private var nativeDevelopment: Bool {
@@ -752,6 +789,39 @@ private struct InstallerView: View {
     @State private var preferredAccount: String?
     @State private var releaseChannel = "beta"
     @State private var importedIPA: URL?
+    @State private var importedApplication: ImportedApplication?
+    @State private var inspectingIPA = false
+    @State private var importError = false
+    @State private var importRequest = UUID()
+    @State private var dropTargeted = false
+
+    @MainActor private func selectIPA(_ url: URL) {
+        guard !installer.busy, !completed, url.isFileURL,
+              url.pathExtension.lowercased() == "ipa" else { return }
+        let request = UUID()
+        importRequest = request
+        importedIPA = url
+        importedApplication = nil
+        inspectingIPA = true
+        importError = false
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                ImportedApplication.inspect(url)
+            }.value
+            guard importRequest == request else { return }
+            importedApplication = result
+            inspectingIPA = false
+            importError = result == nil
+        }
+    }
+
+    @MainActor private func clearIPA() {
+        importRequest = UUID()
+        importedIPA = nil
+        importedApplication = nil
+        inspectingIPA = false
+        importError = false
+    }
 
     private var accountColumn: some View {
         let accounts = RememberedAccounts.decode(rememberedAppleIDs)
@@ -810,7 +880,7 @@ private struct InstallerView: View {
             } label: {
                 Label("Use another Apple ID", systemImage: "plus.circle")
                     .frame(maxWidth: .infinity)
-            }.disabled(!device.ready || nativeUSBPreview || installer.busy || completed)
+            }.disabled(!device.ready || nativeUSBPreview || installer.busy || completed || importedIPA != nil)
             Divider()
             Label("Only account identifiers are remembered. Passwords are not saved.", systemImage: "lock.shield")
                 .font(.caption).foregroundStyle(muted)
@@ -939,7 +1009,7 @@ private struct InstallerView: View {
             .font(.system(size: 14))
             .foregroundStyle(muted)
 
-            if !nativeDevelopment {
+            if !nativeDevelopment && importedIPA == nil {
                 Toggle("Upgrade an existing Personal Team copy", isOn: $upgrade)
                     .disabled(installer.busy)
                 if upgrade {
@@ -949,6 +1019,7 @@ private struct InstallerView: View {
                 }
             }
             Spacer(minLength: 0)
+            if importedIPA == nil {
             HStack(spacing: 4) {
                 ForEach(["stable", "beta", "nightly"], id: \.self) { channel in
                     Button {
@@ -984,18 +1055,19 @@ private struct InstallerView: View {
             .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(border, lineWidth: 1) }
             .accessibilityLabel("Release channel")
             .disabled(installer.busy)
+            }
             Spacer(minLength: 0)
             InstallerProgressControl(title: actionTitle,
                                      milestone: installer.prompt == nil ? installer.milestone : "Awaiting your confirmation",
                                      progress: installer.progressFraction,
                                      measuredPercent: installer.prompt == nil ? installer.measuredPercent : nil,
                                      busy: installer.busy,
-                                     enabled: completed || (device.ready && !nativeUSBPreview),
+                                     enabled: completed || (importedIPA == nil && device.ready && !nativeUSBPreview),
                                      success: successfulSetup,
                                      action: {
                 if completed {
                     installer.dismissCompletion()
-                } else {
+                } else if importedIPA == nil {
                     installer.begin(upgrade: upgrade, team: team, channel: releaseChannel,
                                     targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
                 }
@@ -1007,39 +1079,82 @@ private struct InstallerView: View {
         }
         .fixedSize(horizontal: false, vertical: true)
             Divider()
-            Button {
-                let panel = NSOpenPanel()
-                panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
-                panel.allowsMultipleSelection = false
-                panel.canChooseDirectories = false
-                if panel.runModal() == .OK, let url = panel.url, url.pathExtension.lowercased() == "ipa" { importedIPA = url }
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "shippingbox.and.arrow.backward")
-                        .font(.system(size: 23, weight: .medium))
-                        .foregroundStyle(ZagPalette.blue)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(importedIPA?.lastPathComponent ?? "Import an IPA")
-                            .font(.system(size: 18, weight: .semibold))
-                            .lineLimit(1).truncationMode(.middle)
-                        Text(importedIPA == nil ? "Browse for an application package" : "Selected · Installation not yet available")
-                            .font(.system(size: 12)).foregroundStyle(muted)
+            HStack(spacing: 12) {
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
+                    panel.allowsMultipleSelection = false
+                    panel.canChooseDirectories = false
+                    if panel.runModal() == .OK, let url = panel.url { selectIPA(url) }
+                } label: {
+                    HStack(spacing: 12) {
+                        if let encoded = importedApplication?.icon,
+                           let data = Data(base64Encoded: encoded),
+                           let image = NSImage(data: data) {
+                            Image(nsImage: image).resizable().scaledToFit()
+                                .frame(width: 44, height: 44)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                        } else {
+                            Image(systemName: "shippingbox.and.arrow.backward")
+                                .font(.system(size: 23, weight: .medium))
+                                .foregroundStyle(ZagPalette.blue)
+                                .frame(width: 44, height: 44)
+                        }
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(importedApplication?.name ?? importedIPA?.lastPathComponent ?? "Import an IPA")
+                                .font(.system(size: 18, weight: .semibold))
+                                .lineLimit(1).truncationMode(.middle)
+                            if let app = importedApplication {
+                                Text([app.version.isEmpty ? nil : "Version " + app.version,
+                                      app.bundle].compactMap { $0 }.joined(separator: " · "))
+                                    .font(.system(size: 12)).foregroundStyle(muted).lineLimit(1)
+                                Text("Selected · Third-party installation not yet enabled")
+                                    .font(.caption).foregroundStyle(muted)
+                            } else {
+                                Text(inspectingIPA ? "Reading application metadata…" :
+                                     importError ? "Could not read a valid IPA. Choose another file." :
+                                     "Drag an IPA here or browse for an application package")
+                                    .font(.system(size: 12)).foregroundStyle(importError ? attention : muted)
+                            }
+                        }
+                        Spacer()
+                        if importedIPA == nil {
+                            Image(systemName: "plus.circle").font(.system(size: 22)).foregroundStyle(muted)
+                        }
                     }
-                    Spacer()
-                    Image(systemName: "plus.circle").font(.system(size: 22)).foregroundStyle(muted)
+                    .contentShape(Rectangle())
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(surface.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
-                .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(ZagPalette.blue.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [5, 4])) }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .onHover { inside in
+                    if inside && !installer.busy && !completed { NSCursor.pointingHand.set() }
+                    else { NSCursor.arrow.set() }
+                }
+                if importedIPA != nil {
+                    Button(action: clearIPA) {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 22)).foregroundStyle(muted)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear imported IPA")
+                    .help("Return to Zag Store installation")
+                }
             }
-            .buttonStyle(.plain)
-            .disabled(installer.busy)
-            .help("Select an IPA file. Third-party installation is not enabled yet.")
-            .onHover { inside in
-                if inside && !installer.busy { NSCursor.pointingHand.set() }
-                else { NSCursor.arrow.set() }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(surface.opacity(dropTargeted ? 1 : 0.55), in: RoundedRectangle(cornerRadius: 14))
+            .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(ZagPalette.blue.opacity(dropTargeted ? 1 : 0.5),
+                style: StrokeStyle(lineWidth: dropTargeted ? 2 : 1, dash: [5, 4])) }
+            .disabled(installer.busy || completed)
+            .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
+                guard !installer.busy, !completed, providers.count == 1,
+                      let provider = providers.first else { return false }
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    let url = (item as? URL) ?? (item as? Data).flatMap {
+                        URL(dataRepresentation: $0, relativeTo: nil)
+                    }
+                    guard let url else { return }
+                    Task { @MainActor in selectIPA(url) }
+                }
+                return true
             }
             Divider()
             if !installer.busy && !installer.installedBundle.isEmpty {
