@@ -21,9 +21,16 @@ class IdentityTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_only_matching_inventory_resolves_an_uncertain_request(self):
         def der(key):
-            return subprocess.check_output(
-                ["openssl", "req", "-x509", "-key", "/dev/stdin", "-subj", "/CN=Test",
-                 "-days", "1", "-outform", "DER"], input=key, stderr=subprocess.DEVNULL)
+            # macOS OpenSSL 3 cannot reliably reopen /dev/stdin while loading
+            # an RSA private key. A private, owner-only fixture also works with
+            # the system OpenSSL and does not depend on a shell pipe.
+            with tempfile.NamedTemporaryFile(mode="wb", prefix="zag-test-rsa-", suffix=".pem") as key_file:
+                key_file.write(key)
+                key_file.flush()
+                return subprocess.check_output(
+                    ["openssl", "req", "-new", "-x509", "-key", key_file.name,
+                     "-subj", "/CN=Test", "-days", "1", "-outform", "DER"],
+                    stderr=subprocess.DEVNULL)
 
         values = {}
         store = Mock()
