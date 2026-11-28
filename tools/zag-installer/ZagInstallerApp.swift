@@ -398,7 +398,6 @@ private struct InstallerView: View {
         guard let url = Bundle.main.url(forResource: name, withExtension: "png") else { return nil }
         return NSImage(contentsOf: url)
     }
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var installer: InstallerController
     @State private var showRecovery = false
     @State private var upgrade = false
