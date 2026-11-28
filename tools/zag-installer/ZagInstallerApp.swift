@@ -15,6 +15,7 @@ private struct InstallerProgressControl: View {
     let title: String
     let milestone: String
     let progress: Double
+    let measuredPercent: Int?
     let busy: Bool
     let enabled: Bool
     let success: Bool
@@ -57,17 +58,26 @@ private struct InstallerProgressControl: View {
                 else { NSCursor.arrow.set() }
             }
             if busy {
-                ZStack {
-                    Text(milestone)
-                        .id(milestone)
-                        .transition(.opacity)
-                        .font(.system(size: 14, weight: .medium))
-                        .lineLimit(1)
+                HStack(spacing: 6) {
+                    ZStack {
+                        Text(milestone)
+                            .id(milestone)
+                            .transition(.opacity)
+                            .font(.system(size: 14, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: milestone)
+                    if let measuredPercent {
+                        Text("\(measuredPercent)%")
+                            .font(.system(size: 13, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .frame(maxWidth: .infinity, minHeight: 20)
-                .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: milestone)
+                .accessibilityElement(children: .combine)
                 .accessibilityLabel(milestone)
-                .accessibilityValue("\(Int(progress * 100)) percent of installation milestones")
+                .accessibilityValue(measuredPercent.map { "\($0) percent of current operation" }
+                    ?? "In progress")
                 Button("Cancel installation", action: cancel)
                     .font(.caption)
                     .buttonStyle(.plain)
@@ -88,6 +98,7 @@ final class InstallerController: ObservableObject {
     @Published var setupVerified = false
     @Published var stage: String?
     @Published private(set) var progressFraction: Double = 0
+    @Published private(set) var measuredPercent: Int?
     @Published private(set) var milestone = "Checking release and device"
     private static let milestones = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
     private static let milestoneLabels = ["Checking release and device", "Authenticating Apple ID",
@@ -99,6 +110,7 @@ final class InstallerController: ObservableObject {
         if let stage, let previous = Self.milestones.firstIndex(of: stage), index < previous { return false }
         var label = Self.milestoneLabels[index]
         var fraction = 0.0
+        var measured: Int?
         if object["phase"] != nil || object["percent"] != nil {
             guard next == "installation",
                   let phase = object["phase"] as? String,
@@ -107,12 +119,14 @@ final class InstallerController: ObservableObject {
             let labels = ["Transferring IPA to iPhone", "Verifying transferred IPA", "Installing on iPhone", "Verifying installation"]
             guard let phaseIndex = phases.firstIndex(of: phase) else { return false }
             label = labels[phaseIndex]
+            measured = phase == "readback" ? nil : percent
             fraction = min(0.99, (Double(phaseIndex) + Double(percent) / 100) / Double(phases.count))
         }
         observedStages.insert(next)
         stage = next
         progressFraction = max(progressFraction, (Double(index) + fraction) / Double(Self.milestones.count))
         milestone = label
+        measuredPercent = measured
         status = label
         return true
     }
@@ -246,6 +260,7 @@ final class InstallerController: ObservableObject {
         prompt = nil
         log = ""
         progressFraction = resumeSetup ? 5.0 / 6.0 : 0
+        measuredPercent = nil
         milestone = resumeSetup ? "Checking signing receipt" : "Checking release and device"
         status = resumeSetup ? "Checking the existing installation and signing receipt" : "Verifying the signed release and connected iPhone"
         busy = true
@@ -387,6 +402,7 @@ final class InstallerController: ObservableObject {
         stage = nil
         observedStages.removeAll()
         progressFraction = 0
+        measuredPercent = nil
         status = "Ready"
     }
 
@@ -972,6 +988,7 @@ private struct InstallerView: View {
             InstallerProgressControl(title: actionTitle,
                                      milestone: installer.prompt == nil ? installer.milestone : "Awaiting your confirmation",
                                      progress: installer.progressFraction,
+                                     measuredPercent: installer.prompt == nil ? installer.measuredPercent : nil,
                                      busy: installer.busy,
                                      enabled: completed || (device.ready && !nativeUSBPreview),
                                      success: successfulSetup,

@@ -3,8 +3,10 @@
 import io
 import json
 import unittest
+import subprocess
+import sys
 
-from ui_protocol import Channel, AppleFailure
+from ui_protocol import Channel, AppleFailure, run_native_install
 
 
 class ProtocolTests(unittest.TestCase):
@@ -98,6 +100,51 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             channel.progress("private-password")
         self.assertNotIn(b"private-password", out.getvalue())
+
+    def test_native_progress_contract(self):
+        channel, out = self.make_channel(b"")
+        channel.installation_progress("transfer", 42)
+        self.assertEqual(json.loads(out.getvalue()), {
+            "type": "progress", "stage": "installation", "phase": "transfer", "percent": 42
+        })
+        for phase, percent in (("secret", 1), ("transfer", -1), ("transfer", 101),
+                               ("installing", True), ("verification", "42")):
+            with self.subTest(phase=phase, percent=percent), self.assertRaises(ValueError):
+                channel.installation_progress(phase, percent)
+
+    def test_native_stream_reports_measured_progress_in_order(self):
+        records = [
+            {"native_progress": "transfer", "percent": 0},
+            {"native_progress": "transfer", "percent": 50},
+            {"native_progress": "transfer", "percent": 20},
+            {"native_progress": "transfer", "percent": 50},
+            {"native_progress": "verification", "percent": 100},
+            {"native_progress": "installing", "percent": 70},
+            {"native_progress": "readback", "percent": 0},
+            {"installed": True},
+        ]
+        wire = "".join(json.dumps(item) + "\n" for item in records)
+        seen = []
+        result = run_native_install(
+            [sys.executable, "-c", "import sys; sys.stdout.write(" + repr(wire) + ")"],
+            lambda phase, percent: seen.append((phase, percent)), timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {"installed": True})
+        self.assertEqual(seen, [("transfer", 0), ("transfer", 50), ("verification", 100),
+                                ("installing", 70), ("readback", 0)])
+
+    def test_native_stream_rejects_invalid_and_trailing_events(self):
+        for wire in ('{"native_progress":"transfer","percent":101}\n',
+                     '{"installed":true}\n{"native_progress":"transfer","percent":5}\n',
+                     'not-json\n', '{"installed":true}', 'x' * 4097 + '\n'):
+            with self.subTest(wire=wire[:60]), self.assertRaises(ValueError):
+                run_native_install([sys.executable, "-c", "import sys; sys.stdout.write(" + repr(wire) + ")"],
+                                   lambda *_: None, timeout=5)
+
+    def test_native_stream_timeout(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_native_install([sys.executable, "-c", "import time; time.sleep(10)"],
+                               lambda *_: None, timeout=0.1)
 
     def test_structured_apple_failure(self):
         channel, out = self.make_channel(b"")
