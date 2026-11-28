@@ -31,6 +31,7 @@ final class InstallerController: ObservableObject {
     private var eventStreamEnded = false
     private var exitCode: Int32?
     private var receivedError = false
+    private var cancellationRequested = false
 
     func begin(upgrade: Bool, team: String, resumeSetup: Bool = false) {
         guard !busy else { return }
@@ -133,6 +134,7 @@ final class InstallerController: ObservableObject {
         eventStreamEnded = false
         exitCode = nil
         receivedError = false
+        cancellationRequested = false
         installedBundle = ""
         identityImported = false
         setupVerified = false
@@ -159,6 +161,12 @@ final class InstallerController: ObservableObject {
                 guard let self, self.sessionID == session, self.busy else { return }
                 self.exitCode = code
                 self.finishIfReady()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self, self.sessionID == session, self.busy, !self.eventStreamEnded else { return }
+                    self.status = "Installer event stream did not close. Check the device before retrying."
+                    self.receivedError = true
+                    self.close()
+                }
             }
         }
         do {
@@ -282,7 +290,9 @@ final class InstallerController: ObservableObject {
     }
 
     func cancel() {
-        guard busy else { return }
+        guard busy, !cancellationRequested else { return }
+        cancellationRequested = true
+        let session = sessionID
         if prompt != nil, let input,
            let wire = try? JSONSerialization.data(withJSONObject: ["cancel": true]) {
             input.write(wire + Data([10]))
@@ -291,6 +301,11 @@ final class InstallerController: ObservableObject {
             task?.terminate()
         }
         status = "Cancelling. Certificate requests may require reconciliation."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.sessionID == session, self.busy, let process = self.task, process.isRunning else { return }
+            process.terminate()
+            self.status = "Cancellation requested. Check the device and signing state before retrying."
+        }
     }
 
     private func append(_ value: String) {
