@@ -266,6 +266,62 @@ class NativeUSBAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "did not complete"):
                 installer.installed_app(dev, self.UDID, DESTINATION)
 
+    def test_native_install_developer_feature_is_disabled_by_default(self):
+        dev = self.make_adapter()
+        dev.identity = self.UDID
+        with patch.object(installer.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "disabled"):
+                dev.install_signed_developer(self.UDID, Path("/tmp/dummy.ipa"),
+                    RELEASE, TEAM, Path("/tmp/apple.pem"), b"certificate",
+                    check_authorization=lambda _:None)
+            run.assert_not_called()
+
+    def test_native_install_developer_enforces_intact_ipa_and_receipt(self):
+        dev = self.make_adapter()
+        dev.native_install_dev = True
+        dev.identity = self.UDID
+        signed = dev.scratch / "validated-signed.ipa"
+        signed.write_bytes(b"valid-ipa-test-only")
+        sha = hashlib.sha256(signed.read_bytes()).hexdigest()
+        plan = {"schema":1, "bundle_identifier":DESTINATION, "version":"1.0.0",
+                "build":"4", "ipa_sha256":sha, "ipa_path":str(signed),
+                "device_udid":self.UDID, "previous":None}
+        early = {"sha256":sha, "bundleIdentifier":DESTINATION,
+                 "version":"1.0.0", "build":"4", "installation_authorized":False}
+        receipt = {"mode":"native-install-dev", "installed":True,
+                   "installed_bundle":DESTINATION, "version":"1.0.0", "build":"4"}
+        with patch.object(installer.native_preflight, "create", return_value=plan), \
+             patch.object(installer.subprocess, "run") as run:
+            run.side_effect = [
+                self.reply(),
+                subprocess.CompletedProcess([], 0, __import__("json").dumps(receipt).encode(), b"")
+            ]
+            result = dev.install_signed_developer(self.UDID, signed, RELEASE, TEAM,
+                 Path("/tmp/root.pem"), b"test", check_authorization=lambda _: None,
+                 earlier=early)
+            self.assertEqual(result["installed_bundle"], DESTINATION)
+            command = run.call_args.args[0]
+            self.assertEqual(command[1], "install-signed-dev")
+            self.assertEqual(command[3].__len__(), 32)
+            self.assertEqual(command[4], f"INSTALL {DESTINATION} ON {self.UDID}")
+        self.assertFalse((dev.scratch / "native-ipa-preflight.json").exists())
+
+    def test_native_install_rejects_changed_ipa_after_approval(self):
+        dev = self.make_adapter()
+        dev.native_install_dev = True
+        dev.identity = self.UDID
+        plan = {"ipa_sha256":"b"*64, "bundle_identifier":DESTINATION,
+                "version":"1.0.0","build":"4"}
+        early = {"sha256":"a"*64,"bundleIdentifier":DESTINATION,
+                 "version":"1.0.0","build":"4","installation_authorized":False}
+        with patch.object(installer.native_preflight, "create", return_value=plan), \
+             patch.object(installer.subprocess, "run", return_value=self.reply()) as run:
+            with self.assertRaisesRegex(ValueError, "changed"):
+                dev.install_signed_developer(self.UDID, Path("/tmp/signed.ipa"),
+                    RELEASE, TEAM, Path("/tmp/root.pem"), b"test",
+                    check_authorization=lambda _: None, earlier=early)
+        self.assertEqual(run.call_count, 1)
+
     def test_handoff_rejects_unmapped_bundle_before_helper(self):
         dev = self.make_adapter()
         dev.identity = self.UDID
@@ -413,6 +469,40 @@ class NativeSignedIpaPreflightTests(unittest.TestCase):
         path.write_bytes(b"mock native helper")
         path.chmod(0o700)
         return path
+
+    def test_signed_native_install_passes_intact_ipa_without_extracting_app(self):
+        dev = installer.StandaloneUSB(self.root, self._helper(), native_install_dev=True)
+        with zipfile.ZipFile(self.ipa) as archive:
+            info = plistlib.loads(archive.read("Payload/Zag.app/Info.plist"))
+        observed = {"bundleIdentifier":DESTINATION, "version":"1.0.0", "bundleVersion":"4"}
+        with patch.object(installer.artifact, "validate", return_value={
+            "bundle_identifier":DESTINATION,"build":"4"
+        }), patch.object(installer.artifact, "main_bundle",
+                        return_value=(Path("Payload/Zag.app"), info)), \
+             patch.object(installer.artifact, "extract",
+                          side_effect=AssertionError("native must not unpack IPA")) as extract, \
+             patch.object(dev, "usb_device", return_value=(self.udid,self.udid)), \
+             patch.object(dev, "check_compatibility"), \
+             patch.object(dev, "preflight_signed", return_value={
+                 "sha256":hashlib.sha256(self.ipa.read_bytes()).hexdigest(),
+                 "bundleIdentifier":DESTINATION,"version":"1.0.0","build":"4",
+                 "installation_authorized":False
+             }) as preflight, \
+             patch.object(dev, "destination_app", side_effect=[None, observed]) as inventory, \
+             patch.object(dev, "install_signed_developer", return_value={
+                 "installed_bundle":DESTINATION,"version":"1.0.0","build":"4"
+             }) as install:
+            result = installer.validate_and_install(
+                self.ipa, RELEASE, TEAM, self.root_pem, self.root,
+                dev, self.udid, self.udid, lambda _: "INSTALL", self.cert,
+                check_authorization=lambda _:None)
+        self.assertEqual(result["installed_bundle"], DESTINATION)
+        extract.assert_not_called()
+        self.assertFalse((self.root / "staged").exists())
+        self.assertEqual(install.call_args.args[1], self.ipa)
+        self.assertEqual(install.call_args.kwargs["earlier"]["bundleIdentifier"], DESTINATION)
+        preflight.assert_called_once()
+        self.assertEqual(inventory.call_count, 2)
 
     def test_bad_apple_signature_never_generates_plan(self):
         with patch.object(installer.artifact, "validate", side_effect=ValueError("bad profile")):
