@@ -45,10 +45,17 @@ class StandaloneUSB:
         self.identity = None
         self.device_info = None
 
-    def _run(self, mode):
-        artifact.require(mode in ("status", "inventory"), "Only native USB read operations are available")
+    def _run(self, mode, team=None):
+        if mode == "inventory-team":
+            artifact.require(isinstance(team, str) and re.fullmatch(r"[A-Z0-9]{10}", team),
+                             "Invalid Personal Team for targeted native inventory")
+            command = [str(self.executable), mode, team]
+        else:
+            artifact.require(team is None and mode in ("status", "inventory"),
+                             "Only approved native USB read operations are available")
+            command = [str(self.executable), mode]
         try:
-            result = subprocess.run([str(self.executable), mode], capture_output=True, timeout=36, check=False)
+            result = subprocess.run(command, capture_output=True, timeout=45, check=False)
         except subprocess.TimeoutExpired as error:
             raise ValueError("Native USB inspection timed out") from error
         artifact.require(result.returncode == 0 and len(result.stdout) <= 65536,
@@ -136,6 +143,39 @@ class StandaloneUSB:
                 + "; destination occupancy is unconfirmed"
             )
         return result
+
+    def destination_app(self, identifier, bundle):
+        """Read one exact destination without inferring vacancy from broad scans.
+
+        Empty targeted results are an observation, not proof of vacancy.
+        A separate verified signing flow and explicit install confirmation
+        remain mandatory before the native installer may modify a device.
+        """
+        artifact.require(self.identity is not None
+                         and identifier.casefold() == self.identity.casefold(),
+                         "The trusted USB device changed")
+        prefix = artifact.ORIGINAL + "."
+        artifact.require(isinstance(bundle, str) and bundle.startswith(prefix)
+                         and re.fullmatch(r"[A-Z0-9]{10}", bundle[len(prefix):]),
+                         "Only a mapped Personal Team destination can be selected")
+        _, _, response = self._run("inventory-team", bundle[len(prefix):])
+        artifact.require(response.get("targeted_checked") is True,
+                         "Targeted native inventory did not complete")
+        apps = response.get("targeted_apps")
+        artifact.require(isinstance(apps, list) and len(apps) <= 1,
+                         "Targeted destination inventory is missing or ambiguous")
+        if not apps:
+            return None
+        record = apps[0]
+        artifact.require(isinstance(record, dict)
+                         and record.get("bundleIdentifier") == bundle
+                         and isinstance(record.get("version"), str)
+                         and isinstance(record.get("bundleVersion"), str),
+                         "Unexpected targeted native destination")
+        version_number(record["version"])
+        version_number(record["bundleVersion"])
+        return {"bundleIdentifier":bundle,
+                "version":record["version"], "bundleVersion":record["bundleVersion"]}
 
     def preflight_signed(self, signed, release, team, root, certificate, *,
                          previous=None, check_authorization=releases.check_fresh):
@@ -310,6 +350,8 @@ def version_number(value):
 
 
 def installed_app(device, target, expected):
+    if isinstance(device, StandaloneUSB):
+        return device.destination_app(target, expected)
     matches = [app for app in device.apps(target) if app.get("bundleIdentifier") == expected]
     artifact.require(len(matches) <= 1, "Destination inventory is ambiguous")
     return matches[0] if matches else None
