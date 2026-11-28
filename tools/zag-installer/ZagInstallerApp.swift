@@ -543,7 +543,7 @@ private struct InstallerView: View {
                 Spacer()
                 let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
                 let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
-                Text("v\(version) (\(build))")
+                Text("Version \(version) (\(build))")
                     .font(.system(size: 14, weight: .medium)).monospacedDigit().foregroundStyle(muted)
             }
         }
