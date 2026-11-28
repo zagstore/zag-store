@@ -30,6 +30,20 @@ fn matches_target(udid: &str, connection: Option<&str>, target: Target<'_>) -> b
     }
 }
 
+// Query the authenticated Lockdown domain first: the AMFI service may
+// be unavailable over network transport. Never interpret absence as enabled.
+async fn developer_mode_status(lockdown: &mut LockdownClient, provider: &UsbmuxdProvider) -> Option<bool> {
+    if let Ok(value) = lockdown.get_value(Some("DeveloperModeStatus"), Some("com.apple.security.mac.amfi")).await {
+        if let Some(enabled) = value.as_boolean() {
+            return Some(enabled);
+        }
+    }
+    match AmfiClient::connect(provider).await {
+        Ok(mut amfi) => amfi.get_developer_mode_status().await.ok(),
+        Err(_) => None,
+    }
+}
+
 async fn inspect(mode: &str, team: Option<&str>, target: Target<'_>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
@@ -67,8 +81,7 @@ async fn inspect(mode: &str, team: Option<&str>, target: Target<'_>) -> Result<s
         if mode == "status" { return Ok(diagnostic("unsupported_device")); }
         return Err("Expected iPhone".into());
     }
-    let mut amfi = AmfiClient::connect(&provider).await?;
-    let developer_mode = amfi.get_developer_mode_status().await?;
+    let developer_mode = developer_mode_status(&mut lockdown, &provider).await;
     let mut result = json!({"transport":"system-usbmuxd","trust_verified":true,
         "developer_mode":developer_mode,"udid":d.udid,"device":info,
         "connection":connection_kind(&d.connection_type).ok_or("Unknown device connection")?});
@@ -139,8 +152,7 @@ async fn handoff_command(args: &[String], target: Target<'_>) -> Result<serde_js
     if lockdown.get_value(Some("DeviceClass"),None).await?.as_string() != Some("iPhone") {
         return Err("Signing handoff requires a trusted iPhone".into());
     }
-    let mut amfi = AmfiClient::connect(&provider).await?;
-    if !amfi.get_developer_mode_status().await? {
+    if developer_mode_status(&mut lockdown, &provider).await != Some(true) {
         return Err("Developer Mode is disabled".into());
     }
     let team = bundle.strip_prefix("app.zagstore.ios.").ok_or("Invalid team bundle")?;
@@ -235,8 +247,7 @@ async fn install_developer(args: &[String], target: Target<'_>) -> Result<serde_
     if lockdown.get_value(Some("DeviceClass"), None).await?.as_string() != Some("iPhone") {
         return Err("Refusing to install on a non-iPhone device".into());
     }
-    let mut amfi = AmfiClient::connect(&provider).await?;
-    if !amfi.get_developer_mode_status().await? {
+    if developer_mode_status(&mut lockdown, &provider).await != Some(true) {
         return Err("Refusing to install without Developer Mode".into());
     }
     let hash_bytes = plan.ipa_sha256.as_bytes();
@@ -354,10 +365,7 @@ async fn main() {
                 let value = lockdown.get_value(Some(key), None).await?;
                 info.insert(key.into(), json!(value.as_string().ok_or("Unexpected device metadata")?));
             }
-            let developer_mode = match AmfiClient::connect(&provider).await {
-                Ok(mut amfi) => amfi.get_developer_mode_status().await.ok(),
-                Err(_) => None,
-            };
+            let developer_mode = developer_mode_status(&mut lockdown, &provider).await;
             Ok::<_, Box<dyn std::error::Error>>(json!({"connection":connection,
                 "trust_verified":true,"developer_mode":developer_mode,"device":info}))
         };
@@ -471,6 +479,6 @@ async fn main() {
     }
     match tokio::time::timeout(Duration::from_secs(30), inspect(&args[0], None, target)).await {
         Ok(Ok(result)) => println!("{}", result),
-        _ => { eprintln!("Trusted USB inspection failed; check pairing, unlock and USB connection"); std::process::exit(1); }
+        _ => { eprintln!("Trusted device inspection failed; check pairing, unlock and selected connection"); std::process::exit(1); }
     }
 }
