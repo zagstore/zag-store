@@ -359,8 +359,13 @@ class Provisioning:
             self._pending_password = None
 
 
-def personal_entitlements(artifact, profile, certificate, team, udid, suffix=""):
-    identifier = artifact.mapped_bundle(team) + suffix
+def personal_entitlements(artifact, profile, certificate, team, udid, suffix="", *, imported_bundle=None):
+    if imported_bundle is not None:
+        from ipa_preview import mapped_import_bundle
+        require(not suffix, "Imported extensions are not supported")
+        identifier = mapped_import_bundle(imported_bundle, team)
+    else:
+        identifier = artifact.mapped_bundle(team) + suffix
     qualified = f"{team}.{identifier}"
     require(profile.get("LocalProvision") is True, "Apple did not issue a Personal Team profile")
     entitlements = {
@@ -403,7 +408,15 @@ def signing_components(app, original):
     return components
 
 
-def sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch):
+def sign(artifact, app, relative, team, udid, identity, profiles, components, root, helper, scratch, *, imported_bundle=None):
+    if imported_bundle is not None:
+        from ipa_preview import mapped_import_bundle
+        require(components == {"": ""} and set(profiles) == {""}, "Unexpected imported components")
+        require(plistlib.loads((app / "Info.plist").read_bytes()).get("CFBundleIdentifier") == imported_bundle,
+                "Imported source identity mismatch")
+        destination = mapped_import_bundle(imported_bundle, team)
+    else:
+        destination = artifact.mapped_bundle(team)
     manifest = {}
     for index, (path, suffix) in enumerate(components.items()):
         profile = scratch / f"component-{index}.mobileprovision"
@@ -412,13 +425,13 @@ def sign(artifact, app, relative, team, udid, identity, profiles, components, ro
         trusted = plistlib.loads(artifact.command("openssl", "smime", "-verify", "-inform", "DER",
                                                  "-purpose", "any", "-CAfile", str(root), "-no-CApath", "-no-CAstore",
                                                  "-in", str(profile)))
-        entitlements = personal_entitlements(artifact, trusted, identity.certificate, team, udid, suffix)
+        entitlements = personal_entitlements(artifact, trusted, identity.certificate, team, udid, suffix, imported_bundle=imported_bundle)
         manifest[path] = {"provision": raw, "entitlements": plistlib.dumps(entitlements)}
     leaf = scratch / "leaf.der"
     leaf.write_bytes(identity.certificate)
     component_file = scratch / "components.plist"
     component_file.write_bytes(plistlib.dumps(manifest))
-    command([helper, "sign", app, artifact.mapped_bundle(team), leaf, component_file],
+    command([helper, "sign", app, destination, leaf, component_file],
             identity.key, "Strict desktop Zsign signing")
     signed = scratch / "signed.ipa"
     with zipfile.ZipFile(signed, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=3) as archive:

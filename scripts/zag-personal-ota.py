@@ -203,7 +203,11 @@ def validate_profile(profile, entitlements, signer, team, identifier, udid, now)
     return expires
 
 
-def validate(ipa, team, udid, root, probe=False, expected_signer=None):
+def validate(ipa, team, udid, root, probe=False, expected_signer=None, *, imported_destination=None):
+    if imported_destination is not None:
+        require(not probe and expected_signer is not None and TEAM.fullmatch(team)
+                and re.fullmatch(r"app\.zloader\.imported\.[a-f0-9]{32}\." + team, imported_destination),
+                "Invalid imported validation scope")
     require(sys.platform == "darwin", "Run full artifact validation on macOS")
     pinned = command("openssl", "x509", "-in", str(root), "-outform", "DER")
     require(hashlib.sha256(pinned).hexdigest() == APPLE_ROOT, "Unexpected profile trust anchor")
@@ -215,7 +219,13 @@ def validate(ipa, team, udid, root, probe=False, expected_signer=None):
         directory = Path(scratch)
         with zipfile.ZipFile(ipa) as archive:
             relative, metadata = main_bundle(archive)
-            bundle, build = verify_identity(metadata, team, probe)
+            if imported_destination is None:
+                bundle, build = verify_identity(metadata, team, probe)
+            else:
+                bundle = metadata.get("CFBundleIdentifier")
+                build = metadata.get("CFBundleVersion")
+                require(bundle == imported_destination and isinstance(build, str)
+                        and re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", build), "Imported signed identity mismatch")
             extract(archive, directory)
         app = directory / relative
         command("codesign", "--verify", "--deep", "--strict", str(app),
@@ -226,6 +236,8 @@ def validate(ipa, team, udid, root, probe=False, expected_signer=None):
                         stage="Verify Mach-O executable", component=file.relative_to(directory))
         expiry = []
         components = [app] + sorted(p for p in app.rglob("*") if p.is_dir() and p.suffix in (".appex", ".app"))
+        if imported_destination is not None:
+            require(len(components) == 1 and not any(app.rglob("*.xpc")), "Unexpected imported nested application")
         if probe:
             require(len(components) == 1 and not any(app.rglob("*.framework")), "Unexpected nested probe code")
         for index, component in enumerate(components):
