@@ -478,7 +478,8 @@ private struct InstallerView: View {
                     connectionLight
                     Button { showDeviceDetails.toggle() } label: {
                         Image(systemName: showDeviceDetails ? "chevron.down" : "chevron.right")
-                    }.buttonStyle(.plain).accessibilityLabel("Device details")
+                            .frame(width: 28, height: 28)
+                    }.buttonStyle(.plain).accessibilityLabel(showDeviceDetails ? "Hide device details" : "Show device details")
                 }
                 .padding(12)
                 .background(surface, in: RoundedRectangle(cornerRadius: 12))
@@ -545,6 +546,7 @@ private struct InstallerView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(installer.busy || !device.ready || nativeUSBPreview)
+                .accessibilityLabel(installer.busy ? "Installation in progress" : (nativeDevelopment ? "Continue with Apple ID" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store")))
             }
             if installer.busy {
                 Button("Cancel installation") { installer.cancel() }.frame(maxWidth: .infinity)
@@ -660,10 +662,11 @@ private struct InstallerView: View {
             VStack(alignment: .leading, spacing: 20) {
                 let accountPrompt = prompt.message == "Apple ID: "
                 let passwordPrompt = prompt.message == "Apple ID password: "
+                let verificationPrompt = prompt.secure && prompt.message == "Apple verification code: "
                 VStack(spacing: 8) {
                     Image(systemName: accountPrompt || passwordPrompt ? "apple.logo" : (prompt.secure ? "lock.shield" : "checkmark.shield"))
                         .font(.system(size: 34))
-                    Text(accountPrompt || passwordPrompt ? "Sign in with your Apple ID" : (prompt.secure ? "Secure verification" : "Confirm Installation"))
+                    Text(accountPrompt || passwordPrompt ? "Sign in with your Apple ID" : (verificationPrompt ? "Enter verification code" : (prompt.secure ? "Secure verification" : "Confirm Installation")))
                         .font(.title2.bold())
                     Text("Zag Installer").font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity)
@@ -676,7 +679,20 @@ private struct InstallerView: View {
                 }
                 Text(prompt.message)
                     .fixedSize(horizontal: false, vertical: true)
-                if prompt.secure {
+                if verificationPrompt {
+                    Text("Enter the six-digit code from your trusted Apple device or phone number.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    SecureField("Six-digit code", text: $reply)
+                        .font(.system(size: 26, weight: .medium, design: .monospaced))
+                        .multilineTextAlignment(.center)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($promptFocused)
+                        .accessibilityLabel("Six-digit Apple verification code")
+                        .onChange(of: reply) { value in
+                            let filtered = String(value.filter { $0.isASCII && $0.isNumber }.prefix(6))
+                            if filtered != value { reply = filtered }
+                        }
+                } else if prompt.secure {
                     HStack {
                         if passwordPrompt && revealPassword {
                             TextField("Password", text: $reply).focused($promptFocused)
@@ -713,7 +729,7 @@ private struct InstallerView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(prompt.confirmation == nil && reply.isEmpty)
+                    .disabled(prompt.confirmation == nil && (reply.isEmpty || (verificationPrompt && reply.count != 6)))
                 }
             }
             .padding(24)
@@ -764,6 +780,11 @@ struct ZagInstallerApp: App {
         }
         .windowResizability(.contentMinSize)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About Zag Installer") {
+                    NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "Zag Installer"])
+                }
+            }
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
                     updates.checkNow(installerBusy: installer.busy)
