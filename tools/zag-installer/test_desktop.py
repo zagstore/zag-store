@@ -122,6 +122,25 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unexpected account"):
             portal.handle(event)
 
+    def test_portable_apple_token_is_opaque_not_restricted_to_ascii_graphics(self):
+        import json
+        store = Mock()
+        store.read.return_value = None
+        portal = desktop.Provisioning(None, "udid", store, "openssl", lambda _: TEAM,
+                                      Mock(return_value="apple@example.invalid"), "native")
+        portal.account_bootstrap = True
+        portal.handle({"event": "configuration"})
+        portal.handle({"event": "team", "account": "12345", "teams": [{"id": TEAM}]})
+        # Opaque Apple tokens may contain non-ASCII data or spaces. Do not
+        # enforce a speculative alphabet; the bound identity and live Apple
+        # service verification are authoritative.
+        event = {"event": "account_bootstrap", "credential": {
+            "accountID": "12345", "token": "test token · \\u00e9",
+            "expiresAtMs": int((dt.datetime.now(dt.timezone.utc).timestamp() + 300) * 1000)}}
+        self.assertTrue(portal.handle(event))
+        self.assertEqual(json.loads(portal.account_credential)["token"]["token"], event["credential"]["token"])
+        store.write.assert_not_called()
+
     def test_local_account_bootstrap_refuses_non_native_or_same_build(self):
         with patch.object(installer, "stage_local_candidate") as stage:
             with self.assertRaisesRegex(ValueError, "newer local candidate"):

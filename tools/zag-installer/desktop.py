@@ -276,8 +276,9 @@ class Provisioning:
             token = message.get("credential")
             require(isinstance(token, dict) and set(token) == {"accountID", "token", "expiresAtMs"}
                     and token["accountID"] == self.account_id
-                    and isinstance(token["accountID"], str) and re.fullmatch(r"[0-9]{1,32}", token["accountID"])
-                    and isinstance(token["token"], str) and re.fullmatch(r"[!-~]{1,3500}", token["token"])
+                    and isinstance(token["accountID"], str) and 0 < len(token["accountID"]) <= 128
+                    and isinstance(token["token"], str) and 0 < len(token["token"]) <= 3500
+                    and all(ord(c) >= 32 for c in token["token"])
                     and type(token["expiresAtMs"]) is int
                     and token["expiresAtMs"] > int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
                     "Invalid portable developer credential")
