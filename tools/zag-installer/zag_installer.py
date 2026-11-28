@@ -787,7 +787,7 @@ def main():
             channel.send({"type": "finished", "result": result})
         else:
             print(json.dumps(result))
-        if result.get("signing_setup") == "incomplete":
+        if result.get("signing_setup") == "incomplete" and result.get("signing_identity") != "imported":
             return 1
     except KeyboardInterrupt:
         if channel is not None:

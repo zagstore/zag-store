@@ -199,7 +199,7 @@ final class InstallerController: ObservableObject {
                     if result["signing_setup"] as? String == "verified" {
                         status = "Installed and Signing Setup verified"
                     } else if result["signing_identity"] as? String == "imported" {
-                        status = "Installed. Signing identity imported; local installation verification is pending."
+                        status = "Installed · Signing identity ready · Pairing optional"
                     } else if result["signing_setup"] as? String == "incomplete" {
                         status = "Installed. Signing Setup can be resumed separately."
                     } else {
@@ -416,7 +416,7 @@ private struct InstallerView: View {
                 .padding(12)
                 .background(surface, in: RoundedRectangle(cornerRadius: 12))
                 .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(border, lineWidth: 1) }
-                Label("Signing Setup prepares on-device renewal.", systemImage: "arrow.triangle.2.circlepath")
+                Label("Pairing can be configured later in Zag Store for local installation and renewal.", systemImage: "arrow.triangle.2.circlepath")
                 if nativeUSBPreview {
                     Label("Native USB verified. Installation remains disabled until the USB transfer path is validated.", systemImage: "wrench.and.screwdriver")
                         .foregroundStyle(attention)
