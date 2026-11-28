@@ -658,15 +658,15 @@ def main():
         # registration or download may begin while device writes are disabled.
         developer_native = (
             args.usb_transport == "standalone" and args.native_install_dev
-            and args.mode == "install" and not args.ui_pipe and sys.stdin.isatty()
+            and args.mode in ("install", "setup") and not args.ui_pipe and sys.stdin.isatty()
         )
         artifact.require(args.usb_transport != "standalone"
                          or args.mode == "prepare" or developer_native,
                          "Native USB installation and signing handoff are not yet enabled")
         artifact.require(not args.native_install_dev or developer_native,
-                         "Native installation developer mode requires interactive standalone install")
+                         "Native developer mode requires interactive standalone install or setup")
         artifact.require(args.native_dev_helper is None or developer_native,
-                         "Native developer helper requires interactive standalone install")
+                         "Native developer helper requires interactive standalone install or setup")
         if developer_native:
             helper = args.native_dev_helper
             artifact.require(helper is not None and helper.is_absolute()
