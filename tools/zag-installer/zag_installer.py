@@ -526,12 +526,16 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
         teams = [team for team in teams if isinstance(team["id"], str) and artifact.TEAM.fullmatch(team["id"])
                  and (not upgrade or team["id"] == upgrade_team)]
         artifact.require(teams, "Apple returned no matching Personal Team")
-        for index, team in enumerate(teams, 1):
-            print(f"  {index}. {json.dumps(team['name'])} ({team['id']})")
-        choice = approve("Select your Personal Team by number, or Enter to cancel: ").strip()
-        artifact.require(re.fullmatch(r"[0-9]{1,5}", choice) and 1 <= int(choice) <= len(teams),
-                         "Team selection cancelled")
-        team = teams[int(choice) - 1]["id"]
+        if len(teams) == 1:
+            team = teams[0]["id"]
+            print(f"Selected Personal Team: {json.dumps(teams[0]['name'])} ({team})", flush=True)
+        else:
+            options = "\n".join(f"{index}. {json.dumps(entry['name'])} ({entry['id']})"
+                                for index, entry in enumerate(teams, 1))
+            choice = approve("Select your Personal Team by number, or Enter to cancel:\n" + options).strip()
+            artifact.require(re.fullmatch(r"[0-9]{1,5}", choice) and 1 <= int(choice) <= len(teams),
+                             "Team selection cancelled")
+            team = teams[int(choice) - 1]["id"]
         artifact.require(device.usb_device() == (target, udid), "The trusted USB device changed")
         current = installed_app(device, target, artifact.mapped_bundle(team))
         check_destination(current, release, upgrade, replace_same_build=replace_same_build)
