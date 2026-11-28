@@ -226,12 +226,40 @@ class NativeUSBAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "AppTesters copy detected separately"):
                 dev.apps(self.UDID)
 
+    def test_handoff_rejects_unmapped_bundle_before_helper(self):
+        dev = self.make_adapter()
+        dev.identity = self.UDID
+        with patch.object(installer.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "Personal Team"):
+                dev.copy_to_app(self.UDID, "com.cwd43.gu29", Path("secret"),
+                                "Library/Caches/ZagSetupResponse.json")
+            run.assert_not_called()
+
+    def test_native_handoff_receipt_is_checked(self):
+        dev = self.make_adapter()
+        dev.identity = self.UDID
+        with tempfile.TemporaryDirectory() as folder:
+            local = Path(folder) / "encrypted.json"
+            local.write_bytes(b"ciphertext")
+            with patch.object(installer.subprocess, "run") as run:
+                run.side_effect = [
+                    self.reply(),
+                    subprocess.CompletedProcess([], 0, __import__("json").dumps({
+                        "operation":"handoff-write",
+                        "bundleIdentifier":DESTINATION,
+                        "bytes":10,
+                        "sha256":hashlib.sha256(b"ciphertext").hexdigest()
+                    }).encode(), b""),
+                ]
+                receipt = dev.copy_to_app(self.UDID, DESTINATION, local,
+                                          "Library/Caches/ZagSetupResponse.json")
+            self.assertEqual(receipt["operation"], "handoff-write")
+            self.assertEqual(run.call_args.args[0][1], "handoff-write")
+
     def test_usb_adapter_does_not_expose_device_writes(self):
         dev = self.make_adapter()
         for operation, args in ((dev.install, (self.UDID, Path("signed.app"))),
-                                (dev.launch_app, (self.UDID, DESTINATION)),
-                                (dev.copy_to_app, (self.UDID, DESTINATION, Path("secret"), "Documents/key")),
-                                (dev.copy_from_app, (self.UDID, DESTINATION, "Documents/key", Path("out")))):
+                                (dev.launch_app, (self.UDID, DESTINATION))):
             with self.assertRaisesRegex(ValueError, "disabled|not.*validated"):
                 operation(*args)
 

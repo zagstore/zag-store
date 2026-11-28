@@ -143,11 +143,51 @@ class StandaloneUSB:
     def launch_app(self, identifier, bundle):
         raise ValueError("Native app launch has not been validated")
 
+    def _handoff(self, operation, identifier, bundle, remote, path):
+        artifact.require(operation in ("handoff-read", "handoff-write"),
+                         "Unsupported USB handoff operation")
+        artifact.require(self.identity is not None
+                         and identifier.casefold() == self.identity.casefold(),
+                         "The trusted USB device changed")
+        artifact.require(re.fullmatch(re.escape(artifact.ORIGINAL) + r"\.[A-Z0-9]{10}", bundle),
+                         "Only an exact Personal Team Zag Store bundle can receive signing setup")
+        artifact.require(isinstance(path, (str, Path)), "Invalid local handoff path")
+        # Check the original trusted iPhone immediately before every I/O operation.
+        self._run("status")
+        command = [str(self.executable), operation, identifier, bundle,
+                   remote, str(Path(path).absolute()), f"HANDOFF {bundle}"]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=50, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("Native signing handoff timed out") from error
+        artifact.require(result.returncode == 0 and len(result.stdout) <= 4096,
+                         "Native signing handoff failed or the app container is inaccessible")
+        try:
+            receipt = json.loads(result.stdout)
+        except (ValueError, UnicodeError) as error:
+            raise ValueError("Malformed native signing handoff receipt") from error
+        artifact.require(isinstance(receipt, dict) and receipt.get("operation") == operation
+                         and receipt.get("bundleIdentifier") == bundle
+                         and isinstance(receipt.get("bytes"), int)
+                         and 0 < receipt["bytes"] <= 24 * 1024
+                         and isinstance(receipt.get("sha256"), str)
+                         and re.fullmatch(r"[a-f0-9]{64}", receipt["sha256"]),
+                         "Invalid native handoff receipt")
+        if operation == "handoff-read":
+            artifact.require(Path(path).is_file() and not Path(path).is_symlink()
+                             and Path(path).stat().st_size == receipt["bytes"]
+                             and hashlib.sha256(Path(path).read_bytes()).hexdigest() == receipt["sha256"],
+                             "Private signing request did not match native readback")
+        else:
+            artifact.require(hashlib.sha256(Path(path).read_bytes()).hexdigest() == receipt["sha256"],
+                             "Encrypted signing response did not match native delivery")
+        return receipt
+
     def copy_from_app(self, identifier, bundle, remote, destination):
-        raise ValueError("Native signing handoff is not yet validated")
+        return self._handoff("handoff-read", identifier, bundle, remote, destination)
 
     def copy_to_app(self, identifier, bundle, source, remote):
-        raise ValueError("Native signing handoff is not yet validated")
+        return self._handoff("handoff-write", identifier, bundle, remote, source)
 
 
 

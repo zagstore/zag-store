@@ -52,9 +52,99 @@ async fn inspect(mode: &str, team: Option<&str>) -> Result<serde_json::Value, Bo
     Ok(result)
 }
 
+
+/// Handle only the existing, explicitly requested encrypted signing-setup
+/// transport. No app installation, arbitrary file path, or other bundle access.
+async fn handoff_command(args: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use std::{fs, io::Write, os::unix::fs::{MetadataExt, OpenOptionsExt}, path::Path};
+    use sha2::{Digest, Sha256};
+
+    if args.len() != 6 || !matches!(args[0].as_str(), "handoff-read" | "handoff-write") {
+        return Err("Expected handoff-read|handoff-write UDID BUNDLE REMOTE LOCAL".into());
+    }
+    let expected_udid = &args[1];
+    let bundle = &args[2];
+    let remote = &args[3];
+    let local = Path::new(&args[4]);
+    // Sixth argument is an exact, separately typed confirmation string.
+    if args[5] != format!("HANDOFF {}",bundle) {
+        return Err("Missing exact signing handoff confirmation".into());
+    }
+    if !installation::is_personal_team_bundle(bundle) || !local.is_absolute() {
+        return Err("Invalid signing destination or local file path".into());
+    }
+    if args[0] == "handoff-read" {
+        app_container::Message::from_read_path(remote)?;
+    } else {
+        app_container::Message::from_write_path(remote)?;
+    }
+
+    // The provider, pairing session and installed bundle are all bound to the
+    // same exact wired device, not to a network-discovered device.
+    let addr = UsbmuxdAddr::default();
+    let mut mux = addr.connect(1).await?;
+    let devices: Vec<_> = mux.get_devices().await?.into_iter()
+        .filter(|d| d.connection_type == Connection::Usb).collect();
+    if devices.len() != 1 || !devices[0].udid.eq_ignore_ascii_case(expected_udid) {
+        return Err("Signing handoff target is not the sole wired iPhone".into());
+    }
+    let dev = &devices[0];
+    let provider = UsbmuxdProvider { addr, tag: 2, udid: dev.udid.clone(),
+        device_id: dev.device_id, label: "Zag Installer handoff".into() };
+    let pairing = provider.get_pairing_file().await?;
+    let mut lockdown = LockdownClient::connect(&provider).await?;
+    lockdown.start_session(&pairing).await?;
+    if lockdown.get_value(Some("DeviceClass"),None).await?.as_string() != Some("iPhone") {
+        return Err("Signing handoff requires a trusted iPhone".into());
+    }
+    let mut amfi = AmfiClient::connect(&provider).await?;
+    if !amfi.get_developer_mode_status().await? {
+        return Err("Developer Mode is disabled".into());
+    }
+    let team = bundle.strip_prefix("app.zagstore.ios.").ok_or("Invalid team bundle")?;
+    let mut proxy = InstallationProxyClient::connect(&provider).await?;
+    let matches = inventory::targeted_lookup(&mut proxy, team).await?;
+    if !matches.contains_key(bundle) {
+        return Err("The Personal Team copy is not verified as installed".into());
+    }
+
+    if args[0] == "handoff-read" {
+        // Never print any request contents or verification material to stdout.
+        let data = app_container::read_message(&provider, bundle, remote).await?;
+        let mut output = fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).open(local)?;
+        if let Err(err) = output.write_all(&data) {
+            let _ = fs::remove_file(local);
+            return Err(err.into());
+        }
+        output.sync_all()?;
+        Ok(json!({"operation":"handoff-read","bundleIdentifier":bundle,
+            "bytes":data.len(),"sha256":format!("{:x}",Sha256::digest(&data))}))
+    } else {
+        let meta = fs::symlink_metadata(local)?;
+        if !meta.is_file() || meta.len() == 0 || meta.len() > 24 * 1024 ||
+            meta.mode() & 0o077 != 0 {
+            return Err("The encrypted handoff source must be a private regular file".into());
+        }
+        let data = fs::read(local)?;
+        let digest = app_container::write_envelope(&provider, bundle, remote, &data).await?;
+        Ok(json!({"operation":"handoff-write","bundleIdentifier":bundle,
+            "bytes":data.len(),"sha256":digest.iter().map(|b|format!("{b:02x}")).collect::<String>()}))
+    }
+}
+
 #[tokio::main(flavor="current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("handoff-read" | "handoff-write")) {
+        let job = handoff_command(&args);
+        match tokio::time::timeout(Duration::from_secs(45), job).await {
+            Ok(Ok(result)) => println!("{}", result),
+            _ => { eprintln!("Native signing handoff failed; verify USB trust and the exact Personal Team app");
+                   std::process::exit(1); }
+        }
+        return;
+    }
     if args.len() == 2 && args[0] == "preflight" {
         // Read-only, bounded digest and USB identity check. The plan is
         // untrusted input and never authorizes a device installation.
