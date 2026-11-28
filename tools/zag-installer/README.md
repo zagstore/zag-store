@@ -233,7 +233,7 @@ Run development checks without modifying an iPhone:
 
 ```sh
 cd "$HOME/Documents/ZagStore-claude"
-python3 -m unittest -q tools/zag-installer/test_zag_installer.py
+(cd tools/zag-installer && python3 -m unittest -q test_zag_installer)
 cargo test --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
 cargo build --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
 ```
