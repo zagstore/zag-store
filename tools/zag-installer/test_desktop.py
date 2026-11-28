@@ -126,7 +126,9 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             desktop.Provisioning(None, "udid", Mock(), "openssl", Mock(), Mock(),
                                  native_helper="native", upgrade=True, imported_bundle="com.example.app")
-        portal = desktop.Provisioning(None, "udid", Mock(), "openssl", lambda _: TEAM,
+        store = Mock()
+        store.read.return_value = None  # No prior signing key: keep this a read-only isolation test.
+        portal = desktop.Provisioning(None, "udid", store, "openssl", lambda _: TEAM,
                                       lambda _: "test@example.com", native_helper="native",
                                       imported_bundle="com.example.app")
         config = portal.handle({"event": "configuration"})
