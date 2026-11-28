@@ -37,10 +37,13 @@ with tempfile.TemporaryDirectory(prefix=".zag-helpers-", dir=dest.parent) as tmp
             shutil.copy2(binary, stage / name)
             subprocess.run(["/usr/bin/file", str(stage / name)], check=True)
             subprocess.run(["/usr/bin/otool", "-L", str(stage / name)], check=True)
-    adapter = desktop.PrecompiledCache(stage)
-    adapter.build_swift("release", [])
-    adapter.build_swift("handoff", [])
-    adapter.installer_tools(root, native=True)
+    # Raw staging precedes relocation; the complete PrecompiledCache
+    # inventory is validated by package-engine.sh after relocation.
+    for name in ("release", "handoff", "zag_desktop", "zag-desktop-signer",
+                 "zag-desktop-anisette", "openssl"):
+        binary = stage / name
+        if not binary.is_file() or binary.is_symlink() or not binary.stat().st_mode & 0o111:
+            raise ValueError(f"Invalid staged helper: {name}")
     if dest.exists():
         raise ValueError("Output directory already exists")
     stage.rename(dest)
