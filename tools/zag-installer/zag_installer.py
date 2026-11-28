@@ -618,7 +618,7 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     if account_bootstrap:
         artifact.require(confirm_action(approve,
             "Use the Apple ID from this Mac in Zag Store if its account library is empty? "
-            "Only its developer session and signing identity will be transferred privately over USB.",
+            "Only its developer session and signing identity will be transferred privately over the selected trusted connection.",
             "ACCOUNT", "Continue") == "ACCOUNT", "Apple ID transfer cancelled")
         portal.account_bootstrap = True
     progress("authentication")

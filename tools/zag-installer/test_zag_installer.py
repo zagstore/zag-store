@@ -174,13 +174,13 @@ class NativeUSBAdapterTests(unittest.TestCase):
     INFO = {"DeviceClass": "iPhone", "ProductType": "iPhone16,2",
             "ProductVersion": "27.2.1", "DeviceName": "Test iPhone"}
 
-    def make_adapter(self):
+    def make_adapter(self, **kwargs):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         helper = Path(directory.name) / "zag-usb"
         helper.write_bytes(b"offline mock")
         helper.chmod(0o700)
-        return installer.StandaloneUSB(Path(directory.name), helper)
+        return installer.StandaloneUSB(Path(directory.name), helper, **kwargs)
 
     def reply(self, *, udid=None, mode="status", apps=None, developer=True):
         doc = {"transport": "system-usbmuxd", "trust_verified": True,
@@ -189,6 +189,30 @@ class NativeUSBAdapterTests(unittest.TestCase):
         if mode == "inventory":
             doc["zag_apps"] = apps if apps is not None else []
         return subprocess.CompletedProcess([], 0, __import__("json").dumps(doc).encode(), b"")
+
+    def test_explicit_network_binding_persists_and_rejects_transport_change(self):
+        dev = self.make_adapter(target_udid=self.UDID, target_transport="network")
+        doc = __import__("json").loads(self.reply().stdout)
+        doc["connection"] = "network"
+        good = subprocess.CompletedProcess([], 0, __import__("json").dumps(doc).encode(), b"")
+        doc["connection"] = "usb"
+        bad = subprocess.CompletedProcess([], 0, __import__("json").dumps(doc).encode(), b"")
+        with patch.object(installer.subprocess, "run", side_effect=[good, bad]) as run:
+            self.assertEqual(dev.usb_device(), (self.UDID, self.UDID))
+            with self.assertRaisesRegex(ValueError, "transport changed"):
+                dev.usb_device()
+            for call in run.call_args_list:
+                self.assertEqual(call.args[0][1:], ["--target", self.UDID, "network", "status"])
+        for command in ("inventory-team", "preflight", "install-signed-dev", "handoff-read", "handoff-write"):
+            self.assertEqual(dev._command(command)[1:], ["--target", self.UDID, "network", command])
+
+    def test_invalid_or_partial_target_binding_rejected(self):
+        for kwargs in ({"target_udid":self.UDID},
+                       {"target_transport":"network"},
+                       {"target_udid":"wrong","target_transport":"network"},
+                       {"target_udid":self.UDID,"target_transport":"unknown"}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "device binding"):
+                self.make_adapter(**kwargs)
 
     def test_identity_compatibility_and_inventory(self):
         dev = self.make_adapter()

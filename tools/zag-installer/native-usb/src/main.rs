@@ -14,11 +14,19 @@ fn diagnostic(code: &str) -> serde_json::Value {
 // Explicit target is immutable for one installer operation. Legacy CLI stays sole-USB.
 type Target<'a> = Option<(&'a str, &'a str)>;
 
-fn matches_target(udid: &str, usb: bool, target: Target<'_>) -> bool {
+fn connection_kind(connection: &Connection) -> Option<&'static str> {
+    match connection {
+        Connection::Usb => Some("usb"),
+        Connection::Network(_) => Some("network"),
+        _ => None,
+    }
+}
+
+fn matches_target(udid: &str, connection: Option<&str>, target: Target<'_>) -> bool {
     match target {
-        None => usb,
+        None => connection == Some("usb"),
         Some((id, transport)) => udid.eq_ignore_ascii_case(id)
-            && ((transport == "usb" && usb) || (transport == "network" && !usb)),
+            && connection == Some(transport),
     }
 }
 
@@ -26,7 +34,7 @@ async fn inspect(mode: &str, team: Option<&str>, target: Target<'_>) -> Result<s
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
     let devices: Vec<_> = mux.get_devices().await?.into_iter()
-        .filter(|d| matches_target(&d.udid, d.connection_type == Connection::Usb, target)).collect();
+        .filter(|d| matches_target(&d.udid, connection_kind(&d.connection_type), target)).collect();
     if devices.len() != 1 {
         if mode == "status" {
             return Ok(diagnostic(if devices.is_empty() { "no_device" } else { "multiple_devices" }));
@@ -63,7 +71,7 @@ async fn inspect(mode: &str, team: Option<&str>, target: Target<'_>) -> Result<s
     let developer_mode = amfi.get_developer_mode_status().await?;
     let mut result = json!({"transport":"system-usbmuxd","trust_verified":true,
         "developer_mode":developer_mode,"udid":d.udid,"device":info,
-        "connection":if d.connection_type == Connection::Usb { "usb" } else { "network" }});
+        "connection":connection_kind(&d.connection_type).ok_or("Unknown device connection")?});
     // Lightweight authenticated status for the GUI poller. No app enumeration.
     if mode == "status" { return Ok(result); }
     let mut proxy = InstallationProxyClient::connect(&provider).await?;
@@ -114,11 +122,11 @@ async fn handoff_command(args: &[String], target: Target<'_>) -> Result<serde_js
     }
 
     // The provider, pairing session and installed bundle are all bound to the
-    // same exact wired device, not to a network-discovered device.
+    // same explicitly selected device and transport (or legacy sole USB).
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
     let devices: Vec<_> = mux.get_devices().await?.into_iter()
-        .filter(|d| matches_target(&d.udid, d.connection_type == Connection::Usb, target)).collect();
+        .filter(|d| matches_target(&d.udid, connection_kind(&d.connection_type), target)).collect();
     if devices.len() != 1 || !devices[0].udid.eq_ignore_ascii_case(expected_udid) {
         return Err("Signing handoff target is unavailable or ambiguous".into());
     }
@@ -208,13 +216,13 @@ async fn install_developer(args: &[String], target: Target<'_>) -> Result<serde_
         _ => return Err("Personal Team installation destination differs from signed plan".into()),
     }
 
-    // Reacquire sole USB device and pairing for the write-capable session;
+    // Reacquire the exact selected transport and pairing for the write-capable session;
     // installation::install_authorized independently checks destination
     // before and after staging as well as installed version/build readback.
     let addr = UsbmuxdAddr::default();
     let mut mux = addr.connect(1).await?;
     let devices: Vec<_> = mux.get_devices().await?.into_iter()
-        .filter(|d| matches_target(&d.udid, d.connection_type == Connection::Usb, target)).collect();
+        .filter(|d| matches_target(&d.udid, connection_kind(&d.connection_type), target)).collect();
     if devices.len() != 1 || !devices[0].udid.eq_ignore_ascii_case(&plan.device_udid) {
         return Err("The original device and transport are no longer available".into());
     }
@@ -289,11 +297,13 @@ mod grouped_discovery_tests {
     use super::*;
     #[test]
     fn exact_binding_rejects_other_devices_and_transport_changes() {
-        assert!(matches_target("ABC", false, Some(("abc", "network"))));
-        assert!(!matches_target("ABC", true, Some(("abc", "network"))));
-        assert!(!matches_target("DEF", false, Some(("abc", "network"))));
-        assert!(!matches_target("ABC", false, None));
-        assert!(matches_target("ABC", true, None));
+        assert!(matches_target("ABC", Some("network"), Some(("abc", "network"))));
+        assert!(!matches_target("ABC", Some("usb"), Some(("abc", "network"))));
+        assert!(!matches_target("DEF", Some("network"), Some(("abc", "network"))));
+        assert!(!matches_target("ABC", Some("network"), None));
+        assert!(matches_target("ABC", Some("usb"), None));
+        assert!(!matches_target("ABC", None, Some(("abc", "network"))));
+        assert_eq!(connection_kind(&Connection::Unknown("other".into())), None);
     }
     #[test]
     fn merges_case_insensitive_identity_and_prefers_usb() {
@@ -329,10 +339,11 @@ async fn main() {
             let mut mux = addr.connect(1).await?;
             let devices = mux.get_devices().await?;
             let d = devices.iter().filter(|d| d.udid.eq_ignore_ascii_case(requested)
-                && requested_transport.map_or(true, |t| matches_target(&d.udid, d.connection_type == Connection::Usb, Some((requested.as_str(), t)))))
+                && connection_kind(&d.connection_type).is_some()
+                && requested_transport.map_or(true, |t| matches_target(&d.udid, connection_kind(&d.connection_type), Some((requested.as_str(), t)))))
                 .min_by_key(|d| if d.connection_type == Connection::Usb { 0 } else { 1 })
                 .ok_or("Device no longer advertised")?;
-            let connection = if d.connection_type == Connection::Usb { "usb" } else { "network" };
+            let connection = connection_kind(&d.connection_type).ok_or("Unknown device connection")?;
             let provider = UsbmuxdProvider { addr, tag: 2, udid: d.udid.clone(),
                 device_id: d.device_id, label: "zLoader device status".into() };
             let pairing = provider.get_pairing_file().await?;
@@ -361,7 +372,7 @@ async fn main() {
         let job = async {
             let mut mux = UsbmuxdAddr::default().connect(1).await?;
             let devices = mux.get_devices().await?;
-            let rows = group_transports(devices.into_iter().map(|d| (d.udid, d.connection_type == Connection::Usb)));
+            let rows = group_transports(devices.into_iter().filter_map(|d| connection_kind(&d.connection_type).map(|kind| (d.udid, kind == "usb"))));
             Ok::<_, Box<dyn std::error::Error>>(json!({"devices":rows}))
         };
         match tokio::time::timeout(Duration::from_secs(10), job).await {
@@ -377,8 +388,9 @@ async fn main() {
         let job = async {
             let mut mux = UsbmuxdAddr::default().connect(1).await?;
             let devices = mux.get_devices().await?;
-            let rows: Vec<_> = devices.into_iter().map(|d| {
-                json!({"udid": d.udid, "connection": if d.connection_type == Connection::Usb { "usb" } else { "network" }})
+            let rows: Vec<_> = devices.into_iter().filter_map(|d| {
+                let connection = connection_kind(&d.connection_type)?;
+                Some(json!({"udid": d.udid, "connection": connection}))
             }).collect();
             Ok::<_, Box<dyn std::error::Error>>(json!({"devices": rows}))
         };
