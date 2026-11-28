@@ -143,14 +143,12 @@ final class InstallerController: ObservableObject {
             }
             Task { @MainActor [weak self] in self?.consume(data) }
         }
-        logsPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty {
+        // Drain unstructured child output without displaying or retaining it.
+        // Only structured protocol guidance and local diagnostic messages reach the UI.
+        logsPipe.fileHandleForReading.readabilityHandler = { handle in
+            if handle.availableData.isEmpty {
                 handle.readabilityHandler = nil
-                return
             }
-            let value = String(decoding: data, as: UTF8.self)
-            Task { @MainActor [weak self] in self?.append(value) }
         }
         process.terminationHandler = { [weak self] completed in
             let code = completed.terminationStatus
