@@ -27,6 +27,10 @@ final class InstallerController: ObservableObject {
     private var stdout: Pipe?
     private var stderr: Pipe?
     private var events = Data()
+    private var sessionID = UUID()
+    private var eventStreamEnded = false
+    private var exitCode: Int32?
+    private var receivedError = false
 
     func begin(upgrade: Bool, team: String, resumeSetup: Bool = false) {
         guard !busy else { return }
@@ -124,6 +128,11 @@ final class InstallerController: ObservableObject {
         stdout = eventsPipe
         stderr = logsPipe
         events.removeAll()
+        sessionID = UUID()
+        let session = sessionID
+        eventStreamEnded = false
+        exitCode = nil
+        receivedError = false
         installedBundle = ""
         identityImported = false
         setupVerified = false
@@ -135,14 +144,8 @@ final class InstallerController: ObservableObject {
         busy = true
         task = process
 
-        eventsPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            Task { @MainActor [weak self] in self?.consume(data) }
-        }
+        // A single reader enqueues data and EOF in order on the main queue.
+        // Process exit alone does not imply the final event has been consumed.
         // Drain unstructured child output without displaying or retaining it.
         // Only structured protocol guidance and local diagnostic messages reach the UI.
         logsPipe.fileHandleForReading.readabilityHandler = { handle in
@@ -152,10 +155,30 @@ final class InstallerController: ObservableObject {
         }
         process.terminationHandler = { [weak self] completed in
             let code = completed.terminationStatus
-            Task { @MainActor [weak self] in self?.ended(code) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.sessionID == session, self.busy else { return }
+                self.exitCode = code
+                self.finishIfReady()
+            }
         }
         do {
             try process.run()
+            let reader = eventsPipe.fileHandleForReading
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                while true {
+                    let data = reader.availableData
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.sessionID == session, self.busy else { return }
+                        if data.isEmpty {
+                            self.eventStreamEnded = true
+                            self.finishIfReady()
+                        } else {
+                            self.consume(data)
+                        }
+                    }
+                    if data.isEmpty { break }
+                }
+            }
         } catch {
             status = "Unable to start the installer"
             append(bundled ? "Check the local Python runtime and USB support." :
@@ -227,6 +250,7 @@ final class InstallerController: ObservableObject {
                     }
                 }
             case "error":
+                receivedError = true
                 status = (object["message"] as? String) ?? "Installation failed"
             default:
                 status = "Unknown installer response"
@@ -276,10 +300,14 @@ final class InstallerController: ObservableObject {
         if log.count > 14_000 { log = String(log.suffix(14_000)) }
     }
 
-    private func ended(_ code: Int32) {
-        if installedBundle.isEmpty && !status.contains("failed") && !status.contains("error")
-            && !status.contains("stopped") && !status.contains("cancel") {
-            status = code == 0 ? "Finished" : "Installer exited (\(code))"
+    private func finishIfReady() {
+        guard eventStreamEnded, let code = exitCode else { return }
+        if !events.isEmpty {
+            receivedError = true
+            status = "Incomplete installer response"
+        }
+        if installedBundle.isEmpty && !receivedError && !status.lowercased().contains("cancel") {
+            status = code == 0 ? "Finished without an installation confirmation" : "Installer exited (\(code))"
         }
         if code != 0 && installedBundle.isEmpty { append("\nInstaller exited with status \(code).\n") }
         close()
