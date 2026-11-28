@@ -714,15 +714,41 @@ private struct InstallerView: View {
                         .disabled(installer.busy)
                 }
             }
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Zag Store").font(.system(size: 23, weight: .semibold))
-                Picker("Release channel", selection: $releaseChannel) {
-                    Text("Stable").tag("stable")
-                    Text("Beta").tag("beta")
-                    Text("Nightly").tag("nightly")
-                }.pickerStyle(.segmented).disabled(installer.busy)
-                Text("Only published, verified releases can be installed.").font(.caption).foregroundStyle(muted)
+            HStack(spacing: 4) {
+                ForEach(["stable", "beta", "nightly"], id: \.self) { channel in
+                    Button {
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
+                            releaseChannel = channel
+                        }
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: channel == "stable" ? "checkmark.shield" : (channel == "beta" ? "testtube.2" : "moon.stars"))
+                            Text(channel.capitalized)
+                        }
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(releaseChannel == channel ? Color.white : muted)
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                        .background {
+                            if releaseChannel == channel {
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(LinearGradient(colors: [ZagPalette.rgb(0x4778ee), ZagPalette.rgb(0x3654ce)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                    .shadow(color: ZagPalette.blue.opacity(0.22), radius: 5, y: 2)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                    .accessibilityAddTraits(releaseChannel == channel ? .isSelected : [])
+                    .onHover { inside in
+                        if inside && !installer.busy { NSCursor.pointingHand.set() }
+                        else { NSCursor.arrow.set() }
+                    }
+                }
             }
+            .padding(4)
+            .background(surface, in: RoundedRectangle(cornerRadius: 14))
+            .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(border, lineWidth: 1) }
+            .accessibilityLabel("Release channel")
+            .disabled(installer.busy)
             HStack {
                 Button {
                     if completed {
@@ -771,21 +797,40 @@ private struct InstallerView: View {
                     .frame(maxWidth: .infinity)
             }
             Divider()
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Other Apps").font(.system(size: 23, weight: .semibold))
-                Button {
-                    let panel = NSOpenPanel()
-                    panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
-                    panel.allowsMultipleSelection = false
-                    panel.canChooseDirectories = false
-                    if panel.runModal() == .OK, let url = panel.url, url.pathExtension.lowercased() == "ipa" { importedIPA = url }
-                } label: {
-                    Label(importedIPA?.lastPathComponent ?? "Import IPA…", systemImage: "square.and.arrow.down")
-                        .frame(maxWidth: .infinity, minHeight: 36)
-                }.disabled(installer.busy)
-                Text("IPA selection is available. Third-party signing and installation are not enabled yet.").font(.caption).foregroundStyle(muted)
-            }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
-                .background(surface, in: RoundedRectangle(cornerRadius: 12))
+            Button {
+                let panel = NSOpenPanel()
+                panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
+                panel.allowsMultipleSelection = false
+                panel.canChooseDirectories = false
+                if panel.runModal() == .OK, let url = panel.url, url.pathExtension.lowercased() == "ipa" { importedIPA = url }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "shippingbox.and.arrow.backward")
+                        .font(.system(size: 23, weight: .medium))
+                        .foregroundStyle(ZagPalette.blue)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(importedIPA?.lastPathComponent ?? "Import an IPA")
+                            .font(.system(size: 18, weight: .semibold))
+                            .lineLimit(1).truncationMode(.middle)
+                        Text(importedIPA == nil ? "Browse for an application package" : "Selected · Installation not yet available")
+                            .font(.system(size: 12)).foregroundStyle(muted)
+                    }
+                    Spacer()
+                    Image(systemName: "plus.circle").font(.system(size: 22)).foregroundStyle(muted)
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(surface.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
+                .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(ZagPalette.blue.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [5, 4])) }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(installer.busy)
+            .help("Select an IPA file. Third-party installation is not enabled yet.")
+            .onHover { inside in
+                if inside && !installer.busy { NSCursor.pointingHand.set() }
+                else { NSCursor.arrow.set() }
+            }
             Divider()
             if installer.busy {
                 Text(installer.status).font(.headline).frame(maxWidth: .infinity)
