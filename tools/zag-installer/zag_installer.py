@@ -744,6 +744,7 @@ def main():
     recovery = modes.add_parser("handoff", help="Send the existing signing identity to an installed Personal Team copy")
     recovery.add_argument("--team", required=True)
     for mode in (prepare, install):
+        mode.add_argument("--channel", choices=("stable", "beta", "nightly"), default="beta")
         mode.add_argument("--expect-tag", help="Require this exact release tag in the signed channel")
     args = parser.parse_args()
     channel = None
@@ -784,7 +785,7 @@ def main():
                              "Native developer mode requires an absolute executable --native-dev-helper")
         with desktop.locked_cache(precompiled=args.precompiled_helpers) as cache:
             if args.mode == "prepare":
-                release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
+                release, release_helper = releases.discover(ROOT, cache, args.expect_tag, args.channel)
                 with tempfile.TemporaryDirectory(prefix=".zag-release-", dir=args.destination.parent) as directory:
                     candidate = Path(directory) / "release.ipa"
                     result = releases.acquire(artifact, release, release_helper, candidate)
@@ -816,7 +817,7 @@ def main():
                                                              replace_same_build=args.replace_same_build,
                                                              account_bootstrap_dev=local_account_dev, fresh_local=args.fresh_install)
                         else:
-                            release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
+                            release, release_helper = releases.discover(ROOT, cache, args.expect_tag, args.channel)
                             result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
                                                      args.upgrade, scratch, device, cache, approve=approve,
                                                      defer_setup=gui_helper is not None)

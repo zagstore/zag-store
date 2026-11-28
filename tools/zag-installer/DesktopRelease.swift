@@ -112,10 +112,11 @@ struct DesktopRelease {
                 try await AssetTransfer.download(url, to: URL(fileURLWithPath: args[3]))
                 return
             }
-            guard args.count == 1 else { throw DesktopNetworkError.invalidResponse }
+            let channel = args.count == 1 ? "beta" : (args.count == 3 && args[1] == "channel" ? args[2] : "")
+            guard ["stable", "beta", "nightly"].contains(channel) else { throw DesktopNetworkError.invalidResponse }
             let store = ZagUpdateRollbackStore(service: "app.zagstore.desktop-installer.release-v2")
-            let endpoint = URL(string: "https://raw.githubusercontent.com/zagorskey/zag-store-releases/main/releases/v2/beta.json")!
-            let payload = try await ZagUpdateV2Discovery.fetchVerified(from: endpoint, channel: "beta", store: store,
+            let endpoint = URL(string: "https://raw.githubusercontent.com/zagorskey/zag-store-releases/main/releases/v2/\(channel).json")!
+            let payload = try await ZagUpdateV2Discovery.fetchVerified(from: endpoint, channel: channel, store: store,
                                                                        session: URLSession(configuration: .ephemeral))
             let result = [
                 "version": payload.version, "build": payload.build, "minimum_os": payload.minimumIOSVersion,

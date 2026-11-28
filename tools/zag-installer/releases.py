@@ -44,12 +44,13 @@ def run_helper(args, timeout, stage):
     return result.stdout
 
 
-def discover(repo, cache, expected_tag=None):
+def discover(repo, cache, expected_tag=None, channel="beta"):
+    require(channel in ("stable", "beta", "nightly"), "Unsupported release channel")
     sources = [Path(__file__).with_name(name) for name in ("DesktopRelease.swift", "DesktopNetwork.swift")]
     sources += [repo / "Feather/Utilities" / f"ZagUpdate{name}.swift"
                 for name in ("MetadataV2", "TrustStore", "RollbackStore", "VerifiedPipeline", "V2Discovery")]
     helper = cache.build_swift("release", sources)
-    release = json.loads(run_helper([helper], 40, "Signed release discovery"))
+    release = json.loads(run_helper([helper] if channel == "beta" else [helper, "channel", channel], 40, "Signed release discovery"))
     tag = release_tag(release["url"])
     require(expected_tag is None or tag == expected_tag, f"Signed channel authorizes {tag}, expected {expected_tag}")
     check_fresh(release)

@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct InstallerPrompt: Identifiable {
     let id = UUID()
@@ -33,7 +34,7 @@ final class InstallerController: ObservableObject {
     private var receivedError = false
     private var cancellationRequested = false
 
-    func begin(upgrade: Bool, team: String, resumeSetup: Bool = false) {
+    func begin(upgrade: Bool, team: String, resumeSetup: Bool = false, channel: String = "beta") {
         guard !busy else { return }
         let environment = ProcessInfo.processInfo.environment
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
@@ -89,10 +90,10 @@ final class InstallerController: ObservableObject {
                                  root + "/helpers", "--usb-transport", "standalone"]
                 + (nativeDev ? ["--native-gui-dev"] : [])
                 + (resumeSetup ? ["setup", "--team", selectedTeam] :
-                    ["install"] + (upgrade ? ["--upgrade", selectedTeam] : []))
+                    ["install", "--channel", channel] + (upgrade ? ["--upgrade", selectedTeam] : []))
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["python3", script, "--ui-pipe", "install"]
+            process.arguments = ["python3", script, "--ui-pipe", "install", "--channel", channel]
                 + (upgrade ? ["--upgrade", selectedTeam] : [])
         }
         process.currentDirectoryURL = URL(fileURLWithPath: root, isDirectory: true)
@@ -508,7 +509,7 @@ private struct InstallerView: View {
     private var successfulSetup: Bool { completed && installer.identityImported }
     private var actionTitle: String {
         if completed { return "Done" }
-        return nativeDevelopment ? "Continue with Apple ID" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store")
+        return upgrade ? "Upgrade Zag Store" : "Install Zag Store"
     }
     private var nativeDevelopment: Bool {
         Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true &&
@@ -563,6 +564,9 @@ private struct InstallerView: View {
     @State private var combinedPassword = ""
     @FocusState private var promptFocused: Bool
     @State private var preferredAccount: String?
+    @State private var releaseChannel = "beta"
+    @State private var hoveringInstall = false
+    @State private var importedIPA: URL?
 
     private var accountColumn: some View {
         let accounts = RememberedAccounts.decode(rememberedAppleIDs)
@@ -617,7 +621,7 @@ private struct InstallerView: View {
             }
             Button {
                 preferredAccount = nil
-                installer.begin(upgrade: upgrade, team: team)
+                installer.begin(upgrade: upgrade, team: team, channel: releaseChannel)
             } label: {
                 Label("Use another Apple ID", systemImage: "plus.circle")
                     .frame(maxWidth: .infinity)
@@ -646,9 +650,9 @@ private struct InstallerView: View {
                 } else {
                     Text("Z").font(.largeTitle.bold()).frame(width: 64, height: 64)
                 }
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text("Loader").font(.system(size: 38, weight: .bold)).foregroundStyle(dark ? Color.white : Color.primary).accessibilityLabel("zLoader")
-                    Text("Your device. Your apps.")
+                    Text("Your Device. Your Apps.")
                         .font(.system(size: 16, weight: .medium)).foregroundStyle(muted)
                 }
                 Spacer()
@@ -659,9 +663,9 @@ private struct InstallerView: View {
                 HStack(spacing: 12) {
                     DeviceIllustration(identifier: device.modelIdentifier)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(device.title).font(.system(size: 24, weight: .semibold))
+                        Text(device.title).font(.system(size: 21, weight: .semibold))
                             .foregroundStyle(dark ? ZagPalette.rgb(0xe8edf5) : Color.primary)
-                        Text(device.detail).font(.system(size: 15)).foregroundStyle(muted)
+                        Text(device.detail).font(.system(size: 13)).foregroundStyle(muted)
                     }
                     Spacer()
                     connectionLight
@@ -710,12 +714,21 @@ private struct InstallerView: View {
                         .disabled(installer.busy)
                 }
             }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Zag Store").font(.system(size: 23, weight: .semibold))
+                Picker("Release channel", selection: $releaseChannel) {
+                    Text("Stable").tag("stable")
+                    Text("Beta").tag("beta")
+                    Text("Nightly").tag("nightly")
+                }.pickerStyle(.segmented).disabled(installer.busy)
+                Text("Only published, verified releases can be installed.").font(.caption).foregroundStyle(muted)
+            }
             HStack {
                 Button {
                     if completed {
                         installer.dismissCompletion()
                     } else {
-                        installer.begin(upgrade: upgrade, team: team)
+                        installer.begin(upgrade: upgrade, team: team, channel: releaseChannel)
                     }
                 } label: {
                     Text(actionTitle)
@@ -739,6 +752,14 @@ private struct InstallerView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(installer.busy || (!completed && (!device.ready || nativeUSBPreview)))
+                .scaleEffect(hoveringInstall && !installer.busy && device.ready && !nativeUSBPreview && !reduceMotion ? 1.012 : 1)
+                .brightness(hoveringInstall && !installer.busy && device.ready && !nativeUSBPreview ? 0.07 : 0)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: hoveringInstall)
+                .onHover { inside in
+                    hoveringInstall = inside
+                    if inside && !installer.busy && (completed || (device.ready && !nativeUSBPreview)) { NSCursor.pointingHand.set() }
+                    else { NSCursor.arrow.set() }
+                }
                 .accessibilityLabel(installer.busy ? "Installation in progress" : actionTitle)
             }
             if installer.busy {
@@ -749,6 +770,22 @@ private struct InstallerView: View {
                     .font(.caption).foregroundStyle(muted).multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
             }
+            Divider()
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Other Apps").font(.system(size: 23, weight: .semibold))
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
+                    panel.allowsMultipleSelection = false
+                    panel.canChooseDirectories = false
+                    if panel.runModal() == .OK, let url = panel.url, url.pathExtension.lowercased() == "ipa" { importedIPA = url }
+                } label: {
+                    Label(importedIPA?.lastPathComponent ?? "Import IPA…", systemImage: "square.and.arrow.down")
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                }.disabled(installer.busy)
+                Text("IPA selection is available. Third-party signing and installation are not enabled yet.").font(.caption).foregroundStyle(muted)
+            }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                .background(surface, in: RoundedRectangle(cornerRadius: 12))
             Divider()
             if installer.busy {
                 Text(installer.status).font(.headline).frame(maxWidth: .infinity)
