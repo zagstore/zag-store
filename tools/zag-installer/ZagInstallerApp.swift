@@ -479,6 +479,7 @@ private struct InstallerView: View {
     @AppStorage("rememberedAppleIDs") private var rememberedAppleIDs = "[]"
     @State private var rememberAccount = false
     @State private var revealPassword = false
+    @State private var combinedPassword = ""
     @FocusState private var promptFocused: Bool
 
     var body: some View {
@@ -730,7 +731,8 @@ private struct InstallerView: View {
         .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
             VStack(alignment: .leading, spacing: 20) {
-                let accountPrompt = prompt.message == "Apple ID: "
+                let combinedPrompt = prompt.secure && prompt.message == "Apple ID credentials: "
+                let accountPrompt = prompt.message == "Apple ID: " || combinedPrompt
                 let passwordPrompt = prompt.message == "Apple ID password: "
                 let verificationPrompt = prompt.secure && prompt.message == "Apple verification code: "
                 VStack(spacing: 8) {
@@ -762,7 +764,7 @@ private struct InstallerView: View {
                             let filtered = String(value.filter { $0.isASCII && $0.isNumber }.prefix(6))
                             if filtered != value { reply = filtered }
                         }
-                } else if prompt.secure {
+                } else if prompt.secure && !combinedPrompt {
                     HStack {
                         if passwordPrompt && revealPassword {
                             TextField("Password", text: $reply).focused($promptFocused)
@@ -789,6 +791,18 @@ private struct InstallerView: View {
                                 Button("Use another Apple ID") { reply = ""; rememberAccount = false; promptFocused = true }
                             }
                         }
+                        if combinedPrompt {
+                            HStack {
+                                if revealPassword {
+                                    TextField("Password", text: $combinedPassword)
+                                } else {
+                                    SecureField("Password", text: $combinedPassword)
+                                }
+                                Button { revealPassword.toggle() } label: {
+                                    Image(systemName: revealPassword ? "eye.slash" : "eye")
+                                }.buttonStyle(.plain).accessibilityLabel(revealPassword ? "Hide password" : "Show password")
+                            }.textFieldStyle(.roundedBorder)
+                        }
                         Toggle("Remember this Apple ID on this Mac", isOn: $rememberAccount)
                         Text("Only the account identifier is saved, never your password.").font(.caption).foregroundStyle(.secondary)
                     }
@@ -800,7 +814,7 @@ private struct InstallerView: View {
                     }
                     Spacer()
                     Button(prompt.action ?? "Continue") {
-                        let answer = prompt.confirmation ?? reply
+                        var answer = prompt.confirmation ?? reply
                         if accountPrompt {
                             let account = answer.trimmingCharacters(in: .whitespacesAndNewlines)
                             var accounts = RememberedAccounts.decode(rememberedAppleIDs)
@@ -811,12 +825,21 @@ private struct InstallerView: View {
                             rememberedAppleIDs = RememberedAccounts.encode(accounts)
                             rememberedAppleID = ""
                         }
+                        if combinedPrompt {
+                            guard let data = try? JSONSerialization.data(withJSONObject: ["email": reply, "password": combinedPassword]),
+                                  let encoded = String(data: data, encoding: .utf8),
+                                  encoded.count <= 2048,
+                                  let wire = try? JSONSerialization.data(withJSONObject: ["value": encoded]),
+                                  wire.count < 4096 else { return }
+                            answer = encoded
+                        }
+                        combinedPassword = ""
                         reply = "" // Do not retain passwords in UI state
                         installer.answer(answer)
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(prompt.confirmation == nil && (reply.isEmpty || (verificationPrompt && reply.count != 6)))
+                    .disabled(prompt.confirmation == nil && (reply.isEmpty || (verificationPrompt && reply.count != 6) || (combinedPrompt && combinedPassword.isEmpty)))
                 }
             }
             .padding(24)
@@ -835,7 +858,7 @@ private struct InstallerView: View {
                 revealPassword = false
                 promptFocused = true
             }
-            .onDisappear { reply = ""; revealPassword = false }
+            .onDisappear { reply = ""; combinedPassword = ""; revealPassword = false }
             .interactiveDismissDisabled()
         }
     }

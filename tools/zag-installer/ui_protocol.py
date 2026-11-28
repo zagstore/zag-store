@@ -94,6 +94,20 @@ class Channel:
             raise ValueError("Installation cancelled")
         return reply["value"]
 
+    def credentials(self):
+        # One bounded private-pipe reply; never emit credential contents.
+        value = self.ask("Apple ID credentials: ", secret=True)
+        try:
+            fields = json.loads(value)
+        except (ValueError, TypeError):
+            raise ValueError("Invalid credential reply") from None
+        if (type(fields) is not dict or set(fields) != {"email", "password"}
+                or any(type(v) is not str for v in fields.values())
+                or not fields["email"].strip() or not fields["password"]
+                or len(fields["email"]) > 320 or len(fields["password"]) > 1024):
+            raise ValueError("Invalid credential reply")
+        return fields["email"].strip(), fields["password"]
+
     def progress(self, stage):
         if stage not in ("preflight", "authentication", "provisioning", "signing", "installation", "handoff"):
             raise ValueError("Invalid installer stage")

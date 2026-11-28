@@ -220,11 +220,17 @@ class Provisioning:
         self.account_credential = None
         self.account_id = None
         self.email = None
+        self._pending_password = None
 
     def handle(self, message):
         event = message["event"]
         if event == "configuration":
-            email = self.approve("Apple ID: ").strip()
+            from ui_protocol import Channel
+            channel = getattr(self.approve, "__self__", None)
+            if self.native and isinstance(channel, Channel):
+                email, self._pending_password = channel.credentials()
+            else:
+                email = self.approve("Apple ID: ").strip()
             require(email, "Apple ID is required")
             self.email = email
             if self.native:
@@ -244,6 +250,9 @@ class Provisioning:
                 return self.native.identity()
             return self.native.headers(message["prepare"])
         if event == "password":
+            if self._pending_password is not None:
+                password, self._pending_password = self._pending_password, None
+                return password
             return secret("Apple ID password: ")
         if event in ("state_read", "state_write"):
             require(self.anisette_scope is not None, "Missing anisette account scope")
