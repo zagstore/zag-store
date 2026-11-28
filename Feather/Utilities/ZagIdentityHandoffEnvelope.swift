@@ -22,6 +22,7 @@ enum ZagIdentityHandoffEnvelope {
         let team: String
         let keyScope: String
         let certificate: Data
+        var accountTransfer: Bool? = nil
 
         func validate(now: Date = .now) throws {
             guard UUID(uuidString: id) != nil, secret.count == 32 else { throw Failure.invalid }

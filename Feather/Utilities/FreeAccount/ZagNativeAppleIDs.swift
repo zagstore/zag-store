@@ -202,6 +202,29 @@ struct ZagNativeAppleIDs {
 		return id
 	}
 
+	/// Accept only an already live-validated, expiring developer token into
+	/// an empty catalog. No raw GrandSlam session is imported, and existing
+	/// accounts or signed-out identities are never overwritten or resurrected.
+	func importValidatedDesktopToken(_ token: ZagPersistedDeveloperToken, email: String?,
+									 teams: [ZagDeveloperTeam]) throws -> UUID {
+		var catalog = try catalog()
+		let id = token.nativeAccountID
+		let destination = Self.scope(id)
+		guard token.expiresAtMs > 0, token.isUsable(at: Date()),
+			  catalog.accounts.isEmpty,
+			  catalog.signedOutAccounts?.contains(where: { $0.id == id }) != true,
+			  catalog.pendingSignOuts?.isEmpty != false,
+			  try vault.token(destination) == nil, try vault.session(destination) == nil else { throw Failure.storage }
+		try copyCredentials(to: destination, token: token, session: nil, previous: (nil, nil)) {
+			catalog.register(id: id, email: email)
+			catalog.accounts[0].teams = teams
+			catalog.activeID = id
+			catalog.migratedLegacy = true
+			try vault.saveCatalog(catalog)
+		}
+		return id
+	}
+
 	private func copyCredentials(to scope: String, token: ZagPersistedDeveloperToken, session: Data?,
 		previous: (token: ZagPersistedDeveloperToken?, session: Data?), commit: () throws -> Void) throws {
 		var sessionWritten = false

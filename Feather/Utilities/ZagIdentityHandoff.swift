@@ -136,7 +136,92 @@ final class ZagIdentityHandoff: ObservableObject {
                        serial: evidence.2, certificateExpiry: evidence.3)
     }
 
+    private struct DesktopAccountCredential: Decodable {
+        let token: ZagPersistedDeveloperToken
+        let email: String?
+    }
+
+    /// The Mac has already authenticated and obtained explicit consent.
+    /// Challenge it through the same private USB container and verify the
+    /// candidate with Apple's read-only APIs before any account activation.
+    func receiveDesktopAccount(_ bootstrap: Envelope.Bootstrap) async -> UUID? {
+        let attempt = generation
+        do {
+            try bootstrap.validate()
+            guard bootstrap.accountTransfer == true,
+                  Bundle.main.object(forInfoDictionaryKey: "ZagDesktopAccountBootstrap") as? Bool == true,
+                  (try ZagNativeAppleIDs.shared.catalog()).accounts.isEmpty,
+                  let bundle = Bundle.main.bundleIdentifier, bundle == bootstrap.bundle,
+                  let executable = Bundle.main.executableURL,
+                  let profile = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision")
+            else { return nil }
+            let certificate = bootstrap.certificate, team = bootstrap.team, udid = bootstrap.udid
+            try await Task.detached(priority: .utility) {
+                let data = try Data(contentsOf: executable, options: .mappedIfSafe)
+                guard let signers = ZagCodeSignatureInspection.signerCertificates(in: data),
+                      !signers.isEmpty, signers.allSatisfy({ $0 == certificate }),
+                      let inspected = ZagCertificateInspection(der: certificate),
+                      inspected.organizationalUnit == team, inspected.expiresAt > .now,
+                      let entitlements = try ZagNativeAccountInstall.runningComponents(certificate: certificate)[bundle]
+                else { throw Failure.context }
+                let component = ZagNativeInstalledProfiles.Component(originalBundleIdentifier: "app.zagstore.ios",
+                    bundleIdentifier: bundle, uuid: "", expiresAt: .distantPast, signedEntitlements: entitlements)
+                _ = try ZagProfileOnlyRenewal.validate(Data(contentsOf: profile), component: component,
+                    team: team, certificate: certificate, udid: udid)
+            }.value
+            guard generation == attempt, !Task.isCancelled else { return nil }
+            try bootstrap.validate()
+            let key = Curve25519.KeyAgreement.PrivateKey()
+            let request = Envelope.Request(protocolVersion: 1, nonce: UUID(),
+                expires: bootstrap.expires, recipient: key.publicKey.rawRepresentation, udid: udid,
+                bundle: bundle, team: team, keyScope: bootstrap.keyScope, certificate: certificate)
+            try bootstrap.check(request)
+            let bytes = try JSONEncoder().encode(request)
+            let requestURL = try Self.file(Envelope.setupRequestPath)
+            let responseURL = try Self.file(Envelope.setupResponsePath)
+            defer {
+                try? FileManager.default.removeItem(at: requestURL)
+                try? FileManager.default.removeItem(at: responseURL)
+            }
+            try bootstrap.wrap(bytes, label: "account-request").write(to: requestURL, options: [.atomic, .completeFileProtection])
+            while generation == attempt, !Task.isCancelled, (try? bootstrap.validate()) != nil {
+                if let wire = try? Self.read(Envelope.setupResponsePath, limit: Envelope.maxWireSize),
+                   let response = try? bootstrap.unwrap(wire, label: "account-response") {
+                    var clear = try Envelope.open(response, request: bytes, recipient: key)
+                    defer { clear.resetBytes(in: clear.startIndex..<clear.endIndex) }
+                    let credential = try JSONDecoder().decode(DesktopAccountCredential.self, from: clear)
+                    let token = credential.token
+                    guard token.expiresAtMs > 0, token.isUsable(at: .now),
+                          try Envelope.scope(account: token.accountID, team: team) == bootstrap.keyScope
+                    else { throw Failure.context }
+                    let machine = ZagAppleAuthMachine.nativeAccount()
+                    if !(await machine.isProvisioned()) {
+                        _ = try await machine.anisetteHeaders(allowProvisioning: true)
+                    }
+                    let portal = ZagNativeDeveloperPortal(transport: ZagNativeDeveloperPortal.transport(), headers: {
+                        guard let headers = await machine.candidateDeveloperHeaders(token) else { throw ZagPortalError.network }
+                        return headers
+                    }, consent: ZagDenyingMutationConsent(), maxRequests: 16)
+                    let teams = try await portal.teams()
+                    guard ZagNativeDeveloperTeam.personalTeam(in: teams, expectedID: team) != nil else { throw Failure.certificate }
+                    let certificates = try await portal.certificates(team: team)
+                    guard certificates.contains(where: { $0.data == certificate && $0.expiresAt > .now }),
+                          generation == attempt, !Task.isCancelled else { throw Failure.certificate }
+                    try bootstrap.validate()
+                    return try ZagNativeAppleIDs.shared.importValidatedDesktopToken(token, email: credential.email,
+                        teams: teams.map(\.signingTeam))
+                }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        } catch {
+            // Never expose a credential, Apple response body or token-derived
+            // identifier in diagnostics. The manual sign-in path remains.
+        }
+        return nil
+    }
+
     func verifyExisting(_ bootstrap: Envelope.Bootstrap) async -> Bool {
+        guard ZagRPPairingCore.shared.hasSavedPairing else { return false }
         do {
             let attempt = generation
             guard let account = try ZagNativeAppleIDs.shared.catalog().activeID,
@@ -391,11 +476,12 @@ private struct ZagAutomaticIdentitySetupView: View {
         NavigationStack {
             Form {
                 Text("Use the signing identity from your trusted USB connection. This copy will keep the certificate it was installed with.")
-                if selectedAccount == nil {
+                if selectedAccount == nil && !checkingExisting {
                     Button("Sign In with the Original Apple ID") { signingIn = true }
                 }
                 if checkingExisting {
-                    ProgressView("Checking existing signing identity…")
+                    ProgressView(bootstrap.accountTransfer == true && selectedAccount == nil
+                        ? "Verifying Apple ID from Mac…" : "Checking existing signing identity…")
                 } else if !authorised && !verifiedExisting {
                     Button("Authorize Signing Identity") { authorize() }
                         .disabled(selectedAccount == nil)
@@ -429,8 +515,20 @@ private struct ZagAutomaticIdentitySetupView: View {
             }
         }
         .task {
+            guard checkingExisting else { return }
+            var imported = false
+            if bootstrap.accountTransfer == true && selectedAccount == nil {
+                if let id = await handoff.receiveDesktopAccount(bootstrap) {
+                    selectAccount(id)
+                    imported = selectedAccount == id
+                } else if !Task.isCancelled {
+                    notice = "The Apple ID session could not be transferred. Sign in with the original Apple ID."
+                }
+            }
+            guard !Task.isCancelled else { return }
             verifiedExisting = await handoff.verifyExisting(bootstrap)
             checkingExisting = false
+            if imported && !verifiedExisting { authorize() }
         }
         .task(id: authorised) {
             guard authorised, await handoff.prepare(bootstrap: bootstrap) else { return }

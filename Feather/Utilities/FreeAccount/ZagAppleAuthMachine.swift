@@ -789,9 +789,18 @@ actor ZagAppleAuthMachine {
 	/// not provisioned. Reads only (never writes/alters any ADI profile). The
 	/// token and the returned headers are never logged.
 	func developerHeaders(now: Date = Date(), expectedAccountID: String? = nil) -> [String: String]? {
-		guard let persisted = try? store.load(scope: scope),
-			  let token = ZagDeveloperTokenStore().load(scope: credentialScope), token.isUsable(at: now),
-			  expectedAccountID == nil || token.accountID == expectedAccountID else { return nil }
+		guard let token = ZagDeveloperTokenStore().load(scope: credentialScope), token.isUsable(at: now),
+			  expectedAccountID == nil || token.accountID == expectedAccountID,
+			  let headers = candidateDeveloperHeaders(token, now: now),
+			  ZagDeveloperTokenStore().load(scope: credentialScope) == token else { return nil }
+		return headers
+	}
+
+	/// Derive headers for a temporary USB-delivered candidate without saving
+	/// it. The caller must prove the account and exact certificate with Apple
+	/// before it can be promoted to an account-scoped Keychain token.
+	func candidateDeveloperHeaders(_ token: ZagPersistedDeveloperToken, now: Date = Date()) -> [String: String]? {
+		guard token.isUsable(at: now), let persisted = try? store.load(scope: scope) else { return nil }
 		let platform = self.platform
 		// A refused transport: developer_headers is local, so no request is made;
 		// this guarantees the bridge can never reach the network.
@@ -809,7 +818,6 @@ actor ZagAppleAuthMachine {
 			return .success(obj)
 		}
 		if case .success(let headers) = result, !headers.isEmpty,
-		   ZagDeveloperTokenStore().load(scope: credentialScope) == token,
 		   headers.keys.contains(where: { $0.lowercased() == "x-apple-gs-token" }) { return headers }
 		return nil
 	}
