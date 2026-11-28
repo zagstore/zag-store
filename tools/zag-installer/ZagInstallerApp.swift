@@ -246,6 +246,15 @@ final class InstallerController: ObservableObject {
         status = "Continuing installation"
     }
 
+    func dismissCompletion() {
+        guard !busy, !installedBundle.isEmpty else { return }
+        installedBundle = ""
+        identityImported = false
+        setupVerified = false
+        stage = nil
+        status = "Ready"
+    }
+
     func cancel() {
         guard busy else { return }
         if prompt != nil, let input,
@@ -408,6 +417,12 @@ private enum RememberedAccounts {
 private struct InstallerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var dark: Bool { colorScheme == .dark }
+    private var completed: Bool { !installer.busy && !installer.installedBundle.isEmpty }
+    private var successfulSetup: Bool { completed && installer.identityImported }
+    private var actionTitle: String {
+        if completed { return "Done" }
+        return nativeDevelopment ? "Continue with Apple ID" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store")
+    }
     private var nativeDevelopment: Bool {
         Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true &&
         Bundle.main.object(forInfoDictionaryKey: "ZagNativeInstallDevelopment") as? Bool == true
@@ -536,9 +551,13 @@ private struct InstallerView: View {
             }
             HStack {
                 Button {
-                    installer.begin(upgrade: upgrade, team: team)
+                    if completed {
+                        installer.dismissCompletion()
+                    } else {
+                        installer.begin(upgrade: upgrade, team: team)
+                    }
                 } label: {
-                    Text(nativeDevelopment ? "Continue with Apple ID" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store"))
+                    Text(actionTitle)
                         .font(.system(size: 19, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
@@ -548,18 +567,18 @@ private struct InstallerView: View {
                         .background {
                             ZagUpdateSpectrumSurface(morph: installer.busy ? 1 : 0,
                                                      progress: 1, theme: ZagPalette.rgb(0x0090ff),
-                                                     moving: installer.busy)
+                                                     moving: installer.busy, success: successfulSetup)
                         }
                         .contentShape(Capsule())
-                        .opacity(!installer.busy && (!device.ready || nativeUSBPreview) ? 0.45 : 1)
+                        .opacity(!installer.busy && !completed && (!device.ready || nativeUSBPreview) ? 0.45 : 1)
                         .animation(reduceMotion ? nil : .timingCurve(ZagUpdateMorphSpecification.x1,
                             ZagUpdateMorphSpecification.y1, ZagUpdateMorphSpecification.x2,
                             ZagUpdateMorphSpecification.y2, duration: ZagUpdateMorphSpecification.duration),
                             value: installer.busy)
                 }
                 .buttonStyle(.plain)
-                .disabled(installer.busy || !device.ready || nativeUSBPreview)
-                .accessibilityLabel(installer.busy ? "Installation in progress" : (nativeDevelopment ? "Continue with Apple ID" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store")))
+                .disabled(installer.busy || (!completed && (!device.ready || nativeUSBPreview)))
+                .accessibilityLabel(installer.busy ? "Installation in progress" : actionTitle)
             }
             if installer.busy {
                 Button("Cancel installation") { installer.cancel() }.frame(maxWidth: .infinity)
