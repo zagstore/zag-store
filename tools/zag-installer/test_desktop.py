@@ -100,7 +100,7 @@ class CredentialLifecycleTests(unittest.TestCase):
         context = MagicMock()
         context.__enter__.return_value = child
         with patch.object(desktop.subprocess, "Popen", return_value=context):
-            with self.assertRaisesRegex(ValueError, "Unknown desktop provisioning event"):
+            with self.assertRaisesRegex(ValueError, "Missing authenticated signing identity"):
                 portal.run("unused-helper")
         self.assertIsNone(portal._pending_password)
         child.kill.assert_called_once()
