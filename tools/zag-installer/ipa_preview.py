@@ -78,6 +78,71 @@ def inspect(path):
                 continue
         return result
 
+
+def stage_for_signing(source, destination, artifact):
+    """Snapshot an explicitly selected IPA; reject protected identities and unsupported layouts.
+    No portal requests, signing or device writes occur here.
+    """
+    import os
+    import hashlib
+    source, destination = Path(source), Path(destination)
+    digest = hashlib.sha256()
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        meta = os.fstat(stream.fileno())
+        if not stat.S_ISREG(meta.st_mode) or not 0 < meta.st_size <= MAX_IPA:
+            raise ValueError("Invalid IPA source")
+        size = 0
+        with destination.open("xb") as output:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                size += len(chunk)
+                if size > MAX_IPA:
+                    raise ValueError("IPA exceeds staging limit")
+                digest.update(chunk)
+                output.write(chunk)
+    destination.chmod(0o600)
+    preview = inspect(destination)
+    original = preview["bundle"]
+    protected = ("app.zagstore.ios", "com.cwd43.gu29")
+    if any(original.casefold() == value or original.casefold().startswith(value + ".") for value in protected):
+        raise ValueError("Protected Zag Store identity")
+    with zipfile.ZipFile(destination) as archive:
+        entries = archive.infolist()
+        if len(entries) > 100000 or sum(e.file_size for e in entries) > 2 * 1024**3:
+            raise ValueError("Archive exceeds staging bounds")
+        relative, info = artifact.main_bundle(archive)
+        if info.get("CFBundleIdentifier") != original:
+            raise ValueError("Application identity changed")
+        for item in entries:
+            if item.flag_bits & 1:
+                raise ValueError("Encrypted ZIP member")
+        # First installation scope: one main application, no extensions or nested apps.
+        # Reject instead of silently removing capabilities.
+        prefix = str(relative) + "/"
+        for item in entries:
+            if item.filename.startswith(prefix):
+                parts = item.filename[len(prefix):].split("/")
+                if any(part.endswith((".appex", ".app", ".xpc")) for part in parts):
+                    raise ValueError("Nested applications and extensions are not supported yet")
+        folder = destination.parent / "imported-unsigned"
+        folder.mkdir(mode=0o700)
+        artifact.extract(archive, folder)
+    return {"metadata": preview, "sha256": digest.hexdigest(), "app": folder / relative,
+            "relative": relative, "info": info}
+
+def mapped_import_bundle(original, team):
+    """Separate namespace from official Zag Store; deterministic per app and team."""
+    import hashlib
+    if not re.fullmatch(r"[A-Z0-9]{10}", team):
+        raise ValueError("Invalid Personal Team")
+    if not isinstance(original, str) or not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", original):
+        raise ValueError("Invalid bundle identifier")
+    if any(original.casefold() == value or original.casefold().startswith(value + ".")
+           for value in ("app.zagstore.ios", "com.cwd43.gu29")):
+        raise ValueError("Protected Zag Store identity")
+    return "app.zloader.imported." + hashlib.sha256(original.casefold().encode("ascii")).hexdigest()[:32] + "." + team
+
+
 if __name__ == "__main__":
     try:
         if len(sys.argv) != 2:
