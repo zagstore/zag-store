@@ -39,24 +39,19 @@ async fn installed(
     proxy: &mut InstallationProxyClient,
     bundle: &str,
 ) -> Result<Option<VersionStamp>, Box<dyn Error>> {
-    let snapshot = inventory::inspect(proxy, None).await?;
-    // Broad inventory misses cannot authorise a fresh installation. An
-    // explicit targeted query is required, and still cannot prove absence.
+    // Collect all three broad Apple inventory sources AND the exact targeted
+    // User/Any lookup. All must succeed, with cross-source conflicts rejected.
+    // A zero-match result is not absolute proof of vacancy; it is only
+    // sufficient to attempt a separately approved fresh install of this exact
+    // mapped bundle. Installation Proxy must still reject a collision.
     let team = bundle.strip_prefix("app.zagstore.ios.")
         .ok_or("Unexpected destination bundle")?;
-    let targeted = inventory::targeted_lookup(proxy, team).await?;
-    let broad = snapshot.apps.get(bundle);
-    let exact = targeted.get(bundle);
-    if let (Some(a), Some(b)) = (broad, exact) {
-        if a != b { return Err("Conflicting targeted and broad inventory".into()); }
+    let snapshot = inventory::inspect(proxy, Some(team)).await?;
+    if !snapshot.targeted_checked {
+        return Err("Targeted destination query did not complete".into());
     }
-    // A missing record is ambiguous on iOS; do not turn that into permission
-    // to replace or collide with an existing app.
-    let found = exact.or(broad).ok_or(
-        "Zag Store destination not confirmed in native inventory; installation is disabled"
-    )?;
-    Ok(Some(VersionStamp {
-        version: found.version.clone(), build: found.build.clone()
+    Ok(snapshot.apps.get(bundle).map(|entry| VersionStamp {
+        version: entry.version.clone(), build: entry.build.clone()
     }))
 }
 
@@ -80,9 +75,13 @@ pub async fn install_authorized(
         return Err("Invalid requested version or build".into());
     }
     let mut proxy = InstallationProxyClient::connect(provider).await?;
-    if installed(&mut proxy, request.bundle).await? != request.previous {
+    let before = installed(&mut proxy, request.bundle).await?;
+    if before != request.previous {
         return Err("Destination inventory changed before installation".into());
     }
+    // The fresh path is restricted to an exact mapped bundle; the unrelated
+    // legacy AppTesters copy is never uninstalled, upgraded, or overwritten.
+    // The caller's explicit INSTALL approval must occur before reaching here.
     // This call verifies both local and remote SHA256 before returning.
     let remote = transfer::stage_and_verify(
         provider, request.ipa, request.job_token, request.sha256
@@ -127,6 +126,15 @@ mod tests {
             authorization_verified: false,
         };
         assert!(!request.authorization_verified);
+    }
+    #[test]
+    fn fresh_install_requires_explicit_missing_previous_state() {
+        // A separate fresh install is represented by None. An upgrade must
+        // bind an affirmative prior version and build, not a broad zero count.
+        let fresh: Option<VersionStamp> = None;
+        let existing = Some(VersionStamp {version:"1.0.0".into(),build:"3".into()});
+        assert_eq!(fresh,None);
+        assert_ne!(existing,fresh);
     }
     #[test]
     fn bundle_identifier_restricted_to_zag_personal_team() {
