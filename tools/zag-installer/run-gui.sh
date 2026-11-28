@@ -62,6 +62,12 @@ elif [[ "$NATIVE_DEV" != 0 ]]; then
 fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 /usr/bin/ditto "$SPARKLE_ROOT/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+NOTICES="$APP/Contents/Resources/ThirdPartyNotices"
+mkdir -p "$NOTICES"
+cp "$ROOT/AppleAuthCore/zag-isideload/LICENSE-isideload-MIT" "$NOTICES/isideload-MIT.txt"
+cp "$ROOT/AppleAuthCore/zag-isideload/LICENSE-MPL-2.0" "$NOTICES/MPL-2.0.txt"
+cp "$ROOT/docs/free-developer-accounts/G2-THIRD-PARTY-NOTICES-DRAFT.md" "$NOTICES/Review-Draft.md"
+printf '%s\n' "$(git -C "$ROOT" rev-parse HEAD)" > "$NOTICES/SourceRevision.txt"
 ASSETS="$ROOT/Feather/Resources/Assets.xcassets/AppIcon.appiconset"
 cp "$ASSETS/zagstore.png" "$ASSETS/zagstore_dark.png" "$APP/Contents/Resources/"
 for variant in zagstore zagstore_dark; do

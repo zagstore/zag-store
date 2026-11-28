@@ -941,6 +941,16 @@ private struct InstallerGeneralSettingsView: View {
                 let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
                 Text("Zag Installer · Version \(version) (\(build))")
                 Link("Zag Store website", destination: URL(string: "https://zagstore.app")!)
+                Button("Third-party acknowledgements…") {
+                    if let resources = Bundle.main.resourceURL {
+                        let notices = resources.appendingPathComponent("ThirdPartyNotices", isDirectory: true)
+                        if FileManager.default.fileExists(atPath: notices.path) {
+                            NSWorkspace.shared.open(notices)
+                        }
+                    }
+                }
+                Text("Development candidate: third-party licence review is not yet complete.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }.padding(20)
     }
