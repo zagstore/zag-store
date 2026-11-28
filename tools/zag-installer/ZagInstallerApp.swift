@@ -20,6 +20,7 @@ final class InstallerController: ObservableObject {
     @Published var identityImported = false
     @Published var setupVerified = false
     @Published var stage: String?
+    @Published private(set) var observedStages: Set<String> = []
 
     private var task: Process?
     private var input: FileHandle?
@@ -127,6 +128,7 @@ final class InstallerController: ObservableObject {
         identityImported = false
         setupVerified = false
         stage = nil
+        observedStages.removeAll()
         prompt = nil
         log = ""
         status = resumeSetup ? "Checking the existing installation and signing receipt" : "Verifying the signed release and connected iPhone"
@@ -208,6 +210,7 @@ final class InstallerController: ObservableObject {
                     task?.terminate()
                     return
                 }
+                observedStages.insert(next)
                 stage = next
                 status = label
             case "finished":
@@ -252,6 +255,7 @@ final class InstallerController: ObservableObject {
         identityImported = false
         setupVerified = false
         stage = nil
+        observedStages.removeAll()
         status = "Ready"
     }
 
@@ -599,12 +603,16 @@ private struct InstallerView: View {
                     if let current = steps.firstIndex(of: stage) {
                         VStack(alignment: .leading, spacing: 8) {
                             ForEach(steps.indices, id: \.self) { index in
+                                let visited = installer.observedStages.contains(steps[index])
+                                let active = index == current
                                 HStack(spacing: 10) {
-                                    Image(systemName: index < current ? "checkmark.circle.fill" : (index == current ? "circle.dotted" : "circle"))
-                                        .foregroundStyle(index < current ? success : (index == current ? ZagPalette.blue : muted))
-                                    Text(labels[index]).foregroundStyle(index == current ? Color.primary : muted)
+                                    Image(systemName: active ? "circle.dotted" : (visited ? "checkmark.circle.fill" : "circle"))
+                                        .foregroundStyle(active ? ZagPalette.blue : (visited ? success : muted))
+                                        .accessibilityHidden(true)
+                                    Text(labels[index]).foregroundStyle(active ? Color.primary : muted)
                                     Spacer()
-                                    if index == current { Text("In progress").font(.caption).foregroundStyle(muted) }
+                                    Text(active ? "In progress" : (visited ? "Passed" : "Not started"))
+                                        .font(.caption).foregroundStyle(muted)
                                 }.accessibilityElement(children: .combine)
                             }
                         }.font(.callout).padding(12)
@@ -616,7 +624,7 @@ private struct InstallerView: View {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 48, weight: .light)).foregroundStyle(success)
                         .accessibilityHidden(true)
-                    Text(installer.identityImported ? "You're all set!" : "Installation complete").font(.title2.bold())
+                    Text(installer.identityImported ? "You're all set!" : "Signing Setup pending").font(.title2.bold())
                     Text("Zag Store installed on your iPhone.").foregroundStyle(muted)
                 }.frame(maxWidth: .infinity)
                 Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
