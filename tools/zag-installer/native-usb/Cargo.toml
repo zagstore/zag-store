@@ -5,6 +5,12 @@ edition = "2024"
 
 [workspace]
 
+[features]
+default = []
+# Developer-only build: introduces native Installation Proxy writes; never
+# enable in public, packaged, or unattended Zag Installer builds.
+native-install-dev = []
+
 [dependencies]
 idevice = { path = "../../../IDeviceKitten/idevice", default-features = false, features = ["aws-lc", "usbmuxd", "installation_proxy", "amfi", "afc", "house_arrest"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "fs", "io-util"] }

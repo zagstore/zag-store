@@ -7,7 +7,7 @@ use std::path::Path;
 const MAX_IPA: u64 = 512 * 1024 * 1024;
 const CHUNK: usize = 256 * 1024;
 
-fn valid_token(token: &str) -> bool {
+pub(crate) fn valid_token(token: &str) -> bool {
     token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

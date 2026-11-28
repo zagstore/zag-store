@@ -137,9 +137,106 @@ async fn handoff_command(args: &[String]) -> Result<serde_json::Value, Box<dyn s
     }
 }
 
+
+#[cfg(feature = "native-install-dev")]
+fn install_dev_confirmation(bundle: &str, udid: &str, upgrading: bool) -> String {
+    let action = if upgrading { "UPGRADE" } else { "INSTALL" };
+    format!("{action} {bundle} ON {udid}")
+}
+
+#[cfg(feature = "native-install-dev")]
+async fn install_developer(args: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    // NEVER an ordinary release command: this developer-only entry point
+    // assumes the calling macOS signer has already verified Apple's IPA
+    // signature, certificate, profile, exact device and signed release.
+    // An arbitrary JSON plan is NOT cryptographic proof of authorization.
+    if args.len() != 4 || args[0] != "install-signed-dev" {
+        return Err("Expected install-signed-dev PLAN.json STAGING_TOKEN CONFIRMATION".into());
+    }
+    if !transfer::valid_token(&args[2]) {
+        return Err("Invalid native installation staging token".into());
+    }
+    let plan = preflight::verify(std::path::Path::new(&args[1])).await?;
+    if args[3] != install_dev_confirmation(&plan.bundle_identifier, &plan.device_udid, plan.previous.is_some()) {
+        return Err("Exact interactive installation confirmation is required".into());
+    }
+    let team = plan.bundle_identifier.strip_prefix("app.zagstore.ios.")
+        .ok_or("Invalid mapped Zag Store bundle")?;
+    let observed = inspect("inventory", Some(team)).await?;
+    let _ = preflight::device_binding(&plan, &observed)?;
+    let apps = observed["zag_apps"].as_array().ok_or("Native application inventory unavailable")?;
+    let existing = apps.iter().find(|app|
+        app["bundleIdentifier"].as_str() == Some(plan.bundle_identifier.as_str()));
+    match (existing, &plan.previous) {
+        (None, None) => (),
+        (Some(app), Some(previous))
+            if app["version"].as_str() == Some(previous.version.as_str())
+            && app["bundleVersion"].as_str() == Some(previous.build.as_str()) => (),
+        _ => return Err("Personal Team installation destination differs from signed plan".into()),
+    }
+
+    // Reacquire sole USB device and pairing for the write-capable session;
+    // installation::install_authorized independently checks destination
+    // before and after staging as well as installed version/build readback.
+    let addr = UsbmuxdAddr::default();
+    let mut mux = addr.connect(1).await?;
+    let devices: Vec<_> = mux.get_devices().await?.into_iter()
+        .filter(|d| d.connection_type == Connection::Usb).collect();
+    if devices.len() != 1 || !devices[0].udid.eq_ignore_ascii_case(&plan.device_udid) {
+        return Err("The original, sole wired iPhone is no longer connected".into());
+    }
+    let device = &devices[0];
+    let provider = UsbmuxdProvider {addr, tag:2, udid:device.udid.clone(),
+        device_id:device.device_id, label:"Zag Installer native installation developer mode".into()};
+    let pairing = provider.get_pairing_file().await?;
+    let mut lockdown = LockdownClient::connect(&provider).await?;
+    lockdown.start_session(&pairing).await?;
+    if lockdown.get_value(Some("DeviceClass"), None).await?.as_string() != Some("iPhone") {
+        return Err("Refusing to install on a non-iPhone device".into());
+    }
+    let mut amfi = AmfiClient::connect(&provider).await?;
+    if !amfi.get_developer_mode_status().await? {
+        return Err("Refusing to install without Developer Mode".into());
+    }
+    let hash_bytes = plan.ipa_sha256.as_bytes();
+    let mut sha256 = [0u8;32];
+    for (i, chunk) in hash_bytes.chunks_exact(2).enumerate() {
+        // Use radix-16, not decimal, to match the validated SHA-256 hex.
+        sha256[i] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?;
+    }
+    let previous = plan.previous.as_ref().map(|old| installation::VersionStamp {
+        version:old.version.clone(), build:old.build.clone()
+    });
+    let request = installation::AuthorizedInstall {
+        ipa:std::path::Path::new(&plan.ipa_path),
+        sha256, job_token:&args[2], bundle:&plan.bundle_identifier,
+        expected:installation::VersionStamp {version:plan.version.clone(), build:plan.build.clone()},
+        previous,
+        // This is a developer-only trust assertion, NOT independently verified
+        // release provenance. Do not enable this path in production.
+        authorization_verified:true,
+    };
+    let result = installation::install_authorized(&provider, &request).await?;
+    Ok(json!({"installed_bundle":plan.bundle_identifier,"version":result.version,
+        "build":result.build,"mode":"native-install-dev","installed":true,
+        "legacy_app_untouched":true}))
+}
+
 #[tokio::main(flavor="current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(feature = "native-install-dev")]
+    if args.first().is_some_and(|a| a == "install-signed-dev") {
+        // This feature is never compiled into default / GUI release builds.
+        // No fixed short timeout on device installation: a large IPA can take
+        // longer than a USB status poll; errors are still propagated.
+        match install_developer(&args).await {
+            Ok(result) => println!("{}", result),
+            Err(err) => { eprintln!("Native developer installation failed: {err}");
+                          std::process::exit(1); }
+        }
+        return;
+    }
     if matches!(args.first().map(String::as_str), Some("handoff-read" | "handoff-write")) {
         let job = handoff_command(&args);
         match tokio::time::timeout(Duration::from_secs(45), job).await {
