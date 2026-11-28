@@ -730,28 +730,27 @@ private struct InstallerView: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("Devices").font(.headline)
+                    Button {
+                        Task { await refreshDevices() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(muted)
+                            .frame(width: 32, height: 32)
+                            .background(surface.opacity(hoveringRefresh ? 1 : 0.5), in: Circle())
+                            .overlay { Circle().strokeBorder(border, lineWidth: 1) }
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(discoveringDevices || installer.busy)
+                    .accessibilityLabel("Refresh all devices")
+                    .onHover { inside in
+                        hoveringRefresh = inside
+                        if inside && !installer.busy { NSCursor.pointingHand.set() }
+                        else { NSCursor.arrow.set() }
+                    }
+                    .padding(.leading, 17)
                     Spacer()
-                Button {
-                    Task { await refreshDevices() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(ZagPalette.spectrum)
-                        .frame(width: 32, height: 32)
-                        .background(surface.opacity(hoveringRefresh ? 1 : 0.5), in: Circle())
-                        .overlay { Circle().strokeBorder(border, lineWidth: 1) }
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .disabled(discoveringDevices || installer.busy)
-                .help("Refresh USB and Wi-Fi device discovery")
-                .accessibilityLabel(discoveringDevices ? "Discovering devices" : "Refresh devices")
-                .onHover { inside in
-                    hoveringRefresh = inside
-                    if inside && !discoveringDevices && !installer.busy { NSCursor.pointingHand.set() }
-                    else { NSCursor.arrow.set() }
-                }
                 }
                 HStack(spacing: 12) {
                     DeviceIllustration(identifier: device.modelIdentifier)
@@ -1073,7 +1072,12 @@ private struct InstallerView: View {
             .padding(.horizontal, 24)
             .padding(.vertical, 10)
         }
-        .task { await refreshDevices() }
+        .task {
+            while !Task.isCancelled {
+                await refreshDevices()
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
         .frame(minWidth: 860, idealWidth: 1000, minHeight: 460, idealHeight: 650)
         .background { atmosphere.ignoresSafeArea() }
         .tint(ZagPalette.rgb(0x3a5ce8))
