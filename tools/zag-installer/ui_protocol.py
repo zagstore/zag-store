@@ -9,6 +9,9 @@ the log stream. This is an opt-in replacement for interactive Terminal prompts.
 import json
 import os
 import sys
+import selectors
+import subprocess
+import time
 
 MAX_REPLY = 4096
 
@@ -113,6 +116,11 @@ class Channel:
             raise ValueError("Invalid installer stage")
         self.send({"type": "progress", "stage": stage})
 
+    def installation_progress(self, phase, percent):
+        if phase not in ("transfer", "verification", "installing", "readback") or type(percent) is not int or not 0 <= percent <= 100:
+            raise ValueError("Invalid native installation progress")
+        self.send({"type": "progress", "stage": "installation", "phase": phase, "percent": percent})
+
     def apple_failure(self, error):
         message = APPLE_GUIDANCE.get(error.stage, "Apple operation failed.") if isinstance(error.stage, str) else "Apple operation failed."
         if isinstance(error.hint, str) and error.hint in NETWORK_GUIDANCE:
@@ -141,3 +149,60 @@ class Channel:
 
     def confirm(self, message, expected, action):
         return self.ask(message, confirmation=expected, action=action)
+
+
+def run_native_install(command, callback, *, timeout=1800):
+    """Read bounded structured native events without exposing native logs or changing CLI output."""
+    environment = dict(os.environ, ZAG_NATIVE_PROGRESS="1")
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment) as child:
+        try:
+            pending = bytearray()
+            received = 0
+            final = None
+            phases = ("transfer", "verification", "installing", "readback")
+            previous = (-1, -1)
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    data = os.read(child.stdout.fileno(), 4096)
+                    if not data:
+                        break
+                    received += len(data)
+                    if received > 256 * 1024:
+                        raise ValueError("Native installation response is oversized")
+                    pending.extend(data)
+                    while b"\n" in pending:
+                        line, _, rest = pending.partition(b"\n")
+                        pending = bytearray(rest)
+                        if not line or len(line) > 4096 or final is not None:
+                            raise ValueError("Invalid native installation response")
+                        try:
+                            item = json.loads(line)
+                        except (ValueError, UnicodeError):
+                            raise ValueError("Invalid native installation response") from None
+                        if type(item) is not dict:
+                            raise ValueError("Invalid native installation response")
+                        if set(item) == {"native_progress", "percent"}:
+                            phase, percent = item["native_progress"], item["percent"]
+                            if phase not in phases or type(percent) is not int or not 0 <= percent <= 100:
+                                raise ValueError("Invalid native installation progress")
+                            position = (phases.index(phase), percent)
+                            if position > previous:
+                                callback(phase, percent)
+                                previous = position
+                        else:
+                            final = bytes(line)
+                    if len(pending) > 4096:
+                        raise ValueError("Native installation response is oversized")
+            if pending:
+                raise ValueError("Incomplete native installation response")
+            code = child.wait(timeout=max(0.001, deadline - time.monotonic()))
+            return subprocess.CompletedProcess(command, code, final or b"", b"")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()

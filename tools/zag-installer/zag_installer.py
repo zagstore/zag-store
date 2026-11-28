@@ -52,6 +52,7 @@ class StandaloneUSB:
         self.identity = target_udid
         self.device_info = None
         self.native_install_dev = native_install_dev
+        self.progress_callback = None
 
     def _command(self, *args):
         prefix = [str(self.executable)]
@@ -271,8 +272,11 @@ class StandaloneUSB:
             phrase = f"{operation} {plan['bundle_identifier']} ON {self.identity}"
             token = secrets.token_hex(16)
             try:
-                response = subprocess.run(
-                    self._command("install-signed-dev", str(intent_file), token, phrase), capture_output=True, timeout=1800, check=False)
+                command = self._command("install-signed-dev", str(intent_file), token, phrase)
+                if self.progress_callback is not None:
+                    response = ui_protocol.run_native_install(command, self.progress_callback)
+                else:
+                    response = subprocess.run(command, capture_output=True, timeout=1800, check=False)
             except subprocess.TimeoutExpired as error:
                 raise ValueError("Native developer installation timed out; check device inventory") from error
             artifact.require(response.returncode == 0 and len(response.stdout) <= 4096,
@@ -515,6 +519,9 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
 def install_release(release, release_helper, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input,
                     *, defer_setup=False):
     local_source = scratch / "official.ipa"
+    channel = getattr(approve, "__self__", None)
+    if isinstance(channel, ui_protocol.Channel):
+        channel.progress("preflight")
     releases.acquire(artifact, release, release_helper, local_source)
     return install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
                             approve, releases.check_fresh, defer_setup=defer_setup)
@@ -528,6 +535,8 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
         if isinstance(channel, ui_protocol.Channel):
             channel.progress(stage)
     progress("preflight")
+    if isinstance(channel, ui_protocol.Channel) and isinstance(device, StandaloneUSB):
+        device.progress_callback = channel.installation_progress
     artifact.require(not fresh_local or (account_bootstrap_dev and upgrade_team == LOCAL_UPGRADE_TEAM and not replace_same_build),
                      "Fresh local installation requires the exact experimental team")
     artifact.require(not replace_same_build or upgrade_team == LOCAL_UPGRADE_TEAM,

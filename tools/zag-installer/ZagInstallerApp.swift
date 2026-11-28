@@ -11,6 +11,72 @@ struct InstallerPrompt: Identifiable {
     let action: String?
 }
 
+private struct InstallerProgressControl: View {
+    let title: String
+    let milestone: String
+    let progress: Double
+    let busy: Bool
+    let enabled: Bool
+    let success: Bool
+    let action: () -> Void
+    let cancel: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ZStack {
+                ZagUpdateSpectrumSurface(morph: busy ? 1 : 0, progress: progress,
+                                         theme: ZagPalette.rgb(0x0090ff),
+                                         moving: busy, success: success)
+                    .opacity(!busy && !enabled ? 0.45 : 1)
+                    .allowsHitTesting(false)
+                Button(action: action) {
+                    Text(title)
+                        .font(.system(size: 21, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity, minHeight: 54)
+                        .contentShape(Capsule())
+                        .opacity(busy ? 0 : 1)
+                }
+                .buttonStyle(.plain)
+                .disabled(busy || !enabled)
+                .accessibilityHidden(busy)
+            }
+            .frame(height: busy ? 22 : 54)
+            .scaleEffect(hovering && enabled && !busy && !reduceMotion ? 1.012 : 1)
+            .brightness(hovering && enabled && !busy ? 0.07 : 0)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: hovering)
+            .animation(reduceMotion ? nil : .timingCurve(ZagUpdateMorphSpecification.x1,
+                ZagUpdateMorphSpecification.y1, ZagUpdateMorphSpecification.x2,
+                ZagUpdateMorphSpecification.y2, duration: ZagUpdateMorphSpecification.duration),
+                value: busy)
+            .onHover { inside in
+                hovering = inside
+                if inside && enabled && !busy { NSCursor.pointingHand.set() }
+                else { NSCursor.arrow.set() }
+            }
+            if busy {
+                ZStack {
+                    Text(milestone)
+                        .id(milestone)
+                        .transition(.opacity)
+                        .font(.system(size: 14, weight: .medium))
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, minHeight: 20)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: milestone)
+                .accessibilityLabel(milestone)
+                .accessibilityValue("\(Int(progress * 100)) percent of installation milestones")
+                Button("Cancel installation", action: cancel)
+                    .font(.caption)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 @MainActor
 final class InstallerController: ObservableObject {
     @Published var busy = false
@@ -21,6 +87,35 @@ final class InstallerController: ObservableObject {
     @Published var identityImported = false
     @Published var setupVerified = false
     @Published var stage: String?
+    @Published private(set) var progressFraction: Double = 0
+    @Published private(set) var milestone = "Checking release and device"
+    private static let milestones = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
+    private static let milestoneLabels = ["Checking release and device", "Authenticating Apple ID",
+        "Preparing signing credentials", "Signing application", "Installing on iPhone", "Transferring signing identity"]
+
+    private func updateProgress(_ object: [String: Any]) -> Bool {
+        guard let next = object["stage"] as? String,
+              let index = Self.milestones.firstIndex(of: next) else { return false }
+        if let stage, let previous = Self.milestones.firstIndex(of: stage), index < previous { return false }
+        var label = Self.milestoneLabels[index]
+        var fraction = 0.0
+        if object["phase"] != nil || object["percent"] != nil {
+            guard next == "installation",
+                  let phase = object["phase"] as? String,
+                  let percent = object["percent"] as? Int, (0...100).contains(percent) else { return false }
+            let phases = ["transfer", "verification", "installing", "readback"]
+            let labels = ["Transferring IPA to iPhone", "Verifying transferred IPA", "Installing on iPhone", "Verifying installation"]
+            guard let phaseIndex = phases.firstIndex(of: phase) else { return false }
+            label = labels[phaseIndex]
+            fraction = min(0.99, (Double(phaseIndex) + Double(percent) / 100) / Double(phases.count))
+        }
+        observedStages.insert(next)
+        stage = next
+        progressFraction = max(progressFraction, (Double(index) + fraction) / Double(Self.milestones.count))
+        milestone = label
+        status = label
+        return true
+    }
     @Published private(set) var observedStages: Set<String> = []
 
     private var task: Process?
@@ -150,6 +245,8 @@ final class InstallerController: ObservableObject {
         observedStages.removeAll()
         prompt = nil
         log = ""
+        progressFraction = resumeSetup ? 5.0 / 6.0 : 0
+        milestone = resumeSetup ? "Checking signing receipt" : "Checking release and device"
         status = resumeSetup ? "Checking the existing installation and signing receipt" : "Verifying the signed release and connected iPhone"
         busy = true
         task = process
@@ -239,20 +336,15 @@ final class InstallerController: ObservableObject {
                 prompt = InstallerPrompt(message: message, secure: secure, confirmation: confirmation, action: action)
                 status = "Your confirmation is required"
             case "progress":
-                let labels = ["preflight": "Checking release and device", "authentication": "Authenticating Apple ID",
-                              "provisioning": "Preparing signing credentials", "signing": "Signing Zag Store",
-                              "installation": "Installing Zag Store", "handoff": "Transferring signing setup"]
-                guard let next = object["stage"] as? String, let label = labels[next] else {
-                    status = "Invalid installer stage"
+                guard updateProgress(object) else {
+                    status = "Invalid installer progress"
                     task?.terminate()
                     return
                 }
-                observedStages.insert(next)
-                stage = next
-                status = label
             case "finished":
                 if let result = object["result"] as? [String: Any] {
                     installedBundle = result["installed_bundle"] as? String ?? ""
+                    if !installedBundle.isEmpty { progressFraction = 1 }
                     setupVerified = result["signing_setup"] as? String == "verified"
                     identityImported = setupVerified || result["signing_identity"] as? String == "imported"
                     if setupVerified {
@@ -284,7 +376,7 @@ final class InstallerController: ObservableObject {
         }
         input.write(wire + Data([10]))
         prompt = nil
-        status = "Continuing installation"
+        status = milestone
     }
 
     func dismissCompletion() {
@@ -294,6 +386,7 @@ final class InstallerController: ObservableObject {
         setupVerified = false
         stage = nil
         observedStages.removeAll()
+        progressFraction = 0
         status = "Ready"
     }
 
@@ -642,7 +735,6 @@ private struct InstallerView: View {
     @FocusState private var promptFocused: Bool
     @State private var preferredAccount: String?
     @State private var releaseChannel = "beta"
-    @State private var hoveringInstall = false
     @State private var importedIPA: URL?
 
     private var accountColumn: some View {
@@ -877,54 +969,26 @@ private struct InstallerView: View {
             .accessibilityLabel("Release channel")
             .disabled(installer.busy)
             Spacer(minLength: 0)
-            HStack {
-                Button {
-                    if completed {
-                        installer.dismissCompletion()
-                    } else {
-                        installer.begin(upgrade: upgrade, team: team, channel: releaseChannel, targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
-                    }
-                } label: {
-                    Text(actionTitle)
-                        .font(.system(size: 21, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .frame(maxWidth: .infinity, minHeight: 54)
-                        .opacity(installer.busy ? 0 : 1)
-                        .background {
-                            ZagUpdateSpectrumSurface(morph: installer.busy ? 1 : 0,
-                                                     progress: 1, theme: ZagPalette.rgb(0x0090ff),
-                                                     moving: installer.busy, success: successfulSetup)
-                        }
-                        .contentShape(Capsule())
-                        .opacity(!installer.busy && !completed && (!device.ready || nativeUSBPreview) ? 0.45 : 1)
-                        .animation(reduceMotion ? nil : .timingCurve(ZagUpdateMorphSpecification.x1,
-                            ZagUpdateMorphSpecification.y1, ZagUpdateMorphSpecification.x2,
-                            ZagUpdateMorphSpecification.y2, duration: ZagUpdateMorphSpecification.duration),
-                            value: installer.busy)
+            InstallerProgressControl(title: actionTitle,
+                                     milestone: installer.prompt == nil ? installer.milestone : "Awaiting your confirmation",
+                                     progress: installer.progressFraction,
+                                     busy: installer.busy,
+                                     enabled: completed || (device.ready && !nativeUSBPreview),
+                                     success: successfulSetup,
+                                     action: {
+                if completed {
+                    installer.dismissCompletion()
+                } else {
+                    installer.begin(upgrade: upgrade, team: team, channel: releaseChannel,
+                                    targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
                 }
-                .buttonStyle(.plain)
-                .disabled(installer.busy || (!completed && (!device.ready || nativeUSBPreview)))
-                .scaleEffect(hoveringInstall && !installer.busy && device.ready && !nativeUSBPreview && !reduceMotion ? 1.012 : 1)
-                .brightness(hoveringInstall && !installer.busy && device.ready && !nativeUSBPreview ? 0.07 : 0)
-                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: hoveringInstall)
-                .onHover { inside in
-                    hoveringInstall = inside
-                    if inside && !installer.busy && (completed || (device.ready && !nativeUSBPreview)) { NSCursor.pointingHand.set() }
-                    else { NSCursor.arrow.set() }
-                }
-                .accessibilityLabel(installer.busy ? "Installation in progress" : actionTitle)
-            }
+            }, cancel: { installer.cancel() })
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         accountColumn
             .frame(maxHeight: .infinity, alignment: .top)
         }
         .fixedSize(horizontal: false, vertical: true)
-            if installer.busy {
-                Button("Cancel installation") { installer.cancel() }.frame(maxWidth: .infinity)
-            }
             Divider()
             Button {
                 let panel = NSOpenPanel()
@@ -961,32 +1025,7 @@ private struct InstallerView: View {
                 else { NSCursor.arrow.set() }
             }
             Divider()
-            if installer.busy {
-                Text(installer.status).font(.headline).frame(maxWidth: .infinity)
-                Text("Keep your iPhone connected.").font(.caption).foregroundStyle(muted).frame(maxWidth: .infinity)
-                if let stage = installer.stage {
-                    let steps = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
-                    let labels = ["Checking release and device", "Apple ID authentication", "Preparing signing credentials", "Signing Zag Store", "Installing on iPhone", "Transferring signing identity"]
-                    if let current = steps.firstIndex(of: stage) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(steps.indices, id: \.self) { index in
-                                let visited = installer.observedStages.contains(steps[index])
-                                let active = index == current
-                                HStack(spacing: 10) {
-                                    Image(systemName: active ? "circle.dotted" : (visited ? "checkmark.circle.fill" : "circle"))
-                                        .foregroundStyle(active ? ZagPalette.blue : (visited ? success : muted))
-                                        .accessibilityHidden(true)
-                                    Text(labels[index]).foregroundStyle(active ? Color.primary : muted)
-                                    Spacer()
-                                    Text(active ? "In progress" : (visited ? "Passed" : "Not started"))
-                                        .font(.caption).foregroundStyle(muted)
-                                }.accessibilityElement(children: .combine)
-                            }
-                        }.font(.callout).padding(12)
-                            .background(surface, in: RoundedRectangle(cornerRadius: 12))
-                    }
-                }
-            } else if !installer.installedBundle.isEmpty {
+            if !installer.busy && !installer.installedBundle.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 48, weight: .light)).foregroundStyle(success)
@@ -1012,7 +1051,7 @@ private struct InstallerView: View {
                             .font(.caption).foregroundStyle(muted)
                     }
                 }
-            } else {
+            } else if !installer.busy {
                 Text(installer.status).font(.headline)
             }
             DisclosureGroup("Advanced", isExpanded: $showAdvanced) {

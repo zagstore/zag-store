@@ -98,11 +98,16 @@ pub async fn install_authorized(
     let result: Result<VersionStamp, Box<dyn Error>> = async {
         let during = installed(&mut proxy, request.bundle).await?;
         require_destination(request.previous.as_ref(), during.as_ref())?;
+        transfer::report_progress("installing", 0);
+        let callback = |(percent, ())| async move {
+            transfer::report_progress("installing", percent);
+        };
         if request.previous.is_some() {
-            proxy.upgrade(remote, None).await?;
+            proxy.upgrade_with_callback(remote, None, callback, ()).await?;
         } else {
-            proxy.install(remote, None).await?;
+            proxy.install_with_callback(remote, None, callback, ()).await?;
         }
+        transfer::report_progress("readback", 0);
         let observed = installed(&mut proxy, request.bundle).await?;
         if observed.as_ref() != Some(&request.expected) {
             return Err("Installation completed without matching bundle version and build".into());

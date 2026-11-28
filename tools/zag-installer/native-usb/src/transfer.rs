@@ -7,6 +7,12 @@ use std::path::Path;
 const MAX_IPA: u64 = 512 * 1024 * 1024;
 const CHUNK: usize = 256 * 1024;
 
+pub(crate) fn report_progress(phase: &str, percent: u64) {
+    if std::env::var("ZAG_NATIVE_PROGRESS").as_deref() == Ok("1") && percent <= 100 {
+        println!("{}", serde_json::json!({"native_progress":phase,"percent":percent}));
+    }
+}
+
 pub(crate) fn valid_token(token: &str) -> bool {
     token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -35,6 +41,8 @@ pub async fn stage_and_verify(provider: &dyn IdeviceProvider, local: &Path,
         let mut buf = vec![0; CHUNK];
         let mut digest = Sha256::new();
         let mut total = 0u64;
+        let mut reported = 0;
+        report_progress("transfer", 0);
         loop {
             let n = source.read(&mut buf).await?;
             if n == 0 { break; }
@@ -42,6 +50,8 @@ pub async fn stage_and_verify(provider: &dyn IdeviceProvider, local: &Path,
             if total > metadata.len() { return Err("IPA changed during transfer".into()); }
             digest.update(&buf[..n]);
             file.write_entire(&buf[..n]).await?;
+            let percent = total * 100 / metadata.len();
+            if percent > reported { report_progress("transfer", percent); reported = percent; }
         }
         file.close().await?;
         if total != metadata.len() || <[u8;32]>::from(digest.finalize()) != expected {
@@ -54,6 +64,8 @@ pub async fn stage_and_verify(provider: &dyn IdeviceProvider, local: &Path,
         let mut file = afc.open(&remote, AfcFopenMode::RdOnly).await?;
         let mut digest = Sha256::new();
         let mut remaining = total;
+        let mut reported = 0;
+        report_progress("verification", 0);
         while remaining > 0 {
             let bytes = file.read_n(remaining.min(CHUNK as u64) as usize).await?;
             if bytes.is_empty() || bytes.len() as u64 > remaining {
@@ -61,6 +73,8 @@ pub async fn stage_and_verify(provider: &dyn IdeviceProvider, local: &Path,
             }
             remaining -= bytes.len() as u64;
             digest.update(&bytes);
+            let percent = (total - remaining) * 100 / total;
+            if percent > reported { report_progress("verification", percent); reported = percent; }
         }
         file.close().await?;
         if <[u8;32]>::from(digest.finalize()) != expected {
