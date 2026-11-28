@@ -31,8 +31,24 @@ xcrun swiftc -parse-as-library -O -framework SwiftUI -framework AppKit \
     "$SOURCE" "$UPDATE_SOURCE" -o "$CACHE/ZagInstaller"
 
 APP="$HOME/Applications/Zag Installer.app"
-if [[ -d "/Applications/Zag Installer.app" ]]; then
+NATIVE_DEV="${ZAG_INSTALLER_NATIVE_GUI_DEV:-0}"
+if [[ -n "${ZAG_INSTALLER_APP_OUTPUT:-}" ]]; then
+    APP="$ZAG_INSTALLER_APP_OUTPUT"
+    [[ "$APP" == /*.app && ! -e "$APP" && ! -L "$APP" ]] || {
+        echo "Specify an absolute, new .app output path." >&2; exit 1;
+    }
+elif [[ -d "/Applications/Zag Installer.app" ]]; then
     APP="/Applications/Zag Installer.app"
+fi
+if [[ "$NATIVE_DEV" == 1 ]]; then
+    [[ -n "${ZAG_INSTALLER_APP_OUTPUT:-}" && -n "${ZAG_INSTALLER_ENGINE_STAGE:-}" ]] || {
+        echo "Native GUI development requires a separate app output and staged engine." >&2; exit 1;
+    }
+    [[ "$("$ZAG_INSTALLER_ENGINE_STAGE/helpers/zag-usb" capabilities)" == '{"native_install_dev":true}' ]] || {
+        echo "Native GUI development requires the explicitly feature-enabled USB helper." >&2; exit 1;
+    }
+elif [[ "$NATIVE_DEV" != 0 ]]; then
+    echo "Invalid native GUI development setting." >&2; exit 1
 fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 /usr/bin/ditto "$SPARKLE_ROOT/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
@@ -135,10 +151,18 @@ PLIST
 if [[ -n "$ENGINE_STAGE" ]]; then
     /usr/libexec/PlistBuddy -c "Set :ZagEngineBundled true" "$APP/Contents/Info.plist"
 fi
+if [[ "$NATIVE_DEV" == 1 ]]; then
+    /usr/libexec/PlistBuddy -c "Add :ZagNativeInstallDevelopment bool true" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 6" "$APP/Contents/Info.plist"
+fi
 plutil -lint "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 otool -L "$APP/Contents/MacOS/ZagInstaller" | grep "Sparkle.framework"
 touch "$APP"
-open -n --env "ZAG_INSTALLER_ROOT=$ROOT" "$APP"
-echo "Launched $APP"
+if [[ "$NATIVE_DEV" == 1 ]]; then
+    echo "Built separate native USB development candidate: $APP"
+else
+    open -n --env "ZAG_INSTALLER_ROOT=$ROOT" "$APP"
+    echo "Launched $APP"
+fi

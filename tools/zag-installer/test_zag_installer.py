@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import zipfile
 
@@ -17,6 +18,34 @@ APPTESTERS = {"bundleIdentifier": "com.cwd43.gu29"}
 RELEASE = {"version": "1.0.0", "build": "4", "minimum_os": "16.4", "expires": "2099-11-01T00:00:00Z"}
 INSTALLED = {"bundleIdentifier": DESTINATION, "bundleVersion": "3", "version": "1.0.0"}
 URL = "https://github.com/zagorskey/zag-store-releases/releases/download/test/ZagStore.ipa"
+
+
+class NativeGUIGateTests(unittest.TestCase):
+    def args(self, **changes):
+        values = dict(ui_pipe=True, usb_transport="standalone", mode="install",
+                      native_install_dev=False, native_dev_helper=None,
+                      precompiled_helpers=installer.ROOT / "helpers")
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def test_rejects_unbundled_or_conflicting_modes_before_helper_access(self):
+        for changes in ({"ui_pipe": False}, {"usb_transport": "coredevice"},
+                        {"mode": "handoff"}, {"native_install_dev": True},
+                        {"native_dev_helper": Path("/tmp/helper")},
+                        {"precompiled_helpers": Path("/tmp/helpers")}):
+            with self.subTest(changes=changes), patch.object(installer, "StandaloneUSB") as adapter:
+                with self.assertRaises(ValueError):
+                    installer.native_gui_helper(self.args(**changes))
+                adapter.assert_not_called()
+
+    def test_requires_feature_enabled_bundled_helper(self):
+        with patch.object(installer, "StandaloneUSB"), patch.object(installer.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b'{"native_install_dev":false}', b"")
+            with self.assertRaisesRegex(ValueError, "not enabled"):
+                installer.native_gui_helper(self.args())
+            run.return_value = subprocess.CompletedProcess([], 0, b'{"native_install_dev":true}', b"")
+            self.assertEqual(installer.native_gui_helper(self.args(mode="setup")),
+                             installer.ROOT / "helpers" / "zag-usb")
 
 
 class InstallTests(unittest.TestCase):

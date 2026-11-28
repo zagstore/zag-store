@@ -243,6 +243,11 @@ mod developer_install_gate_tests {
 #[tokio::main(flavor="current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Local capability query: never opens a device connection.
+    if args.len() == 1 && args[0] == "capabilities" {
+        println!("{}", json!({"native_install_dev": cfg!(feature = "native-install-dev")}));
+        return;
+    }
     #[cfg(feature = "native-install-dev")]
     if args.first().is_some_and(|a| a == "install-signed-dev") {
         // This feature is never compiled into default / GUI release builds.

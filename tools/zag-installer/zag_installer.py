@@ -489,15 +489,16 @@ def validate_and_install(signed, release, team, apple_root, scratch, device, tar
     return result
 
 
-def install_release(release, release_helper, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input):
+def install_release(release, release_helper, apple_root, endpoint, upgrade_team, scratch, device, cache, approve=input,
+                    *, defer_setup=False):
     local_source = scratch / "official.ipa"
     releases.acquire(artifact, release, release_helper, local_source)
     return install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
-                            approve, releases.check_fresh)
+                            approve, releases.check_fresh, defer_setup=defer_setup)
 
 
 def install_verified(release, local_source, apple_root, endpoint, upgrade_team, scratch, device, cache,
-                     approve, check_authorization, *, replace_same_build=False):
+                     approve, check_authorization, *, replace_same_build=False, defer_setup=False):
     artifact.require(not replace_same_build or upgrade_team == LOCAL_UPGRADE_TEAM,
                      "Same-build replacement is restricted to the experimental Personal Team copy")
     endpoint = desktop.provider_origin(endpoint) if endpoint else None
@@ -555,6 +556,10 @@ def install_verified(release, local_source, apple_root, endpoint, upgrade_team, 
     except (OSError, ValueError, subprocess.SubprocessError):
         result["signing_receipt_saved"] = False
     if info.get("ZagAutomaticSigningSetup") is True:
+        if defer_setup:
+            result["signing_setup"] = "incomplete"
+            print("Installation verified. Use Resume Signing Setup when ready; no pairing changes have been requested.", flush=True)
+            return result
         print(f"Installed {result['installed_bundle']}. Starting Signing Setup.", flush=True)
         try:
             observed = installed_app(device, target, result["installed_bundle"])
@@ -612,6 +617,25 @@ def upgrade_local_candidate(source, sha256, version, build, apple_root, scratch,
                             scratch, device, cache, approve, check_digest, replace_same_build=replace_same_build)
 
 
+def native_gui_helper(args):
+    """Only the explicitly opted-in, bundled development GUI may use writes."""
+    artifact.require(args.ui_pipe and args.usb_transport == "standalone"
+                     and args.mode in ("install", "setup")
+                     and not args.native_install_dev and args.native_dev_helper is None,
+                     "Native GUI developer mode requires bundled standalone install or setup")
+    expected = ROOT / "helpers"
+    artifact.require(args.precompiled_helpers == expected and not expected.is_symlink(),
+                     "Native GUI developer mode requires its bundled helpers")
+    helper = expected / "zag-usb"
+    StandaloneUSB(ROOT, helper)  # Check ownership, permissions and executable type.
+    result = subprocess.run([str(helper), "capabilities"], capture_output=True, timeout=10)
+    artifact.require(result.returncode == 0 and len(result.stdout) <= 4096,
+                     "Bundled native USB capability check failed")
+    artifact.require(json.loads(result.stdout) == {"native_install_dev": True},
+                     "Bundled native USB installation is not enabled")
+    return helper
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ui-pipe", action="store_true", help=argparse.SUPPRESS)
@@ -622,6 +646,7 @@ def main():
     parser.add_argument("--native-install-dev", action="store_true",
                         help=argparse.SUPPRESS)
     parser.add_argument("--native-dev-helper", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--native-gui-dev", action="store_true", help=argparse.SUPPRESS)
     modes = parser.add_subparsers(dest="mode", required=True)
     prepare = modes.add_parser("prepare", help="Download and verify the latest authorized release")
     prepare.add_argument("destination", type=Path)
@@ -647,7 +672,8 @@ def main():
     try:
         artifact.require(sys.platform == "darwin", "Use macOS")
         if args.ui_pipe:
-            artifact.require(args.mode in ("install",), "Graphical transport only supports official installation")
+            artifact.require(args.mode == "install" or (args.mode == "setup" and args.native_gui_dev),
+                             "Graphical transport only supports official installation or native setup recovery")
             channel = ui_protocol.Channel()
             desktop.secret = lambda prompt: channel.ask(prompt, secret=True)
             approve = channel.ask
@@ -660,8 +686,9 @@ def main():
             args.usb_transport == "standalone" and args.native_install_dev
             and args.mode in ("install", "setup") and not args.ui_pipe and sys.stdin.isatty()
         )
+        gui_helper = native_gui_helper(args) if args.native_gui_dev else None
         artifact.require(args.usb_transport != "standalone"
-                         or args.mode == "prepare" or developer_native,
+                         or args.mode == "prepare" or developer_native or gui_helper is not None,
                          "Native USB installation and signing handoff are not yet enabled")
         artifact.require(not args.native_install_dev or developer_native,
                          "Native developer mode requires interactive standalone install or setup")
@@ -687,12 +714,19 @@ def main():
                     helper_root = (args.precompiled_helpers if args.precompiled_helpers is not None
                                    else ROOT / "tools/zag-installer/native-usb/target/release")
                     device = (CoreDevice(scratch) if args.usb_transport == "coredevice"
-                              else StandaloneUSB(scratch, args.native_dev_helper if developer_native else helper_root / "zag-usb",
-                                                 native_install_dev=developer_native))
+                              else StandaloneUSB(scratch, args.native_dev_helper if developer_native else
+                                                 (gui_helper if gui_helper is not None else helper_root / "zag-usb"),
+                                                 native_install_dev=developer_native or gui_helper is not None))
                     if args.mode in ("handoff", "setup"):
                         artifact.mapped_bundle(args.team)
                         command = handoff.send if args.mode == "handoff" else handoff.retry
+                        if gui_helper is not None:
+                            bundle = artifact.mapped_bundle(args.team)
+                            artifact.require(approve(f"Resume Signing Setup for {bundle}? Type SETUP: ") == "SETUP",
+                                             "Signing Setup cancelled")
                         result = command(ROOT, cache, scratch, device, args.team)
+                        if gui_helper is not None:
+                            result["installed_bundle"] = bundle
                     else:
                         if args.mode == "upgrade-local-candidate":
                             result = upgrade_local_candidate(args.ipa, args.sha256, args.version, args.build,
@@ -701,7 +735,8 @@ def main():
                         else:
                             release, release_helper = releases.discover(ROOT, cache, args.expect_tag)
                             result = install_release(release, release_helper, args.apple_root, os.environ.get("ZAG_ANISETTE_URL", ""),
-                                                     args.upgrade, scratch, device, cache, approve=approve)
+                                                     args.upgrade, scratch, device, cache, approve=approve,
+                                                     defer_setup=gui_helper is not None)
         if channel is not None:
             channel.send({"type": "finished", "result": result})
         else:

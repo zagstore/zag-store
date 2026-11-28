@@ -22,10 +22,12 @@ final class InstallerController: ObservableObject {
     private var stderr: Pipe?
     private var events = Data()
 
-    func begin(upgrade: Bool, team: String) {
+    func begin(upgrade: Bool, team: String, resumeSetup: Bool = false) {
         guard !busy else { return }
         let environment = ProcessInfo.processInfo.environment
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
+        let nativeDev = bundled && Bundle.main.object(forInfoDictionaryKey: "ZagNativeInstallDevelopment") as? Bool == true
+        guard !resumeSetup || nativeDev else { return }
         let resource = Bundle.main.resourceURL?.appendingPathComponent("DesktopEngine", isDirectory: true)
         let fileManager = FileManager.default
         let root: String
@@ -56,7 +58,7 @@ final class InstallerController: ObservableObject {
             root = checkout
         }
         let selectedTeam = team.trimmingCharacters(in: .whitespacesAndNewlines)
-        if upgrade && selectedTeam.range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil {
+        if (upgrade || resumeSetup) && selectedTeam.range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil {
             status = "Enter the original 10-character Personal Team ID"
             return
         }
@@ -73,8 +75,10 @@ final class InstallerController: ObservableObject {
             }
             process.executableURL = URL(fileURLWithPath: privatePython)
             process.arguments = [script, "--ui-pipe", "--precompiled-helpers",
-                                 root + "/helpers", "--usb-transport", "standalone", "install"]
-                + (upgrade ? ["--upgrade", selectedTeam] : [])
+                                 root + "/helpers", "--usb-transport", "standalone"]
+                + (nativeDev ? ["--native-gui-dev"] : [])
+                + (resumeSetup ? ["setup", "--team", selectedTeam] :
+                    ["install"] + (upgrade ? ["--upgrade", selectedTeam] : []))
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = ["python3", script, "--ui-pipe", "install"]
@@ -117,7 +121,7 @@ final class InstallerController: ObservableObject {
         installedBundle = ""
         prompt = nil
         log = ""
-        status = "Verifying the signed release and connected iPhone"
+        status = resumeSetup ? "Checking the existing installation and signing receipt" : "Verifying the signed release and connected iPhone"
         busy = true
         task = process
 
@@ -186,7 +190,7 @@ final class InstallerController: ObservableObject {
                     if result["signing_setup"] as? String == "verified" {
                         status = "Installed and Signing Setup verified"
                     } else if result["signing_setup"] as? String == "incomplete" {
-                        status = "Installed. Complete Signing Setup on your iPhone."
+                        status = "Installed. Signing Setup can be resumed separately."
                     } else {
                         status = "Installation complete"
                     }
@@ -324,7 +328,13 @@ private enum ZagPalette {
 private struct InstallerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var dark: Bool { colorScheme == .dark }
-    private var nativeUSBPreview: Bool { Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true }
+    private var nativeDevelopment: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true &&
+        Bundle.main.object(forInfoDictionaryKey: "ZagNativeInstallDevelopment") as? Bool == true
+    }
+    private var nativeUSBPreview: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true && !nativeDevelopment
+    }
     private var surface: Color { ZagPalette.rgb(dark ? 0x141e33 : 0xffffff) }
     private var border: Color { ZagPalette.rgb(dark ? 0x29374e : 0xdcdcde) }
     private var muted: Color { dark ? ZagPalette.rgb(0xa6b5d2) : Color.secondary }
@@ -398,6 +408,9 @@ private struct InstallerView: View {
                 if nativeUSBPreview {
                     Label("Native USB verified. Installation remains disabled until the USB transfer path is validated.", systemImage: "wrench.and.screwdriver")
                         .foregroundStyle(attention)
+                } else if nativeDevelopment {
+                    Label("Native USB development build. Signing Setup is separate; existing pairing is not changed automatically.", systemImage: "wrench.and.screwdriver")
+                        .foregroundStyle(attention)
                 }
             }
             .font(.callout)
@@ -405,7 +418,7 @@ private struct InstallerView: View {
 
             Toggle("Upgrade an existing Personal Team copy", isOn: $upgrade)
                 .disabled(installer.busy)
-            if upgrade {
+            if upgrade || nativeDevelopment {
                 TextField("Original Personal Team ID (10 characters)", text: $team)
                     .textFieldStyle(.roundedBorder)
                     .disabled(installer.busy)
@@ -432,6 +445,12 @@ private struct InstallerView: View {
                     ProgressView().controlSize(.small)
                     Button("Cancel") { installer.cancel() }
                 }
+            }
+            if nativeDevelopment {
+                Button("Resume Signing Setup") {
+                    installer.begin(upgrade: false, team: team, resumeSetup: true)
+                }
+                .disabled(installer.busy || !device.ready || team.trimmingCharacters(in: .whitespacesAndNewlines).range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) == nil)
             }
             Divider()
             HStack {
