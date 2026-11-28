@@ -29,6 +29,7 @@ APPLE_GUIDANCE = {
     "development certificate inventory": "Certificate inventory could not be read. Try again before changing certificates.",
     "Apple certificate submission or issuance lookup": "Certificate issuance could not be confirmed. Check certificate availability before retrying.",
     "Apple device registration": "Device registration failed. Check Personal Team device eligibility.",
+    "Apple App ID inventory": "Could not read the Personal Team App ID inventory. No new identifiers were requested during this check.",
     "Apple app identifier registration": "App ID registration failed. Check Personal Team availability and limits.",
     "Apple Personal Team profile": "Apple provisioning profile unavailable. Check team, device and certificate eligibility.",
 }
@@ -123,6 +124,11 @@ class Channel:
 
     def apple_failure(self, error):
         message = APPLE_GUIDANCE.get(error.stage, "Apple operation failed.") if isinstance(error.stage, str) else "Apple operation failed."
+        if error.stage == "Apple app identifier registration" and type(error.code) is int and error.code == 9120:
+            message = ("Personal Team App ID limit reached. Apple allows up to 10 App IDs per 7 days. "
+                       "Extensions need their own IDs. Some identifiers may already have been registered "
+                       "during this attempt. Wait for IDs to expire before retrying with this team, "
+                       "or choose another eligible Apple ID. No certificates or App IDs were automatically revoked.")
         if isinstance(error.hint, str) and error.hint in NETWORK_GUIDANCE:
             message += " " + error.hint
         if type(error.code) is int and -(2**31) <= error.code < 2**31:
