@@ -299,6 +299,26 @@ class Provisioning:
                 require(re.fullmatch(r"[0-9a-f]{64}", expected), "Installed signing receipt is unreadable")
             self.identity = Identity(self.store, account, self.team, self.openssl, self.approve, self.upgrade, expected)
             return self.team
+        if event == "app_id_inventory":
+            require(self.imported_bundle is not None and self.identity is not None,
+                    "Unexpected imported App ID inventory")
+            registered, reused, needed = (message.get(key) for key in ("registered", "reused", "needed"))
+            require(all(type(value) is int and 0 <= value <= 1000
+                        for value in (registered, reused, needed))
+                    and reused <= registered and reused + needed == len(self.components),
+                    "Invalid App ID inventory counts")
+            summary = (f"Apple reports {registered} registered App IDs. "
+                       f"This app uses {len(self.components)} IDs: {reused} reusable, {needed} new. "
+                       "Personal Teams allow up to 10 IDs per 7 days. "
+                       "The inventory count is not a guaranteed quota balance. ")
+            if needed and registered + needed > 10:
+                summary += ("The reported inventory suggests insufficient capacity. "
+                            "Cancel and select another eligible Apple ID or wait for IDs to expire "
+                            "unless you know capacity is available. ")
+            summary += "Continue with provisioning? No existing certificates or IDs will be revoked."
+            require(confirm_action(self.approve, summary, "IMPORT-APP-IDS", "Continue")
+                    == "IMPORT-APP-IDS", "Installation cancelled")
+            return True
         if event == "account_bootstrap":
             # This event arrives over the private child pipe, never the GUI
             # event stream, and is retained in memory only for this install.
