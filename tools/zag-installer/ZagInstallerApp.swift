@@ -97,6 +97,8 @@ final class InstallerController: ObservableObject {
     @Published var status = "Ready"
     @Published var installedBundle = ""
     @Published var identityImported = false
+    @Published private(set) var importedInstallation = false
+    private var installingImported = false
     @Published var setupVerified = false
     @Published var stage: String?
     @Published private(set) var progressFraction: Double = 0
@@ -110,7 +112,7 @@ final class InstallerController: ObservableObject {
         guard let next = object["stage"] as? String,
               let index = Self.milestones.firstIndex(of: next) else { return false }
         if let stage, let previous = Self.milestones.firstIndex(of: stage), index < previous { return false }
-        var label = Self.milestoneLabels[index]
+        var label = installingImported && next == "preflight" ? "Checking IPA and device" : Self.milestoneLabels[index]
         var fraction = 0.0
         var measured: Int?
         if object["phase"] != nil || object["percent"] != nil {
@@ -126,7 +128,7 @@ final class InstallerController: ObservableObject {
         }
         observedStages.insert(next)
         stage = next
-        progressFraction = max(progressFraction, (Double(index) + fraction) / Double(Self.milestones.count))
+        progressFraction = max(progressFraction, (Double(index) + fraction) / Double(installingImported ? 5 : Self.milestones.count))
         milestone = label
         measuredPercent = measured
         status = label
@@ -145,12 +147,13 @@ final class InstallerController: ObservableObject {
     private var receivedError = false
     private var cancellationRequested = false
 
-    func begin(upgrade: Bool, team: String, resumeSetup: Bool = false, channel: String = "beta", targetID: String? = nil, targetTransport: String? = nil) {
+    fileprivate func begin(upgrade: Bool, team: String, resumeSetup: Bool = false, channel: String = "beta", targetID: String? = nil, targetTransport: String? = nil, importedURL: URL? = nil, importedMetadata: ImportedApplication? = nil) {
         guard !busy else { return }
         let environment = ProcessInfo.processInfo.environment
         let bundled = Bundle.main.object(forInfoDictionaryKey: "ZagEngineBundled") as? Bool == true
         let nativeDev = bundled && Bundle.main.object(forInfoDictionaryKey: "ZagNativeInstallDevelopment") as? Bool == true
         guard !resumeSetup || nativeDev else { return }
+        guard importedURL == nil || (nativeDev && !resumeSetup && !upgrade && importedMetadata != nil) else { return }
         if nativeDev {
             guard let targetID, targetID.range(of: #"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})$"#, options: .regularExpression) != nil,
                   let targetTransport, ["usb", "network"].contains(targetTransport) else {
@@ -207,8 +210,13 @@ final class InstallerController: ObservableObject {
             process.arguments = [script, "--ui-pipe", "--precompiled-helpers",
                                  root + "/helpers", "--usb-transport", "standalone"]
                 + (nativeDev ? ["--native-gui-dev", "--target-udid", targetID ?? "", "--target-transport", targetTransport ?? ""] : [])
-                + (resumeSetup ? ["setup", "--team", selectedTeam] :
+            if let importedURL, let importedMetadata {
+                process.arguments = (process.arguments ?? []) + ["install-imported", importedURL.path,
+                    "--bundle", importedMetadata.bundle, "--version", importedMetadata.version, "--build", importedMetadata.build]
+            } else {
+                process.arguments = (process.arguments ?? []) + (resumeSetup ? ["setup", "--team", selectedTeam] :
                     ["install", "--channel", channel] + (upgrade ? ["--upgrade", selectedTeam] : []))
+            }
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = ["python3", script, "--ui-pipe", "install", "--channel", channel]
@@ -254,6 +262,8 @@ final class InstallerController: ObservableObject {
         exitCode = nil
         receivedError = false
         cancellationRequested = false
+        installingImported = importedURL != nil
+        importedInstallation = false
         installedBundle = ""
         identityImported = false
         setupVerified = false
@@ -362,6 +372,7 @@ final class InstallerController: ObservableObject {
                 if let result = object["result"] as? [String: Any] {
                     installedBundle = result["installed_bundle"] as? String ?? ""
                     if !installedBundle.isEmpty { progressFraction = 1 }
+                    importedInstallation = installingImported && (result["imported_application"] as? Bool == true) && !installedBundle.isEmpty
                     setupVerified = result["signing_setup"] as? String == "verified"
                     identityImported = setupVerified || result["signing_identity"] as? String == "imported"
                     if setupVerified {
@@ -398,6 +409,7 @@ final class InstallerController: ObservableObject {
 
     func dismissCompletion() {
         guard !busy, !installedBundle.isEmpty else { return }
+        importedInstallation = false
         installedBundle = ""
         identityImported = false
         setupVerified = false
@@ -666,7 +678,7 @@ private enum RememberedAccounts {
     }
 }
 
-private struct ImportedApplication: Decodable, Sendable {
+fileprivate struct ImportedApplication: Decodable, Sendable {
     let name: String
     let bundle: String
     let version: String
@@ -702,7 +714,7 @@ private struct InstallerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var dark: Bool { colorScheme == .dark }
     private var completed: Bool { !installer.busy && !installer.installedBundle.isEmpty }
-    private var successfulSetup: Bool { completed && installer.identityImported }
+    private var successfulSetup: Bool { completed && (installer.identityImported || installer.importedInstallation) }
     private var actionTitle: String {
         if completed { return "Done" }
         if inspectingIPA { return "Reading IPA…" }
@@ -1062,11 +1074,16 @@ private struct InstallerView: View {
                                      progress: installer.progressFraction,
                                      measuredPercent: installer.prompt == nil ? installer.measuredPercent : nil,
                                      busy: installer.busy,
-                                     enabled: completed || (importedIPA == nil && device.ready && !nativeUSBPreview),
+                                     enabled: completed || (device.ready && !nativeUSBPreview && (importedIPA == nil || (nativeDevelopment && importedApplication != nil && !inspectingIPA))),
                                      success: successfulSetup,
                                      action: {
                 if completed {
                     installer.dismissCompletion()
+                    clearIPA()
+                } else if let importedIPA, let importedApplication, nativeDevelopment {
+                    installer.begin(upgrade: false, team: "", targetID: device.udid,
+                                    targetTransport: device.usb ? "usb" : "network", importedURL: importedIPA,
+                                    importedMetadata: importedApplication)
                 } else if importedIPA == nil {
                     installer.begin(upgrade: upgrade, team: team, channel: releaseChannel,
                                     targetID: device.udid, targetTransport: device.usb ? "usb" : "network")
@@ -1108,7 +1125,7 @@ private struct InstallerView: View {
                                 Text([app.version.isEmpty ? nil : "Version " + app.version,
                                       app.bundle].compactMap { $0 }.joined(separator: " · "))
                                     .font(.system(size: 12)).foregroundStyle(muted).lineLimit(1)
-                                Text("Selected · Third-party installation not yet enabled")
+                                Text(nativeDevelopment ? "Selected · Ready for Apple ID signing" : "Selected · Installation not enabled in this build")
                                     .font(.caption).foregroundStyle(muted)
                             } else {
                                 Text(inspectingIPA ? "Reading application metadata…" :
@@ -1162,11 +1179,13 @@ private struct InstallerView: View {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 48, weight: .light)).foregroundStyle(success)
                         .accessibilityHidden(true)
-                    Text(installer.identityImported ? "You're all set!" : "Signing Setup pending").font(.title2.bold())
-                    Text("Zag Store installed on your iPhone.").foregroundStyle(muted)
+                    Text(installer.importedInstallation || installer.identityImported ? "You're all set!" : "Signing Setup pending").font(.title2.bold())
+                    Text(installer.importedInstallation ? "\(importedApplication?.name ?? "Application") installed on your iPhone." : "Zag Store installed on your iPhone.").foregroundStyle(muted)
                 }.frame(maxWidth: .infinity)
-                Label("Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
-                if installer.identityImported {
+                Label(installer.importedInstallation ? "\(importedApplication?.name ?? "Application") installed" : "Zag Store installed", systemImage: "checkmark.circle.fill").foregroundStyle(success).font(.headline)
+                if installer.importedInstallation {
+                    Text("Installation verified on your selected device.").foregroundStyle(muted)
+                } else if installer.identityImported {
                     Label("Signing identity ready", systemImage: "checkmark.circle.fill").foregroundStyle(success)
                     Label(installer.setupVerified ? "Signing Setup verified" : "Pairing can be configured later", systemImage: installer.setupVerified ? "checkmark.circle.fill" : "shield")
                         .foregroundStyle(installer.setupVerified ? success : muted)
