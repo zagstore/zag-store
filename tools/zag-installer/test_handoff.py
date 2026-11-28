@@ -48,6 +48,27 @@ class HandoffTests(unittest.TestCase):
              patch.object(desktop, "command", side_effect=commands or [b"same-public", b"same-public", b"DER", b"ciphertext"]):
             return handoff.send(Path("."), self.cache, self.scratch, self.device, TEAM, lambda _: next(answers))
 
+    def test_private_handoff_files_are_exclusive_mode_0600(self):
+        target = self.scratch / "private-bootstrap.json"
+        handoff.private_write(target, b"transaction-secret")
+        self.assertEqual(target.read_bytes(), b"transaction-secret")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        with self.assertRaises(FileExistsError):
+            handoff.private_write(target, b"second")
+        self.assertEqual(target.read_bytes(), b"transaction-secret")
+        for invalid in (b"", b"x" * (handoff.MAX_WIRE_SIZE + 1)):
+            with self.assertRaises(ValueError):
+                handoff.private_write(self.scratch / "invalid.json", invalid)
+
+    def test_private_handoff_refuses_symlinks(self):
+        original = self.scratch / "original"
+        original.write_bytes(b"keep")
+        target = self.scratch / "link"
+        target.symlink_to(original)
+        with self.assertRaises(FileExistsError):
+            handoff.private_write(target, b"secret")
+        self.assertEqual(original.read_bytes(), b"keep")
+
     def test_same_scoped_identity_goes_only_to_the_experimental_app_as_ciphertext(self):
         result = self.send(self.request_bytes())
         self.assertEqual(result["handoff_delivered"], BUNDLE)
