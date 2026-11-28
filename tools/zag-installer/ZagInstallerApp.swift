@@ -522,7 +522,7 @@ private struct InstallerView: View {
                 Button {
                     installer.begin(upgrade: upgrade, team: team)
                 } label: {
-                    Text(upgrade ? "Upgrade Zag Store" : "Install Zag Store")
+                    Text(nativeDevelopment ? "Continue with Apple ID" : (upgrade ? "Upgrade Zag Store" : "Install Zag Store"))
                         .font(.system(size: 19, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
@@ -546,6 +546,11 @@ private struct InstallerView: View {
             }
             if installer.busy {
                 Button("Cancel installation") { installer.cancel() }.frame(maxWidth: .infinity)
+            }
+            if nativeDevelopment && !installer.busy && installer.installedBundle.isEmpty {
+                Text("Install, update or recover Zag Store using your Apple ID. Existing installations are checked before any changes.")
+                    .font(.caption).foregroundStyle(muted).multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
             }
             Divider()
             if installer.busy {
@@ -660,6 +665,13 @@ private struct InstallerView: View {
                         .font(.title2.bold())
                     Text("Zag Installer").font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity)
+                if prompt.confirmation == "AUTO-RECOVER" {
+                    Label("Recover existing installation", systemImage: "arrow.clockwise.circle")
+                        .font(.headline)
+                } else if prompt.confirmation == "AUTO-UPGRADE" {
+                    Label("Update existing installation", systemImage: "arrow.up.circle")
+                        .font(.headline)
+                }
                 Text(prompt.message)
                     .fixedSize(horizontal: false, vertical: true)
                 if prompt.secure {
