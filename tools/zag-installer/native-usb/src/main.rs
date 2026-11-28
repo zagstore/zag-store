@@ -222,6 +222,24 @@ async fn install_developer(args: &[String]) -> Result<serde_json::Value, Box<dyn
         "legacy_app_untouched":true}))
 }
 
+#[cfg(all(test, feature = "native-install-dev"))]
+mod developer_install_gate_tests {
+    use super::*;
+    #[test]
+    fn typed_confirmation_binds_exact_operation_bundle_and_device() {
+        let bundle = "app.zagstore.ios.FTB8PRW638";
+        let udid = "00000000-0000000000000000";
+        assert_eq!(install_dev_confirmation(bundle, udid, false),
+            format!("INSTALL {bundle} ON {udid}"));
+        assert_eq!(install_dev_confirmation(bundle, udid, true),
+            format!("UPGRADE {bundle} ON {udid}"));
+        assert_ne!(install_dev_confirmation(bundle, udid, false),
+            install_dev_confirmation(bundle, udid, true));
+        assert_ne!(install_dev_confirmation(bundle, udid, false),
+            install_dev_confirmation(bundle, "11111111-1111111111111111", false));
+    }
+}
+
 #[tokio::main(flavor="current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

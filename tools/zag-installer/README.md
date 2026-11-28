@@ -310,3 +310,52 @@ enable it. The macOS standalone CLI still blocks provisioning and
 installation, `StandaloneUSB.install` still rejects writes, and `zag-usb
 install` is intentionally not a supported command. The AppTesters
 installation `com.cwd43.gu29` is not an upgrade or uninstall target.
+
+
+## Developer-only native installation path (not a release capability)
+
+The full native Installation Proxy writer is now reachable **only** when
+`zag-usb` is compiled with Cargo feature `native-install-dev`, which
+is disabled by default. This feature is intentionally excluded from
+`package-engine.sh`, the distributed GUI, and ordinary release builds.
+The development-only Rust command is `install-signed-dev`, which
+requires a strict plan, unguessable staging token, and exact
+`INSTALL/UPGRADE BUNDLE ON UDID` confirmation. It validates the IPA digest,
+paired USB device, mapped bundle, minimum iOS and stable destination both
+before and after staging, then performs Installation Proxy install/upgrade
+and independently checks installed version/build. It does not uninstall or
+modify the legacy `com.cwd43.gu29` bundle.
+
+The Python CLI enables this branch only with **all** of the following:
+`--usb-transport standalone`, `--native-install-dev`, interactive Terminal
+(rather than the GUI), and official `install` mode. Its Apple signing
+validation, profile/certificate checks, current release authorization,
+Personal Team selection, user confirmation, targeted inventory and
+independent native preflight still apply. Unlike the old CoreDevice
+backend, the new native branch stages the **intact signed IPA**; it does
+not unpack and rewrite the executable bundle before installation.
+
+**Important security boundary:** a JSON preflight record is not signed
+and the developer-only Rust command cannot independently prove Apple's
+signature chain or the authorized signed release. It trusts the macOS
+signing frontend's prior validation and the explicit local developer
+confirmation. It must not be enabled in distributed builds or used as an
+unattended API. No physical iOS 27 installation has yet been verified;
+do not treat the feature as production ready.
+
+To compile both paths without replacing the default release binary:
+
+```sh
+cd "$HOME/Documents/ZagStore-claude"
+(cd tools/zag-installer && python3 -m unittest -q test_zag_installer test_handoff)
+cargo test --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
+cargo build --release --manifest-path tools/zag-installer/native-usb/Cargo.toml
+cargo test --release --features native-install-dev \
+  --target-dir /tmp/zag-native-dev-build \
+  --manifest-path tools/zag-installer/native-usb/Cargo.toml
+```
+
+Do **not** copy the feature-enabled binary into the installed GUI. The
+default release helper must continue rejecting `install` and
+`install-signed-dev`. The experimental code remains on the development
+branch and should be reviewed before any physical write to an iPhone.
