@@ -63,7 +63,7 @@ struct InstallerUpdateSettingsView: View {
 
     var body: some View {
         Form {
-            Section("Zag Installer Updates") {
+            Section("zLoader Updates") {
                 LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Development")
                 LabeledContent("Channel", value: "Beta")
                 Toggle("Automatically check for updates", isOn: $automaticChecks)

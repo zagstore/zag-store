@@ -43,7 +43,7 @@ final class InstallerController: ObservableObject {
                   fileManager.fileExists(atPath: resource.appendingPathComponent("helpers/release").path),
                   fileManager.fileExists(atPath: resource.appendingPathComponent("helpers/zag_desktop").path) else {
                 status = "Bundled installer engine is unavailable"
-                append("The signed installer bundle is incomplete. Reinstall Zag Installer from the official source.")
+                append("The signed installer bundle is incomplete. Reinstall zLoader from the official source.")
                 return
             }
             root = resource.path
@@ -76,7 +76,7 @@ final class InstallerController: ObservableObject {
             guard fileManager.isExecutableFile(atPath: privatePython),
                   fileManager.isExecutableFile(atPath: localOpenSSL) else {
                 status = "Private installer runtime is missing"
-                append("The installer package is incomplete. Reinstall Zag Installer from the official source.")
+                append("The installer package is incomplete. Reinstall zLoader from the official source.")
                 return
             }
             process.executableURL = URL(fileURLWithPath: privatePython)
@@ -375,7 +375,7 @@ private struct WiredDevice: Sendable {
         }
         guard let helper, FileManager.default.isExecutableFile(atPath: helper.path) else {
             return WiredDevice(title: "Native USB helper unavailable",
-                               detail: "Zag Installer requires its bundled USB helper.", ready: false)
+                               detail: "zLoader requires its bundled USB helper.", ready: false)
         }
         do {
             let process = Process()
@@ -506,7 +506,7 @@ private struct InstallerView: View {
     @State private var showDeviceDetails = false
 
     private var brandImage: NSImage? {
-        let name = colorScheme == .dark ? "zagstore_dark" : "zagstore"
+        let name = colorScheme == .dark ? "zagstore_dark_installer" : "zagstore_installer"
         guard let url = Bundle.main.url(forResource: name, withExtension: "png") else { return nil }
         return NSImage(contentsOf: url)
     }
@@ -535,7 +535,7 @@ private struct InstallerView: View {
                     Text("Z").font(.largeTitle.bold()).frame(width: 64, height: 64)
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Zag Installer").font(.largeTitle.bold())
+                    Text("Loader").font(.largeTitle.bold()).accessibilityLabel("zLoader")
                     Text("Install Zag Store using your own Apple ID")
                         .foregroundStyle(muted)
                 }
@@ -715,7 +715,7 @@ private struct InstallerView: View {
                 let allowedStages = ["preflight", "authentication", "provisioning", "signing", "installation", "handoff"]
                 let stage = installer.stage.flatMap { allowedStages.contains($0) ? $0 : nil } ?? "none"
                 let report = [
-                    "Zag Installer \(version) (\(build))",
+                    "zLoader \(version) (\(build))",
                     "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)",
                     "USB trust verified: \(device.trusted)",
                     "Developer Mode verified: \(device.ready)",
@@ -779,7 +779,7 @@ private struct InstallerView: View {
                         .font(.system(size: 34))
                     Text(accountPrompt || passwordPrompt ? "Sign in with your Apple ID" : (verificationPrompt ? "Enter verification code" : (prompt.secure ? "Secure verification" : "Confirm Installation")))
                         .font(.title2.bold())
-                    Text("Zag Installer").font(.caption).foregroundStyle(.secondary)
+                    Text("zLoader").font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity)
                 if prompt.confirmation == "AUTO-RECOVER" {
                     Label("Recover existing installation", systemImage: "arrow.clockwise.circle")
@@ -939,7 +939,7 @@ private struct InstallerGeneralSettingsView: View {
             Section("About") {
                 let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
                 let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
-                Text("Zag Installer · Version \(version) (\(build))")
+                Text("zLoader · Version \(version) (\(build))")
                 Link("Zag Store website", destination: URL(string: "https://zagstore.app")!)
                 Button("Third-party acknowledgements…") {
                     if let resources = Bundle.main.resourceURL {
@@ -969,12 +969,12 @@ struct ZagInstallerApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .appInfo) {
-                Button("About Zag Installer") {
+                Button("About zLoader") {
                     let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
                     let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
                     let credits = NSAttributedString(string: "Install Zag Store using your own Apple ID.\n\nhttps://zagstore.app", attributes: [.font: NSFont.systemFont(ofSize: 12)])
                     NSApp.orderFrontStandardAboutPanel(options: [
-                        .applicationName: "Zag Installer",
+                        .applicationName: "zLoader",
                         .applicationVersion: version,
                         .version: build,
                         .credits: credits

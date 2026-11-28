@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 if [[ "$(uname -s)" != Darwin ]]; then
-    echo "Zag Installer's native graphical interface currently requires macOS." >&2
+    echo "zLoader's native graphical interface currently requires macOS." >&2
     exit 1
 fi
 
@@ -15,7 +15,7 @@ mkdir -p "$CACHE"
 chmod 700 "$CACHE"
 
 command -v xcrun >/dev/null || {
-    echo "Install Xcode Command Line Tools before starting Zag Installer." >&2
+    echo "Install Xcode Command Line Tools before starting zLoader." >&2
     exit 1
 }
 
@@ -40,15 +40,15 @@ xcrun swiftc -parse-as-library -O -framework SwiftUI -framework AppKit \
     -Xlinker -rpath -Xlinker "@executable_path/../Frameworks" \
     "$SOURCE" "$UPDATE_SOURCE" "$SPECTRUM_SOURCE" "$PROGRESS_SOURCE" "$PALETTE_SOURCE" -o "$CACHE/ZagInstaller"
 
-APP="$HOME/Applications/Zag Installer.app"
+APP="$HOME/Applications/zLoader.app"
 NATIVE_DEV="${ZAG_INSTALLER_NATIVE_GUI_DEV:-0}"
 if [[ -n "${ZAG_INSTALLER_APP_OUTPUT:-}" ]]; then
     APP="$ZAG_INSTALLER_APP_OUTPUT"
     [[ "$APP" == /*.app && ! -e "$APP" && ! -L "$APP" ]] || {
         echo "Specify an absolute, new .app output path." >&2; exit 1;
     }
-elif [[ -d "/Applications/Zag Installer.app" ]]; then
-    APP="/Applications/Zag Installer.app"
+elif [[ -d "/Applications/zLoader.app" ]]; then
+    APP="/Applications/zLoader.app"
 fi
 if [[ "$NATIVE_DEV" == 1 ]]; then
     [[ -n "${ZAG_INSTALLER_APP_OUTPUT:-}" && -n "${ZAG_INSTALLER_ENGINE_STAGE:-}" ]] || {
@@ -68,8 +68,6 @@ cp "$ROOT/AppleAuthCore/zag-isideload/LICENSE-isideload-MIT" "$NOTICES/isideload
 cp "$ROOT/AppleAuthCore/zag-isideload/LICENSE-MPL-2.0" "$NOTICES/MPL-2.0.txt"
 cp "$ROOT/docs/free-developer-accounts/G2-THIRD-PARTY-NOTICES-DRAFT.md" "$NOTICES/Review-Draft.md"
 printf '%s\n' "$(git -C "$ROOT" rev-parse HEAD)" > "$NOTICES/SourceRevision.txt"
-ASSETS="$ROOT/Feather/Resources/Assets.xcassets/AppIcon.appiconset"
-cp "$ASSETS/zagstore.png" "$ASSETS/zagstore_dark.png" "$APP/Contents/Resources/"
 for variant in zagstore zagstore_dark; do
     source="$ROOT/tools/zag-installer/icons/${variant}_installer.png"
     [[ -s "$source" ]] || { echo "Missing approved installer artwork: $source" >&2; exit 1; }
@@ -142,8 +140,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Zag Installer</string>
-    <key>CFBundleDisplayName</key><string>Zag Installer</string>
+    <key>CFBundleName</key><string>zLoader</string>
+    <key>CFBundleDisplayName</key><string>zLoader</string>
     <key>CFBundleIdentifier</key><string>app.zagstore.installer</string>
     <key>CFBundleExecutable</key><string>ZagInstaller</string>
     <key>CFBundlePackageType</key><string>APPL</string>
