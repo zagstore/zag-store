@@ -349,6 +349,9 @@ final class ZagIdentityHandoff: ObservableObject {
                 }
                 return context.device == nil
             }
+            if bootstrap != nil, generation == attempt {
+                UserDefaults.standard.set(ZagSigningPreference.appleAccount.rawValue, forKey: ZagSigningPreference.key)
+            }
             if importedWithoutPairing, let bootstrap {
                 guard generation == attempt else { return }
                 let proof = try bootstrap.wrap(Data(SHA256.hash(data: pending.bytes)), label: "imported")

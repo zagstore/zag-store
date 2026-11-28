@@ -211,6 +211,75 @@ struct SettingsView: View {
 		animation: .snappy
 	) private var _certificates: FetchedResults<CertificatePair>
 	
+	#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+	@State private var _nativeSettingsCertificates: [ZagNativeAccountInstall.LocalCertificate] = []
+	private var _activeAppleCertificate: ZagNativeAccountInstall.LocalCertificate? {
+		guard let account = try? ZagNativeAppleIDs.shared.catalog().activeID else { return nil }
+		return _nativeSettingsCertificates.first { $0.scope.accountID == account && $0.hasPrivateKey && $0.expires > Date() }
+	}
+	#endif
+
+	private var _hasSettingsCertificates: Bool {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		return !_certificates.isEmpty || !_nativeSettingsCertificates.isEmpty
+		#else
+		return !_certificates.isEmpty
+		#endif
+	}
+
+	private func _reloadSettingsCertificates() {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		_nativeSettingsCertificates = ZagNativeAccountInstall.localCertificates()
+		#endif
+	}
+
+	@ViewBuilder
+	private var _settingsCertificateSummary: some View {
+		#if canImport(ZagAppleAuth) && ZAG_ZSIGN_STRICT
+		if let cert = _activeAppleCertificate, _signingPreference == .appleAccount || selectedCertificate == nil {
+			HStack(spacing: 12) {
+				Image(systemName: "checkmark.shield.fill")
+					.foregroundStyle(.green)
+				VStack(alignment: .leading, spacing: 4) {
+					Text("Apple Development").font(.subheadline.weight(.semibold))
+					Text((try? ZagNativeAppleIDs.shared.catalog().accounts.first(where: { $0.id == cert.scope.accountID })?.label) ?? "Personal Team")
+						.font(.footnote).foregroundStyle(.secondary)
+					Text(cert.expires, style: .date)
+						.font(.caption).foregroundStyle(.secondary)
+				}
+			}
+			.padding(.vertical, 4)
+		} else {
+			_importedSettingsCertificateSummary
+		}
+		#else
+		_importedSettingsCertificateSummary
+		#endif
+	}
+
+	@ViewBuilder
+	private var _importedSettingsCertificateSummary: some View {
+				if let cert = selectedCertificate {
+					CertificatesCellView(cert: cert)
+                        .padding(.vertical, 0)
+					.contentShape(Rectangle())
+					.onTapGesture { _selectedCertificateInfo = cert }
+                    .listRowInsets(EdgeInsets(top: 10, leading: 20, bottom: 10, trailing: 20))
+					.swipeActions(edge: .trailing) {
+						Button(role: .destructive) {
+							_pendingCertificateDelete = cert
+						} label: {
+							Label(.localized("Delete"), systemImage: "trash")
+						}
+					}
+				} else {
+					Text(.localized("No Certificate"))
+						.font(.footnote)
+						.foregroundColor(.disabled())
+				}
+
+	}
+
 	private var selectedCertificate: CertificatePair? {
 		guard
 			_storedSelectedCert >= 0,
@@ -309,6 +378,7 @@ struct SettingsView: View {
 				_handleZagStoreRoute(route)
 			}
 			.onAppear {
+				_reloadSettingsCertificates()
 				_loadSettingsSectionOrder()
                 _probeSettingsDictation()
 				_refreshPhotoAuthorizationStatus()
@@ -803,29 +873,12 @@ extension SettingsView {
 					Label {
                         Text(.localized("Certificates"))
                     } icon: {
-                        Image(systemName: _certificates.isEmpty ? "checkmark.shield" : "checkmark.shield.fill")
-                            .foregroundStyle(_certificates.isEmpty ? Color.primary : Color(uiColor: UIColor(displayP3Red: 0.12, green: 0.83, blue: 0.34, alpha: 1)))
+                        Image(systemName: !_hasSettingsCertificates ? "checkmark.shield" : "checkmark.shield.fill")
+                            .foregroundStyle(!_hasSettingsCertificates ? Color.primary : Color(uiColor: UIColor(displayP3Red: 0.12, green: 0.83, blue: 0.34, alpha: 1)))
                     }
 				}
 
-				if let cert = selectedCertificate {
-					CertificatesCellView(cert: cert)
-                        .padding(.vertical, 0)
-					.contentShape(Rectangle())
-					.onTapGesture { _selectedCertificateInfo = cert }
-                    .listRowInsets(EdgeInsets(top: 10, leading: 20, bottom: 10, trailing: 20))
-					.swipeActions(edge: .trailing) {
-						Button(role: .destructive) {
-							_pendingCertificateDelete = cert
-						} label: {
-							Label(.localized("Delete"), systemImage: "trash")
-						}
-					}
-				} else {
-					Text(.localized("No Certificate"))
-						.font(.footnote)
-						.foregroundColor(.disabled())
-				}
+				_settingsCertificateSummary
 
 				LabeledContent("Signing Method") {
 					Menu {

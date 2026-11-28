@@ -115,7 +115,8 @@ struct CertificatesView: View {
         let keyStatus = cert.hasPrivateKey ? "Private key available" : "Private key unavailable"
         let detail = [active ? "Active Apple ID" : nil, keyStatus, "Certificate expiry"]
             .compactMap { $0 }.joined(separator: " · ")
-        return ZagCertificateCard(title: cert.title, team: "Personal Team · " + cert.scope.teamID,
+        let accountLabel = (try? ZagNativeAppleIDs.shared.catalog().accounts.first(where: { $0.id == cert.scope.accountID })?.label) ?? "Apple ID"
+        return ZagCertificateCard(title: accountLabel, team: "Apple Development · Personal Team · " + cert.scope.teamID,
             expiry: cert.expires, needsAttention: !cert.hasPrivateKey || cert.expires <= Date().addingTimeInterval(30 * 86_400),
             status: !cert.hasPrivateKey ? keyStatus : cert.expires <= Date() ? "Certificate expired" : "Expiring soon",
             serial: cert.serial, detail: detail, copyName: { UIPasteboard.general.string = cert.title })
