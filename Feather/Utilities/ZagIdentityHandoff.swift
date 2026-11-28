@@ -27,7 +27,8 @@ final class ZagIdentityHandoff: ObservableObject {
 
     private struct Context {
         let token: ZagPersistedDeveloperToken
-        let device: ZagPairedDeviceIdentity
+        let device: ZagPairedDeviceIdentity?
+        let udid: String
         let bundle: String
         let team: String
         let signer: Data
@@ -77,12 +78,36 @@ final class ZagIdentityHandoff: ObservableObject {
         }
     }
 
-    private func context() async throws -> Context {
+    private func context(bootstrap: Envelope.Bootstrap? = nil) async throws -> Context {
         guard let account = try ZagNativeAppleIDs.shared.catalog().activeID,
               let token = ZagNativeAppleIDs.shared.connectedToken(account),
               let bundle = Bundle.main.bundleIdentifier, let executable = Bundle.main.executableURL,
               let profile = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision") else { throw Failure.context }
-        let (device, installed) = try await ZagRPPairingCore.shared.signingDeviceInventory()
+        // A trusted desktop bootstrap is scoped to the exact USB installation.
+        // It can establish key-import evidence without creating local pairing.
+        // Only the paired path may establish renewable installation ownership.
+        let device: ZagPairedDeviceIdentity?
+        let udid: String
+        let checkInventory: ((String?) -> Bool)?
+        if let bootstrap, !ZagRPPairingCore.shared.hasSavedPairing {
+            try bootstrap.validate()
+            guard bootstrap.bundle == bundle,
+                  try Envelope.scope(account: token.accountID, team: bootstrap.team) == bootstrap.keyScope
+            else { throw Failure.context }
+            device = nil
+            udid = bootstrap.udid
+            checkInventory = nil
+        } else {
+            let (paired, installed) = try await ZagRPPairingCore.shared.signingDeviceInventory()
+            device = paired
+            udid = paired.udid
+            checkInventory = { signerName in
+                guard let app = installed[bundle], let signerName else { return false }
+                return app.version == Bundle.main.version
+                    && app.build == Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+                    && app.signerIdentity == signerName
+            }
+        }
         let evidence = try await Task.detached(priority: .utility) {
             let data = try Data(contentsOf: executable, options: .mappedIfSafe)
             guard let signers = ZagCodeSignatureInspection.signerCertificates(in: data),
@@ -95,16 +120,19 @@ final class ZagIdentityHandoff: ObservableObject {
             let component = ZagNativeInstalledProfiles.Component(originalBundleIdentifier: "app.zagstore.ios",
                 bundleIdentifier: bundle, uuid: "", expiresAt: .distantPast, signedEntitlements: entitlements)
             _ = try ZagProfileOnlyRenewal.validate(Data(contentsOf: profile), component: component, team: team,
-                certificate: signer, udid: device.udid)
+                certificate: signer, udid: udid)
             return (signer, team, certificate.serialNumber, certificate.expiresAt, certificate.commonName)
         }.value
-        guard let app = installed[bundle], app.version == Bundle.main.version,
-              app.build == Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
-              let signerName = evidence.4, app.signerIdentity == signerName,
-              try ZagNativeAppleIDs.shared.catalog().activeID == account,
-              ZagNativeAppleIDs.shared.connectedToken(account) == token,
-              ZagRPPairingCore.shared.pairedIdentity == device else { throw Failure.context }
-        return Context(token: token, device: device, bundle: bundle, team: evidence.1, signer: evidence.0,
+        if let checkInventory {
+            guard checkInventory(evidence.4), ZagRPPairingCore.shared.pairedIdentity == device else { throw Failure.context }
+        } else {
+            guard let bootstrap, (try? bootstrap.validate()) != nil,
+                  bootstrap.team == evidence.1, bootstrap.certificate == evidence.0,
+                  !ZagRPPairingCore.shared.hasSavedPairing else { throw Failure.context }
+        }
+        guard try ZagNativeAppleIDs.shared.catalog().activeID == account,
+              ZagNativeAppleIDs.shared.connectedToken(account) == token else { throw Failure.context }
+        return Context(token: token, device: device, udid: udid, bundle: bundle, team: evidence.1, signer: evidence.0,
                        serial: evidence.2, certificateExpiry: evidence.3)
     }
 
@@ -124,7 +152,7 @@ final class ZagIdentityHandoff: ObservableObject {
             else { return false }
             let context = try await context()
             guard generation == attempt, context.token == token,
-                  context.device.udid.caseInsensitiveCompare(bootstrap.udid) == .orderedSame,
+                  context.udid.caseInsensitiveCompare(bootstrap.udid) == .orderedSame,
                   context.bundle == bootstrap.bundle, context.team == bootstrap.team, context.signer == bootstrap.certificate
             else { return false }
             try await ZagNativeAccountInstall.verifyRunningInstallation()
@@ -156,12 +184,12 @@ final class ZagIdentityHandoff: ObservableObject {
         let attempt = generation
         message = nil
         do {
-            let context = try await context()
+            let context = try await context(bootstrap: bootstrap)
             guard generation == attempt else { return false }
             let key = Curve25519.KeyAgreement.PrivateKey()
             let request = Envelope.Request(protocolVersion: 1, nonce: UUID(),
                 expires: min(bootstrap?.expires ?? .infinity, Date().timeIntervalSince1970 + Envelope.lifetime),
-                recipient: key.publicKey.rawRepresentation, udid: context.device.udid, bundle: context.bundle, team: context.team,
+                recipient: key.publicKey.rawRepresentation, udid: context.udid, bundle: context.bundle, team: context.team,
                 keyScope: try Envelope.scope(account: context.token.accountID, team: context.team), certificate: context.signer)
             try request.validate()
             let bytes = try JSONEncoder().encode(request)
@@ -198,12 +226,12 @@ final class ZagIdentityHandoff: ObservableObject {
             // Consume before import. Interrupted transfers need a new challenge.
             cancel()
             let attempt = generation
-            try await ZagNativeAccountInstall.withExclusiveOperation {
-                let context = try await context()
+            let importedWithoutPairing = try await ZagNativeAccountInstall.withExclusiveOperation {
+                let context = try await context(bootstrap: bootstrap)
                 guard context.token == pending.token else { throw Failure.context }
                 let request = try Envelope.decodeRequest(pending.bytes)
                 try bootstrap?.check(request)
-                try request.checkBinding(device: context.device.udid, bundle: context.bundle, team: context.team,
+                try request.checkBinding(device: context.udid, bundle: context.bundle, team: context.team,
                     scope: Envelope.scope(account: context.token.accountID, team: context.team), certificate: context.signer)
                 let account = context.token.nativeAccountID
                 let scope = ZagSigningScope(accountID: account, teamID: context.team)
@@ -218,7 +246,10 @@ final class ZagIdentityHandoff: ObservableObject {
                       certificates.contains(where: { $0.data == context.signer && $0.expiresAt > .now }),
                       try ZagNativeAppleIDs.shared.catalog().activeID == account,
                       ZagNativeAppleIDs.shared.connectedToken(account) == context.token,
-                      ZagRPPairingCore.shared.pairedIdentity == context.device else { throw Failure.certificate }
+                      (context.device == nil ? !ZagRPPairingCore.shared.hasSavedPairing
+                                             : ZagRPPairingCore.shared.pairedIdentity == context.device)
+                else { throw Failure.certificate }
+                try bootstrap?.validate()
                 var key = try Envelope.open(response, request: pending.bytes, recipient: pending.key)
                 defer { key.resetBytes(in: key.startIndex..<key.endIndex) }
                 try ZagNativeAppleIDs.shared.storeTeams(teams.map(\.signingTeam), for: account)
@@ -231,6 +262,14 @@ final class ZagIdentityHandoff: ObservableObject {
                 } catch ZagSigningIdentityHandoffImport.Failure.conflict {
                     throw Failure.conflict
                 }
+                return context.device == nil
+            }
+            if importedWithoutPairing, let bootstrap {
+                guard generation == attempt else { return }
+                let proof = try bootstrap.wrap(Data(SHA256.hash(data: pending.bytes)), label: "imported")
+                try proof.write(to: Self.file(Envelope.acknowledgementPath), options: [.atomic, .completeFileProtection])
+                message = "Signing identity received. Installation pairing is only needed to enable local installation and renewal."
+                return
             }
             // This independently verifies paired inventory, existing ownership
             // and profile readback before publishing a renewable receipt.
@@ -352,9 +391,6 @@ private struct ZagAutomaticIdentitySetupView: View {
         NavigationStack {
             Form {
                 Text("Use the signing identity from your trusted USB connection. This copy will keep the certificate it was installed with.")
-                if !pairing.hasSavedPairing {
-                    NavigationLink("Set Up Installation Pairing") { InstallationView() }
-                }
                 if selectedAccount == nil {
                     Button("Sign In with the Original Apple ID") { signingIn = true }
                 }
@@ -362,11 +398,14 @@ private struct ZagAutomaticIdentitySetupView: View {
                     ProgressView("Checking existing signing identity…")
                 } else if !authorised && !verifiedExisting {
                     Button("Authorize Signing Identity") { authorize() }
-                        .disabled(selectedAccount == nil || !pairing.hasSavedPairing)
+                        .disabled(selectedAccount == nil)
                 } else if handoff.message == nil && notice == nil {
                     ProgressView("Verifying signing setup…")
                 }
                 if let notice = notice ?? handoff.message { Text(notice) }
+                if !pairing.hasSavedPairing && (verifiedExisting || handoff.message != nil) {
+                    NavigationLink("Set Up Installation Pairing") { InstallationView() }
+                }
             }
             .navigationTitle("Signing Setup")
             .toolbar {

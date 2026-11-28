@@ -150,6 +150,33 @@ class HandoffTests(unittest.TestCase):
         wait.assert_called_once_with(2)
         self.assertEqual(state.delivery_attempts, 2)
 
+    def test_imported_identity_does_not_claim_renewal_verification(self):
+        state = {}
+        def copy_to(target, bundle, local, remote):
+            self.assertEqual((target, bundle), ("target", BUNDLE))
+            if remote == handoff.BOOTSTRAP:
+                bootstrap = json.loads(local.read_bytes())
+                state["id"] = bootstrap["id"]
+                state["secret"] = base64.b64decode(bootstrap["secret"])
+                state["request"] = self.request_bytes(expires=bootstrap["expires"] - 10)
+            else:
+                self.assertEqual(remote, handoff.SETUP_RESPONSE)
+        def copy_from(target, bundle, remote, local):
+            self.assertEqual((target, bundle), ("target", BUNDLE))
+            if remote == handoff.SETUP_REQUEST:
+                label, payload = "request", state["request"]
+            else:
+                self.assertEqual(remote, handoff.ACKNOWLEDGEMENT)
+                label, payload = "imported", hashlib.sha256(state["request"]).digest()
+            local.write_bytes(handoff.wrap(state["secret"], state["id"], label, payload))
+        self.device.copy_to_app.side_effect = copy_to
+        self.device.copy_from_app.side_effect = copy_from
+        with patch.object(handoff, "encrypt", return_value=b"ciphertext"):
+            result = handoff.automatic(Path("."), self.cache, self.scratch, self.device,
+                                       "target", UDID, TEAM, self.scope, self.leaf,
+                                       b"existing-key", "openssl", {"bundleIdentifier": BUNDLE}, notify=Mock())
+        self.assertEqual(result, {"signing_setup": "incomplete", "signing_identity": "imported"})
+
     def test_automatic_wire_rejects_tampering_replay_and_unrelated_phase(self):
         secret = b"1" * 32
         wire = handoff.wrap(secret, "original", "request", b"payload")
