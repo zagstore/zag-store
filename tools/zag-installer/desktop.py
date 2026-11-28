@@ -225,6 +225,7 @@ class Provisioning:
     def handle(self, message):
         event = message["event"]
         if event == "configuration":
+            self._pending_password = None
             from ui_protocol import Channel
             channel = getattr(self.approve, "__self__", None)
             if self.native and isinstance(channel, Channel):
@@ -253,6 +254,10 @@ class Provisioning:
             if self._pending_password is not None:
                 password, self._pending_password = self._pending_password, None
                 return password
+            from ui_protocol import Channel
+            channel = getattr(self.approve, "__self__", None)
+            if isinstance(channel, Channel):
+                return channel.ask("Apple ID password: ", secret=True)
             return secret("Apple ID password: ")
         if event in ("state_read", "state_write"):
             require(self.anisette_scope is not None, "Missing anisette account scope")
@@ -317,20 +322,24 @@ class Provisioning:
         raise ValueError("Unknown desktop provisioning event")
 
     def run(self, binary):
-        with subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, text=True, encoding="utf-8") as child:
-            try:
-                for line in child.stdout:
-                    response = self.handle(json.loads(line))
-                    child.stdin.write(json.dumps(response) + "\n")
-                    child.stdin.flush()
-                require(child.wait(timeout=10) == 0 and self.profiles.keys() == set(self.components.values()),
-                        "Desktop Apple provisioning did not complete")
-            finally:
-                if child.poll() is None:
-                    child.kill()
-                    child.wait()
-        return self.team, self.identity, self.profiles
+        self._pending_password = None
+        try:
+            with subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, encoding="utf-8") as child:
+                try:
+                    for line in child.stdout:
+                        response = self.handle(json.loads(line))
+                        child.stdin.write(json.dumps(response) + "\n")
+                        child.stdin.flush()
+                    require(child.wait(timeout=10) == 0 and self.profiles.keys() == set(self.components.values()),
+                            "Desktop Apple provisioning did not complete")
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+            return self.team, self.identity, self.profiles
+        finally:
+            self._pending_password = None
 
 
 def personal_entitlements(artifact, profile, certificate, team, udid, suffix=""):
