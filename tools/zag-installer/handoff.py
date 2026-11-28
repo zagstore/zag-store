@@ -185,6 +185,7 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
 
     def poll(paths):
         local = scratch / "setup-inbound"
+        next_progress = time.monotonic() + 60
         while time.monotonic() < deadline:
             for remote, labels in paths:
                 local.unlink(missing_ok=True)
@@ -203,6 +204,9 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
                         raise ValueError("Signing Setup was cancelled on the iPhone.")
                     return label, payload
             # Stale and incomplete messages permit no key transfer.
+            if time.monotonic() >= next_progress:
+                notify("Still awaiting iPhone Signing Setup. Complete Installation Pairing in this Personal Team copy if prompted.")
+                next_progress = time.monotonic() + 60
             time.sleep(2)
         raise ValueError("iPhone setup did not complete. Reconnect and use setup to retry.")
 
@@ -218,6 +222,7 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
             "certificate": base64.b64encode(certificate).decode(),
         }).encode())
         device.copy_to_app(target, bundle, bootstrap, BOOTSTRAP)
+        notify("Verified USB bootstrap delivery to the installed Personal Team app.")
     finally:
         bootstrap.unlink(missing_ok=True)
     try:
@@ -225,6 +230,7 @@ def automatic(repo, cache, scratch, device, target, udid, team, item, certificat
     except (ValueError, subprocess.SubprocessError):
         notify("Unlock the iPhone and open the newly installed Zag Store.")
     notify("Complete any prerequisites on the iPhone and authorize Signing Setup there.")
+    notify("If shown, Set Up Installation Pairing is required for this separate app copy; the AppTesters copy does not share its pairing.")
     phase, request_bytes = poll([(SETUP_REQUEST, ("request",)), (ACKNOWLEDGEMENT, ("existing", "cancelled"))])
     if phase == "existing":
         desktop.require(hmac.compare_digest(request_bytes, hashlib.sha256(certificate).digest()),
