@@ -379,9 +379,11 @@ private struct WiredDevice: Sendable {
             }
             let developerMode = root["developer_mode"] as? Bool
             let ready = developerMode == true
+            let modelName = friendlyModel(model)
+            let modelAlreadyInName = name.range(of: modelName, options: [.caseInsensitive, .diacriticInsensitive]) != nil
             return WiredDevice(title: name,
-                               detail: [friendlyModel(model), "iOS \(version)",
-                                        ready ? "Trusted USB connection" : (developerMode == false ? "Developer Mode required" : "Developer Mode status unavailable")]
+                               detail: ((modelAlreadyInName ? [] : [modelName]) + ["iOS \(version)",
+                                        ready ? "Trusted USB connection" : (developerMode == false ? "Developer Mode required" : "Developer Mode status unavailable")])
                                    .joined(separator: " · "),
                                ready: ready, developerModeRequired: developerMode == false, trusted: true)
         } catch {
@@ -504,8 +506,8 @@ private struct InstallerView: View {
                     Image(systemName: "iphone").font(.system(size: 42, weight: .light)).foregroundStyle(ZagPalette.spectrum)
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(device.title).font(.headline)
-                        Text(device.detail).font(.caption).foregroundStyle(muted)
+                        Text(device.title).font(.system(size: 19, weight: .semibold))
+                        Text(device.detail).font(.system(size: 13)).foregroundStyle(muted)
                     }
                     Spacer()
                     connectionLight
