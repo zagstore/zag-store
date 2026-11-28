@@ -377,6 +377,63 @@ async fn issue_certificate(
 }
 
 // Publish only fixed stage names. Apple response bodies can contain account or device data.
+// Counts are advisory: listAppIds does not guarantee the server's remaining
+// rolling-window quota. Match exact identifiers, never wildcard or foreign IDs.
+fn imported_id_counts(
+    response: &Dictionary, prefix: &str, team_id: &str, suffixes: &[&str],
+) -> Result<(usize, usize, usize), Report> {
+    let rows = response.get("appIds").and_then(Plist::as_array)
+        .filter(|rows| rows.len() <= 1000)
+        .ok_or_else(|| report!("Missing or oversized App ID inventory"))?;
+    let mut identifiers = std::collections::HashSet::new();
+    for row in rows {
+        let row = row.as_dictionary().ok_or_else(|| report!("Invalid App ID inventory row"))?;
+        let identifier = row.get("identifier").and_then(Plist::as_string)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| report!("Missing App ID identifier"))?;
+        if !identifiers.insert(identifier) {
+            bail!("Duplicate App ID inventory identifier");
+        }
+    }
+    let reused = suffixes.iter().filter(|suffix| {
+        let identifier = format!("{prefix}.{team_id}{suffix}");
+        identifiers.contains(identifier.as_str())
+    }).count();
+    Ok((identifiers.len(), reused, suffixes.len() - reused))
+}
+
+#[cfg(test)]
+mod imported_id_tests {
+    use super::*;
+
+    #[test]
+    fn counts_only_exact_reusable_identifiers() {
+        let mut response = Dictionary::new();
+        response.insert("appIds".into(), Plist::Array([
+            "app.zloader.imported.test.TEAM",
+            "app.zloader.imported.test.TEAM.Share",
+            "app.zloader.imported.test.OTHER.Notification",
+        ].iter().map(|id| {
+            let mut row = Dictionary::new();
+            row.insert("identifier".into(), Plist::String((*id).into()));
+            Plist::Dictionary(row)
+        }).collect()));
+        assert_eq!(imported_id_counts(&response, "app.zloader.imported.test", "TEAM",
+            &["", ".Share", ".Notification"]).unwrap(), (3, 2, 1));
+    }
+
+    #[test]
+    fn rejects_missing_and_duplicate_inventory() {
+        let missing = Dictionary::new();
+        assert!(imported_id_counts(&missing, "prefix", "TEAM", &[""]).is_err());
+        let mut duplicate = Dictionary::new();
+        let mut row = Dictionary::new();
+        row.insert("identifier".into(), Plist::String("prefix.TEAM".into()));
+        duplicate.insert("appIds".into(), Plist::Array(vec![Plist::Dictionary(row.clone()), Plist::Dictionary(row)]));
+        assert!(imported_id_counts(&duplicate, "prefix", "TEAM", &[""]).is_err());
+    }
+}
+
 async fn run(stage: &mut &'static str) -> Result<(), Report> {
     if !net_policy::LIVE_NETWORK {
         bail!("Desktop networking was disabled at build time");
@@ -523,6 +580,19 @@ async fn run(stage: &mut &'static str) -> Result<(), Report> {
     if let Some(credential) = portable {
         if relay(json!({"event":"account_bootstrap","credential":credential}))? != true {
             bail!("Desktop account transfer was not accepted");
+        }
+    }
+    if let Some(prefix) = imported_prefix {
+        *stage = "Apple App ID inventory";
+        check_session()?;
+        let response = session.send_dev_request_no_response(
+            &dev_url("listAppIds", Ios),
+            plist!(dict {"teamId": team_id}),
+        ).await?;
+        let (registered, reused, needed) = imported_id_counts(&response, prefix, team_id, &suffixes)?;
+        if relay(json!({"event":"app_id_inventory","registered":registered,
+                       "reused":reused,"needed":needed}))? != true {
+            bail!("App ID inventory confirmation was not accepted");
         }
     }
     *stage = "development certificate inventory";
