@@ -442,6 +442,8 @@ private struct InstallerView: View {
     @State private var upgrade = false
     @State private var team = ""
     @State private var reply = ""
+    @State private var revealPassword = false
+    @FocusState private var promptFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -624,16 +626,33 @@ private struct InstallerView: View {
         .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
             VStack(alignment: .leading, spacing: 20) {
-                Text(prompt.secure ? "Secure Apple Authentication" : "Confirm Installation")
-                    .font(.title2.bold())
+                let accountPrompt = prompt.message == "Apple ID: "
+                let passwordPrompt = prompt.message == "Apple ID password: "
+                VStack(spacing: 8) {
+                    Image(systemName: accountPrompt || passwordPrompt ? "apple.logo" : (prompt.secure ? "lock.shield" : "checkmark.shield"))
+                        .font(.system(size: 34))
+                    Text(accountPrompt || passwordPrompt ? "Sign in with your Apple ID" : (prompt.secure ? "Secure verification" : "Confirm Installation"))
+                        .font(.title2.bold())
+                    Text("Zag Installer").font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity)
                 Text(prompt.message)
                     .fixedSize(horizontal: false, vertical: true)
                 if prompt.secure {
-                    SecureField("Enter securely", text: $reply)
-                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        if passwordPrompt && revealPassword {
+                            TextField("Password", text: $reply).focused($promptFocused)
+                        } else {
+                            SecureField(passwordPrompt ? "Password" : "Enter securely", text: $reply).focused($promptFocused)
+                        }
+                        if passwordPrompt {
+                            Button { revealPassword.toggle() } label: {
+                                Image(systemName: revealPassword ? "eye.slash" : "eye")
+                            }.buttonStyle(.plain).accessibilityLabel(revealPassword ? "Hide password" : "Show password")
+                        }
+                    }.textFieldStyle(.roundedBorder)
                 } else if prompt.confirmation == nil {
-                    TextField("Response", text: $reply)
-                        .textFieldStyle(.roundedBorder)
+                    TextField(accountPrompt ? "name@example.com" : "Response", text: $reply)
+                        .textFieldStyle(.roundedBorder).focused($promptFocused)
                 }
                 HStack {
                     Button("Cancel") {
@@ -647,11 +666,14 @@ private struct InstallerView: View {
                         installer.answer(answer)
                     }
                     .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(prompt.confirmation == nil && reply.isEmpty)
                 }
             }
             .padding(24)
             .frame(width: 440)
-            .onAppear { reply = "" }
+            .onAppear { reply = ""; revealPassword = false; promptFocused = true }
+            .onDisappear { reply = ""; revealPassword = false }
             .interactiveDismissDisabled()
         }
     }
