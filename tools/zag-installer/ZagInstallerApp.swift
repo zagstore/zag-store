@@ -715,6 +715,7 @@ private struct InstallerView: View {
                         .disabled(installer.busy)
                 }
             }
+            Spacer(minLength: 0)
             HStack(spacing: 4) {
                 ForEach(["stable", "beta", "nightly"], id: \.self) { channel in
                     Button {
@@ -728,11 +729,11 @@ private struct InstallerView: View {
                         }
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(releaseChannel == channel ? Color.white : muted)
-                        .frame(maxWidth: .infinity, minHeight: 36)
+                        .frame(maxWidth: .infinity, minHeight: 30)
                         .background {
                             if releaseChannel == channel {
                                 RoundedRectangle(cornerRadius: 10)
-                                    .fill(LinearGradient(colors: [ZagPalette.rgb(0x4778ee), ZagPalette.rgb(0x3654ce)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                    .fill(ZagPalette.spectrum)
                                     .shadow(color: ZagPalette.blue.opacity(0.22), radius: 5, y: 2)
                             }
                         }

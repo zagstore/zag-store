@@ -265,6 +265,23 @@ mod developer_install_gate_tests {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Local capability query: never opens a device connection.
+    // Read-only discovery of devices already advertised by the system mux.
+    // No pairing creation, network scanning or write-capable service access.
+    if args.len() == 1 && args[0] == "discover-devices" {
+        let job = async {
+            let mut mux = UsbmuxdAddr::default().connect(1).await?;
+            let devices = mux.get_devices().await?;
+            let rows: Vec<_> = devices.into_iter().map(|d| {
+                json!({"udid": d.udid, "connection": if d.connection_type == Connection::Usb { "usb" } else { "network" }})
+            }).collect();
+            Ok::<_, Box<dyn std::error::Error>>(json!({"devices": rows}))
+        };
+        match tokio::time::timeout(Duration::from_secs(10), job).await {
+            Ok(Ok(result)) => println!("{}", result),
+            _ => { eprintln!("Device discovery unavailable"); std::process::exit(1); }
+        }
+        return;
+    }
     if args.len() == 1 && args[0] == "capabilities" {
         println!("{}", json!({"native_install_dev": cfg!(feature = "native-install-dev")}));
         return;
