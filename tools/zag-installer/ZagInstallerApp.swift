@@ -884,11 +884,11 @@ private struct InstallerView: View {
         .background { atmosphere.ignoresSafeArea() }
         .tint(ZagPalette.rgb(0x3a5ce8))
         .sheet(item: $installer.prompt) { prompt in
+            let combinedPrompt = prompt.secure && prompt.message == "Apple ID credentials: "
+            let accountPrompt = prompt.message == "Apple ID: " || combinedPrompt
+            let passwordPrompt = prompt.message == "Apple ID password: "
+            let verificationPrompt = prompt.secure && prompt.message == "Apple verification code: "
             VStack(alignment: .leading, spacing: 20) {
-                let combinedPrompt = prompt.secure && prompt.message == "Apple ID credentials: "
-                let accountPrompt = prompt.message == "Apple ID: " || combinedPrompt
-                let passwordPrompt = prompt.message == "Apple ID password: "
-                let verificationPrompt = prompt.secure && prompt.message == "Apple verification code: "
                 VStack(spacing: 8) {
                     Image(systemName: accountPrompt || passwordPrompt ? "apple.logo" : (prompt.secure ? "lock.shield" : "checkmark.shield"))
                         .font(.system(size: 34))
