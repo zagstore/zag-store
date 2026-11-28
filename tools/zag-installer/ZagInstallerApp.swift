@@ -499,7 +499,9 @@ private struct InstallerView: View {
             Spacer(minLength: 0)
             HStack {
                 Spacer()
-                Text("Zag Installer \(Bundle.main.object(forInfoDictionaryKey: \"CFBundleShortVersionString\") as? String ?? \"—\") (\(Bundle.main.object(forInfoDictionaryKey: \"CFBundleVersion\") as? String ?? \"—\"))")
+                let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+                let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+                Text("Zag Installer \(version) (\(build))")
                     .font(.caption).foregroundStyle(muted)
             }
         }
