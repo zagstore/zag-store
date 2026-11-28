@@ -204,7 +204,7 @@ class NativeUSBAdapterTests(unittest.TestCase):
         with patch.object(installer.subprocess, "run") as run:
             run.side_effect = [self.reply(), self.reply(mode="inventory")]
             dev.usb_device()
-            with self.assertRaisesRegex(ValueError, "cannot confirm"):
+            with self.assertRaisesRegex(ValueError, "destination occupancy is unconfirmed"):
                 dev.apps(self.UDID)
 
     def test_apptesters_legacy_cannot_be_a_personal_team_destination(self):
