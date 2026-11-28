@@ -261,6 +261,30 @@ mod developer_install_gate_tests {
     }
 }
 
+fn group_transports(devices: impl IntoIterator<Item = (String, bool)>) -> Vec<serde_json::Value> {
+    let mut grouped = std::collections::BTreeMap::<String, (bool, bool)>::new();
+    for (udid, usb) in devices {
+        let entry = grouped.entry(udid.to_ascii_lowercase()).or_default();
+        if usb { entry.0 = true; } else { entry.1 = true; }
+    }
+    grouped.into_iter().map(|(udid, (usb, network))|
+        json!({"udid":udid,"usb":usb,"network":network,
+            "preferred_connection":if usb {"usb"} else {"network"}})).collect()
+}
+
+#[cfg(test)]
+mod grouped_discovery_tests {
+    use super::*;
+    #[test]
+    fn merges_case_insensitive_identity_and_prefers_usb() {
+        let rows = group_transports([("ABC".into(), false), ("abc".into(), true),
+            ("ABC".into(), true), ("DEF".into(), false)]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], json!({"udid":"abc","usb":true,"network":true,"preferred_connection":"usb"}));
+        assert_eq!(rows[1], json!({"udid":"def","usb":false,"network":true,"preferred_connection":"network"}));
+    }
+}
+
 #[tokio::main(flavor="current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -291,6 +315,20 @@ async fn main() {
         match tokio::time::timeout(Duration::from_secs(10), job).await {
             Ok(Ok(result)) => println!("{}", result),
             _ => println!("{}", json!({"trust_verified":false,"diagnostic":"session_unavailable"})),
+        }
+        return;
+    }
+    // Group transport advertisements by physical device identity.
+    if args.len() == 1 && args[0] == "discover-grouped" {
+        let job = async {
+            let mut mux = UsbmuxdAddr::default().connect(1).await?;
+            let devices = mux.get_devices().await?;
+            let rows = group_transports(devices.into_iter().map(|d| (d.udid, d.connection_type == Connection::Usb)));
+            Ok::<_, Box<dyn std::error::Error>>(json!({"devices":rows}))
+        };
+        match tokio::time::timeout(Duration::from_secs(10), job).await {
+            Ok(Ok(result)) => println!("{}", result),
+            _ => { eprintln!("Device discovery unavailable"); std::process::exit(1); }
         }
         return;
     }
