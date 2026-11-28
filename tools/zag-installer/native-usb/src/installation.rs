@@ -55,6 +55,17 @@ async fn installed(
     }))
 }
 
+/// A fresh destination is represented as None; any different observed
+/// version or newly appearing app must abort before writing further.
+fn require_destination(expected: Option<&VersionStamp>, observed: Option<&VersionStamp>)
+    -> Result<(), Box<dyn Error>>
+{
+    if expected != observed {
+        return Err("Personal Team destination changed or is unexpectedly occupied".into());
+    }
+    Ok(())
+}
+
 /// Verified IPA staging, exact destination checks, install/upgrade, and
 /// independent readback. This function CAN modify an iPhone, so it is kept
 /// unexposed until end-to-end verification and explicit user opt-in.
@@ -76,9 +87,7 @@ pub async fn install_authorized(
     }
     let mut proxy = InstallationProxyClient::connect(provider).await?;
     let before = installed(&mut proxy, request.bundle).await?;
-    if before != request.previous {
-        return Err("Destination inventory changed before installation".into());
-    }
+    require_destination(request.previous.as_ref(), before.as_ref())?;
     // The fresh path is restricted to an exact mapped bundle; the unrelated
     // legacy AppTesters copy is never uninstalled, upgraded, or overwritten.
     // The caller's explicit INSTALL approval must occur before reaching here.
@@ -87,9 +96,8 @@ pub async fn install_authorized(
         provider, request.ipa, request.job_token, request.sha256
     ).await?;
     let result: Result<VersionStamp, Box<dyn Error>> = async {
-        if installed(&mut proxy, request.bundle).await? != request.previous {
-            return Err("Destination inventory changed during transfer".into());
-        }
+        let during = installed(&mut proxy, request.bundle).await?;
+        require_destination(request.previous.as_ref(), during.as_ref())?;
         if request.previous.is_some() {
             proxy.upgrade(remote, None).await?;
         } else {
@@ -128,13 +136,17 @@ mod tests {
         assert!(!request.authorization_verified);
     }
     #[test]
-    fn fresh_install_requires_explicit_missing_previous_state() {
-        // A separate fresh install is represented by None. An upgrade must
-        // bind an affirmative prior version and build, not a broad zero count.
-        let fresh: Option<VersionStamp> = None;
-        let existing = Some(VersionStamp {version:"1.0.0".into(),build:"3".into()});
-        assert_eq!(fresh,None);
-        assert_ne!(existing,fresh);
+    fn destination_transition_rejects_unexpected_app_and_changed_upgrade() {
+        let previous = VersionStamp {version:"1.0.0".into(),build:"3".into()};
+        let newer = VersionStamp {version:"1.0.0".into(),build:"4".into()};
+        // Fresh installs can proceed only while *both* inventory checks
+        // continue to report no mapped destination.
+        assert!(require_destination(None, None).is_ok());
+        assert!(require_destination(None, Some(&previous)).is_err());
+        // Upgrades require the original exact version/build at both checks.
+        assert!(require_destination(Some(&previous), Some(&previous)).is_ok());
+        assert!(require_destination(Some(&previous), Some(&newer)).is_err());
+        assert!(require_destination(Some(&previous), None).is_err());
     }
     #[test]
     fn bundle_identifier_restricted_to_zag_personal_team() {
