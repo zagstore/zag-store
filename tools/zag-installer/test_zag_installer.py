@@ -261,7 +261,7 @@ class NativeSignedIpaPreflightTests(unittest.TestCase):
                 "CFBundleIdentifier": DESTINATION, "CFBundleShortVersionString": "1.0.0",
                 "CFBundleVersion": "4", "MinimumOSVersion": "16.4"
             }))
-        self.udid = "00008130-000E3D9C2110001C"
+        self.udid = "00000000-0000000000000000"
         self.cert = b"test certificate"
         self.root_pem = self.root / "apple.pem"
 

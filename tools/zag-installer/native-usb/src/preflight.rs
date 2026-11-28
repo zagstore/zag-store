@@ -152,7 +152,7 @@ mod tests {
             bundle_identifier:"app.zagstore.ios.FTB8PRW638".into(),
             version:"1.0.0".into(), build:"5".into(),
             minimum_os:"16.4".into(),
-            device_udid:"00008130-000E3D9C2110001C".into(),
+            device_udid:"00000000-0000000000000000".into(),
             previous:None
         }
     }
@@ -178,7 +178,7 @@ mod tests {
             "schema":1,"ipa_path":"/tmp/signed.ipa","ipa_sha256":"0".repeat(64),
             "ipa_bytes":256,"bundle_identifier":"app.zagstore.ios.FTB8PRW638",
             "version":"1.0.0","build":"5","minimum_os":"16.4",
-            "device_udid":"00008130-000E3D9C2110001C","previous":null,
+            "device_udid":"00000000-0000000000000000","previous":null,
             "install_now":true
         });
         assert!(serde_json::from_value::<PreflightPlan>(value).is_err());
@@ -188,14 +188,14 @@ mod tests {
         let request = plan();
         let valid = json!({
             "transport":"system-usbmuxd","trust_verified":true,
-            "developer_mode":true,"udid":"00008130-000E3D9C2110001C",
+            "developer_mode":true,"udid":"00000000-0000000000000000",
             "device":{"ProductVersion":"27.2.1"}
         });
         let output = device_binding(&request,&valid).unwrap();
         assert_eq!(output["writes_performed"],false);
         assert_eq!(output["installation_authorized"],false);
         let mut changed = valid.clone();
-        changed["udid"] = json!("00008130-000E3D9C2110001D");
+        changed["udid"] = json!("11111111-1111111111111111");
         assert!(device_binding(&request,&changed).is_err());
         let mut old_os = valid;
         old_os["device"]["ProductVersion"] = json!("15.7");
