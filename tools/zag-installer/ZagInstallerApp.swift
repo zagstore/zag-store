@@ -482,8 +482,9 @@ private struct InstallerView: View {
     @FocusState private var promptFocused: Bool
 
     var body: some View {
+        VStack(spacing: 0) {
         ScrollView {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
                 if let image = brandImage {
                     Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
@@ -701,7 +702,11 @@ private struct InstallerView: View {
             .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(border, lineWidth: 1) }
             }
             }
-            Spacer(minLength: 0)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        Divider()
             HStack {
                 Spacer()
                 let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
@@ -709,9 +714,8 @@ private struct InstallerView: View {
                 Text("Version \(version) (\(build))")
                     .font(.system(size: 14, weight: .medium)).monospacedDigit().foregroundStyle(muted)
             }
-        }
-        .padding(24)
-        .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 10)
         }
         .task {
             while !Task.isCancelled {
